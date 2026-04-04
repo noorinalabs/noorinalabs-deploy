@@ -1,0 +1,65 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to roll back to (e.g., sha-a1b2c3d, phase12-wave1)'
+        required: true
+      service:
+        description: 'Service to roll back'
+        type: choice
+        options:
+          - all
+          - api
+          - frontend
+        default: 'all'
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rollback services
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          ROLLBACK_SERVICE: ${{ inputs.service }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: IMAGE_TAG,ROLLBACK_SERVICE
+          script: |
+            set -euo pipefail
+            cd /opt/noorinalabs-deploy
+
+            echo "==> Rolling back ${ROLLBACK_SERVICE} to image tag: ${IMAGE_TAG}"
+
+            # Update IMAGE_TAG in .env
+            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=\"${IMAGE_TAG}\"/" .env
+
+            if [ "$ROLLBACK_SERVICE" = "all" ]; then
+              docker compose -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || true
+              docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate api frontend
+            else
+              docker compose -f compose/docker-compose.prod.yml --env-file .env pull "$ROLLBACK_SERVICE" 2>/dev/null || true
+              docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate "$ROLLBACK_SERVICE"
+            fi
+
+            sleep 15
+            echo "==> Rollback complete. Verifying health..."
+            docker compose -f compose/docker-compose.prod.yml ps --format '{{.Name}}\t{{.Status}}'
+
+      - name: Report rollback status
+        if: always()
+        run: |
+          echo "## Rollback: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Service:** ${{ inputs.service }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target tag:** ${{ inputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
