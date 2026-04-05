@@ -112,7 +112,7 @@ jobs:
             done
 
             echo "==> Checking all container health..."
-            docker compose -p noorinalabs -f compose/docker-compose.prod.yml ps --format '{{.Name}}\t{{.Status}}'
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env ps --format '{{.Name}}\t{{.Status}}'
             echo "==> Deployment verified successfully"
 
       - name: Report deployment status
