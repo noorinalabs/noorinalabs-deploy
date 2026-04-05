@@ -35,6 +35,17 @@ This file provides guidance to Claude Code when working in the deployment orches
 - `terraform/hetzner/main.tf` — VPS provisioning
 - `scripts/verify_deployment.sh` — post-deploy verification script
 
+## Team
+
+| Role | Level | Name | Roster File |
+|------|-------|------|-------------|
+| Infrastructure Manager | Senior VP | Bereket Tadesse | `roster/manager_bereket.md` |
+| Platform Architect | Staff | Weronika Zielinska | `roster/platform_architect_weronika.md` |
+| SRE Engineer | Senior | Lucas Ferreira | `roster/sre_engineer_lucas.md` |
+| SRE Engineer | Senior | Aisha Idrissi | `roster/sre_engineer_aisha.md` |
+| Security Engineer | Senior | Nino Kavtaradze | `roster/security_engineer_nino.md` |
+| Observability Engineer | Senior | Nurul Hakim | `roster/observability_engineer_nurul.md` |
+
 ## Team Workflow
 
 See the org-level charter at `noorinalabs-main/.claude/team/charter.md` and this repo's charter at `.claude/team/charter.md`.
