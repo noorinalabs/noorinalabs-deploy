@@ -2,7 +2,7 @@ name: Verify Deployment
 
 on:
   workflow_run:
-    workflows: ["Deploy isnad-graph"]
+    workflows: ["Deploy noorinalabs-isnad-graph"]
     types: [completed]
   workflow_dispatch:
 

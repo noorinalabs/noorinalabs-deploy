@@ -1,6 +1,6 @@
 # Terraform — Hetzner Cloud Provisioning
 
-Provisions a Hetzner Cloud VPS (CPX41) for the isnad-graph production deployment.
+Provisions a Hetzner Cloud VPS (CPX41) for the noorinalabs-isnad-graph production deployment.
 
 ## Resources Created
 
@@ -46,7 +46,7 @@ ssh_public_key_path = "~/.ssh/id_ed25519.pub"
 | `hcloud_token` | Hetzner Cloud API token (sensitive) | — |
 | `ssh_public_key_path` | Path to SSH public key | `~/.ssh/id_ed25519.pub` |
 | `server_type` | Hetzner server type | `cpx41` |
-| `server_name` | Instance name | `isnad-graph-prod` |
+| `server_name` | Instance name | `noorinalabs-isnad-graph-prod` |
 | `location` | Hetzner location | `ash` |
 
 ## Outputs

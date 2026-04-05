@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily backup timer for isnad-graph databases
+Description=Daily backup timer for noorinalabs-isnad-graph databases
 
 [Timer]
 OnCalendar=*-*-* 03:00:00 UTC

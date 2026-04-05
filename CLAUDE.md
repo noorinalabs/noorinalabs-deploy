@@ -24,7 +24,7 @@ This file provides guidance to Claude Code when working in the deployment orches
 
 ## Deployment Flow
 
-1. Push to `isnad-graph` main → CI passes → `notify-deploy.yml` fires `repository_dispatch`
+1. Push to `noorinalabs-isnad-graph` main → CI passes → `notify-deploy.yml` fires `repository_dispatch`
 2. This repo's `deploy-isnad-graph.yml` receives the event → SSHs to VPS → pulls images → `docker compose up`
 3. `verify-deploy.yml` runs post-deploy health checks
 
@@ -37,7 +37,7 @@ This file provides guidance to Claude Code when working in the deployment orches
 
 ## Team Workflow
 
-See the org-level charter at `noorinalabs_main/.claude/team/charter.md` and this repo's charter at `.claude/team/charter.md`.
+See the org-level charter at `noorinalabs-main/.claude/team/charter.md` and this repo's charter at `.claude/team/charter.md`.
 
 ## Infrastructure Details
 

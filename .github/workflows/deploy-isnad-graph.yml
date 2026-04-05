@@ -1,8 +1,8 @@
-name: Deploy isnad-graph
+name: Deploy noorinalabs-isnad-graph
 
 on:
   repository_dispatch:
-    types: [deploy-isnad-graph]
+    types: [deploy-noorinalabs-isnad-graph]
   workflow_dispatch:
     inputs:
       image_tag:
@@ -70,8 +70,8 @@ jobs:
             echo "CACHEBUST=\"$(date +%s)\"" >> "$env_file"
             chmod 600 "$env_file"
 
-            echo "==> Pulling latest isnad-graph source (for local builds)..."
-            cd /opt/isnad-graph
+            echo "==> Pulling latest noorinalabs-isnad-graph source (for local builds)..."
+            cd /opt/noorinalabs-isnad-graph
             git fetch origin main
             git reset --hard origin/main
             cd /opt/noorinalabs-deploy
@@ -118,7 +118,7 @@ jobs:
       - name: Report deployment status
         if: always()
         run: |
-          echo "## Deploy isnad-graph: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Deploy noorinalabs-isnad-graph: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "- **Source repo:** ${{ github.event.client_payload.repo }}" >> "$GITHUB_STEP_SUMMARY"

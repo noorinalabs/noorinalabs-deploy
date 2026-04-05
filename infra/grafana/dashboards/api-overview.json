@@ -126,11 +126,11 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["isnad-graph", "api"],
+  "tags": ["noorinalabs-isnad-graph", "api"],
   "templating": { "list": [] },
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "isnad-graph API Overview",
+  "title": "noorinalabs-isnad-graph API Overview",
   "uid": "isnad-api-overview"
 }

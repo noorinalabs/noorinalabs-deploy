@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify_deployment.sh — Production deployment verification for isnad-graph
+# verify_deployment.sh — Production deployment verification for noorinalabs-isnad-graph
 # Checks deploy workflow, live site, API health, security headers, and SSL.
 #
 # Usage:

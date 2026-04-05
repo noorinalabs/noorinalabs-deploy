@@ -10,7 +10,7 @@ services:
     build:
       context: ../infra/neo4j
       dockerfile: Dockerfile
-    image: isnad-graph-neo4j:5-community
+    image: noorinalabs-isnad-graph-neo4j:5-community
     ports:
       - "7474:7474"
       - "7687:7687"
@@ -112,9 +112,9 @@ services:
     restart: unless-stopped
 
   api:
-    image: ghcr.io/noorinalabs/isnad-graph:${IMAGE_TAG:-latest}
+    image: ghcr.io/noorinalabs/noorinalabs-isnad-graph:${IMAGE_TAG:-latest}
     build:
-      context: /opt/isnad-graph
+      context: /opt/noorinalabs-isnad-graph
       dockerfile: Dockerfile
     expose:
       - "8000"
@@ -173,9 +173,9 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: ghcr.io/noorinalabs/isnad-graph-frontend:${IMAGE_TAG:-latest}
+    image: ghcr.io/noorinalabs/noorinalabs-isnad-graph-frontend:${IMAGE_TAG:-latest}
     build:
-      context: /opt/isnad-graph/frontend
+      context: /opt/noorinalabs-isnad-graph/frontend
       dockerfile: Dockerfile
       args:
         CACHEBUST: ${CACHEBUST:-1}

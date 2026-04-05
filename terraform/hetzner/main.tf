@@ -48,7 +48,7 @@ resource "hcloud_server" "app" {
   firewall_ids = [hcloud_firewall.web.id]
 
   labels = {
-    project     = "isnad-graph"
+    project     = "noorinalabs-isnad-graph"
     environment = "production"
   }
 }

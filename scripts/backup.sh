@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# isnad-graph automated backup script
+# noorinalabs-isnad-graph automated backup script
 # Dumps PostgreSQL and Neo4j databases, compresses, checksums, and uploads
 # to Backblaze B2 via rclone. Manages retention (7 daily + 4 weekly).
 #

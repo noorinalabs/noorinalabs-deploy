@@ -1,6 +1,6 @@
 # Repo Charter — noorinalabs-deploy
 
-This charter supplements the org-level charter at `noorinalabs_main/.claude/team/charter.md`. All org charter rules apply.
+This charter supplements the org-level charter at `noorinalabs-main/.claude/team/charter.md`. All org charter rules apply.
 
 ## team_name
 
@@ -25,7 +25,7 @@ Deployment orchestration for all NoorinALabs services. Owns:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| `deploy-isnad-graph.yml` | `repository_dispatch` from isnad-graph | Deploy isnad-graph services |
+| `deploy-isnad-graph.yml` | `repository_dispatch` from noorinalabs-isnad-graph | Deploy noorinalabs-isnad-graph services |
 | `deploy-all.yml` | Manual dispatch | Full stack redeploy with sequencing |
 | `verify-deploy.yml` | After deploy succeeds | Post-deploy health checks |
 | `rollback.yml` | Manual dispatch | Emergency rollback to specific image tag |

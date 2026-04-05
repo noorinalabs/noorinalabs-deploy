@@ -79,7 +79,7 @@ if [ -f "$ENV_FILE" ]; then
 else
   cat > "$ENV_FILE" << 'ENVEOF'
 # =============================================================================
-# isnad-graph production environment
+# noorinalabs-isnad-graph production environment
 # Fill in all values marked CHANGE-ME before starting the stack.
 # =============================================================================
 

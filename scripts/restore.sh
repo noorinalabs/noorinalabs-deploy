@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# isnad-graph restore script
+# noorinalabs-isnad-graph restore script
 # Downloads backups from Backblaze B2, verifies checksums, and restores
 # PostgreSQL and Neo4j databases.
 #

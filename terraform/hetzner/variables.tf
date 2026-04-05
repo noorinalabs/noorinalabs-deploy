@@ -19,7 +19,7 @@ variable "server_type" {
 variable "server_name" {
   description = "Name for the VPS instance"
   type        = string
-  default     = "isnad-graph-prod"
+  default     = "noorinalabs-isnad-graph-prod"
 }
 
 variable "location" {
