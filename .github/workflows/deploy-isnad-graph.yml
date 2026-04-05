@@ -23,10 +23,7 @@ jobs:
       - name: Determine image tag
         id: tag
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            # Use the SHA from the dispatching repo as the tag
-            echo "tag=sha-$(echo '${{ github.event.client_payload.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
-          elif [ -n "${{ inputs.image_tag }}" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_tag }}" ]; then
             echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
@@ -73,9 +70,17 @@ jobs:
             echo "CACHEBUST=\"$(date +%s)\"" >> "$env_file"
             chmod 600 "$env_file"
 
-            echo "==> Pulling images and starting services..."
-            docker compose -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || echo "Image pull failed — will use cached"
-            docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
+            echo "==> Pulling latest isnad-graph source (for local builds)..."
+            cd /opt/isnad-graph
+            git fetch origin main
+            git reset --hard origin/main
+            cd /opt/noorinalabs-deploy
+
+            echo "==> Attempting GHCR image pull..."
+            docker compose -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || echo "GHCR pull failed — will build locally"
+
+            echo "==> Starting services (builds locally if no GHCR image)..."
+            docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --build --force-recreate --remove-orphans
 
             echo "==> Waiting for services to stabilize..."
             sleep 15

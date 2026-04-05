@@ -113,6 +113,9 @@ services:
 
   api:
     image: ghcr.io/noorinalabs/isnad-graph:${IMAGE_TAG:-latest}
+    build:
+      context: /opt/isnad-graph
+      dockerfile: Dockerfile
     expose:
       - "8000"
     # Security: read_only prevents runtime writes to the container filesystem.
@@ -171,6 +174,11 @@ services:
 
   frontend:
     image: ghcr.io/noorinalabs/isnad-graph-frontend:${IMAGE_TAG:-latest}
+    build:
+      context: /opt/isnad-graph/frontend
+      dockerfile: Dockerfile
+      args:
+        CACHEBUST: ${CACHEBUST:-1}
     expose:
       - "80"
     read_only: true
