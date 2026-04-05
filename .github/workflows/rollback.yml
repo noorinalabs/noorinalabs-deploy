@@ -46,16 +46,16 @@ jobs:
             sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=\"${IMAGE_TAG}\"/" .env
 
             if [ "$ROLLBACK_SERVICE" = "all" ]; then
-              docker compose -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || true
-              docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate api frontend
+              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || true
+              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate api frontend
             else
-              docker compose -f compose/docker-compose.prod.yml --env-file .env pull "$ROLLBACK_SERVICE" 2>/dev/null || true
-              docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate "$ROLLBACK_SERVICE"
+              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull "$ROLLBACK_SERVICE" 2>/dev/null || true
+              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate "$ROLLBACK_SERVICE"
             fi
 
             sleep 15
             echo "==> Rollback complete. Verifying health..."
-            docker compose -f compose/docker-compose.prod.yml ps --format '{{.Name}}\t{{.Status}}'
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml ps --format '{{.Name}}\t{{.Status}}'
 
       - name: Report rollback status
         if: always()

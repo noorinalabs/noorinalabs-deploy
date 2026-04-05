@@ -55,12 +55,12 @@ jobs:
             echo "CACHEBUST=\"$(date +%s)\"" >> "$env_file"
             chmod 600 "$env_file"
 
-            docker compose -f compose/docker-compose.prod.yml --env-file .env pull 2>/dev/null || true
-            docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull 2>/dev/null || true
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
             sleep 15
 
             for i in $(seq 1 24); do
-              api_health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-deploy-api-1 2>/dev/null || echo "not_found")
+              api_health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-api-1 2>/dev/null || echo "not_found")
               if [ "$api_health" = "healthy" ]; then echo "All services healthy"; break; fi
               if [ "$i" -eq 24 ]; then echo "Health check timeout"; exit 1; fi
               sleep 5

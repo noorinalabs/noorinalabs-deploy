@@ -77,10 +77,10 @@ jobs:
             cd /opt/noorinalabs-deploy
 
             echo "==> Attempting GHCR image pull..."
-            docker compose -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || echo "GHCR pull failed — will build locally"
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || echo "GHCR pull failed — will build locally"
 
             echo "==> Starting services (builds locally if no GHCR image)..."
-            docker compose -f compose/docker-compose.prod.yml --env-file .env up -d --build --force-recreate --remove-orphans
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --build --force-recreate --remove-orphans
 
             echo "==> Waiting for services to stabilize..."
             sleep 15
@@ -97,7 +97,7 @@ jobs:
 
             echo "==> Checking service health via Docker..."
             for i in $(seq 1 24); do
-              api_health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-deploy-api-1 2>/dev/null || echo "not_found")
+              api_health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-api-1 2>/dev/null || echo "not_found")
               echo "Attempt $i/24: API=$api_health"
               if [ "$api_health" = "healthy" ]; then
                 echo "API health check passed"
@@ -112,7 +112,7 @@ jobs:
             done
 
             echo "==> Checking all container health..."
-            docker compose -f compose/docker-compose.prod.yml ps --format '{{.Name}}\t{{.Status}}'
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml ps --format '{{.Name}}\t{{.Status}}'
             echo "==> Deployment verified successfully"
 
       - name: Report deployment status
