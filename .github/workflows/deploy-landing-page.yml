@@ -1,0 +1,57 @@
+name: Deploy noorinalabs-landing-page
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (default: latest)'
+        default: 'latest'
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy landing page to VPS
+        uses: appleboy/ssh-action@v1
+        env:
+          LANDING_IMAGE_TAG: ${{ inputs.image_tag }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: LANDING_IMAGE_TAG
+          script: |
+            set -euo pipefail
+            cd /opt/noorinalabs-deploy
+            git fetch origin main && git reset --hard origin/main
+
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull landing
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d landing
+
+            echo "==> Waiting for landing service to stabilize..."
+            for i in $(seq 1 12); do
+              health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-landing-1 2>/dev/null || echo "not_found")
+              echo "Attempt $i/12: landing=$health"
+              if [ "$health" = "healthy" ]; then echo "Landing page healthy"; break; fi
+              if [ "$i" -eq 12 ]; then
+                echo "ERROR: Landing health check failed after 60 seconds"
+                docker compose -p noorinalabs -f compose/docker-compose.prod.yml logs --tail=50 landing
+                exit 1
+              fi
+              sleep 5
+            done
+
+      - name: Report deployment status
+        if: always()
+        run: |
+          echo "## Deploy noorinalabs-landing-page: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image tag:** ${{ inputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Triggered by:** ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"

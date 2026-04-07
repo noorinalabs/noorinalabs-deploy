@@ -212,6 +212,41 @@ services:
       - frontend
     restart: unless-stopped
 
+  landing:
+    image: ghcr.io/noorinalabs/noorinalabs-landing-page:${LANDING_IMAGE_TAG:-latest}
+    build:
+      context: /opt/noorinalabs-landing-page
+      dockerfile: Dockerfile
+    expose:
+      - "80"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+      - /var/cache/nginx:size=128M
+      - /run:size=16M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/ || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+          cpus: "0.1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - frontend
+    restart: unless-stopped
+
   # --- Reverse Proxy ---
 
   caddy:
@@ -236,6 +271,8 @@ services:
       api:
         condition: service_healthy
       frontend:
+        condition: service_healthy
+      landing:
         condition: service_healthy
     deploy:
       resources:
