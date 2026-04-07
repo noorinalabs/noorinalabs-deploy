@@ -52,8 +52,8 @@ jobs:
       - name: Init
         run: terraform init
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APP_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
       - name: Plan
         id: plan
         run: terraform plan -no-color -out=tfplan
@@ -100,7 +100,7 @@ jobs:
       - name: Init
         run: terraform init
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APP_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
       - name: Apply
         run: terraform apply -auto-approve
