@@ -1,6 +1,6 @@
 # Architecture
 
-This document is the definitive reference for how the NoorinALabs deployment system works.
+This document is the definitive reference for how the Noorina Labs deployment system works.
 
 ## Table of Contents
 
@@ -19,7 +19,7 @@ This document is the definitive reference for how the NoorinALabs deployment sys
 
 ## Overview
 
-`noorinalabs-deploy` orchestrates deployments for the NoorinALabs platform. It owns everything running on the production VPS: Docker Compose services, infrastructure provisioning, reverse proxy configuration, and observability.
+`noorinalabs-deploy` orchestrates deployments for the Noorina Labs platform. It owns everything running on the production VPS: Docker Compose services, infrastructure provisioning, reverse proxy configuration, and observability.
 
 **Core principle:** Service repos own what they build; this repo owns what runs on the server.
 

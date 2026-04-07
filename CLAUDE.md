@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working in the deployment orches
 
 ## Project Overview
 
-**noorinalabs-deploy** is the deployment orchestration repo for all NoorinALabs services. It owns everything that runs on the production server: Docker Compose configs, Terraform provisioning, reverse proxy, observability stack, and deployment workflows.
+**noorinalabs-deploy** is the deployment orchestration repo for all Noorina Labs services. It owns everything that runs on the production server: Docker Compose configs, Terraform provisioning, reverse proxy, observability stack, and deployment workflows.
 
 ## Guiding Principle
 
