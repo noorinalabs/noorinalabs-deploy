@@ -6,6 +6,9 @@ on:
       isnad_image_tag:
         description: 'noorinalabs-isnad-graph image tag'
         default: 'latest'
+      landing_image_tag:
+        description: 'noorinalabs-landing-page image tag'
+        default: 'latest'
 
 concurrency:
   group: deploy-production
@@ -32,11 +35,12 @@ jobs:
           AUTH_GITHUB_CLIENT_SECRET: ${{ secrets.AUTH_GITHUB_CLIENT_SECRET }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
           IMAGE_TAG: ${{ inputs.isnad_image_tag }}
+          LANDING_IMAGE_TAG: ${{ inputs.landing_image_tag }}
         with:
           host: ${{ vars.VPS_HOST }}
           username: deploy
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          envs: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,IMAGE_TAG
+          envs: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,IMAGE_TAG,LANDING_IMAGE_TAG
           script: |
             set -euo pipefail
             cd /opt/noorinalabs-deploy
@@ -52,6 +56,7 @@ jobs:
               echo "$var=\"$val\"" >> "$env_file"
             done
             echo "IMAGE_TAG=\"${IMAGE_TAG}\"" >> "$env_file"
+            echo "LANDING_IMAGE_TAG=\"${LANDING_IMAGE_TAG}\"" >> "$env_file"
             echo "CACHEBUST=\"$(date +%s)\"" >> "$env_file"
             chmod 600 "$env_file"
 
