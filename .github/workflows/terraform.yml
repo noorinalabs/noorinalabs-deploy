@@ -40,6 +40,8 @@ jobs:
         working-directory: terraform/hetzner
     env:
       TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -51,9 +53,6 @@ jobs:
           echo "TF_VAR_ssh_public_key_path=/tmp/ci_key.pub" >> "$GITHUB_ENV"
       - name: Init
         run: terraform init
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
       - name: Plan
         id: plan
         run: terraform plan -no-color -out=tfplan
@@ -88,6 +87,8 @@ jobs:
         working-directory: terraform/hetzner
     env:
       TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -99,8 +100,5 @@ jobs:
           echo "TF_VAR_ssh_public_key_path=/tmp/ci_key.pub" >> "$GITHUB_ENV"
       - name: Init
         run: terraform init
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
       - name: Apply
         run: terraform apply -auto-approve
