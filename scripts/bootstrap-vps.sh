@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bootstrap-vps.sh — First-time VPS setup for NoorinALabs
+# bootstrap-vps.sh — First-time VPS setup for Noorina Labs
 #
 # Run as root on a fresh Hetzner VPS:
 #   ssh -i ~/.ssh/isnad_deploy root@isnad-graph.noorinalabs.com
@@ -16,7 +16,7 @@ INSTALL_DIR="/opt/noorinalabs-deploy"
 DEPLOY_USER="deploy"
 
 echo "============================================="
-echo "  NoorinALabs VPS bootstrap"
+echo "  Noorina Labs VPS bootstrap"
 echo "============================================="
 echo ""
 

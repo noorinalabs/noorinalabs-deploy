@@ -1,4 +1,4 @@
-# Production Docker Compose — NoorinALabs deployment
+# Production Docker Compose — Noorina Labs deployment
 # Location: noorinalabs-deploy/compose/docker-compose.prod.yml
 # Usage: docker compose -f compose/docker-compose.prod.yml --env-file .env up -d
 #
