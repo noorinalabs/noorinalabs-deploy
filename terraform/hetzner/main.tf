@@ -47,6 +47,11 @@ resource "hcloud_server" "app" {
 
   firewall_ids = [hcloud_firewall.web.id]
 
+  user_data = templatefile("${path.module}/cloud-init.yaml.tpl", {
+    ssh_public_key = file(var.ssh_public_key_path)
+    ghcr_auth_b64  = var.ghcr_auth_b64
+  })
+
   labels = {
     project     = "noorinalabs-isnad-graph"
     environment = "production"
