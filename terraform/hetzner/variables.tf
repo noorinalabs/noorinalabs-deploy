@@ -40,3 +40,43 @@ variable "ghcr_auth_b64" {
   sensitive   = true
   default     = ""
 }
+
+# ---------------------------------------------------------------------------
+# User Service variables
+# ---------------------------------------------------------------------------
+
+variable "user_postgres_password" {
+  description = "Password for the user-service PostgreSQL database"
+  type        = string
+  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.user_postgres_password == "" || length(var.user_postgres_password) >= 16
+    error_message = "user_postgres_password must be at least 16 characters when set."
+  }
+}
+
+variable "user_redis_password" {
+  description = "Password for the user-service Redis instance"
+  type        = string
+  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.user_redis_password == "" || length(var.user_redis_password) >= 16
+    error_message = "user_redis_password must be at least 16 characters when set."
+  }
+}
+
+variable "user_service_jwt_secret" {
+  description = "JWT signing secret for user-service authentication"
+  type        = string
+  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.user_service_jwt_secret == "" || length(var.user_service_jwt_secret) >= 32
+    error_message = "user_service_jwt_secret must be at least 32 characters when set."
+  }
+}

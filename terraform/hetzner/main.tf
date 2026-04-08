@@ -48,12 +48,15 @@ resource "hcloud_server" "app" {
   firewall_ids = [hcloud_firewall.web.id]
 
   user_data = templatefile("${path.module}/cloud-init.yaml.tpl", {
-    ssh_public_key = file(var.ssh_public_key_path)
-    ghcr_auth_b64  = var.ghcr_auth_b64
+    ssh_public_key          = file(var.ssh_public_key_path)
+    ghcr_auth_b64           = var.ghcr_auth_b64
+    user_postgres_password  = var.user_postgres_password
+    user_redis_password     = var.user_redis_password
+    user_service_jwt_secret = var.user_service_jwt_secret
   })
 
   labels = {
-    project     = "noorinalabs-isnad-graph"
+    project     = "noorinalabs"
     environment = "production"
   }
 }
