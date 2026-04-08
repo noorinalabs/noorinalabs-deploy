@@ -274,6 +274,8 @@ services:
         condition: service_healthy
       landing:
         condition: service_healthy
+      user-service:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -291,6 +293,142 @@ services:
       - backend
       - frontend
     restart: unless-stopped
+
+  # --- User Service ---
+
+  user-service:
+    image: ghcr.io/noorinalabs/noorinalabs-user-service:${USER_SERVICE_IMAGE_TAG:-latest}
+    expose:
+      - "8000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M
+    environment:
+      - USER_DATABASE_URL=postgresql://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
+      - USER_REDIS_URL=redis://:${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}@user-redis:6379/0
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set}
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://isnad-graph.noorinalabs.com}
+      - AUTH_GOOGLE_CLIENT_ID=${AUTH_GOOGLE_CLIENT_ID:-}
+      - AUTH_GOOGLE_CLIENT_SECRET=${AUTH_GOOGLE_CLIENT_SECRET:-}
+      - AUTH_GITHUB_CLIENT_ID=${AUTH_GITHUB_CLIENT_ID:-}
+      - AUTH_GITHUB_CLIENT_SECRET=${AUTH_GITHUB_CLIENT_SECRET:-}
+      - AUTH_OAUTH_REDIRECT_BASE_URL=https://isnad-graph.noorinalabs.com
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      user-postgres:
+        condition: service_healthy
+      user-redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - backend
+      - user-backend
+    command: /app/.venv/bin/uvicorn src.app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 2
+    restart: unless-stopped
+
+  user-postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_DB: "${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}"
+      POSTGRES_USER: "${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}"
+      POSTGRES_PASSWORD: "${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}"
+    volumes:
+      - user_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${USER_POSTGRES_USER} -d ${USER_POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
+        reservations:
+          memory: 512M
+          cpus: "0.25"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - user-backend
+    restart: unless-stopped
+
+  user-redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass "${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+    volumes:
+      - user_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"${USER_REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - user-backend
+    restart: unless-stopped
+
+  user-postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}?sslmode=disable"
+    expose:
+      - "9187"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9187/metrics || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      user-postgres:
+        condition: service_healthy
+    networks:
+      - user-backend
+      - backend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
 
   # --- Observability ---
 
@@ -504,6 +642,9 @@ networks:
     internal: true
   frontend:
     driver: bridge
+  user-backend:
+    driver: bridge
+    internal: true
 
 volumes:
   neo4j_data:
@@ -515,3 +656,5 @@ volumes:
   caddy_data:
   caddy_config:
   loki_data:
+  user_pg_data:
+  user_redis_data:
