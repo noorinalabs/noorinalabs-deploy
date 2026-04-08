@@ -54,8 +54,8 @@ isnad-graph.noorinalabs.com {
         reverse_proxy user-service:8000
     }
 
-    # User service — TOTP/2FA
-    handle /api/v1/totp/* {
+    # User service — 2FA (TOTP)
+    handle /api/v1/2fa/* {
         reverse_proxy user-service:8000
     }
 
