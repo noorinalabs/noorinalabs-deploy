@@ -1,0 +1,9 @@
+# Cloudflare API token — create at https://dash.cloudflare.com/profile/api-tokens
+# Required permissions: Zone:DNS:Edit, Zone:Zone Settings:Edit, Zone:Zone:Read
+cloudflare_api_token = "CHANGE-ME"
+
+# Zone ID — found on the Cloudflare dashboard overview page for noorinalabs.com
+cloudflare_zone_id = "CHANGE-ME"
+
+# VPS public IPv4 — from `terraform output -raw server_ip` in the hetzner/ module
+vps_ipv4_address = "CHANGE-ME"

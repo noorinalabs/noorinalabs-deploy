@@ -33,3 +33,10 @@ variable "ssh_source_ips" {
   type        = list(string)
   default     = ["0.0.0.0/0", "::/0"]
 }
+
+variable "ghcr_auth_b64" {
+  description = "Base64-encoded 'username:token' for GHCR Docker authentication"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
