@@ -3,10 +3,25 @@ terraform/**/.terraform/
 terraform/**/*.tfstate
 terraform/**/*.tfstate.backup
 terraform/**/.terraform.lock.hcl
+terraform/**/crash.log
+*.tfplan
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Docker
+*.log
+docker-compose.override.yml
 
 # Environment
 .env
 *.env.local
+
+# Temp / Cache
+tmp/
+temp/
 
 # OS
 .DS_Store
