@@ -39,6 +39,32 @@ isnad-graph.noorinalabs.com {
         reverse_proxy grafana:3000
     }
 
+    # User service — auth endpoints
+    # NOTE: rate limiting on /auth/* should be enforced at the app layer
+    handle /auth/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — user management API
+    handle /api/v1/users/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — session management
+    handle /api/v1/sessions/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — subscription management
+    handle /api/v1/subscriptions/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — health check
+    handle /api/v1/user-service/health {
+        reverse_proxy user-service:8000
+    }
+
     # Frontend (default)
     handle {
         reverse_proxy frontend:80
