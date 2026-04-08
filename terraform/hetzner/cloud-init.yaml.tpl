@@ -2,6 +2,13 @@
 # =============================================================================
 # cloud-init template for Noorina Labs VPS provisioning
 # Installs Docker, Caddy, security hardening (fail2ban, ufw), and GHCR auth.
+#
+# Services provisioned on this VPS:
+#   - isnad-graph (FastAPI + React + Neo4j)
+#   - user-service (FastAPI + PostgreSQL + Redis)
+#
+# Individual containers are managed by Docker Compose, not Terraform.
+# This template bootstraps the VPS with prerequisites for all services.
 # =============================================================================
 
 package_update: true
@@ -68,6 +75,20 @@ write_files:
         }
       }
 
+  # ---------------------------------------------------------------------------
+  # User-service environment file
+  # Docker Compose reads this to configure user-postgres, user-redis, and
+  # user-service containers. Values are injected from Terraform variables.
+  # ---------------------------------------------------------------------------
+  - path: /opt/noorinalabs-deploy/.env.user-service
+    owner: deploy:deploy
+    permissions: '0600'
+    content: |
+      # user-service secrets — managed by Terraform cloud-init
+      USER_POSTGRES_PASSWORD=${user_postgres_password}
+      USER_REDIS_PASSWORD=${user_redis_password}
+      USER_SERVICE_JWT_SECRET=${user_service_jwt_secret}
+
   # Deploy directory marker
   - path: /opt/noorinalabs-deploy/.cloud-init-provisioned
     content: |
@@ -105,6 +126,10 @@ runcmd:
   # Set up deploy user home directory
   - mkdir -p /home/deploy/.docker
   - chown -R deploy:deploy /home/deploy/.docker
+
+  # Pre-create Docker volumes for user-service data persistence
+  - docker volume create user-postgres-data
+  - docker volume create user-redis-data
 
   # Install Caddy via official apt repo
   - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
