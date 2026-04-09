@@ -308,7 +308,7 @@ services:
       - REDIS_URL=redis://:${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}@user-redis:6379/0
       - JWT_PRIVATE_KEY=${JWT_PRIVATE_KEY:?JWT_PRIVATE_KEY must be set}
       - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY must be set}
-      - CORS_ORIGINS=${CORS_ORIGINS:-https://isnad-graph.noorinalabs.com}
+      - CORS_ORIGINS=["https://isnad-graph.noorinalabs.com"]
       - AUTH_GOOGLE_CLIENT_ID=${AUTH_GOOGLE_CLIENT_ID:-}
       - AUTH_GOOGLE_CLIENT_SECRET=${AUTH_GOOGLE_CLIENT_SECRET:-}
       - AUTH_GITHUB_CLIENT_ID=${AUTH_GITHUB_CLIENT_ID:-}
