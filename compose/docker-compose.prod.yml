@@ -304,8 +304,8 @@ services:
     tmpfs:
       - /tmp:size=256M
     environment:
-      - USER_DATABASE_URL=postgresql://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
-      - USER_REDIS_URL=redis://:${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}@user-redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
+      - REDIS_URL=redis://:${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}@user-redis:6379/0
       - JWT_PRIVATE_KEY=${JWT_PRIVATE_KEY:?JWT_PRIVATE_KEY must be set}
       - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY must be set}
       - CORS_ORIGINS=${CORS_ORIGINS:-https://isnad-graph.noorinalabs.com}
