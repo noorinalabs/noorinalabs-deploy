@@ -9,6 +9,9 @@ on:
       landing_image_tag:
         description: 'noorinalabs-landing-page image tag'
         default: 'latest'
+      user_service_image_tag:
+        description: 'noorinalabs-user-service image tag'
+        default: 'latest'
 
 concurrency:
   group: deploy-production
@@ -34,13 +37,20 @@ jobs:
           AUTH_GITHUB_CLIENT_ID: ${{ secrets.AUTH_GITHUB_CLIENT_ID }}
           AUTH_GITHUB_CLIENT_SECRET: ${{ secrets.AUTH_GITHUB_CLIENT_SECRET }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          USER_POSTGRES_USER: ${{ secrets.USER_POSTGRES_USER }}
+          USER_POSTGRES_PASSWORD: ${{ secrets.USER_POSTGRES_PASSWORD }}
+          USER_POSTGRES_DB: ${{ secrets.USER_POSTGRES_DB }}
+          USER_REDIS_PASSWORD: ${{ secrets.USER_REDIS_PASSWORD }}
+          JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+          JWT_PUBLIC_KEY: ${{ secrets.JWT_PUBLIC_KEY }}
           IMAGE_TAG: ${{ inputs.isnad_image_tag }}
           LANDING_IMAGE_TAG: ${{ inputs.landing_image_tag }}
+          USER_SERVICE_IMAGE_TAG: ${{ inputs.user_service_image_tag }}
         with:
           host: ${{ vars.VPS_HOST }}
           username: deploy
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          envs: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,IMAGE_TAG,LANDING_IMAGE_TAG
+          envs: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,IMAGE_TAG,LANDING_IMAGE_TAG,USER_POSTGRES_USER,USER_POSTGRES_PASSWORD,USER_POSTGRES_DB,USER_REDIS_PASSWORD,JWT_PRIVATE_KEY,JWT_PUBLIC_KEY,USER_SERVICE_IMAGE_TAG
           script: |
             set -euo pipefail
             cd /opt/noorinalabs-deploy
@@ -51,12 +61,15 @@ jobs:
             for var in NEO4J_PASSWORD POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
                        REDIS_PASSWORD AUTH_GOOGLE_CLIENT_ID AUTH_GOOGLE_CLIENT_SECRET \
                        AUTH_GITHUB_CLIENT_ID AUTH_GITHUB_CLIENT_SECRET \
-                       GRAFANA_ADMIN_PASSWORD; do
+                       GRAFANA_ADMIN_PASSWORD \
+                       USER_POSTGRES_USER USER_POSTGRES_PASSWORD USER_POSTGRES_DB \
+                       USER_REDIS_PASSWORD JWT_PRIVATE_KEY JWT_PUBLIC_KEY; do
               eval "val=\$$var"
               echo "$var=\"$val\"" >> "$env_file"
             done
             echo "IMAGE_TAG=\"${IMAGE_TAG}\"" >> "$env_file"
             echo "LANDING_IMAGE_TAG=\"${LANDING_IMAGE_TAG}\"" >> "$env_file"
+            echo "USER_SERVICE_IMAGE_TAG=\"${USER_SERVICE_IMAGE_TAG}\"" >> "$env_file"
             echo "CACHEBUST=\"$(date +%s)\"" >> "$env_file"
             chmod 600 "$env_file"
 
@@ -66,7 +79,14 @@ jobs:
 
             for i in $(seq 1 24); do
               api_health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-api-1 2>/dev/null || echo "not_found")
-              if [ "$api_health" = "healthy" ]; then echo "All services healthy"; break; fi
-              if [ "$i" -eq 24 ]; then echo "Health check timeout"; exit 1; fi
+              if [ "$api_health" = "healthy" ]; then echo "API healthy"; break; fi
+              if [ "$i" -eq 24 ]; then echo "API health check timeout"; exit 1; fi
+              sleep 5
+            done
+
+            for i in $(seq 1 24); do
+              us_health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-user-service-1 2>/dev/null || echo "not_found")
+              if [ "$us_health" = "healthy" ]; then echo "User service healthy"; break; fi
+              if [ "$i" -eq 24 ]; then echo "User service health check timeout"; exit 1; fi
               sleep 5
             done
