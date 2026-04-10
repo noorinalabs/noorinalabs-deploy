@@ -30,31 +30,49 @@ isnad-graph.noorinalabs.com {
     }
 
     # User service — user management API
+    handle /api/v1/users {
+        reverse_proxy user-service:8000
+    }
     handle /api/v1/users/* {
         reverse_proxy user-service:8000
     }
 
     # User service — session management
+    handle /api/v1/sessions {
+        reverse_proxy user-service:8000
+    }
     handle /api/v1/sessions/* {
         reverse_proxy user-service:8000
     }
 
     # User service — subscription management
+    handle /api/v1/subscriptions {
+        reverse_proxy user-service:8000
+    }
     handle /api/v1/subscriptions/* {
         reverse_proxy user-service:8000
     }
 
     # User service — email verification
+    handle /api/v1/verification {
+        reverse_proxy user-service:8000
+    }
     handle /api/v1/verification/* {
         reverse_proxy user-service:8000
     }
 
     # User service — roles
+    handle /api/v1/roles {
+        reverse_proxy user-service:8000
+    }
     handle /api/v1/roles/* {
         reverse_proxy user-service:8000
     }
 
     # User service — 2FA (TOTP)
+    handle /api/v1/2fa {
+        reverse_proxy user-service:8000
+    }
     handle /api/v1/2fa/* {
         reverse_proxy user-service:8000
     }
