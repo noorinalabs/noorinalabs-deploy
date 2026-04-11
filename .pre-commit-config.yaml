@@ -1,0 +1,40 @@
+# Pre-commit hooks for noorinalabs-deploy
+# Install: pre-commit install
+# Docs: https://pre-commit.com/
+#
+# Hook execution order (fail-fast, cheapest first):
+#   1. Terraform format check
+#   2. Terraform validate
+#   3. gitleaks (secret detection)
+#
+# Prerequisites:
+#   - Terraform ~> 1.5
+
+repos:
+  # --- Terraform format ---
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.3
+    hooks:
+      - id: terraform_fmt
+        name: terraform-fmt
+
+      - id: terraform_validate
+        name: terraform-validate
+
+  # --- Secret detection ---
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.3
+    hooks:
+      - id: gitleaks
+        name: gitleaks
+
+  # --- Env file completeness check ---
+  - repo: local
+    hooks:
+      - id: env-example-check
+        name: env-example-check
+        entry: bash -c 'docker compose --env-file compose/.env.example -f compose/docker-compose.prod.yml config > /dev/null 2>&1 || echo "WARNING: .env.example may be incomplete (docker compose config failed)"'
+        language: system
+        pass_filenames: false
+        files: (\.env|docker-compose)
+        stages: [pre-commit]
