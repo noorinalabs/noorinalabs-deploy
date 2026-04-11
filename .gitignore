@@ -36,3 +36,5 @@ Thumbs.db
 
 # Claude Code project data
 .claude/projects/
+.claude/annunaki/errors.jsonl
+.claude/annunaki/errors.jsonl.bak.*
