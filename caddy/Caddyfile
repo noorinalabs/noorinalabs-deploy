@@ -98,9 +98,10 @@ isnad-graph.noorinalabs.com {
         reverse_proxy api:8000
     }
 
-    # Metrics (Prometheus scrape endpoint)
+    # Metrics — not publicly proxied; Prometheus scrapes api:8000
+    # directly via the Docker backend network (see prometheus.yml).
     handle /metrics {
-        reverse_proxy api:8000
+        respond 403
     }
 
     # ── Other services ───────────────────────────────────────────────
