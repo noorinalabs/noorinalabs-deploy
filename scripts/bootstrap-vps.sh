@@ -70,6 +70,29 @@ else
 fi
 chown -R $DEPLOY_USER:$DEPLOY_USER "$INSTALL_DIR"
 
+# ── Step 4.5: Pre-provision auxiliary repo directories ─────────────────────
+# /opt/ is root-owned by default, so the deploy user can't `git clone` into it
+# without these dirs existing first with the right ownership. The deploy
+# workflow (.github/workflows/deploy-isnad-graph.yml) clone-or-pulls into each
+# of these. To add a new repo to the deploy pipeline: append it to AUX_REPOS,
+# re-run this bootstrap script (idempotent), done. See deploy#108 for context.
+echo "==> [4.5/7] Pre-provisioning auxiliary repo directories under /opt/..."
+AUX_REPOS=(
+  "noorinalabs-isnad-graph"
+  "noorinalabs-design-system"
+)
+for repo in "${AUX_REPOS[@]}"; do
+  dir="/opt/$repo"
+  if [ ! -d "$dir" ]; then
+    mkdir -p "$dir"
+    echo "    Created $dir"
+  else
+    echo "    Exists  $dir"
+  fi
+  chown $DEPLOY_USER:$DEPLOY_USER "$dir"
+done
+echo "    Auxiliary repo dirs ready."
+
 # ── Step 5: Create production .env ──────────────────────────────────────────
 echo "==> [5/7] Creating production .env..."
 ENV_FILE="$INSTALL_DIR/.env"
