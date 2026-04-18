@@ -11,15 +11,14 @@ resource "b2_bucket" "pipeline" {
 
   lifecycle_rules {
     file_name_prefix              = ""
-    days_from_uploading_to_hiding = null
+    days_from_uploading_to_hiding = var.lifecycle_days_hide_old_versions
     days_from_hiding_to_deleting  = var.lifecycle_days_delete_hidden
   }
 
   # Abort stuck multipart uploads to avoid silent cost growth.
   lifecycle_rules {
-    file_name_prefix              = ""
-    days_from_uploading_to_hiding = var.lifecycle_days_hide_old_versions
-    days_from_hiding_to_deleting  = null
+    file_name_prefix                                       = ""
+    days_from_starting_to_canceling_unfinished_large_files = var.lifecycle_days_unfinished_uploads
   }
 
   dynamic "cors_rules" {
