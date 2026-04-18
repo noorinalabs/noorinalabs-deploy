@@ -23,7 +23,7 @@ async def test_admin_endpoint_rejects_non_admin(
     tokens = await issue_token_for(user_service, auth_code)
 
     r = await isnad_graph.get(
-        "/api/v1/admin/health",
+        "/api/v1/admin/health/live",
         headers={"Authorization": f"Bearer {tokens['access_token']}"},
     )
     assert r.status_code in (401, 403), f"expected forbidden, got {r.status_code}"
@@ -41,7 +41,7 @@ async def test_admin_endpoint_accepts_admin(
     tokens = await issue_token_for(user_service, auth_code)
 
     r = await isnad_graph.get(
-        "/api/v1/admin/health",
+        "/api/v1/admin/health/live",
         headers={"Authorization": f"Bearer {tokens['access_token']}"},
     )
     # 200 expected; 404 is also acceptable if the admin router is registered
