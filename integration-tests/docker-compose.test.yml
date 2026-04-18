@@ -162,6 +162,7 @@ services:
       JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY}
       JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
       TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
+      ISOLATION_CHECK_RESULT: ${ISOLATION_CHECK_RESULT:-unknown}
     depends_on:
       user-service:
         condition: service_healthy
@@ -170,8 +171,14 @@ services:
     volumes:
       - ./tests:/app/tests:ro
       - ./reports:/app/reports
+    # user-backend join is required so the runner can reach user-postgres/
+    # user-redis for test-user seeding. This does NOT weaken the isolation
+    # invariant — that invariant is "isnad-graph-api cannot reach user-postgres",
+    # enforced at the isnad-graph-api's network boundary (it is on `backend` and
+    # `testnet` only, never `user-backend`).
     networks:
       - testnet
+      - user-backend
     profiles:
       - runner
 

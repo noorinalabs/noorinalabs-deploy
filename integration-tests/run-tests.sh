@@ -73,5 +73,20 @@ print(\" \".join(bad))
     done
 '
 
+echo "--- Running network isolation probe ---"
+# The isolation invariant is "isnad-graph-api cannot reach user-postgres".
+# We probe from INSIDE isnad-graph-api (the container whose isolation we care
+# about) and pass the boolean result into the test-runner as an env var.
+if $COMPOSE exec -T isnad-graph-api python3 -c \
+    "import socket; socket.gethostbyname('user-postgres')" >/dev/null 2>&1; then
+    export ISOLATION_CHECK_RESULT="fail"
+    echo "  WARNING: isnad-graph-api resolved user-postgres — isolation broken."
+else
+    export ISOLATION_CHECK_RESULT="pass"
+    echo "  pass — isnad-graph-api cannot resolve user-postgres."
+fi
+
 echo "--- Running integration tests ---"
-$COMPOSE run --rm --build test-runner pytest -v --tb=short --junit-xml=/app/reports/junit.xml "$@"
+$COMPOSE run --rm --build \
+    -e ISOLATION_CHECK_RESULT="$ISOLATION_CHECK_RESULT" \
+    test-runner pytest -v --tb=short --junit-xml=/app/reports/junit.xml "$@"

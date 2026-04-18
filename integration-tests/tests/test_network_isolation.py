@@ -1,46 +1,29 @@
 """Network isolation: user-postgres must NOT be reachable from isnad-graph.
 
-Pattern: run an isolation probe inside the isnad-graph-api container and assert
-that a TCP connect to user-postgres:5432 fails. The two services share no
-Docker network, so resolution itself should fail.
+The probe runs OUTSIDE pytest in `run-tests.sh` via
+`docker compose exec isnad-graph-api python3 -c 'socket.gethostbyname(...)'`
+because isnad-graph-api is the container whose isolation we actually care about.
+The result is passed to the test-runner as ISOLATION_CHECK_RESULT.
+
+Valid values:
+  "pass"     — isnad-graph-api failed to resolve user-postgres (expected)
+  "fail"     — isnad-graph-api resolved user-postgres — isolation broken
+  "unknown"  — runner invoked without run-tests.sh wrapper
 """
 
 from __future__ import annotations
 
-import subprocess
+import os
 
 import pytest
 
 
 @pytest.mark.isolation
 def test_isnad_graph_cannot_reach_user_postgres() -> None:
-    # `docker exec` is not available from the test-runner container; we rely
-    # instead on the docker Compose network topology: the testnet the runner
-    # is attached to does NOT include user-backend, so user-postgres resolution
-    # must fail from the runner as well.
-    result = subprocess.run(
-        [
-            "python3",
-            "-c",
-            "import socket; socket.gethostbyname('user-postgres')",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode != 0, (
-        "Runner (testnet-only) should not resolve user-postgres, but did. "
-        "This means user-postgres is attached to a shared network — PII isolation broken."
-    )
-    # Sanity check: isnad-postgres is also user-backend-less from the runner's POV.
-    result2 = subprocess.run(
-        [
-            "python3",
-            "-c",
-            "import socket; socket.gethostbyname('isnad-postgres')",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result2.returncode != 0, (
-        "isnad-postgres should not be reachable from the testnet either."
+    result = os.environ.get("ISOLATION_CHECK_RESULT", "unknown")
+    assert result == "pass", (
+        f"Isolation probe result = {result!r}. "
+        "Expected 'pass' (isnad-graph-api could NOT resolve user-postgres). "
+        "If 'fail': isnad-graph-api is attached to user-backend — PII isolation broken. "
+        "If 'unknown': run-tests.sh did not set the env var; the probe was not executed."
     )
