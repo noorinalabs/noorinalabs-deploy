@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "~> 1.5"
+          terraform_version: "~> 1.6"
       - name: terraform fmt -check -recursive
         run: terraform fmt -check -recursive terraform/
 
@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "~> 1.5"
+          terraform_version: "~> 1.6"
       - name: Init (no backend)
         run: terraform init -backend=false
       - name: Validate
@@ -60,7 +60,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "~> 1.5"
+          terraform_version: "~> 1.6"
       - name: Generate CI SSH key
         run: |
           ssh-keygen -t ed25519 -f /tmp/ci_key -N ""
@@ -107,7 +107,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "~> 1.5"
+          terraform_version: "~> 1.6"
       - name: Generate CI SSH key
         run: |
           ssh-keygen -t ed25519 -f /tmp/ci_key -N ""
