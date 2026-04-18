@@ -103,16 +103,21 @@ async def _seed_user(
                 role_id,
                 role,
             )
+        # user_roles columns: user_id, role_id, granted_at (not assigned_at).
         await pg.execute(
-            "INSERT INTO user_roles (user_id, role_id, assigned_at) VALUES ($1, $2, NOW())",
+            "INSERT INTO user_roles (user_id, role_id, granted_at) VALUES ($1, $2, NOW())",
             user_id,
             role_id,
         )
     if subscription_status != "free":
+        # subscriptions columns: id, user_id, plan (enum), status (enum),
+        # starts_at (NOT NULL). Plans: free|trial|researcher|institutional.
+        # Statuses: active|expired|cancelled|suspended.
         await pg.execute(
             """
-            INSERT INTO subscriptions (id, user_id, status, tier, created_at, updated_at)
-            VALUES ($1, $2, $3, 'premium', NOW(), NOW())
+            INSERT INTO subscriptions
+                (id, user_id, plan, status, starts_at, created_at, updated_at)
+            VALUES ($1, $2, 'researcher', $3, NOW(), NOW(), NOW())
             """,
             uuid.uuid4(),
             user_id,

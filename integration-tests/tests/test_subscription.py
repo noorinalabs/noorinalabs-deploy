@@ -50,9 +50,11 @@ async def test_trial_start_flow(
     _, auth_code = await seeded_user_factory(email="trial-user@example.com")
     tokens = await issue_token_for(user_service, auth_code)
 
+    # TrialStartRequest is an empty Pydantic model but still required as body.
     r = await user_service.post(
         "/api/v1/subscriptions/trial",
         headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        json={},
     )
     # 201 on success, 409 if trial already used — both are valid end-states.
     assert r.status_code in (201, 409)
