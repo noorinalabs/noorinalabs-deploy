@@ -1,0 +1,60 @@
+name: Compose & Infra Validate
+on:
+  pull_request:
+    paths:
+      - 'compose/**'
+      - 'infra/**'
+      - '.github/workflows/compose-validate.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'compose/**'
+      - 'infra/**'
+      - '.github/workflows/compose-validate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  compose-config:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Materialize .env from .env.example with CI placeholders
+        working-directory: compose
+        run: |
+          cp .env.example .env
+          # Required vars (`:?`) that are empty in .env.example need non-empty placeholders
+          # so `docker compose config` can resolve them. These values are CI-only and
+          # never reach a running container.
+          {
+            echo "AUTH_GOOGLE_CLIENT_ID=ci-placeholder"
+            echo "AUTH_GOOGLE_CLIENT_SECRET=ci-placeholder"
+            echo "AUTH_GITHUB_CLIENT_ID=ci-placeholder"
+            echo "AUTH_GITHUB_CLIENT_SECRET=ci-placeholder"
+            echo "JWT_PRIVATE_KEY=ci-placeholder"
+            echo "JWT_PUBLIC_KEY=ci-placeholder"
+            # Kafka KRaft cluster id must look like a base64-encoded UUID (22 chars).
+            echo "KAFKA_CLUSTER_ID=MkU3OEVCNTcwNTJENDM2Qk"
+          } >> .env
+      - name: Validate compose config
+        working-directory: compose
+        run: docker compose -f docker-compose.prod.yml --env-file .env config --quiet
+
+  shellcheck:
+    name: shellcheck infra & scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint shell scripts
+        run: |
+          mapfile -t files < <(find infra scripts -type f -name '*.sh' 2>/dev/null)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No shell scripts found — nothing to lint."
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          shellcheck "${files[@]}"
