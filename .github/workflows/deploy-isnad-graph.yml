@@ -69,6 +69,11 @@ jobs:
             echo "==> Writing .env for docker-compose..."
             env_file=".env"
             : > "$env_file"
+            # Single-quoted values: docker-compose env-file format treats single-quoted
+            # strings as literal (no escape processing), and single quotes survive the
+            # SSH transport without escape-eating that strips backslash-escaped double
+            # quotes. Limitation: values containing a literal "'" are not supported
+            # (none of our current secrets do — see #94).
             for var in NEO4J_PASSWORD POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
                        REDIS_PASSWORD AUTH_GOOGLE_CLIENT_ID AUTH_GOOGLE_CLIENT_SECRET \
                        AUTH_GITHUB_CLIENT_ID AUTH_GITHUB_CLIENT_SECRET \
@@ -77,10 +82,10 @@ jobs:
                        PIPELINE_B2_BUCKET PIPELINE_B2_ENDPOINT PIPELINE_B2_KEY \
                        PIPELINE_B2_KEY_ID PIPELINE_B2_REGION; do
               eval "val=\$$var"
-              echo "$var=\"$val\"" >> "$env_file"
+              printf "%s='%s'\n" "$var" "$val" >> "$env_file"
             done
-            echo "IMAGE_TAG=\"${IMAGE_TAG}\"" >> "$env_file"
-            echo "CACHEBUST=\"$(date +%s)\"" >> "$env_file"
+            printf "%s='%s'\n" "IMAGE_TAG" "${IMAGE_TAG}" >> "$env_file"
+            printf "%s='%s'\n" "CACHEBUST" "$(date +%s)" >> "$env_file"
             chmod 600 "$env_file"
 
             echo "==> Pulling latest noorinalabs-isnad-graph source (for local builds)..."
