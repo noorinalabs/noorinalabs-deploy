@@ -18,6 +18,8 @@ Longer retention on `raw.new` gives operators a replay window after a downstream
 
 Defaults for every topic: 3 partitions, replication factor 1, `cleanup.policy=delete`. Retention is enforced by the init script — Kafka UI runs in read-only mode (`KAFKA_UI_READONLY=true`) so operators cannot drift retention out of source control.
 
+Retention values are reapplied on every deploy via `kafka-init`, so out-of-band UI tweaks are intentionally overwritten.
+
 ## Message schema
 
 Messages are lightweight pointers, not payloads. Workers fetch the actual data from B2 using `b2_path`.

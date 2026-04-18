@@ -181,13 +181,11 @@ section "Caddy Config Verification"
 # not a stale cached config from a previous deployment.
 caddy_headers=$(curl -s -D - -o /dev/null --max-time "$TIMEOUT" "$SITE_URL" 2>/dev/null || echo "")
 caddy_check_headers=("X-XSS-Protection" "Content-Security-Policy" "X-Content-Type-Options")
-caddy_ok=true
 for chdr in "${caddy_check_headers[@]}"; do
   if echo "$caddy_headers" | grep -qi "^${chdr}:"; then
     pass "Caddy serves $chdr header"
   else
     fail "Caddy does NOT serve $chdr header — config may not be reloaded"
-    caddy_ok=false
   fi
 done
 # Check for Caddy server identifier (confirms traffic flows through Caddy)

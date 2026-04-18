@@ -692,6 +692,9 @@ services:
     networks:
       - backend
     restart: unless-stopped
+    # Give the broker time to flush log segments and leave the controller quorum cleanly
+    # on `docker compose down`/restart instead of being SIGKILLed after the default 10s.
+    stop_grace_period: 30s
     deploy:
       resources:
         limits:
