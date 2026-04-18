@@ -28,56 +28,6 @@ USER_SERVICE_URL = os.environ["USER_SERVICE_URL"]
 ISNAD_GRAPH_URL = os.environ["ISNAD_GRAPH_URL"]
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _warm_cross_service_jwks() -> None:
-    """Warm isnad-graph's JWKS cache by issuing a throwaway JWT and calling
-    a protected endpoint repeatedly at the start of the session. Without this,
-    the first couple of cross-service JWT validations can 503 because
-    isnad-graph's fetch_jwks() has no httpx-level retry and user-service's
-    first post-startup /.well-known/jwks.json response occasionally arrives
-    out-of-window.
-    """
-    import asyncio
-    import time
-
-    async def _warm() -> None:
-        deadline = time.monotonic() + 30.0
-        # Create a throwaway user + auth code so we can issue a real JWT.
-        pg = await asyncpg.connect(USER_POSTGRES_DSN)
-        redis_cli = aioredis.from_url(USER_REDIS_URL, decode_responses=True)
-        user_id = uuid.uuid4()
-        email = f"warmup-{secrets.token_hex(4)}@example.com"
-        try:
-            await pg.execute(
-                "INSERT INTO users (id, email, email_verified, display_name, is_active, "
-                "created_at, updated_at) VALUES ($1, $2, TRUE, 'warmup', TRUE, NOW(), NOW())",
-                user_id, email,
-            )
-            code = secrets.token_urlsafe(48)
-            await redis_cli.setex(
-                f"auth_code:{code}", 300,
-                json.dumps({"user_id": str(user_id), "email": email,
-                            "roles": [], "subscription_status": "free"}),
-            )
-            async with httpx.AsyncClient(base_url=USER_SERVICE_URL, timeout=10) as us:
-                t = await us.post("/auth/token", json={"authorization_code": code})
-                if t.status_code != 200:
-                    return
-                tokens = t.json()
-            async with httpx.AsyncClient(base_url=ISNAD_GRAPH_URL, timeout=10) as ig:
-                headers = {"Authorization": f"Bearer {tokens['access_token']}"}
-                while time.monotonic() < deadline:
-                    r = await ig.get("/api/v1/narrators", headers=headers,
-                                     params={"limit": 1})
-                    if r.status_code not in (502, 503, 504):
-                        return
-                    await asyncio.sleep(1.0)
-        finally:
-            await pg.execute("DELETE FROM users WHERE id = $1", user_id)
-            await pg.close()
-            await redis_cli.aclose()
-
-    asyncio.run(_warm())
 
 USER_POSTGRES_DSN = (
     f"postgresql://{os.environ['USER_POSTGRES_USER']}"
