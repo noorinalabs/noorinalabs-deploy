@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.6.0"
 
   required_providers {
     hcloud = {
@@ -9,12 +9,15 @@ terraform {
   }
 
   backend "s3" {
-    bucket                      = "noorinalabs-terraform-state"
-    key                         = "hetzner/terraform.tfstate"
-    region                      = "us-east-005"
-    endpoint                    = "https://s3.us-east-005.backblazeb2.com"
+    bucket = "noorinalabs-terraform-state"
+    key    = "hetzner/terraform.tfstate"
+    region = "us-east-005"
+    endpoints = {
+      s3 = "https://s3.us-east-005.backblazeb2.com"
+    }
     skip_credentials_validation = true
     skip_metadata_api_check     = true
     skip_region_validation      = true
+    skip_requesting_account_id  = true
   }
 }
