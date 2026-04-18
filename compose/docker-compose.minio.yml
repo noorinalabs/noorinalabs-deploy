@@ -1,0 +1,67 @@
+# MinIO local-dev stack — S3-compatible object store that mirrors the Backblaze
+# B2 `noorinalabs-pipeline` layout for local ingest-platform development.
+#
+# Usage (from repo root):
+#   cp compose/minio.env.example compose/minio.env
+#   docker compose -f compose/docker-compose.minio.yml --env-file compose/minio.env up -d
+#
+# The `minio-setup` one-shot service creates the bucket and stage prefixes so
+# pipeline code can target the same key structure in dev and prod.
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-08T15-41-24Z
+    container_name: noorinalabs-pipeline-minio
+    command: server /data --console-address ":9001"
+    ports:
+      # 9000 = S3 API, 9001 = web console. Bind to loopback only for dev safety.
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}"
+      MINIO_REGION: "us-east-005"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - pipeline
+    restart: unless-stopped
+
+  # One-shot job: create the pipeline bucket and seed empty stage prefixes.
+  # Runs to completion and exits; re-running is idempotent.
+  minio-setup:
+    image: minio/mc:RELEASE.2025-04-03T17-07-56Z
+    container_name: noorinalabs-pipeline-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}"
+      PIPELINE_BUCKET: "${PIPELINE_B2_BUCKET:-noorinalabs-pipeline}"
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
+      mc mb --ignore-existing local/$$PIPELINE_BUCKET;
+      for stage in raw dedup enriched normalized staged; do
+        mc put /dev/null local/$$PIPELINE_BUCKET/$$stage/.keep || true;
+      done;
+      echo 'MinIO pipeline bucket ready.';
+      "
+    networks:
+      - pipeline
+    restart: "no"
+
+networks:
+  pipeline:
+    driver: bridge
+
+volumes:
+  minio_data:
