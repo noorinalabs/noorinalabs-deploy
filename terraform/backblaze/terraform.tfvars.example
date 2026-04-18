@@ -1,0 +1,19 @@
+# Backblaze B2 master key — create a key in the B2 console with writeBuckets +
+# writeKeys capabilities, then export as env vars for Terraform:
+#   export TF_VAR_b2_application_key_id=...
+#   export TF_VAR_b2_application_key=...
+# or fill these in a .tfvars file that is gitignored.
+
+b2_application_key_id = ""
+b2_application_key    = ""
+
+bucket_name = "noorinalabs-pipeline"
+
+# Lifecycle policy (days). Defaults are conservative; tune for retention needs.
+lifecycle_days_unfinished_uploads = 7
+lifecycle_days_hide_old_versions  = 30
+lifecycle_days_delete_hidden      = 90
+
+# CORS is not needed for server-side pipeline access. Only populate if the UI
+# needs to read staged/normalized artifacts directly from the browser.
+cors_allowed_origins = []
