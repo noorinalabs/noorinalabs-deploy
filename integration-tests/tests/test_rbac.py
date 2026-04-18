@@ -22,10 +22,16 @@ async def test_admin_endpoint_rejects_non_admin(
     )
     tokens = await issue_token_for(user_service, auth_code)
 
-    r = await isnad_graph.get(
-        "/api/v1/admin/health/live",
-        headers={"Authorization": f"Bearer {tokens['access_token']}"},
-    )
+    # Retry on 503 — the first admin call from isnad-graph back to user-service
+    # for a JWKS fetch can race with user-service readiness; the JWKS is then
+    # cached for subsequent calls. Two attempts is enough for the cache to warm.
+    for attempt in range(3):
+        r = await isnad_graph.get(
+            "/api/v1/admin/health/live",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        if r.status_code != 503:
+            break
     assert r.status_code in (401, 403), f"expected forbidden, got {r.status_code}"
 
 
@@ -40,11 +46,12 @@ async def test_admin_endpoint_accepts_admin(
     )
     tokens = await issue_token_for(user_service, auth_code)
 
-    r = await isnad_graph.get(
-        "/api/v1/admin/health/live",
-        headers={"Authorization": f"Bearer {tokens['access_token']}"},
-    )
-    # 200 expected; 404 is also acceptable if the admin router is registered
-    # under a different prefix in the current build — the load-bearing signal
-    # is that we did NOT get 401/403.
+    for attempt in range(3):
+        r = await isnad_graph.get(
+            "/api/v1/admin/health/live",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+        if r.status_code != 503:
+            break
+    # Load-bearing: admin JWT was NOT rejected for auth reasons (401/403).
     assert r.status_code not in (401, 403), f"admin JWT rejected: {r.text}"
