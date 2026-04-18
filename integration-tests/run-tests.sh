@@ -11,24 +11,36 @@ cd "$SCRIPT_DIR"
 
 COMPOSE="docker compose -f docker-compose.test.yml --env-file .env.test"
 
+dump_logs() {
+    echo "--- Container logs (on failure) ---"
+    $COMPOSE logs --no-color --tail=200 || true
+}
+
 cleanup() {
+    ec=$?
+    if [[ "$ec" -ne 0 ]]; then
+        dump_logs
+    fi
     if [[ "${KEEP_STACK:-0}" != "1" ]]; then
         echo "--- Tearing down test stack ---"
         $COMPOSE down -v --remove-orphans || true
     else
         echo "--- KEEP_STACK=1 — leaving stack up. Run '$COMPOSE down -v' to clean up. ---"
     fi
+    exit "$ec"
 }
 trap cleanup EXIT
 
 # Generate fresh JWT keys + TOTP encryption key for this run.
+# The keys are written to files (not a .env file) because multi-line PEM
+# values don't round-trip through dotenv format cleanly. We read the files
+# with real newlines via $(cat ...) below.
 echo "--- Generating fresh test secrets ---"
-./scripts/generate_test_secrets.sh > .env.test.secrets
-# shellcheck disable=SC1091
-set -a
-source .env.test
-source .env.test.secrets
-set +a
+./scripts/generate_test_secrets.sh secrets
+
+export JWT_PRIVATE_KEY="$(cat secrets/jwt.key)"
+export JWT_PUBLIC_KEY="$(cat secrets/jwt.pub)"
+export TOTP_ENCRYPTION_KEY="$(cat secrets/totp.key)"
 
 mkdir -p reports
 
