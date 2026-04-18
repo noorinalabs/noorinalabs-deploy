@@ -76,8 +76,10 @@ The broker listener is on the `backend` Docker network (internal). It is not rea
 `KAFKA_CLUSTER_ID` is required and must remain stable — changing it after the first boot will cause the broker to refuse to start against existing log directories. Generate once at VPS bootstrap time:
 
 ```
-docker run --rm bitnami/kafka:3.8.0 kafka-storage.sh random-uuid
+docker run --rm bitnamilegacy/kafka:3.8.0 kafka-storage.sh random-uuid
 ```
+
+(The `bitnami/*` namespace was sunset Aug 2025; `bitnamilegacy/*` is the same image rebadged. Long-term migration off Bitnami tracked in #100.)
 
 Store the output in the production `.env` file alongside the other secrets.
 

@@ -653,7 +653,10 @@ services:
   # remote access is only via SSH tunnel. Topic creation is handled by the
   # one-shot kafka-init service below.
   kafka:
-    image: bitnami/kafka:3.8.0
+    # bitnami/* namespace was sunset Aug 2025; images now live at bitnamilegacy/*.
+    # Same image, same internal paths (/bitnami/kafka, /opt/bitnami/kafka/...) — only
+    # the registry namespace changes. Long-term migration off Bitnami tracked in #100.
+    image: bitnamilegacy/kafka:3.8.0
     user: "1001:1001"
     environment:
       # Core KRaft identity
@@ -661,7 +664,7 @@ services:
       KAFKA_CFG_PROCESS_ROLES: "controller,broker"
       KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
       # Cluster ID must be stable across restarts — supplied via env (see .env.example).
-      KAFKA_KRAFT_CLUSTER_ID: "${KAFKA_CLUSTER_ID:?KAFKA_CLUSTER_ID must be set (generate once: docker run --rm bitnami/kafka:3.8.0 kafka-storage.sh random-uuid)}"
+      KAFKA_KRAFT_CLUSTER_ID: "${KAFKA_CLUSTER_ID:?KAFKA_CLUSTER_ID must be set (generate once: docker run --rm bitnamilegacy/kafka:3.8.0 kafka-storage.sh random-uuid)}"
       # Listeners (plaintext, internal-only — backend network is docker-internal)
       KAFKA_CFG_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093"
       KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092"
@@ -713,7 +716,8 @@ services:
     # One-shot topic creation. Idempotent: uses --if-not-exists. Exits 0 on success.
     # The service stays in "exited" state after the first successful run and is
     # re-executed whenever compose is brought up — cheap and safe.
-    image: bitnami/kafka:3.8.0
+    # bitnamilegacy/* — see broker service comment + #100 for the long-term plan.
+    image: bitnamilegacy/kafka:3.8.0
     user: "1001:1001"
     volumes:
       - ../infra/kafka/init-topics.sh:/opt/bitnami/kafka/init-topics.sh:ro
