@@ -201,8 +201,6 @@ restore_neo4j() {
 
     local dump_dir
     dump_dir=$(dirname "$dump_file")
-    local dump_basename
-    dump_basename=$(basename "$dump_file")
 
     log "INFO" "Loading Neo4j dump..."
     if docker run --rm \
