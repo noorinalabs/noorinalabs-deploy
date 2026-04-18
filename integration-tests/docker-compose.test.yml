@@ -31,7 +31,7 @@ services:
 
   user-service:
     build:
-      context: ../noorinalabs-user-service
+      context: ../../noorinalabs-user-service
       dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgresql+asyncpg://user_service:user_service_test_pw@user-postgres:5432/user_service_test
@@ -109,7 +109,7 @@ services:
 
   isnad-graph-api:
     build:
-      context: ../noorinalabs-isnad-graph
+      context: ../../noorinalabs-isnad-graph
       dockerfile: Dockerfile
     environment:
       NEO4J_URI: bolt://neo4j:7687
