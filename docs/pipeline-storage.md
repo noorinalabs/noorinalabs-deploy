@@ -27,7 +27,7 @@ noorinalabs-pipeline/
 | `normalized/` | normalize worker | graph-load worker | Rebuildable from `enriched/` |
 | `staged/` | graph-load worker | — | Audit trail of what was loaded into Neo4j |
 
-See `ontology/repos/isnad-ingest-platform.yaml` and
+See `ontology/repos/ingestion.yaml` and
 `ontology/repos/isnad-ingest-platform.yaml` `reset_levels` for how pipeline
 resets map onto prefix deletion.
 

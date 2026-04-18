@@ -11,19 +11,33 @@ permissions:
   pull-requests: write
 
 jobs:
-  validate:
-    name: Validate
+  fmt:
+    name: Format check
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: terraform/hetzner
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.5"
-      - name: Format check
-        run: terraform fmt -check -recursive
+      - name: terraform fmt -check -recursive
+        run: terraform fmt -check -recursive terraform/
+
+  validate:
+    name: Validate (${{ matrix.module }})
+    needs: fmt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [hetzner, cloudflare, backblaze]
+    defaults:
+      run:
+        working-directory: terraform/${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.5"
       - name: Init (no backend)
         run: terraform init -backend=false
       - name: Validate
@@ -61,7 +75,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const output = `#### Terraform Plan
+            const output = `#### Terraform Plan (hetzner)
             \`\`\`
             ${{ steps.plan.outputs.stdout }}
             \`\`\`
