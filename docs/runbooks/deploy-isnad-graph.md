@@ -44,9 +44,9 @@ To deploy all 13 services (including infrastructure):
 1. SSH to VPS as `deploy` user
 2. Pull latest deploy config: `git fetch origin main && git reset --hard origin/main` in `/opt/noorinalabs-deploy`
 3. Write `.env` from GitHub secrets (recreated fresh each deploy, `chmod 600`)
-4. Pull latest `noorinalabs-isnad-graph` source to `/opt/noorinalabs-isnad-graph` (local build fallback)
-5. Attempt GHCR image pull for `api` and `frontend`
-6. Start services: `docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --build --force-recreate --remove-orphans`
+4. Authenticate to GHCR: `docker login ghcr.io` with auto-provisioned `GITHUB_TOKEN` (logout on exit via trap)
+5. Pull images from GHCR for `api`, `frontend`, `landing`, `user-service`
+6. Start services: `docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans`
 7. Health check loop: polls API container up to 24 times at 5-second intervals (120s total)
 
 ## Post-Deployment Verification

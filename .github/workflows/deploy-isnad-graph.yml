@@ -105,7 +105,6 @@ jobs:
               printf "%s='%s'\n" "$var" "$val" >> "$env_file"
             done
             printf "%s='%s'\n" "IMAGE_TAG" "${IMAGE_TAG}" >> "$env_file"
-            printf "%s='%s'\n" "CACHEBUST" "$(date +%s)" >> "$env_file"
             chmod 600 "$env_file"
 
             echo "==> Authenticating to GHCR..."
@@ -114,36 +113,11 @@ jobs:
             trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
             echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-            echo "==> Pulling latest noorinalabs-isnad-graph source (for local builds)..."
-            cd /opt/noorinalabs-isnad-graph
-            git fetch origin main
-            git reset --hard origin/main
-            cd /opt/noorinalabs-deploy
+            echo "==> Pulling images from GHCR..."
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull api frontend landing user-service
 
-            echo "==> Staging design-system tarball into frontend build context..."
-            # frontend/package-lock.json resolves @noorinalabs/design-system from
-            # `file:/noorinalabs-design-system-0.0.1.tgz`. The Dockerfile (see
-            # noorinalabs-isnad-graph#818) COPYs that file from the build context.
-            # The design-system repo commits the pre-built 0.0.1.tgz at its root;
-            # we transport it verbatim. NO `npm pack` here — running pack on the
-            # current design-system source yields 0.0.2.tgz which fails the
-            # lockfile's integrity check. Long-term retired by isnad-graph#817
-            # (frontend → GHCR) and noorinalabs-design-system#57 (DS → npm registry).
-            if [ -d /opt/noorinalabs-design-system ]; then
-              cd /opt/noorinalabs-design-system
-              git fetch origin main
-              git reset --hard origin/main
-            else
-              git clone https://github.com/noorinalabs/noorinalabs-design-system.git /opt/noorinalabs-design-system
-            fi
-            cp /opt/noorinalabs-design-system/noorinalabs-design-system-0.0.1.tgz /opt/noorinalabs-isnad-graph/frontend/
-            cd /opt/noorinalabs-deploy
-
-            echo "==> Attempting GHCR image pull..."
-            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || echo "GHCR pull failed — will build locally"
-
-            echo "==> Starting services (builds locally if no GHCR image)..."
-            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --build --force-recreate --remove-orphans
+            echo "==> Starting services..."
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
 
             echo "==> Waiting for services to stabilize..."
             sleep 15

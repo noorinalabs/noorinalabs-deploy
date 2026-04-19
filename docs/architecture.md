@@ -97,11 +97,10 @@ The primary deployment workflow (`deploy-isnad-graph.yml`) follows this sequence
 1. **SSH to VPS** as `deploy` user via `appleboy/ssh-action@v1`
 2. **Pull latest deploy configs** — `git fetch origin main && git reset --hard origin/main` in `/opt/noorinalabs-deploy`
 3. **Write `.env`** — all secrets are injected as SSH environment variables and written to `.env` with `chmod 600`. The file is recreated fresh each deployment.
-4. **Pull latest isnad-graph source** — `git fetch && reset` in `/opt/noorinalabs-isnad-graph` (used as build context fallback)
-5. **Try GHCR images first** — `docker compose pull api frontend` attempts to pull pre-built images from `ghcr.io/noorinalabs/`
-6. **Fall back to local build** — if GHCR pull fails, `docker compose up --build` builds from the local source checkout
-7. **Start services** — `docker compose up -d --build --force-recreate --remove-orphans`
-8. **Health check loop** — polls the API container health status up to 24 times at 5-second intervals (120 seconds total). On failure, dumps the last 50 lines of API logs and exits non-zero.
+4. **Authenticate to GHCR** — `docker login ghcr.io` using the auto-provisioned `GITHUB_TOKEN`; a trap ensures logout on exit so no credentials persist on the VPS.
+5. **Pull images from GHCR** — `docker compose pull api frontend landing user-service` pulls pre-built images from `ghcr.io/noorinalabs/`. All application services are image-only; there is no local-build fallback.
+6. **Start services** — `docker compose up -d --force-recreate --remove-orphans`
+7. **Health check loop** — polls the API container health status up to 24 times at 5-second intervals (120 seconds total). On failure, dumps the last 50 lines of API logs and exits non-zero.
 
 ## Secrets Management
 
@@ -142,7 +141,6 @@ The `.env` file is ephemeral: recreated fresh on each deployment, written with `
 | Variable | Source |
 |----------|--------|
 | `IMAGE_TAG` | Workflow input or `latest` |
-| `CACHEBUST` | `date +%s` (forces frontend rebuild) |
 
 ## Infrastructure
 
