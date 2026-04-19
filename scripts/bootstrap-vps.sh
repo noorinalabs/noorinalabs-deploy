@@ -11,6 +11,12 @@
 # =============================================================================
 set -euo pipefail
 
+# Suppress all interactive debconf prompts during apt operations. Without this,
+# any package whose postinst asks a question (docker.io "restart Docker?",
+# openssh-server, libc6, etc.) hangs the script indefinitely on the first
+# upgrade-with-prompt. See #110 for the incident this fixes.
+export DEBIAN_FRONTEND=noninteractive
+
 REPO_URL="https://github.com/noorinalabs/noorinalabs-deploy.git"
 INSTALL_DIR="/opt/noorinalabs-deploy"
 DEPLOY_USER="deploy"
@@ -29,7 +35,14 @@ fi
 # ── Step 1: System packages ─────────────────────────────────────────────────
 echo "==> [1/7] Installing system packages..."
 apt-get update -qq
-apt-get install -y -qq docker.io docker-compose-v2 docker-buildx git curl > /dev/null
+# --force-confold: keep operator-modified config files on upgrade (don't blow
+#   away changes under /etc/docker/, /etc/ssh/, etc.).
+# --force-confdef: use the package's default when there's no existing file to
+#   preserve. Standard idempotent-upgrade pair.
+apt-get install -y -qq \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold" \
+  docker.io docker-compose-v2 docker-buildx git curl > /dev/null
 systemctl enable docker
 systemctl start docker
 echo "    Docker version: $(docker --version)"
