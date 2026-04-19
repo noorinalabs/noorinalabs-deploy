@@ -666,7 +666,12 @@ services:
     # Same image, same internal paths (/bitnami/kafka, /opt/bitnami/kafka/...) — only
     # the registry namespace changes. Long-term migration off Bitnami tracked in #100.
     image: bitnamilegacy/kafka:3.8.0
-    user: "1001:1001"
+    # Must run with GID 0 (root group) — matches the image's default USER directive.
+    # /opt/bitnami/kafka/config is root:root 775; the entrypoint cp's default configs
+    # there on first run and requires group-write via gid=0. Explicit user: 1001:1001
+    # loses that group membership and fails with "Permission denied" on server.properties
+    # — see #124. Long-term migration off Bitnami tracked in #100.
+    user: "1001:0"
     environment:
       # Core KRaft identity
       KAFKA_CFG_NODE_ID: "1"
@@ -727,7 +732,12 @@ services:
     # re-executed whenever compose is brought up — cheap and safe.
     # bitnamilegacy/* — see broker service comment + #100 for the long-term plan.
     image: bitnamilegacy/kafka:3.8.0
-    user: "1001:1001"
+    # Must run with GID 0 (root group) — matches the image's default USER directive.
+    # /opt/bitnami/kafka/config is root:root 775; the entrypoint cp's default configs
+    # there on first run and requires group-write via gid=0. Explicit user: 1001:1001
+    # loses that group membership and fails with "Permission denied" on server.properties
+    # — see #124. Long-term migration off Bitnami tracked in #100.
+    user: "1001:0"
     volumes:
       - ../infra/kafka/init-topics.sh:/opt/bitnami/kafka/init-topics.sh:ro
     entrypoint: ["/bin/bash", "/opt/bitnami/kafka/init-topics.sh"]
