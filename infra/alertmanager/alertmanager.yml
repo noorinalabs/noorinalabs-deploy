@@ -16,7 +16,10 @@ route:
 receivers:
   - name: default
     webhook_configs:
-      - url: "${ALERTMANAGER_WEBHOOK_URL:-http://localhost:9095/webhook}"
+      # Alertmanager does NOT expand ${VAR} in config files. URL must be literal.
+      # This points at a non-existent local webhook so config loads cleanly until
+      # real alert routing (PagerDuty/Slack/email) is set up. See #127.
+      - url: "http://localhost:9095/webhook"
         send_resolved: true
     # Uncomment to enable email notifications:
     # email_configs:
@@ -29,7 +32,10 @@ receivers:
 
   - name: critical
     webhook_configs:
-      - url: "${ALERTMANAGER_WEBHOOK_URL:-http://localhost:9095/webhook}"
+      # Alertmanager does NOT expand ${VAR} in config files. URL must be literal.
+      # This points at a non-existent local webhook so config loads cleanly until
+      # real alert routing (PagerDuty/Slack/email) is set up. See #127.
+      - url: "http://localhost:9095/webhook"
         send_resolved: true
     # Uncomment to enable email notifications for critical alerts:
     # email_configs:
