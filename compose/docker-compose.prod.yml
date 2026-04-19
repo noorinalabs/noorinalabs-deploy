@@ -564,18 +564,20 @@ services:
         max-file: "3"
 
   promtail:
-    image: grafana/promtail:2.9.10
+    # 3.x bundles a Docker API client compatible with Docker 26+ daemons (API 1.44).
+    # 2.9.10 shipped a 1.42 client which can't enumerate containers on the prod
+    # VPS — see #128. Push API stays compatible with Loki 2.9.x; no Loki bump needed.
+    image: grafana/promtail:3.4.1
     volumes:
       - ../infra/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
     command:
       - "-config.file=/etc/promtail/config.yml"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9080/ready || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # Healthcheck removed — promtail's distroless image has no wget/curl/nc, so
+    # any HTTP-probe healthcheck fails permanently (888-deep failing streak observed
+    # pre-fix). Liveness signal is restart-policy + Prometheus alerting on log-rate
+    # drop. Long-term: migrate to grafana/alloy (richer base image). See #128.
     depends_on:
       loki:
         condition: service_healthy
