@@ -100,7 +100,7 @@ docker pull ghcr.io/noorinalabs/noorinalabs-isnad-graph:latest
     --jq '.[].metadata.container.tags[]' | head -20
   ```
 
-**Fallback behavior:** The deploy workflow is designed to fall back to local builds from `/opt/noorinalabs-isnad-graph` when GHCR pull fails. This is slower but functional.
+**No fallback:** As of the GHCR cutover (`noorinalabs-main#145`), application services are image-only — there is no local-build fallback. If `docker compose pull` fails, the deploy fails. Fix the GHCR auth/tag/image issue and re-run; do not attempt to `--build` on the VPS.
 
 ## VPS Disk Space / Resource Exhaustion
 
