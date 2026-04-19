@@ -112,10 +112,14 @@ services:
     restart: unless-stopped
 
   api:
+    # GHCR-only — no local-build fallback. The deploy workflow logs into ghcr.io
+    # using the auto-provisioned GITHUB_TOKEN (workflow `permissions: packages: read`
+    # required, see .github/workflows/deploy-isnad-graph.yml). A manual
+    # `docker compose up` on the VPS without prior `docker login ghcr.io` will fail
+    # at pull — that's intentional; deploys go through the workflow. See the
+    # cutover meta (noorinalabs-main#145) and #103 for the rationale (VPS has no
+    # Node toolchain, so the previous local-build path was never viable).
     image: ghcr.io/noorinalabs/noorinalabs-isnad-graph:${IMAGE_TAG:-latest}
-    build:
-      context: /opt/noorinalabs-isnad-graph
-      dockerfile: Dockerfile
     expose:
       - "8000"
     # Security: read_only prevents runtime writes to the container filesystem.
@@ -173,12 +177,15 @@ services:
     restart: unless-stopped
 
   frontend:
+    # GHCR-only — no local-build fallback. The deploy workflow logs into ghcr.io
+    # using the auto-provisioned GITHUB_TOKEN (workflow `permissions: packages: read`
+    # required, see .github/workflows/deploy-isnad-graph.yml). A manual
+    # `docker compose up` on the VPS without prior `docker login ghcr.io` will fail
+    # at pull — that's intentional; deploys go through the workflow. See the
+    # cutover meta (noorinalabs-main#145) and #103 for the rationale: the VPS has
+    # no Node/npm toolchain, so the previous `npm pack`-based build path was
+    # never viable and the CACHEBUST arg (local-build cache buster) went with it.
     image: ghcr.io/noorinalabs/noorinalabs-isnad-graph-frontend:${IMAGE_TAG:-latest}
-    build:
-      context: /opt/noorinalabs-isnad-graph/frontend
-      dockerfile: Dockerfile
-      args:
-        CACHEBUST: ${CACHEBUST:-1}
     expose:
       - "80"
     read_only: true
@@ -217,8 +224,7 @@ services:
     # using the auto-provisioned GITHUB_TOKEN (workflow `permissions: packages: read`
     # required, see .github/workflows/deploy-isnad-graph.yml). A manual
     # `docker compose up` on the VPS without prior `docker login ghcr.io` will fail
-    # at pull — that's intentional; deploys go through the workflow. The api/frontend
-    # services still have `build:` blocks pending the owner decision in #103.
+    # at pull — that's intentional; deploys go through the workflow.
     image: ghcr.io/noorinalabs/noorinalabs-landing-page:${LANDING_IMAGE_TAG:-latest}
     expose:
       - "80"
