@@ -348,8 +348,12 @@ services:
         max-size: "10m"
         max-file: "5"
     networks:
+      # frontend is non-internal — gives user-service outbound egress for OAuth
+      # provider calls (Google, GitHub, etc.). backend + user-backend are internal
+      # for DB isolation. See deploy#138.
       - backend
       - user-backend
+      - frontend
     command: /app/.venv/bin/uvicorn src.app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 2
     restart: unless-stopped
 
