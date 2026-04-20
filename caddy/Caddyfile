@@ -18,6 +18,13 @@ noorinalabs.com {
 isnad-graph.noorinalabs.com {
     # ── User service routes ──────────────────────────────────────────
 
+    # OAuth post-login redirect target lives on the frontend (React Router
+    # AuthCallbackPage), NOT user-service. Carve out before /auth/* which
+    # goes to user-service. See deploy#133, user-service#67.
+    handle /auth/callback/* {
+        reverse_proxy frontend:80
+    }
+
     # User service — auth endpoints
     # NOTE: rate limiting on /auth/* should be enforced at the app layer
     handle /auth/* {
