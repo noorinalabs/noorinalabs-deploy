@@ -141,6 +141,7 @@ services:
       - AUTH_GITHUB_CLIENT_ID=${AUTH_GITHUB_CLIENT_ID:-}
       - AUTH_GITHUB_CLIENT_SECRET=${AUTH_GITHUB_CLIENT_SECRET:-}
       - AUTH_OAUTH_REDIRECT_BASE_URL=https://isnad-graph.noorinalabs.com
+      - AUTH_USER_SERVICE_URL=http://user-service:8000
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
       interval: 15s
