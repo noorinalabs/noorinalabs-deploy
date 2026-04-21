@@ -1,0 +1,5 @@
+.env.test.secrets
+secrets/
+reports/
+__pycache__/
+*.pyc

@@ -1,0 +1,57 @@
+name: Integration Tests — cross-repo (#49)
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "integration-tests/**"
+      - ".github/workflows/integration-tests.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "integration-tests/**"
+  workflow_dispatch:
+
+jobs:
+  cross-repo-integration:
+    name: Full stack end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout noorinalabs-deploy
+        uses: actions/checkout@v4
+        with:
+          path: noorinalabs-deploy
+
+      - name: Checkout noorinalabs-user-service
+        uses: actions/checkout@v4
+        with:
+          repository: noorinalabs/noorinalabs-user-service
+          path: noorinalabs-user-service
+          ref: main
+
+      - name: Checkout noorinalabs-isnad-graph
+        uses: actions/checkout@v4
+        with:
+          repository: noorinalabs/noorinalabs-isnad-graph
+          path: noorinalabs-isnad-graph
+          ref: main
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run integration tests
+        working-directory: noorinalabs-deploy/integration-tests
+        run: ./run-tests.sh --junit-xml=reports/junit.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-junit
+          path: noorinalabs-deploy/integration-tests/reports/
+
+      - name: Dump compose logs on failure
+        if: failure()
+        working-directory: noorinalabs-deploy/integration-tests
+        run: docker compose -f docker-compose.test.yml --env-file .env.test logs --no-color > reports/compose.log || true
