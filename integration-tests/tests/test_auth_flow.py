@@ -5,12 +5,16 @@ Scenario 3: Real OAuth callback against fake_oauth container (noorinalabs-main#1
 
 from __future__ import annotations
 
+import os
 import secrets
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 
 from tests.conftest import issue_token_for
+
+USER_SERVICE_URL = os.environ["USER_SERVICE_URL"]
 
 
 @pytest.mark.asyncio
@@ -86,73 +90,102 @@ async def test_token_validation_endpoint(
 
 @pytest.mark.asyncio
 async def test_oauth_callback_to_token_issue(
-    user_service: httpx.AsyncClient,
     isnad_graph: httpx.AsyncClient,
     user_pg,
 ) -> None:
     """noorinalabs-main#135 — real OAuth callback against fake_oauth.
 
-    Exercises the full Google flow:
-      1. /auth/oauth/google/login — get a state + code_verifier
-      2. /auth/oauth/google/callback — user-service hits fake_oauth's
-         /token + /oauth2/v3/userinfo via OAUTH_PROVIDER_BASE_URL_OVERRIDE,
-         creates the user, returns a one-time authorization_code
-      3. /auth/token — exchange that authorization_code for a JWT pair
-      4. isnad-graph /api/v1/narrators — verify the JWT is accepted
+    The callback is GET + RedirectResponse (user-service #66/#67). The flow:
+      1. GET /auth/oauth/google/login — stashes state + PKCE verifier in Redis
+         and returns the authorization_url (already rewritten to fake_oauth
+         via OAUTH_PROVIDER_BASE_URL_OVERRIDE).
+      2. GET /auth/oauth/google/callback?code=...&state=... — user-service
+         validates state against Redis, exchanges the code with fake_oauth's
+         /token, fetches userinfo from fake_oauth's /oauth2/v3/userinfo,
+         upserts the user, mints tokens, and 302s to
+         AUTH_OAUTH_POST_LOGIN_URL/{provider}?token=...&is_new_user=0|1.
+      3. Parse the access token out of the redirect Location and verify
+         isnad-graph accepts it.
+
+    We do not need to visit fake_oauth's /o/oauth2/v2/auth — fake_oauth's
+    /token accepts any code, and state validation only checks Redis. This
+    keeps the test focused on the user-service ↔ fake_oauth round-trip.
     """
-    # 1. Bootstrap PKCE by hitting the real login endpoint. Returns a
-    # state + code_verifier that user-service will happily accept back
-    # on the callback — the current callback impl does not re-check
-    # state/verifier against Redis, it just forwards the verifier to
-    # the token endpoint.
-    r = await user_service.get("/auth/oauth/google/login")
-    assert r.status_code == 200, r.text
-    login = r.json()
-    assert login["state"]
-    assert login["code_verifier"]
+    async with httpx.AsyncClient(
+        base_url=USER_SERVICE_URL, timeout=10, follow_redirects=False
+    ) as user_service:
+        # 1. Bootstrap PKCE by hitting the login endpoint. This side-effect
+        # (stashing state → {provider, code_verifier} in Redis) is what makes
+        # the direct callback hit below pass state validation.
+        r = await user_service.get("/auth/oauth/google/login")
+        assert r.status_code == 200, r.text
+        login = r.json()
+        state = login["state"]
+        assert state
+        # Sanity: login rewrote the authorize URL onto fake_oauth. If this
+        # regresses, callback will also fail with a surprising network error
+        # rather than a clean 302 — catch it here.
+        parsed_auth_url = urlparse(login["authorization_url"])
+        assert parsed_auth_url.netloc == "fake_oauth:8080", (
+            "login did not rewrite authorization_url onto fake_oauth — "
+            f"OAUTH_PROVIDER_BASE_URL_OVERRIDE wiring regressed: {login['authorization_url']}"
+        )
 
-    # 2. POST the callback. fake_oauth accepts any `code`; the resulting
-    # user's sub/email is derived from the access_token suffix, so the
-    # email is unique per flow and collisions across runs are avoided.
-    fake_code = f"FAKE_CODE_{secrets.token_urlsafe(12)}"
-    r = await user_service.post(
-        "/auth/oauth/google/callback",
-        json={
-            "code": fake_code,
-            "state": login["state"],
-            "code_verifier": login["code_verifier"],
-        },
-    )
-    assert r.status_code == 200, (
-        f"callback failed — fake_oauth reachable? override set? resp={r.text}"
-    )
-    callback = r.json()
-    assert callback["provider"] == "google"
-    assert callback["email"].startswith("fake-") and "@example.com" in callback["email"]
-    authorization_code = callback["authorization_code"]
-    assert authorization_code
+        # 2. GET the callback with a fabricated code + the real state. The
+        # callback is a browser-facing endpoint that returns a RedirectResponse
+        # (302) — we must disable redirect-following so httpx gives us the
+        # Location header with the minted access token on it.
+        fake_code = f"FAKE_CODE_{secrets.token_urlsafe(12)}"
+        r = await user_service.get(
+            "/auth/oauth/google/callback",
+            params={"code": fake_code, "state": state},
+        )
+        assert r.status_code == 302, (
+            "callback did not redirect — fake_oauth reachable? override set? "
+            f"status={r.status_code} body={r.text[:500]}"
+        )
+        location = r.headers.get("location", "")
+        assert location, "callback 302 missing Location header"
+        parsed = urlparse(location)
+        # AUTH_OAUTH_POST_LOGIN_URL default is /auth/callback; the handler
+        # appends /{provider}. Error redirects take the same base but carry
+        # ?error=... — fail loudly if we got an error redirect.
+        assert parsed.path == "/auth/callback/google", (
+            f"unexpected redirect path {parsed.path!r} — full Location={location}"
+        )
+        qs = parse_qs(parsed.query)
+        assert "error" not in qs, (
+            f"callback redirected with error={qs.get('error')} — check user-service "
+            f"logs for the provider/exchange failure. Location={location}"
+        )
+        assert qs.get("token"), f"no token in callback redirect: {location}"
+        access_token = qs["token"][0]
+        assert qs.get("is_new_user") == ["1"], (
+            f"expected a newly-created user on first callback; got is_new_user="
+            f"{qs.get('is_new_user')}"
+        )
 
-    # 3. Exchange the authorization code for JWTs.
-    tokens = await issue_token_for(user_service, authorization_code)
-    assert tokens["access_token"]
-    assert tokens["refresh_token"]
+        # 3. Cross-service: access a protected isnad-graph endpoint with the
+        # token minted by the real OAuth callback. 401 means JWT validation
+        # failed (issuer/audience/JWKS mismatch); anything else is fine here.
+        headers = {"Authorization": f"Bearer {access_token}"}
+        ig = await isnad_graph.get(
+            "/api/v1/narrators", headers=headers, params={"limit": 1}
+        )
+        assert ig.status_code != 401, (
+            f"isnad-graph rejected JWT minted via fake_oauth flow: {ig.text}"
+        )
 
-    # 4. Access a protected isnad-graph endpoint — same bar as the
-    # shim-path test: 401 means JWT rejected, anything else is fine.
-    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
-    r = await isnad_graph.get(
-        "/api/v1/narrators", headers=headers, params={"limit": 1}
+    # 4. Cleanup — find_or_create_oauth_user persisted a row. Its email is
+    # derived from the fake access_token suffix, so we can't predict it; look
+    # it up by OAuth provider + the account id we issued (sub=fake-user-<suffix>).
+    # Simplest path: delete any fake-*@example.com users created during this
+    # test window. These are only produced by this test path.
+    rows = await user_pg.fetch(
+        "SELECT id FROM users WHERE email LIKE 'fake-%@example.com'"
     )
-    assert r.status_code != 401, (
-        f"isnad-graph rejected JWT minted via fake_oauth flow: {r.text}"
-    )
-
-    # Cleanup — find_or_create_oauth_user persisted a row; remove it to
-    # keep the test DB tidy. Match by email (unique) to get the user_id.
-    uid = await user_pg.fetchval(
-        "SELECT id FROM users WHERE email = $1", callback["email"]
-    )
-    if uid is not None:
+    for row in rows:
+        uid = row["id"]
         await user_pg.execute("DELETE FROM sessions WHERE user_id = $1", uid)
         await user_pg.execute("DELETE FROM user_roles WHERE user_id = $1", uid)
         await user_pg.execute("DELETE FROM subscriptions WHERE user_id = $1", uid)
