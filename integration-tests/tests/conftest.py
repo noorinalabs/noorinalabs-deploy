@@ -3,11 +3,15 @@
 These fixtures talk to the *running* services over the docker Compose network.
 Each fixture that creates state also cleans it up.
 
-Why the auth-code shim? The OAuth provider exchange calls real Google/GitHub
-URLs that are hardcoded in `src/app/services/oauth.py`. Rather than adding a
-provider URL override (follow-up), we short-circuit to the *post-callback* point
-in the flow: seed a user in user-postgres and an auth code in user-redis, then
-exercise `/auth/token` through the rest of the stack end-to-end.
+Two auth-flow paths are exercised against the same stack:
+  * Real-callback path — `test_oauth_callback_to_token_issue` exercises
+    `/auth/oauth/google/callback` end-to-end against the `fake_oauth`
+    container, reaching user-service via OAUTH_PROVIDER_BASE_URL_OVERRIDE
+    (user-service#77/#78, deploy #135).
+  * Shim path — the factory below seeds a user in user-postgres and an auth
+    code in user-redis, short-circuiting to `/auth/token`. Predates the
+    override; retained for regression coverage and for other providers that
+    do not yet have fake_oauth support (GitHub / Apple / Facebook).
 """
 
 from __future__ import annotations

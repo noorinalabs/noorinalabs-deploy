@@ -43,6 +43,12 @@ services:
       JWT_REFRESH_TOKEN_EXPIRE_DAYS: "7"
       CORS_ORIGINS: '["http://testnet"]'
       AUTH_OAUTH_REDIRECT_BASE_URL: http://user-service:8000
+      AUTH_GOOGLE_CLIENT_ID: fake-google-client-id
+      AUTH_GOOGLE_CLIENT_SECRET: fake-google-client-secret
+      # #135: route all OAuth provider traffic to the fake_oauth container.
+      # Requires ENVIRONMENT=test per user-service#78 HTTP-downgrade guard.
+      ENVIRONMENT: test
+      OAUTH_PROVIDER_BASE_URL_OVERRIDE: http://fake_oauth:8080
       TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
       WEBHOOK_SIGNING_SECRET: integration_webhook_secret
     healthcheck:
@@ -55,6 +61,8 @@ services:
       user-postgres:
         condition: service_healthy
       user-redis:
+        condition: service_healthy
+      fake_oauth:
         condition: service_healthy
     # NOTE: `alembic upgrade heads` (plural) is a temporary work-around —
     # user-service's migration history has three unmerged heads (0003, 0020, 0030
@@ -69,6 +77,25 @@ services:
     networks:
       - user-backend
       - testnet
+
+  # --- Fake OAuth provider (noorinalabs-main#135) ---
+  # Replaces real Google/GitHub/Apple/Facebook endpoints when user-service's
+  # OAUTH_PROVIDER_BASE_URL_OVERRIDE routes here. Only Google's endpoints are
+  # meaningfully implemented; the other providers still use the Redis shim
+  # in conftest.py.
+  fake_oauth:
+    build:
+      context: ./fake_oauth
+    environment:
+      FAKE_OAUTH_AUDIENCE: fake-google-client-id
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\" || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - user-backend
 
   # --- isnad-graph stack (minimal: api + neo4j + pg + redis) ---
 
