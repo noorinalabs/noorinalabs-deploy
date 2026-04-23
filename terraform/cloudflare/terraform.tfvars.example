@@ -5,5 +5,11 @@ cloudflare_api_token = "CHANGE-ME"
 # Zone ID — found on the Cloudflare dashboard overview page for noorinalabs.com
 cloudflare_zone_id = "CHANGE-ME"
 
-# VPS public IPv4 — from `terraform output -raw server_ip` in the hetzner/ module
-vps_ipv4_address = "CHANGE-ME"
+# Prod VPS IPs — from `terraform output -raw server_ip` (and `server_ipv6`)
+# in terraform/hetzner/envs/prod. See #82.
+prod_vps_ipv4_address = "CHANGE-ME"
+prod_vps_ipv6_address = "" # optional; empty string disables AAAA
+
+# Stg VPS IPs — from terraform/hetzner/envs/stg outputs.
+stg_vps_ipv4_address = "CHANGE-ME"
+stg_vps_ipv6_address = "" # optional; empty string disables AAAA
