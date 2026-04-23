@@ -1,0 +1,15 @@
+# stg env — Terraform variables
+# Copy to terraform.tfvars (git-ignored) and fill in real values.
+
+hcloud_token        = "your-hetzner-api-token"
+ssh_public_key_path = "~/.ssh/id_ed25519.pub"
+
+# Restrict SSH in stg if you have an operator CIDR / VPN. Default ["0.0.0.0/0"] is open.
+# ssh_source_ips = ["203.0.113.0/24"]
+
+ghcr_auth_b64 = "base64('username:ghcr-token')"
+
+# user-service secrets (stg)
+user_postgres_password  = "a-strong-stg-password-at-least-16-chars"
+user_redis_password     = "a-strong-stg-password-at-least-16-chars"
+user_service_jwt_secret = "a-strong-stg-secret-at-least-32-chars"

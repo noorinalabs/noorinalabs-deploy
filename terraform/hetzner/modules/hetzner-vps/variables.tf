@@ -1,31 +1,34 @@
-variable "hcloud_token" {
-  description = "Hetzner Cloud API token"
+variable "env" {
+  description = "Environment identifier — stg or prod. Drives resource naming and labeling."
   type        = string
-  sensitive   = true
-}
 
-variable "ssh_public_key_path" {
-  description = "Path to SSH public key file"
-  type        = string
-  default     = "~/.ssh/id_ed25519.pub"
+  validation {
+    condition     = contains(["stg", "prod"], var.env)
+    error_message = "env must be one of: stg, prod."
+  }
 }
 
 variable "server_type" {
-  description = "Hetzner Cloud server type"
+  description = "Hetzner Cloud server type (e.g., cpx21, cpx41)."
   type        = string
-  default     = "cpx41"
-}
-
-variable "server_name" {
-  description = "Name for the VPS instance"
-  type        = string
-  default     = "noorinalabs-isnad-graph-prod"
 }
 
 variable "location" {
-  description = "Hetzner Cloud location"
+  description = "Hetzner Cloud location (e.g., ash for Ashburn)."
   type        = string
   default     = "ash"
+}
+
+variable "image" {
+  description = "Server image."
+  type        = string
+  default     = "ubuntu-24.04"
+}
+
+variable "ssh_public_key_path" {
+  description = "Path to SSH public key file uploaded to Hetzner and authorized for the deploy user."
+  type        = string
+  default     = "~/.ssh/id_ed25519.pub"
 }
 
 variable "ssh_source_ips" {
@@ -35,18 +38,14 @@ variable "ssh_source_ips" {
 }
 
 variable "ghcr_auth_b64" {
-  description = "Base64-encoded 'username:token' for GHCR Docker authentication"
+  description = "Base64-encoded 'username:token' for GHCR Docker authentication on the VPS."
   type        = string
   sensitive   = true
   default     = ""
 }
 
-# ---------------------------------------------------------------------------
-# User Service variables
-# ---------------------------------------------------------------------------
-
 variable "user_postgres_password" {
-  description = "Password for the user-service PostgreSQL database"
+  description = "Password for the user-service PostgreSQL database."
   type        = string
   sensitive   = true
   default     = ""
@@ -58,7 +57,7 @@ variable "user_postgres_password" {
 }
 
 variable "user_redis_password" {
-  description = "Password for the user-service Redis instance"
+  description = "Password for the user-service Redis instance."
   type        = string
   sensitive   = true
   default     = ""
@@ -70,7 +69,7 @@ variable "user_redis_password" {
 }
 
 variable "user_service_jwt_secret" {
-  description = "JWT signing secret for user-service authentication"
+  description = "JWT signing secret for user-service authentication."
   type        = string
   sensitive   = true
   default     = ""

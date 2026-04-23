@@ -1,16 +1,7 @@
 terraform {
-  required_version = ">= 1.6.0"
-
-  required_providers {
-    hcloud = {
-      source  = "hetznercloud/hcloud"
-      version = "~> 1.49"
-    }
-  }
-
   backend "s3" {
     bucket = "noorinalabs-terraform-state"
-    key    = "hetzner/terraform.tfstate"
+    key    = "hetzner/stg.tfstate"
     region = "us-east-005"
     endpoints = {
       s3 = "https://s3.us-east-005.backblazeb2.com"
