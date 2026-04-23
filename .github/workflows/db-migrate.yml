@@ -1,0 +1,209 @@
+name: DB Migrate (user-service alembic)
+
+# Reusable workflow. Invoked by the promotion workflow (deploy#84) as a
+# pre-deploy gate. Runs `alembic upgrade head` inside a user-service container
+# against the target env's user-postgres. Fails fast on migration failure;
+# a stg failure must block the prod promotion in the caller's job graph.
+#
+# Belt-and-suspenders (deploy#85, per Anya.Kowalczyk 2026-04-23): before
+# `alembic upgrade head`, assert that `alembic heads` reports exactly ONE
+# line containing `0040` — the merge-migration revision introduced by
+# user-service#80. This catches a future migration landing without bumping
+# `down_revision` properly (a silent divergence `alembic upgrade head` alone
+# would mask).
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: "Target env — stg or prod"
+        required: true
+        type: string
+      image_tag:
+        description: "user-service image tag to run alembic from (defaults to <env>-latest per isnad-graph#815 Contract v5)"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      migrated:
+        description: "true if alembic upgrade head succeeded, false otherwise"
+        value: ${{ jobs.migrate.outputs.migrated }}
+
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Target env — stg or prod"
+        required: true
+        type: choice
+        options: [stg, prod]
+      image_tag:
+        description: "user-service image tag (leave empty for <env>-latest)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  # Serialize migrations per env. Never run two alembic upgrades against the
+  # same Postgres concurrently — alembic's version-table lock would serialize
+  # them anyway, but failing a second run loudly is cleaner than a 30s wait.
+  group: db-migrate-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: alembic upgrade head (${{ inputs.env }})
+    runs-on: ubuntu-latest
+    # Maps to GH Environment protection rules — same pattern as terraform.yml
+    # (stg → staging, prod → production). Per-env secrets resolve from the
+    # matching Environment; no cross-env leakage.
+    environment: ${{ inputs.env == 'prod' && 'production' || 'staging' }}
+    permissions:
+      # GHCR pull happens on the VPS via the runtime GITHUB_TOKEN that the
+      # promotion workflow already injects; this job only SSHes.
+      contents: read
+    outputs:
+      migrated: ${{ steps.run.outputs.migrated }}
+    env:
+      # Expected merge-migration revision. Bump this line in the same PR that
+      # lands a future alembic merge migration in user-service. A mismatch
+      # here means "the migration DAG moved under us" and is a hard stop.
+      EXPECTED_MERGE_HEAD: "0040"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.image_tag }}"
+          if [ -z "$tag" ]; then
+            # Contract v5 (isnad-graph#815 issuecomment-4301487132, option C):
+            # env-scoped floating tag `<env>-latest` always resolves to the
+            # current promoted image for that env. Pinned `<env>-<short>` tags
+            # are preferred for auditability; fall back here is for dispatch
+            # testing only.
+            tag="${{ inputs.env }}-latest"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using user-service image tag: $tag"
+
+      - name: Run alembic pre-deploy gate on ${{ inputs.env }} VPS
+        id: run
+        uses: appleboy/ssh-action@v1
+        env:
+          ENV_NAME: ${{ inputs.env }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          EXPECTED_MERGE_HEAD: ${{ env.EXPECTED_MERGE_HEAD }}
+          # DATABASE_URL is assembled on the VPS from the existing user-*
+          # compose env-file the deploy user already writes. We do NOT pass
+          # USER_POSTGRES_PASSWORD through the GH Actions transport here —
+          # the env-file on the VPS is the single source of truth and has
+          # already been gated by the environment-protection approval.
+          USER_POSTGRES_USER: ${{ secrets.USER_POSTGRES_USER }}
+          USER_POSTGRES_DB: ${{ secrets.USER_POSTGRES_DB }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.repository_owner }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: ENV_NAME,IMAGE_TAG,EXPECTED_MERGE_HEAD,USER_POSTGRES_USER,USER_POSTGRES_DB,GITHUB_TOKEN,GITHUB_ACTOR
+          script: |
+            set -euo pipefail
+
+            cd /opt/noorinalabs-deploy
+
+            # .env on the VPS holds USER_POSTGRES_PASSWORD / USER_POSTGRES_USER
+            # / USER_POSTGRES_DB. It was written most recently by the deploy
+            # workflow for this env and has mode 600. Read it with `set -a`
+            # so every KEY=VAL becomes exported, matching docker-compose.
+            if [ ! -f .env ]; then
+              echo "ERROR: /opt/noorinalabs-deploy/.env is missing on ${ENV_NAME} VPS."
+              echo "       The deploy workflow has never written env-file here, or it was removed."
+              exit 1
+            fi
+            set -a
+            . ./.env
+            set +a
+
+            # Log into GHCR so we can pull the user-service image this gate
+            # runs alembic from. The trap logs out at end-of-run so no
+            # credentials persist on the VPS (matches deploy-isnad-graph.yml).
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+            echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+            IMAGE="ghcr.io/noorinalabs/noorinalabs-user-service:${IMAGE_TAG}"
+            echo "==> Pulling ${IMAGE}..."
+            docker pull "${IMAGE}"
+
+            # DATABASE_URL — psycopg driver, sync, because alembic's env.py
+            # is synchronous. user-postgres resolves on the user-backend
+            # docker network which this one-shot container joins explicitly.
+            DATABASE_URL="postgresql+psycopg://${USER_POSTGRES_USER}:${USER_POSTGRES_PASSWORD}@user-postgres:5432/${USER_POSTGRES_DB}"
+
+            # -------- Belt-and-suspenders head-count assertion (Anya, 2026-04-23) --------
+            echo "==> [${ENV_NAME}] alembic heads — heads-count assertion"
+            HEADS_OUT="$(
+              docker run --rm \
+                --network noorinalabs_user-backend \
+                -e DATABASE_URL="${DATABASE_URL}" \
+                "${IMAGE}" \
+                /app/.venv/bin/alembic heads 2>&1
+            )"
+
+            # Log raw output on stdout for CI visibility.
+            echo "$HEADS_OUT"
+
+            # Count non-empty lines. alembic prints one revision per line in
+            # the form "<revid> (head)". Any count != 1 is a hard stop.
+            HEADS_COUNT="$(printf '%s\n' "$HEADS_OUT" | grep -cE '\(head\)')"
+            if [ "$HEADS_COUNT" -ne 1 ]; then
+              echo "ERROR: [${ENV_NAME}] alembic heads reported ${HEADS_COUNT} heads, expected exactly 1."
+              echo "       Multiple heads means a migration was added without bumping down_revision,"
+              echo "       or the merge migration was reverted. \`alembic upgrade head\` would fail"
+              echo "       or silently pick a branch. Fix upstream in user-service before retrying."
+              echo "migrated=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            # Confirm the single head matches the expected merge-migration id.
+            # If a future merge migration lands in user-service, the PR that
+            # lands it must also bump EXPECTED_MERGE_HEAD in this workflow.
+            if ! printf '%s' "$HEADS_OUT" | grep -qE "^${EXPECTED_MERGE_HEAD}[[:space:]]+\(head\)"; then
+              echo "ERROR: [${ENV_NAME}] alembic heads reports a single head, but it is NOT the"
+              echo "       expected merge-migration revision '${EXPECTED_MERGE_HEAD}'."
+              echo "       A new merge migration was probably added in user-service without"
+              echo "       bumping EXPECTED_MERGE_HEAD in .github/workflows/db-migrate.yml."
+              echo "       Update the workflow in the same PR as the migration, then retry."
+              echo "migrated=false" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            echo "==> [${ENV_NAME}] heads-count assertion passed: 1 head, matches ${EXPECTED_MERGE_HEAD}"
+
+            # -------- alembic upgrade head (singular) --------
+            echo "==> [${ENV_NAME}] alembic upgrade head"
+            docker run --rm \
+              --network noorinalabs_user-backend \
+              -e DATABASE_URL="${DATABASE_URL}" \
+              "${IMAGE}" \
+              /app/.venv/bin/alembic upgrade head
+
+            echo "==> [${ENV_NAME}] alembic upgrade head succeeded"
+            echo "migrated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Report migration result
+        if: always()
+        run: |
+          {
+            echo "## DB Migrate (${{ inputs.env }}): ${{ job.status }}"
+            echo ""
+            echo "- **Env:** ${{ inputs.env }}"
+            echo "- **Image tag:** ${{ steps.tag.outputs.tag }}"
+            echo "- **Expected head:** ${{ env.EXPECTED_MERGE_HEAD }}"
+            echo "- **Migrated output:** ${{ steps.run.outputs.migrated }}"
+            echo ""
+            if [ "${{ job.status }}" != "success" ]; then
+              echo "Runbook: [docs/runbooks/user-service-alembic.md](../blob/${{ github.sha }}/docs/runbooks/user-service-alembic.md)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
