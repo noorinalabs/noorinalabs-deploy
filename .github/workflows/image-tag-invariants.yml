@@ -1,6 +1,7 @@
-# Tag-count invariant smoke test for the Contract-v6 image tag scheme
-# (canonical: https://github.com/noorinalabs/noorinalabs-isnad-graph/issues/815#issuecomment-4301538921).
-# v6 shape is identical to v5/v3; program-director ruling-language updated.
+# Tag-count invariant smoke test for the Contract-v5 image tag scheme
+# (canonical per owner/Khoury ruling:
+# https://github.com/noorinalabs/noorinalabs-isnad-graph/issues/815#issuecomment-4301487132).
+# v5 shape is identical to v3; v6 is a retro-audit artifact of the same shape.
 #
 # Per Khoury 2026-04-23: guard against future refactors silently dropping or
 # adding a tag in the publish-side (ghcr-publish.yml) or the promotion-side

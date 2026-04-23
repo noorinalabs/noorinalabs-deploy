@@ -20,7 +20,7 @@
 #     promotion.
 #
 # This workflow does NOT retag. Retagging is promote.yml's job, and it is
-# the only workflow that writes `prod-*` tags (Contract v6).
+# the only workflow that writes `prod-*` tags (Contract v5).
 
 name: Deploy to production
 
