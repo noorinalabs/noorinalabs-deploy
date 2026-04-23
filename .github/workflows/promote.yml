@@ -1,11 +1,10 @@
 # Promote image from stg → prod via registry-side retag.
 #
-# Consumes the image-tag Contract v5 (option C) owned by
+# Consumes the image-tag Contract v6 (option C) owned by
 # noorinalabs-isnad-graph#815 (canonical comment per program-director ruling:
-# https://github.com/noorinalabs/noorinalabs-isnad-graph/issues/815#issuecomment-4301487132).
-# v5 shape is identical to v3 (4301425114); v6 (4301538921) is a retro-audit
-# artifact that re-states v5 content. Owner/Khoury selected v5 URL as
-# canonical citation target.
+# https://github.com/noorinalabs/noorinalabs-isnad-graph/issues/815#issuecomment-4301538921).
+# v6 shape is identical to v5 (4301487132) / v3 (4301425114); v6 is the
+# canonical citation target per Khoury ruling 2026-04-23.
 #
 # Source tags (written by each service's ghcr-publish.yml, NOT here):
 #   sha-<short>, latest, stg-<short>, stg-latest

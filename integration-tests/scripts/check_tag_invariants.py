@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assert Contract-v5 tag-count invariants for a GHCR image.
+"""Assert Contract-v6 tag-count invariants for a GHCR image.
 
 Publish-side (per push): exactly FOUR tags per publish-digest:
     sha-<short>, latest, stg-<short>, stg-latest
@@ -7,9 +7,9 @@ Publish-side (per push): exactly FOUR tags per publish-digest:
 Promote-side (per promotion): exactly TWO tags per promoted-digest:
     prod-<short>, prod-latest
 
-Canonical contract (per owner/Khoury ruling): noorinalabs-isnad-graph#815
-comment 4301487132 (v5). v5 shape is identical to v3 (4301425114); v6
-(4301538921) is a retro-audit artifact re-stating v5 content.
+Canonical contract (per Khoury ruling 2026-04-23): noorinalabs-isnad-graph
+#815 comment 4301538921 (v6). v6 shape is identical to v5 (4301487132) /
+v3 (4301425114); v6 is the canonical citation target.
 
 Usage:
     check_tag_invariants.py <image-path>
@@ -147,7 +147,7 @@ def check_publish_side(image_path: str, tags: list[str], token: str) -> list[str
     # Invariant: the group size is exactly 4 — catches the "added a 5th tag" regression too.
     if len(grouped) != 4:
         errors.append(
-            f"[publish] {image_path}: Contract-v5 requires EXACTLY 4 tags per push at the publish digest. "
+            f"[publish] {image_path}: Contract-v6 requires EXACTLY 4 tags per push at the publish digest. "
             f"Found {len(grouped)}: {sorted(grouped)}"
         )
     else:
@@ -198,7 +198,7 @@ def check_promote_side(image_path: str, tags: list[str], token: str) -> list[str
         )
     if len(grouped) != 2:
         errors.append(
-            f"[promote] {image_path}: Contract-v5 requires EXACTLY 2 tags per promotion at the prod digest. "
+            f"[promote] {image_path}: Contract-v6 requires EXACTLY 2 tags per promotion at the prod digest. "
             f"Found {len(grouped)}: {sorted(grouped)}"
         )
     else:
