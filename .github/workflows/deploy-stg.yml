@@ -1,49 +1,75 @@
-name: Deploy noorinalabs-isnad-graph (LEGACY — manual only)
-
-# DEPRECATED in P2W10 by deploy#84. Kept as a manual-dispatch rollback
-# path to the single pre-W10 VPS while downstream migrations land.
+# Deploy to staging (noorinalabs-stg VPS).
 #
-# - Stg fan-in now goes to `deploy-stg.yml` (repository_dispatch here
-#   removed so dispatching does not double-deploy).
-# - Prod rollout now goes through `promote.yml` → `deploy-prod.yml`.
-# - This workflow targets the legacy single VPS via the default
-#   `vars.VPS_HOST`; once `deploy#86` decommissions the hand-made box
-#   this file will be removed entirely.
+# Triggers:
+#   - repository_dispatch from any service repo (isnad-graph, user-service,
+#     landing-page) — the auto-deploy fan-in point for stg. Service repos
+#     send `deploy-noorinalabs-<service>` events after their ghcr-publish.yml
+#     has pushed the four stg tags (sha-<short>, latest, stg-<short>,
+#     stg-latest) per Contract v5.
+#   - workflow_dispatch — manual redeploy, e.g. to re-pull stg-latest after
+#     a registry hiccup.
+#
+# Env scope:
+#   - `environment: staging` gates secrets and vars to the GH Environment
+#     `staging`. No prod secrets are reachable from this workflow.
+#   - Target host comes from `vars.VPS_HOST` scoped to the `staging`
+#     environment (set by deploy#83 Cloudflare DNS to `noorinalabs-stg`-
+#     prefixed subdomains; hostname = `noorinalabs-stg` from deploy#150's
+#     TF output `server_name`).
+#
+# Image tag consumed: `stg-<short>` (immutable, per-push), resolved from the
+# `sha` field of the dispatching payload. If no payload is present (manual
+# dispatch), defaults to `stg-latest`.
+
+name: Deploy to staging
 
 on:
+  repository_dispatch:
+    types:
+      - deploy-noorinalabs-isnad-graph
+      - deploy-noorinalabs-user-service
+      - deploy-noorinalabs-landing-page
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag to deploy (default: latest)'
-        default: 'latest'
+        description: "Image tag suffix to deploy (default: stg-latest)"
+        default: "stg-latest"
 
 concurrency:
-  group: deploy-legacy
+  group: deploy-staging
   cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: production
-    # `packages: read` lets the auto-provisioned GITHUB_TOKEN pull from GHCR.
-    # `contents: read` is the default once any explicit permissions are listed; restating
-    # for clarity since `actions/checkout` needs it. Least-privilege scope: no writes.
+    environment: staging
     permissions:
       packages: read
       contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine image tag
+      - name: Resolve image tag
         id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          MANUAL_TAG: ${{ inputs.image_tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.image_tag }}" ]; then
-            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "repository_dispatch" ] && [ -n "${DISPATCH_SHA:-}" ]; then
+            # 7-char short SHA per Contract v5 `<short>` definition.
+            short="${DISPATCH_SHA:0:7}"
+            tag="stg-$short"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${MANUAL_TAG:-}" ]; then
+            tag="$MANUAL_TAG"
           else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            tag="stg-latest"
           fi
+          echo "Resolved tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy to Hetzner VPS
+      - name: Deploy to stg VPS
         uses: appleboy/ssh-action@v1
         env:
           NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
@@ -62,13 +88,8 @@ jobs:
           KAFKA_UI_PASSWORD: ${{ secrets.KAFKA_UI_PASSWORD }}
           KAFKA_UI_USER: ${{ secrets.KAFKA_UI_USER }}
           IMAGE_TAG: ${{ steps.tag.outputs.tag }}
-          # GHCR auth — auto-provisioned, runtime-only. NEVER add to the env_file
-          # write loop below; these are session credentials and must not persist on
-          # the VPS in `.env`. The trap in the script logs out at end-of-run.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.repository_owner }}
-          # PIPELINE_B2_* — alphabetical block; outputs of `terraform apply`
-          # in terraform/backblaze. Secrets must be created post-bucket-apply.
           PIPELINE_B2_BUCKET: ${{ secrets.PIPELINE_B2_BUCKET }}
           PIPELINE_B2_ENDPOINT: ${{ secrets.PIPELINE_B2_ENDPOINT }}
           PIPELINE_B2_KEY: ${{ secrets.PIPELINE_B2_KEY }}
@@ -91,14 +112,9 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
-            echo "==> Writing .env for docker-compose..."
+            echo "==> Writing .env for docker-compose (IMAGE_TAG=$IMAGE_TAG)..."
             env_file=".env"
             : > "$env_file"
-            # Single-quoted values: docker-compose env-file format treats single-quoted
-            # strings as literal (no escape processing), and single quotes survive the
-            # SSH transport without escape-eating that strips backslash-escaped double
-            # quotes. Limitation: values containing a literal "'" are not supported
-            # (none of our current secrets do — see #94).
             for var in NEO4J_PASSWORD POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
                        REDIS_PASSWORD AUTH_GOOGLE_CLIENT_ID AUTH_GOOGLE_CLIENT_SECRET \
                        AUTH_GITHUB_CLIENT_ID AUTH_GITHUB_CLIENT_SECRET \
@@ -116,8 +132,6 @@ jobs:
             chmod 600 "$env_file"
 
             echo "==> Authenticating to GHCR..."
-            # Register logout trap FIRST so it fires even if login fails — leaves no
-            # stored credentials in the deploy user's ~/.docker/config.json on exit.
             trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
             echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
@@ -150,7 +164,7 @@ jobs:
               fi
               if [ "$i" -eq 24 ]; then
                 echo "ERROR: API health check failed after 120 seconds"
-                docker compose -f compose/docker-compose.prod.yml logs --tail=50 api
+                docker compose -p noorinalabs -f compose/docker-compose.prod.yml logs --tail=50 api
                 exit 1
               fi
               sleep 5
@@ -158,17 +172,19 @@ jobs:
 
             echo "==> Checking all container health..."
             docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env ps --format '{{.Name}}\t{{.Status}}'
-            echo "==> Deployment verified successfully"
+            echo "==> Stg deployment verified"
 
-      - name: Report deployment status
+      - name: Report status
         if: always()
         run: |
-          echo "## Deploy noorinalabs-isnad-graph: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "- **Source repo:** ${{ github.event.client_payload.repo }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Source SHA:** ${{ github.event.client_payload.sha }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Source ref:** ${{ github.event.client_payload.ref }}" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo "- **Image tag:** ${{ steps.tag.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Triggered by:** ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Deploy to staging: ${{ job.status }}"
+            echo ""
+            if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+              echo "- **Source repo:** ${{ github.event.client_payload.repo }}"
+              echo "- **Source SHA:** ${{ github.event.client_payload.sha }}"
+              echo "- **Event type:** ${{ github.event.action }}"
+            fi
+            echo "- **Image tag:** ${{ steps.tag.outputs.tag }}"
+            echo "- **Actor:** ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"

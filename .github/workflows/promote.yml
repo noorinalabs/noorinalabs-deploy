@@ -1,0 +1,299 @@
+# Promote image from stg → prod via registry-side retag.
+#
+# Consumes the image-tag Contract v5 (option C) owned by
+# noorinalabs-isnad-graph#815 (canonical comment:
+# https://github.com/noorinalabs/noorinalabs-isnad-graph/issues/815#issuecomment-4301487132).
+#
+# Source tags (written by each service's ghcr-publish.yml, NOT here):
+#   sha-<short>, latest, stg-<short>, stg-latest
+#
+# Tags written by THIS workflow, exclusively:
+#   prod-<short>, prod-latest
+#
+# Mechanism: `docker buildx imagetools create` rewrites the multi-arch
+# manifest-list at the registry level. No layer pull, no layer push — the
+# target digest is identical to the source digest. Both prod-<short> and
+# prod-latest are written in a single invocation.
+#
+# Promotion sources:
+#   1. Default: resolve digest of `stg-latest` for each image.
+#   2. Rollback / specific-SHA: `workflow_dispatch` input `source_sha` of the
+#      form `sha-<short>` or bare `<short>` — either resolves to the
+#      corresponding `sha-<short>` tag on the registry.
+#
+# Environment gating:
+#   - environment: production forces a reviewer-required manual-approval gate
+#     per the GH Environments protection rule (owner is the sole reviewer).
+#   - Stg deploy is automatic (repository_dispatch fan-in from each service
+#     repo) — see deploy-stg.yml.
+
+name: Promote to production (image retag)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: >-
+          Short SHA to promote (7 chars, with or without `sha-` prefix).
+          Leave empty to promote the digest currently pointed to by
+          `stg-latest` for each image.
+        required: false
+        default: ""
+      images:
+        description: "Comma-separated image set to promote (default: all)."
+        required: false
+        default: "api,frontend,user-service,landing"
+
+concurrency:
+  # All promotions serialize globally — we never want two promotions racing
+  # to write prod-latest.
+  group: promote-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  plan:
+    name: Plan promotion
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      images_json: ${{ steps.filter.outputs.images_json }}
+    steps:
+      - name: Resolve short SHA
+        id: resolve
+        run: |
+          set -euo pipefail
+          raw="${{ inputs.source_sha }}"
+          # Strip an optional `sha-` prefix, then validate 7-char lowercase hex.
+          raw="${raw#sha-}"
+          if [ -z "$raw" ]; then
+            echo "No source_sha input — resolving from stg-latest at deploy time per image."
+            echo "short_sha=" >> "$GITHUB_OUTPUT"
+          else
+            if ! printf '%s' "$raw" | grep -qE '^[0-9a-f]{7}$'; then
+              echo "::error::source_sha must be 7 lowercase hex chars (optionally prefixed 'sha-'). Got: ${{ inputs.source_sha }}"
+              exit 1
+            fi
+            echo "Resolved explicit short SHA: $raw"
+            echo "short_sha=$raw" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Filter image set
+        id: filter
+        env:
+          IMAGES_INPUT: ${{ inputs.images }}
+        run: |
+          set -euo pipefail
+          # Map service keys to GHCR image names. Keep parallel to the
+          # ghcr-publish.yml matrix in each service repo.
+          python3 - <<'PY'
+          import json, os
+          mapping = {
+              "api":          "noorinalabs/noorinalabs-isnad-graph",
+              "frontend":     "noorinalabs/noorinalabs-isnad-graph-frontend",
+              "user-service": "noorinalabs/noorinalabs-user-service",
+              "landing":      "noorinalabs/noorinalabs-landing-page",
+          }
+          raw = os.environ.get("IMAGES_INPUT", "").strip() or ",".join(mapping)
+          requested = [s.strip() for s in raw.split(",") if s.strip()]
+          unknown = [s for s in requested if s not in mapping]
+          if unknown:
+              raise SystemExit(f"Unknown image keys: {unknown}. Valid: {list(mapping)}")
+          selected = [{"key": k, "image": mapping[k]} for k in requested]
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as fh:
+              fh.write("images_json=" + json.dumps(selected) + "\n")
+          print("Selected:", selected)
+          PY
+
+  retag:
+    name: Retag ${{ matrix.key }} (stg → prod)
+    needs: plan
+    runs-on: ubuntu-latest
+    # The production GH Environment carries the manual-approval reviewer rule.
+    # This job does NOT touch a VPS — it only rewrites tags at GHCR. The
+    # manual gate here enforces "who decides prod goes out?"; the actual
+    # rollout to the prod VPS happens in deploy-prod.yml after this completes.
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.images_json) }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN needs `packages: write` on this repo for the image
+          # namespace. Cross-repo GHCR writes work because all images live
+          # under the same org (noorinalabs) — GitHub resolves org-scoped
+          # package permissions from the workflow's repo token.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Resolve source tag
+        id: src
+        env:
+          SHORT_SHA: ${{ needs.plan.outputs.short_sha }}
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SHORT_SHA" ]; then
+            # Explicit rollback / specific-SHA promotion.
+            source_tag="sha-${SHORT_SHA}"
+          else
+            # Default path: whatever stg-latest currently points to.
+            source_tag="stg-latest"
+          fi
+          echo "Using source tag: $IMAGE:$source_tag"
+          # Resolve the concrete digest so we have one unambiguous target,
+          # AND so the prod-<short> we emit pins to a SHA even when the
+          # input path was the moving stg-latest pointer. `imagetools
+          # inspect --raw` prints the manifest-list JSON; we compute its
+          # digest with GNU coreutils.
+          raw_manifest=$(docker buildx imagetools inspect --raw "$IMAGE:$source_tag")
+          # Digest of the manifest-list itself = sha256 of the raw bytes.
+          digest="sha256:$(printf '%s' "$raw_manifest" | sha256sum | awk '{print $1}')"
+          echo "Resolved digest: $digest"
+          # Emit source-tag and digest for the retag step.
+          {
+            echo "source_tag=$source_tag"
+            echo "digest=$digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve short SHA for prod-<short> tag
+        id: shortsha
+        env:
+          SHORT_SHA: ${{ needs.plan.outputs.short_sha }}
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SHORT_SHA" ]; then
+            # The input already gives us the short SHA.
+            short="$SHORT_SHA"
+          else
+            # Walk the registry's tag list for this image, pick the
+            # sha-<short> whose digest matches stg-latest's digest.
+            #
+            # GitHub container-registry GET /v2/.../tags/list is paginated
+            # but returns all tags for our image sizes without pagination
+            # concerns. We resolve by iterating sha-* tags and matching
+            # manifest digest.
+            stg_digest=$(docker buildx imagetools inspect --raw "$IMAGE:stg-latest" \
+              | sha256sum | awk '{print "sha256:" $1}')
+            # Fetch tag list via GHCR v2 API (needs bearer token).
+            image_path="${IMAGE#${{ env.REGISTRY }}/}"
+            token=$(curl -s -u "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+              "https://ghcr.io/token?scope=repository:${image_path}:pull" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+            tags=$(curl -sH "Authorization: Bearer $token" \
+              "https://ghcr.io/v2/${image_path}/tags/list" \
+              | python3 -c "import sys,json;print('\n'.join(json.load(sys.stdin).get('tags') or []))")
+            short=""
+            while IFS= read -r tag; do
+              case "$tag" in
+                sha-*)
+                  cand=$(docker buildx imagetools inspect --raw "$IMAGE:$tag" 2>/dev/null \
+                    | sha256sum | awk '{print "sha256:" $1}' || true)
+                  if [ "$cand" = "$stg_digest" ]; then
+                    short="${tag#sha-}"
+                    break
+                  fi
+                  ;;
+              esac
+            done <<< "$tags"
+            if [ -z "$short" ]; then
+              echo "::error::Could not resolve sha-<short> matching stg-latest digest for $IMAGE"
+              exit 1
+            fi
+          fi
+          echo "prod-<short> target: prod-$short"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+
+      - name: Retag (write prod-<short> + prod-latest atomically)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          SOURCE_TAG: ${{ steps.src.outputs.source_tag }}
+          SHORT: ${{ steps.shortsha.outputs.short }}
+        run: |
+          set -euo pipefail
+          # Single invocation writes BOTH destinations against the same
+          # manifest-list. This is a pure registry-side operation — no
+          # blobs pulled, no blobs pushed. Multi-arch manifest-list is
+          # preserved identically.
+          #
+          # Failure mode we want: if either tag write fails, the command
+          # errors out. `imagetools create` writes each --tag in sequence
+          # but same run, so a partial success leaves us with prod-<short>
+          # set but prod-latest stale — which is recoverable by rerunning.
+          # We do NOT try to roll back prod-<short> on prod-latest failure;
+          # a stale prod-latest is a known-safe state (points at previous
+          # promotion).
+          docker buildx imagetools create \
+            --tag "$IMAGE:prod-$SHORT" \
+            --tag "$IMAGE:prod-latest" \
+            "$IMAGE:$SOURCE_TAG"
+          echo "== Written tags =="
+          echo "  $IMAGE:prod-$SHORT"
+          echo "  $IMAGE:prod-latest"
+
+      - name: Verify digest parity (source == prod-<short> == prod-latest)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          SOURCE_TAG: ${{ steps.src.outputs.source_tag }}
+          SHORT: ${{ steps.shortsha.outputs.short }}
+        run: |
+          set -euo pipefail
+          # Defense in depth: the retag is registry-side so digests MUST
+          # match, but verifying catches registry bugs or accidental
+          # buildx flag drift.
+          src=$(docker buildx imagetools inspect --raw "$IMAGE:$SOURCE_TAG" | sha256sum | awk '{print $1}')
+          ps=$(docker buildx imagetools inspect --raw "$IMAGE:prod-$SHORT" | sha256sum | awk '{print $1}')
+          pl=$(docker buildx imagetools inspect --raw "$IMAGE:prod-latest" | sha256sum | awk '{print $1}')
+          echo "source digest:       sha256:$src"
+          echo "prod-<short> digest: sha256:$ps"
+          echo "prod-latest digest:  sha256:$pl"
+          if [ "$src" != "$ps" ] || [ "$src" != "$pl" ]; then
+            echo "::error::Digest parity check failed — source/prod-<short>/prod-latest diverged."
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          SHORT: ${{ steps.shortsha.outputs.short }}
+        run: |
+          {
+            echo "## Promotion: ${{ matrix.key }} — ${{ job.status }}"
+            echo ""
+            echo "- **Image:** \`$IMAGE\`"
+            echo "- **Source:** \`${{ steps.src.outputs.source_tag }}\`"
+            echo "- **Written:** \`prod-$SHORT\` + \`prod-latest\`"
+            echo "- **Actor:** ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  trigger-prod-deploy:
+    name: Trigger prod VPS rollout
+    needs: retag
+    runs-on: ubuntu-latest
+    # NOT env-gated — the approval already happened at retag.
+    # Firing deploy-prod.yml here is the rollout-execution step.
+    steps:
+      - name: Dispatch deploy-prod.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run deploy-prod.yml \
+            --ref "${{ github.ref }}" \
+            -f image_tag="prod-latest"
+          echo "Triggered deploy-prod.yml (image_tag=prod-latest)"
