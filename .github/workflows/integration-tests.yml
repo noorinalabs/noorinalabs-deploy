@@ -2,7 +2,6 @@ name: Integration Tests — cross-repo (#49)
 
 on:
   pull_request:
-    branches: ["main"]
     paths:
       - "integration-tests/**"
       - ".github/workflows/integration-tests.yml"
