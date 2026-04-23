@@ -28,6 +28,13 @@
 #     per the GH Environments protection rule (owner is the sole reviewer).
 #   - Stg deploy is automatic (repository_dispatch fan-in from each service
 #     repo) — see deploy-stg.yml.
+#
+# Per-service tag pinning (Lucas review 2026-04-23): short-SHA resolution
+# happens in the `plan` job up-front and is threaded through to both the
+# `retag` matrix AND the `trigger-prod-deploy` dispatch. This guarantees
+# `deploy-prod.yml` rolls out the exact same prod-<short> that our manual
+# approval just gated, not whatever `prod-latest` happens to point at if a
+# second promotion has started in parallel.
 
 name: Promote to production (image retag)
 
@@ -64,38 +71,56 @@ jobs:
     name: Plan promotion
     runs-on: ubuntu-latest
     outputs:
-      short_sha: ${{ steps.resolve.outputs.short_sha }}
-      images_json: ${{ steps.filter.outputs.images_json }}
+      # Each matrix cell of `retag` picks its per-image short from here.
+      # Shape: [{"key": "api", "image": "...", "short": "a1b2c3d"}, ...]
+      images_json: ${{ steps.resolve.outputs.images_json }}
+      # Flat per-service shorts for trigger-prod-deploy's input mapping.
+      api_short:          ${{ steps.resolve.outputs.api_short }}
+      frontend_short:     ${{ steps.resolve.outputs.frontend_short }}
+      user_service_short: ${{ steps.resolve.outputs.user_service_short }}
+      landing_short:      ${{ steps.resolve.outputs.landing_short }}
     steps:
-      - name: Resolve short SHA
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Resolve per-image shorts
         id: resolve
+        env:
+          SOURCE_SHA_INPUT: ${{ inputs.source_sha }}
+          IMAGES_INPUT: ${{ inputs.images }}
+          REGISTRY: ${{ env.REGISTRY }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          raw="${{ inputs.source_sha }}"
-          # Strip an optional `sha-` prefix, then validate 7-char lowercase hex.
-          raw="${raw#sha-}"
-          if [ -z "$raw" ]; then
-            echo "No source_sha input — resolving from stg-latest at deploy time per image."
-            echo "short_sha=" >> "$GITHUB_OUTPUT"
-          else
+
+          # Normalize + validate source_sha.
+          raw="${SOURCE_SHA_INPUT#sha-}"
+          if [ -n "$raw" ]; then
             if ! printf '%s' "$raw" | grep -qE '^[0-9a-f]{7}$'; then
-              echo "::error::source_sha must be 7 lowercase hex chars (optionally prefixed 'sha-'). Got: ${{ inputs.source_sha }}"
+              echo "::error::source_sha must be 7 lowercase hex chars (optionally prefixed 'sha-'). Got: $SOURCE_SHA_INPUT"
               exit 1
             fi
-            echo "Resolved explicit short SHA: $raw"
-            echo "short_sha=$raw" >> "$GITHUB_OUTPUT"
+            explicit_short="$raw"
+          else
+            explicit_short=""
           fi
 
-      - name: Filter image set
-        id: filter
-        env:
-          IMAGES_INPUT: ${{ inputs.images }}
-        run: |
-          set -euo pipefail
-          # Map service keys to GHCR image names. Keep parallel to the
-          # ghcr-publish.yml matrix in each service repo.
-          python3 - <<'PY'
-          import json, os
+          # Build the image set + resolve each image's short-SHA up front.
+          # For the default path (explicit_short empty), walk each image's
+          # `stg-latest` → find the `sha-<short>` that matches. Done once
+          # here rather than per-retag-matrix-cell so that both `retag` and
+          # `trigger-prod-deploy` see the same short without each re-deriving.
+          export _EXPLICIT_SHORT="$explicit_short"
+          python3 - <<'PY' > /tmp/plan.json
+          import json, os, sys
           mapping = {
               "api":          "noorinalabs/noorinalabs-isnad-graph",
               "frontend":     "noorinalabs/noorinalabs-isnad-graph-frontend",
@@ -106,13 +131,88 @@ jobs:
           requested = [s.strip() for s in raw.split(",") if s.strip()]
           unknown = [s for s in requested if s not in mapping]
           if unknown:
-              raise SystemExit(f"Unknown image keys: {unknown}. Valid: {list(mapping)}")
-          selected = [{"key": k, "image": mapping[k]} for k in requested]
-          out = os.environ["GITHUB_OUTPUT"]
-          with open(out, "a") as fh:
-              fh.write("images_json=" + json.dumps(selected) + "\n")
-          print("Selected:", selected)
+              print(f"::error::Unknown image keys: {unknown}. Valid: {list(mapping)}", file=sys.stderr)
+              sys.exit(1)
+          explicit = os.environ.get("_EXPLICIT_SHORT", "")
+          # Plan is deterministic: if an explicit short is given, every image
+          # uses it. Otherwise each image resolves its own via stg-latest walk
+          # in the bash block that follows.
+          out = [{"key": k, "image": mapping[k], "short": explicit} for k in requested]
+          print(json.dumps(out))
           PY
+
+          # If explicit_short is empty, resolve per-image from stg-latest.
+          # We do this in bash since we already have buildx + curl available.
+          if [ -z "$explicit_short" ]; then
+            : > /tmp/resolved_shorts.jsonl
+            while IFS= read -r entry; do
+              key=$(printf '%s' "$entry" | python3 -c "import sys,json;print(json.loads(sys.stdin.read())['key'])")
+              image=$(printf '%s' "$entry" | python3 -c "import sys,json;print(json.loads(sys.stdin.read())['image'])")
+              full="${REGISTRY}/${image}"
+
+              # Resolve stg-latest digest via registry-reported digest
+              # (authoritative), not sha256-of-raw-bytes.
+              stg_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$full:stg-latest")
+
+              # Walk sha-* tags, find match.
+              image_path="$image"
+              token=$(curl -s -u "${GH_ACTOR}:${GH_TOKEN}" \
+                "https://${REGISTRY}/token?scope=repository:${image_path}:pull" \
+                | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+              tags=$(curl -sH "Authorization: Bearer $token" \
+                "https://${REGISTRY}/v2/${image_path}/tags/list" \
+                | python3 -c "import sys,json;print('\n'.join(json.load(sys.stdin).get('tags') or []))")
+              short=""
+              while IFS= read -r tag; do
+                case "$tag" in
+                  sha-*)
+                    cand=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$full:$tag" 2>/dev/null || true)
+                    if [ "$cand" = "$stg_digest" ]; then
+                      short="${tag#sha-}"
+                      break
+                    fi
+                    ;;
+                esac
+              done <<< "$tags"
+              if [ -z "$short" ]; then
+                echo "::error::Could not resolve sha-<short> matching stg-latest digest for $full"
+                exit 1
+              fi
+              echo "[plan] $key ($image): resolved short=$short (digest=$stg_digest)"
+              # Write one JSON object per line for downstream aggregation.
+              KEY="$key" IMAGE_NAME="$image" SHORT="$short" python3 -c "
+          import json, os
+          print(json.dumps({'key': os.environ['KEY'], 'image': os.environ['IMAGE_NAME'], 'short': os.environ['SHORT']}))
+          " >> /tmp/resolved_shorts.jsonl
+            done < <(python3 -c "
+          import json
+          for e in json.load(open('/tmp/plan.json')):
+              print(json.dumps(e))
+          ")
+            # Aggregate the per-line JSON back into a single list.
+            python3 -c "
+          import json
+          with open('/tmp/resolved_shorts.jsonl') as fh:
+              rows = [json.loads(line) for line in fh if line.strip()]
+          json.dump(rows, open('/tmp/plan.json', 'w'))
+          "
+          fi
+
+          # Emit aggregated matrix JSON + per-service short outputs.
+          python3 - <<'PY3'
+          import json, os
+          data = json.load(open("/tmp/plan.json"))
+          out_path = os.environ["GITHUB_OUTPUT"]
+          with open(out_path, "a") as fh:
+              fh.write("images_json=" + json.dumps(data) + "\n")
+              # Per-service flat shorts (empty string if service not in set).
+              by_key = {e["key"]: e["short"] for e in data}
+              fh.write(f"api_short={by_key.get('api', '')}\n")
+              fh.write(f"frontend_short={by_key.get('frontend', '')}\n")
+              fh.write(f"user_service_short={by_key.get('user-service', '')}\n")
+              fh.write(f"landing_short={by_key.get('landing', '')}\n")
+          print("[plan] matrix:", json.dumps(data, indent=2))
+          PY3
 
   retag:
     name: Retag ${{ matrix.key }} (stg → prod)
@@ -145,86 +245,31 @@ jobs:
       - name: Resolve source tag
         id: src
         env:
-          SHORT_SHA: ${{ needs.plan.outputs.short_sha }}
+          # Matrix short is plan-resolved; if plan received an explicit
+          # source_sha, `short` is that SHA and source tag is `sha-<short>`.
+          # If plan walked from stg-latest, `short` is the matched sha-<short>
+          # and we still source from `stg-latest` (same digest; using the
+          # short-tag gives slightly better audit trace).
+          SHORT: ${{ matrix.short }}
           IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
+          EXPLICIT: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          if [ -n "$SHORT_SHA" ]; then
-            # Explicit rollback / specific-SHA promotion.
-            source_tag="sha-${SHORT_SHA}"
+          if [ -n "$EXPLICIT" ]; then
+            # Operator-provided sha: pin to that specific sha-<short>.
+            source_tag="sha-${SHORT}"
           else
-            # Default path: whatever stg-latest currently points to.
+            # Auto-promote from stg-latest. Same digest as sha-${SHORT}.
             source_tag="stg-latest"
           fi
-          echo "Using source tag: $IMAGE:$source_tag"
-          # Resolve the concrete digest so we have one unambiguous target,
-          # AND so the prod-<short> we emit pins to a SHA even when the
-          # input path was the moving stg-latest pointer. `imagetools
-          # inspect --raw` prints the manifest-list JSON; we compute its
-          # digest with GNU coreutils.
-          raw_manifest=$(docker buildx imagetools inspect --raw "$IMAGE:$source_tag")
-          # Digest of the manifest-list itself = sha256 of the raw bytes.
-          digest="sha256:$(printf '%s' "$raw_manifest" | sha256sum | awk '{print $1}')"
-          echo "Resolved digest: $digest"
-          # Emit source-tag and digest for the retag step.
-          {
-            echo "source_tag=$source_tag"
-            echo "digest=$digest"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Resolve short SHA for prod-<short> tag
-        id: shortsha
-        env:
-          SHORT_SHA: ${{ needs.plan.outputs.short_sha }}
-          IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
-        run: |
-          set -euo pipefail
-          if [ -n "$SHORT_SHA" ]; then
-            # The input already gives us the short SHA.
-            short="$SHORT_SHA"
-          else
-            # Walk the registry's tag list for this image, pick the
-            # sha-<short> whose digest matches stg-latest's digest.
-            #
-            # GitHub container-registry GET /v2/.../tags/list is paginated
-            # but returns all tags for our image sizes without pagination
-            # concerns. We resolve by iterating sha-* tags and matching
-            # manifest digest.
-            stg_digest=$(docker buildx imagetools inspect --raw "$IMAGE:stg-latest" \
-              | sha256sum | awk '{print "sha256:" $1}')
-            # Fetch tag list via GHCR v2 API (needs bearer token).
-            image_path="${IMAGE#${{ env.REGISTRY }}/}"
-            token=$(curl -s -u "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-              "https://ghcr.io/token?scope=repository:${image_path}:pull" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
-            tags=$(curl -sH "Authorization: Bearer $token" \
-              "https://ghcr.io/v2/${image_path}/tags/list" \
-              | python3 -c "import sys,json;print('\n'.join(json.load(sys.stdin).get('tags') or []))")
-            short=""
-            while IFS= read -r tag; do
-              case "$tag" in
-                sha-*)
-                  cand=$(docker buildx imagetools inspect --raw "$IMAGE:$tag" 2>/dev/null \
-                    | sha256sum | awk '{print "sha256:" $1}' || true)
-                  if [ "$cand" = "$stg_digest" ]; then
-                    short="${tag#sha-}"
-                    break
-                  fi
-                  ;;
-              esac
-            done <<< "$tags"
-            if [ -z "$short" ]; then
-              echo "::error::Could not resolve sha-<short> matching stg-latest digest for $IMAGE"
-              exit 1
-            fi
-          fi
-          echo "prod-<short> target: prod-$short"
-          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "Using source tag: $IMAGE:$source_tag (matches short=$SHORT)"
+          echo "source_tag=$source_tag" >> "$GITHUB_OUTPUT"
 
       - name: Retag (write prod-<short> + prod-latest atomically)
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
           SOURCE_TAG: ${{ steps.src.outputs.source_tag }}
-          SHORT: ${{ steps.shortsha.outputs.short }}
+          SHORT: ${{ matrix.short }}
         run: |
           set -euo pipefail
           # Single invocation writes BOTH destinations against the same
@@ -251,18 +296,19 @@ jobs:
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
           SOURCE_TAG: ${{ steps.src.outputs.source_tag }}
-          SHORT: ${{ steps.shortsha.outputs.short }}
+          SHORT: ${{ matrix.short }}
         run: |
           set -euo pipefail
           # Defense in depth: the retag is registry-side so digests MUST
           # match, but verifying catches registry bugs or accidental
-          # buildx flag drift.
-          src=$(docker buildx imagetools inspect --raw "$IMAGE:$SOURCE_TAG" | sha256sum | awk '{print $1}')
-          ps=$(docker buildx imagetools inspect --raw "$IMAGE:prod-$SHORT" | sha256sum | awk '{print $1}')
-          pl=$(docker buildx imagetools inspect --raw "$IMAGE:prod-latest" | sha256sum | awk '{print $1}')
-          echo "source digest:       sha256:$src"
-          echo "prod-<short> digest: sha256:$ps"
-          echo "prod-latest digest:  sha256:$pl"
+          # buildx flag drift. Use `--format '{{.Manifest.Digest}}'` to
+          # read registry-authoritative digest.
+          src=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:$SOURCE_TAG")
+          ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-$SHORT")
+          pl=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-latest")
+          echo "source digest:       $src"
+          echo "prod-<short> digest: $ps"
+          echo "prod-latest digest:  $pl"
           if [ "$src" != "$ps" ] || [ "$src" != "$pl" ]; then
             echo "::error::Digest parity check failed — source/prod-<short>/prod-latest diverged."
             exit 1
@@ -272,7 +318,7 @@ jobs:
         if: always()
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
-          SHORT: ${{ steps.shortsha.outputs.short }}
+          SHORT: ${{ matrix.short }}
         run: |
           {
             echo "## Promotion: ${{ matrix.key }} — ${{ job.status }}"
@@ -285,17 +331,57 @@ jobs:
 
   trigger-prod-deploy:
     name: Trigger prod VPS rollout
-    needs: retag
+    needs: [plan, retag]
     runs-on: ubuntu-latest
     # NOT env-gated — the approval already happened at retag.
     # Firing deploy-prod.yml here is the rollout-execution step.
+    #
+    # Per-service tag pinning: we dispatch deploy-prod.yml with each
+    # service's `prod-<short>` — NOT `prod-latest` — so that a second
+    # promotion started in parallel cannot race us. If operator A runs
+    # promote.yml for SHA X and operator B starts promote.yml for SHA Y
+    # before A's deploy-prod.yml dispatch consumes the image, `prod-latest`
+    # would move to Y and A's VPS rollout would deploy Y instead of X
+    # (Lucas review 2026-04-23).
     steps:
-      - name: Dispatch deploy-prod.yml
+      - name: Dispatch deploy-prod.yml (per-service pinned)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_SHORT:          ${{ needs.plan.outputs.api_short }}
+          FRONTEND_SHORT:     ${{ needs.plan.outputs.frontend_short }}
+          USER_SERVICE_SHORT: ${{ needs.plan.outputs.user_service_short }}
+          LANDING_SHORT:      ${{ needs.plan.outputs.landing_short }}
         run: |
           set -euo pipefail
+          # Each tag is `prod-<short>` for its service, OR empty if that
+          # service wasn't in this promotion's image set. deploy-prod.yml
+          # falls back to `prod-latest` for any empty input, so partial
+          # promotions still deploy the remaining services from their
+          # last-promoted pointer.
+          #
+          # api + frontend share one short SHA (both built from the same
+          # isnad-graph commit in ghcr-publish.yml). We pass api's short
+          # as the canonical `api_frontend_tag`. If the two ever diverge
+          # (e.g. independent frontend repo in a future split) this check
+          # will fail loudly.
+          if [ -n "$API_SHORT" ] && [ -n "$FRONTEND_SHORT" ] && [ "$API_SHORT" != "$FRONTEND_SHORT" ]; then
+            echo "::error::api short ($API_SHORT) != frontend short ($FRONTEND_SHORT)."
+            echo "::error::api + frontend are expected to share a single short SHA from isnad-graph's ghcr-publish.yml."
+            exit 1
+          fi
+          af_short="${API_SHORT:-$FRONTEND_SHORT}"
+
+          api_frontend_tag="${af_short:+prod-$af_short}"
+          user_service_tag="${USER_SERVICE_SHORT:+prod-$USER_SERVICE_SHORT}"
+          landing_tag="${LANDING_SHORT:+prod-$LANDING_SHORT}"
+
+          echo "Dispatching deploy-prod.yml with per-service tags:"
+          echo "  api+frontend: ${api_frontend_tag:-<unset — will fall back to prod-latest>}"
+          echo "  user-service: ${user_service_tag:-<unset — will fall back to prod-latest>}"
+          echo "  landing:      ${landing_tag:-<unset — will fall back to prod-latest>}"
+
           gh workflow run deploy-prod.yml \
             --ref "${{ github.ref }}" \
-            -f image_tag="prod-latest"
-          echo "Triggered deploy-prod.yml (image_tag=prod-latest)"
+            -f api_frontend_tag="$api_frontend_tag" \
+            -f user_service_tag="$user_service_tag" \
+            -f landing_tag="$landing_tag"
