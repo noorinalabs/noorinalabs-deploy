@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       image_tag:
-        description: "user-service image tag to run alembic from (defaults to <env>-latest per isnad-graph#815 Contract v5)"
+        description: "user-service image tag to run alembic from (defaults to <env>-latest per isnad-graph#815 Contract v6)"
         required: false
         type: string
         default: ""
@@ -77,10 +77,11 @@ jobs:
           set -euo pipefail
           tag="${{ inputs.image_tag }}"
           if [ -z "$tag" ]; then
-            # Contract v5 (isnad-graph#815 issuecomment-4301487132, option C):
-            # env-scoped floating tag `<env>-latest` always resolves to the
-            # current promoted image for that env. Pinned `<env>-<short>` tags
-            # are preferred for auditability; fall back here is for dispatch
+            # Contract v6 (isnad-graph#815 issuecomment-4301538921, option C,
+            # program-director ruling — supersedes v5/earlier): env-scoped
+            # floating tag `<env>-latest` always resolves to the current
+            # promoted image for that env. Pinned `<env>-<short>` tags are
+            # preferred for auditability; fall back here is for dispatch
             # testing only.
             tag="${{ inputs.env }}-latest"
           fi
