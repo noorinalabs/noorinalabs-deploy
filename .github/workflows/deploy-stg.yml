@@ -5,7 +5,7 @@
 #     landing-page) — the auto-deploy fan-in point for stg. Service repos
 #     send `deploy-noorinalabs-<service>` events after their ghcr-publish.yml
 #     has pushed the four stg tags (sha-<short>, latest, stg-<short>,
-#     stg-latest) per Contract v5.
+#     stg-latest) per Contract v6 (same shape as v3/v5).
 #   - workflow_dispatch — manual redeploy, e.g. to re-pull stg-latest after
 #     a registry hiccup.
 #
@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "repository_dispatch" ] && [ -n "${DISPATCH_SHA:-}" ]; then
-            # 7-char short SHA per Contract v5 `<short>` definition.
+            # 7-char short SHA per Contract v6 `<short>` definition.
             short="${DISPATCH_SHA:0:7}"
             tag="stg-$short"
           elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${MANUAL_TAG:-}" ]; then
