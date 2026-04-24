@@ -108,28 +108,3 @@ groups:
           description: >-
             The last successful backup was more than 24 hours ago.
           runbook: "docs/deployment/alerting.md#backupfailure"
-
-  - name: db_migrations
-    rules:
-      # Emitted by the db-migrate.yml workflow (deploy#85) via a node_exporter
-      # textfile collector drop on the VPS. Absence of a fresh success for
-      # the target env after a promotion attempt is what trips this rule.
-      # The `for:` is short because the gate is one-shot — any persistent
-      # failure means a promotion attempt aborted and needs human eyes.
-      - alert: UserServiceAlembicGateFailure
-        expr: |
-          user_service_alembic_gate_last_run_success == 0
-          and
-          (time() - user_service_alembic_gate_last_run_timestamp_seconds) < 3600
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "user-service alembic pre-deploy gate failed (env={{ $labels.env }})"
-          description: >-
-            The alembic pre-deploy gate in .github/workflows/db-migrate.yml
-            reported a failure for env={{ $labels.env }} within the last hour
-            and has not been re-run successfully since. The promotion this
-            gate was protecting did NOT proceed to `docker compose up`.
-            Investigate per runbook before retrying.
-          runbook: "docs/runbooks/user-service-alembic.md"

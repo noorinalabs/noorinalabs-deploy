@@ -1,6 +1,6 @@
 # Runbook: user-service alembic pre-deploy gate (deploy#85)
 
-**Scope:** the `alembic upgrade head` pre-deploy gate that runs before any user-service deploy to stg or prod. Implemented in `.github/workflows/db-migrate.yml`, invoked by the promotion workflow (`deploy#84`).
+**Scope:** the `alembic upgrade head` pre-deploy gate that runs before any user-service deploy to stg or prod. Implemented in `.github/workflows/db-migrate.yml`, invoked by the promotion workflow (`promote.yml` — landed via [`deploy#155`](https://github.com/noorinalabs/noorinalabs-deploy/pull/155) for issue #84). The wiring step that adds `uses: ./.github/workflows/db-migrate.yml` to the promotion workflow is tracked in [`deploy#160`](https://github.com/noorinalabs/noorinalabs-deploy/issues/160).
 
 **NOT in scope:**
 - Data migrations (user data Neo4j→Postgres) — see `user-service-migration.md`.
@@ -10,7 +10,7 @@
 ## Architecture summary
 
 ```
-promotion workflow (deploy#84)
+promotion workflow (promote.yml — deploy#155, merged)
     │
     ├── pre-deploy gate (this workflow): db-migrate.yml
     │       │
@@ -26,7 +26,7 @@ promotion workflow (deploy#84)
     └── deploy step (docker compose up)  —  ONLY runs if the gate succeeded.
 ```
 
-Stg-first is enforced by the caller (deploy#84) — `matrix: [stg, prod]` with `max-parallel: 1`, same pattern as `terraform.yml`. A stg gate failure halts the workflow before the prod job can be manually approved.
+Stg-first is enforced by the caller (`promote.yml`, landed via deploy#155) — `matrix: [stg, prod]` with `max-parallel: 1`, same pattern as `terraform.yml`. A stg gate failure halts the workflow before the prod job can be manually approved.
 
 ## Environment protection
 
@@ -141,7 +141,7 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 
 1. Land the alembic migration in `noorinalabs-user-service` → merge to the wave branch.
 2. Wait for the image publish workflow to produce a new `<env>-latest` tag.
-3. Promote via the normal promotion workflow (`deploy#84`). Do NOT bypass the gate — even for hotfixes.
+3. Promote via the normal promotion workflow (`promote.yml`, deploy#155). Do NOT bypass the gate — even for hotfixes.
 4. If the gate flags an unexpected head and the migration is genuinely additive and safe, the correct action is still to update `EXPECTED_MERGE_HEAD` in `db-migrate.yml` — not to skip the assertion. This is a 1-line PR and reviewable in minutes.
 
 ## Escalation
@@ -156,12 +156,22 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 
 ## Observability
 
-A Prometheus alert `UserServiceAlembicGateFailure` fires when this workflow writes a failure to the GH Actions summary and the failure flag is scraped by the per-env health probe. The alert routes via `infra/alertmanager/alertmanager.yml` critical receiver. This alert intentionally has a short `for:` interval because the gate is a one-shot — not a persistent signal — and a miss here is "we just tried to deploy and the DB wasn't migrated", which is always actionable.
+**Status: aspirational — deferred to W11 follow-up [`deploy#161`](https://github.com/noorinalabs/noorinalabs-deploy/issues/161).**
+
+The intended end state is a Prometheus alert `UserServiceAlembicGateFailure` that fires when the gate fails — short `for:` interval because the gate is one-shot and a miss is always actionable. The infrastructure to support this (textfile-collector writeout in `db-migrate.yml`, `--collector.textfile.directory=` flag + volume mount on `node-exporter` in `compose/docker-compose.prod.yml`) is **not** in place today. That plumbing is tracked in `deploy#161`.
+
+Until #161 lands, gate failures surface via:
+
+1. **GitHub Actions UI** — the `Report migration result` step in `db-migrate.yml` writes a structured summary to `$GITHUB_STEP_SUMMARY` for every run (success or failure) including env, image tag, expected head, and the `migrated` boolean. The runbook link is included on failure.
+2. **Caller workflow signal** — the reusable workflow's `migrated` output is `false` (and the job result is `failure`) on any gate failure, which the promotion workflow (#155 → `promote.yml`) gates on. A failed stg gate hard-stops before prod manual-approval is even offered.
+3. **On-call escalation** — the table above (§ Escalation) lists primary/secondary owners per failure class. Until the Prometheus alert exists, the on-call engineer learns of a failure when the promotion workflow surfaces a failed run.
 
 ## Related issues
 
 - **deploy#85** — this PR.
-- **deploy#84** — promotion workflow that calls this gate. Must merge before this one goes ready-for-review.
+- **deploy#155** — promotion workflow that will call this gate (merged 2026-04-23, produced `promote.yml` + `deploy-stg.yml` + `deploy-prod.yml`). Issue #84.
+- **deploy#160** — wires `promote.yml` to `uses: ./.github/workflows/db-migrate.yml`. Follow-up.
+- **deploy#161** — textfile-collector plumbing for the deferred `UserServiceAlembicGateFailure` Prometheus alert. P2W11.
 - **user-service#80** — alembic merge migration producing revision `0040`. Upstream unblock.
 - **user-service#63** — original alembic merge migration issue (closed by #80).
 - **deploy#141** — fresh-volume alembic-in-compose-up init container. Out of scope here.
