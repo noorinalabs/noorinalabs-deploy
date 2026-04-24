@@ -31,12 +31,6 @@ Part of [noorinalabs-main#49](https://github.com/noorinalabs/noorinalabs-main/is
 | Real OAuth provider code-exchange | Hardcoded provider URLs in `src/app/services/oauth.py`; needs a `OAUTH_PROVIDER_BASE_URL` override before a fake-provider container can sit in front | noorinalabs-main#135 |
 | Pipeline worker scenarios | Pipeline (#105–#108) not yet live on wave-9 at the time this harness was written | noorinalabs-main#136 |
 
-### Known work-arounds (revert once upstream fix lands)
-
-| Work-around | Reason | Revert-path |
-|-------------|--------|-------------|
-| `alembic upgrade heads` (plural) in the user-service command | user-service has three unmerged migration heads (0003, 0020, 0030 off 0001); `upgrade head` refuses with "Multiple head revisions" | `noorinalabs/noorinalabs-user-service#63` — once a merge migration lands, revert to `head` (singular) |
-
 ## Running locally
 
 ```bash
