@@ -1,0 +1,227 @@
+# Deploy to production (noorinalabs-prod VPS).
+#
+# Triggers:
+#   - workflow_dispatch fired by promote.yml's trigger-prod-deploy job after
+#     the retag + approval gate have completed. The manual-approval gate
+#     lives on the retag step in promote.yml (environment: production);
+#     once retag is approved and succeeds, this workflow rolls out to the
+#     prod VPS without a second approval.
+#   - workflow_dispatch (manual) — operator-initiated rollout, e.g. to
+#     redeploy the current prod-latest after a VPS restart.
+#
+# Env scope:
+#   - `environment: production` so the VPS_HOST var resolves to the prod
+#     host (`noorinalabs-prod`) and all secrets used here are the
+#     production-scoped set. Stg secrets cannot cross into this workflow.
+#
+# Image tags consumed (per-service, all must be prod-* shape):
+#   - api_frontend_tag: applies to both api + frontend (they share a short
+#                       SHA from isnad-graph's ghcr-publish.yml matrix)
+#   - user_service_tag: applies to user-service image
+#   - landing_tag:      applies to landing image
+#   Each input falls back to `prod-latest` if left empty.
+#
+# Per-service pinning eliminates a TOCTOU window: if promote.yml writes
+# prod-<short> for SHA X and auto-dispatches here, and then a second
+# promotion for SHA Y starts before this rollout consumes the images,
+# `prod-latest` would move to Y and we'd deploy Y instead of X. Pinning
+# to prod-<short> closes that window (Lucas review 2026-04-23, #155).
+#
+# This workflow does NOT retag. Retagging is promote.yml's job, and it is
+# the only workflow that writes `prod-*` tags (Contract v6).
+
+name: Deploy to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_frontend_tag:
+        description: "Prod tag for api + frontend (prod-* shape; empty = prod-latest)."
+        required: false
+        default: ""
+      user_service_tag:
+        description: "Prod tag for user-service (prod-* shape; empty = prod-latest)."
+        required: false
+        default: ""
+      landing_tag:
+        description: "Prod tag for landing (prod-* shape; empty = prod-latest)."
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      packages: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve + validate per-service tags
+        id: tags
+        env:
+          API_FRONTEND_TAG: ${{ inputs.api_frontend_tag }}
+          USER_SERVICE_TAG: ${{ inputs.user_service_tag }}
+          LANDING_TAG: ${{ inputs.landing_tag }}
+        run: |
+          set -euo pipefail
+          # Each input falls back to prod-latest when empty.
+          af="${API_FRONTEND_TAG:-prod-latest}"
+          us="${USER_SERVICE_TAG:-prod-latest}"
+          ld="${LANDING_TAG:-prod-latest}"
+
+          # Validate prod-* shape on each resolved tag.
+          for pair in "api+frontend:$af" "user-service:$us" "landing:$ld"; do
+            svc="${pair%%:*}"
+            tag="${pair#*:}"
+            case "$tag" in
+              prod-*) ;;
+              *)
+                echo "::error::deploy-prod refuses non-prod-* tags for $svc. Got: $tag"
+                echo "::error::Use promote.yml to produce a prod-<short> tag from a stg digest first."
+                exit 1
+                ;;
+            esac
+          done
+
+          echo "Resolved tags:"
+          echo "  api+frontend: $af"
+          echo "  user-service: $us"
+          echo "  landing:      $ld"
+
+          {
+            echo "api_frontend_tag=$af"
+            echo "user_service_tag=$us"
+            echo "landing_tag=$ld"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to prod VPS
+        uses: appleboy/ssh-action@v1
+        env:
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          AUTH_GOOGLE_CLIENT_ID: ${{ secrets.AUTH_GOOGLE_CLIENT_ID }}
+          AUTH_GOOGLE_CLIENT_SECRET: ${{ secrets.AUTH_GOOGLE_CLIENT_SECRET }}
+          AUTH_GITHUB_CLIENT_ID: ${{ secrets.AUTH_GITHUB_CLIENT_ID }}
+          AUTH_GITHUB_CLIENT_SECRET: ${{ secrets.AUTH_GITHUB_CLIENT_SECRET }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+          JWT_PUBLIC_KEY: ${{ secrets.JWT_PUBLIC_KEY }}
+          KAFKA_CLUSTER_ID: ${{ secrets.KAFKA_CLUSTER_ID }}
+          KAFKA_UI_PASSWORD: ${{ secrets.KAFKA_UI_PASSWORD }}
+          KAFKA_UI_USER: ${{ secrets.KAFKA_UI_USER }}
+          # Compose env-var names below must match
+          # compose/docker-compose.prod.yml image: ${VAR:-latest} references.
+          # Compose currently uses:
+          #   IMAGE_TAG              — api + frontend
+          #   USER_SERVICE_IMAGE_TAG — user-service
+          #   LANDING_IMAGE_TAG      — landing
+          IMAGE_TAG: ${{ steps.tags.outputs.api_frontend_tag }}
+          USER_SERVICE_IMAGE_TAG: ${{ steps.tags.outputs.user_service_tag }}
+          LANDING_IMAGE_TAG: ${{ steps.tags.outputs.landing_tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.repository_owner }}
+          PIPELINE_B2_BUCKET: ${{ secrets.PIPELINE_B2_BUCKET }}
+          PIPELINE_B2_ENDPOINT: ${{ secrets.PIPELINE_B2_ENDPOINT }}
+          PIPELINE_B2_KEY: ${{ secrets.PIPELINE_B2_KEY }}
+          PIPELINE_B2_KEY_ID: ${{ secrets.PIPELINE_B2_KEY_ID }}
+          PIPELINE_B2_REGION: ${{ secrets.PIPELINE_B2_REGION }}
+          USER_POSTGRES_DB: ${{ secrets.USER_POSTGRES_DB }}
+          USER_POSTGRES_PASSWORD: ${{ secrets.USER_POSTGRES_PASSWORD }}
+          USER_POSTGRES_USER: ${{ secrets.USER_POSTGRES_USER }}
+          USER_REDIS_PASSWORD: ${{ secrets.USER_REDIS_PASSWORD }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,JWT_PRIVATE_KEY,JWT_PUBLIC_KEY,KAFKA_CLUSTER_ID,KAFKA_UI_PASSWORD,KAFKA_UI_USER,IMAGE_TAG,USER_SERVICE_IMAGE_TAG,LANDING_IMAGE_TAG,PIPELINE_B2_BUCKET,PIPELINE_B2_ENDPOINT,PIPELINE_B2_KEY,PIPELINE_B2_KEY_ID,PIPELINE_B2_REGION,USER_POSTGRES_DB,USER_POSTGRES_PASSWORD,USER_POSTGRES_USER,USER_REDIS_PASSWORD,GITHUB_TOKEN,GITHUB_ACTOR
+          script: |
+            set -euo pipefail
+            cd /opt/noorinalabs-deploy
+
+            echo "==> Pulling latest deploy config..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "==> Writing .env for docker-compose..."
+            echo "    IMAGE_TAG=$IMAGE_TAG (api + frontend)"
+            echo "    USER_SERVICE_IMAGE_TAG=$USER_SERVICE_IMAGE_TAG"
+            echo "    LANDING_IMAGE_TAG=$LANDING_IMAGE_TAG"
+            env_file=".env"
+            : > "$env_file"
+            for var in NEO4J_PASSWORD POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
+                       REDIS_PASSWORD AUTH_GOOGLE_CLIENT_ID AUTH_GOOGLE_CLIENT_SECRET \
+                       AUTH_GITHUB_CLIENT_ID AUTH_GITHUB_CLIENT_SECRET \
+                       GRAFANA_ADMIN_PASSWORD \
+                       JWT_PRIVATE_KEY JWT_PUBLIC_KEY \
+                       KAFKA_CLUSTER_ID KAFKA_UI_PASSWORD KAFKA_UI_USER \
+                       PIPELINE_B2_BUCKET PIPELINE_B2_ENDPOINT PIPELINE_B2_KEY \
+                       PIPELINE_B2_KEY_ID PIPELINE_B2_REGION \
+                       USER_POSTGRES_DB USER_POSTGRES_PASSWORD USER_POSTGRES_USER \
+                       USER_REDIS_PASSWORD; do
+              eval "val=\$$var"
+              printf "%s='%s'\n" "$var" "$val" >> "$env_file"
+            done
+            printf "%s='%s'\n" "IMAGE_TAG" "${IMAGE_TAG}" >> "$env_file"
+            printf "%s='%s'\n" "USER_SERVICE_IMAGE_TAG" "${USER_SERVICE_IMAGE_TAG}" >> "$env_file"
+            printf "%s='%s'\n" "LANDING_IMAGE_TAG" "${LANDING_IMAGE_TAG}" >> "$env_file"
+            chmod 600 "$env_file"
+
+            echo "==> Authenticating to GHCR..."
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+            echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+            echo "==> Pulling images from GHCR..."
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull api frontend landing user-service
+
+            echo "==> Starting services..."
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
+
+            echo "==> Waiting for services to stabilize..."
+            sleep 15
+
+      - name: Verify health check
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            cd /opt/noorinalabs-deploy
+            for i in $(seq 1 24); do
+              api_health=$(docker inspect --format='{{.State.Health.Status}}' noorinalabs-api-1 2>/dev/null || echo "not_found")
+              echo "Attempt $i/24: API=$api_health"
+              if [ "$api_health" = "healthy" ]; then
+                echo "API health check passed"
+                break
+              fi
+              if [ "$i" -eq 24 ]; then
+                echo "ERROR: API health check failed after 120 seconds"
+                docker compose -f compose/docker-compose.prod.yml logs --tail=50 api
+                exit 1
+              fi
+              sleep 5
+            done
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env ps --format '{{.Name}}\t{{.Status}}'
+            echo "==> Prod deployment verified"
+
+      - name: Report status
+        if: always()
+        run: |
+          {
+            echo "## Deploy to production: ${{ job.status }}"
+            echo ""
+            echo "- **api + frontend tag:** ${{ steps.tags.outputs.api_frontend_tag }}"
+            echo "- **user-service tag:**   ${{ steps.tags.outputs.user_service_tag }}"
+            echo "- **landing tag:**        ${{ steps.tags.outputs.landing_tag }}"
+            echo "- **Actor:** ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,4 +1,10 @@
-name: Deploy noorinalabs-landing-page
+name: Deploy noorinalabs-landing-page (LEGACY — manual only)
+
+# DEPRECATED in P2W10 by deploy#84. Landing-page stg fan-in now flows via
+# `deploy-stg.yml`'s `deploy-noorinalabs-landing-page` repository_dispatch
+# handler; landing-page prod rollout flows via `promote.yml` →
+# `deploy-prod.yml`. Retained here as a manual-only rollback path to the
+# legacy single VPS until `deploy#86` decommission.
 
 on:
   workflow_dispatch:
@@ -8,7 +14,7 @@ on:
         default: 'latest'
 
 concurrency:
-  group: deploy-production
+  group: deploy-legacy
   cancel-in-progress: false
 
 jobs:
