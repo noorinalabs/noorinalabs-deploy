@@ -22,19 +22,52 @@ jobs:
         with:
           path: noorinalabs-deploy
 
+      # Resolve sibling-repo refs so wave-branch PRs in this repo pull the
+      # matching wave branch from user-service + isnad-graph when it exists,
+      # falling back to main otherwise. Fixes the cross-repo contract skew
+      # where (e.g.) a US migration lands on `deployments/phase-2/wave-N` but
+      # this workflow would have checked out US@main and missed it.
+      - name: Resolve sibling-repo refs (wave-aware)
+        id: sibling-refs
+        run: |
+          BASE="${{ github.base_ref }}"
+          if [ -z "$BASE" ]; then BASE="${{ github.ref_name }}"; fi
+
+          resolve_ref() {
+            local repo="$1"
+            if [[ "$BASE" == deployments/* ]] && \
+               git ls-remote --exit-code "https://github.com/noorinalabs/${repo}.git" "refs/heads/${BASE}" >/dev/null 2>&1; then
+              echo "$BASE"
+            else
+              echo "main"
+            fi
+          }
+
+          US_REF=$(resolve_ref noorinalabs-user-service)
+          IG_REF=$(resolve_ref noorinalabs-isnad-graph)
+
+          echo "user_service_ref=${US_REF}" >> "$GITHUB_OUTPUT"
+          echo "isnad_graph_ref=${IG_REF}"  >> "$GITHUB_OUTPUT"
+          {
+            echo "## Resolved sibling refs"
+            echo "- base branch: \`${BASE}\`"
+            echo "- noorinalabs-user-service: \`${US_REF}\`"
+            echo "- noorinalabs-isnad-graph:  \`${IG_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout noorinalabs-user-service
         uses: actions/checkout@v4
         with:
           repository: noorinalabs/noorinalabs-user-service
           path: noorinalabs-user-service
-          ref: main
+          ref: ${{ steps.sibling-refs.outputs.user_service_ref }}
 
       - name: Checkout noorinalabs-isnad-graph
         uses: actions/checkout@v4
         with:
           repository: noorinalabs/noorinalabs-isnad-graph
           path: noorinalabs-isnad-graph
-          ref: main
+          ref: ${{ steps.sibling-refs.outputs.isnad_graph_ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
