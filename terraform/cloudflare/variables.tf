@@ -16,29 +16,32 @@ variable "domain" {
 }
 
 # ---------------------------------------------------------------------------
-# Per-env Hetzner VPS IPs — consumed from terraform/hetzner/envs/{prod,stg}
-# outputs (`server_ip`, `server_ipv6`). Passed in at plan/apply time as
-# -var flags in CI, or via terraform.tfvars locally.
+# Per-env Hetzner VPS IPs — preferred source is terraform_remote_state
+# (see main.tf data sources + locals). These vars are an override path for
+# local applies that don't have hetzner B2 state access. Default empty means
+# "read from remote state".
 # ---------------------------------------------------------------------------
 
 variable "prod_vps_ipv4_address" {
-  description = "Public IPv4 of the prod Hetzner VPS (from terraform/hetzner/envs/prod output server_ip)."
+  description = "Public IPv4 override for the prod Hetzner VPS. Empty (default) reads from terraform_remote_state.hetzner_prod.outputs.server_ip."
   type        = string
+  default     = ""
 }
 
 variable "prod_vps_ipv6_address" {
-  description = "Public IPv6 of the prod Hetzner VPS (from terraform/hetzner/envs/prod output server_ipv6). Empty string disables the AAAA record."
+  description = "Public IPv6 override for the prod Hetzner VPS. Empty reads from remote state; if remote state also returns empty, the AAAA record is omitted."
   type        = string
   default     = ""
 }
 
 variable "stg_vps_ipv4_address" {
-  description = "Public IPv4 of the stg Hetzner VPS (from terraform/hetzner/envs/stg output server_ip)."
+  description = "Public IPv4 override for the stg Hetzner VPS. Empty (default) reads from terraform_remote_state.hetzner_stg.outputs.server_ip."
   type        = string
+  default     = ""
 }
 
 variable "stg_vps_ipv6_address" {
-  description = "Public IPv6 of the stg Hetzner VPS (from terraform/hetzner/envs/stg output server_ipv6). Empty string disables the AAAA record."
+  description = "Public IPv6 override for the stg Hetzner VPS. Empty reads from remote state; if remote state also returns empty, the AAAA record is omitted."
   type        = string
   default     = ""
 }

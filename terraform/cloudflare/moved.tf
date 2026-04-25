@@ -24,3 +24,18 @@ moved {
   from = cloudflare_record.subdomains
   to   = cloudflare_record.legacy_subdomains
 }
+
+# auth → users rename (deploy#167, P2W10) — per main#212 Q2 owner ruling.
+# Defensive: the auth records were defined in #157 but not yet applied to the
+# Cloudflare zone, so at the API level this is a fresh create. The moved blocks
+# protect any out-of-band state that may have been generated (local plans, etc.).
+
+moved {
+  from = cloudflare_record.prod_auth_cname
+  to   = cloudflare_record.prod_users_cname
+}
+
+moved {
+  from = cloudflare_record.stg_auth_cname
+  to   = cloudflare_record.stg_users_cname
+}

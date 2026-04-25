@@ -136,3 +136,75 @@ jobs:
         run: terraform init
       - name: Apply
         run: terraform apply -auto-approve
+
+  # Cloudflare is a single zone covering both stg + prod records, so this is
+  # a single plan job (not per-env). On PR only — comments plan on the PR.
+  plan_cloudflare:
+    name: Plan (cloudflare)
+    needs: validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/cloudflare
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_zone_id:   ${{ vars.CLOUDFLARE_ZONE_ID }}
+      AWS_ACCESS_KEY_ID:           ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY:       ${{ secrets.TF_STATE_B2_APP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+      - name: Init
+        run: terraform init
+      - name: Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+      - name: Comment PR with plan
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan (cloudflare)
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            *Triggered by @${{ github.actor }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # Cloudflare apply spans both stg + prod records, so it maps to the more-
+  # restrictive `production` GH Environment (matches the prod approval gate).
+  # Owner reviews the plan output on the PR before approving wave wrapup.
+  apply_cloudflare:
+    name: Apply (cloudflare)
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform/cloudflare
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_zone_id:   ${{ vars.CLOUDFLARE_ZONE_ID }}
+      AWS_ACCESS_KEY_ID:           ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY:       ${{ secrets.TF_STATE_B2_APP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+      - name: Init
+        run: terraform init
+      - name: Apply
+        run: terraform apply -auto-approve

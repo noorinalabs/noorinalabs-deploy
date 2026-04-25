@@ -3,6 +3,52 @@ provider "cloudflare" {
 }
 
 # ---------------------------------------------------------------------------
+# Hetzner state — read VPS IPs from terraform/hetzner/envs/{prod,stg} outputs.
+# Same B2 backend config as terraform/hetzner/envs/{prod,stg}/backend.tf.
+# Requires AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (B2 keys) at init time.
+# ---------------------------------------------------------------------------
+data "terraform_remote_state" "hetzner_prod" {
+  backend = "s3"
+  config = {
+    bucket = "noorinalabs-terraform-state"
+    key    = "hetzner/prod.tfstate"
+    region = "us-east-005"
+    endpoints = {
+      s3 = "https://s3.us-east-005.backblazeb2.com"
+    }
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_region_validation      = true
+    skip_requesting_account_id  = true
+  }
+}
+
+data "terraform_remote_state" "hetzner_stg" {
+  backend = "s3"
+  config = {
+    bucket = "noorinalabs-terraform-state"
+    key    = "hetzner/stg.tfstate"
+    region = "us-east-005"
+    endpoints = {
+      s3 = "https://s3.us-east-005.backblazeb2.com"
+    }
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_region_validation      = true
+    skip_requesting_account_id  = true
+  }
+}
+
+# Prefer the explicit var override when set; otherwise read from remote state.
+# Lets `terraform.tfvars` short-circuit remote_state for local-only applies.
+locals {
+  prod_vps_ipv4 = var.prod_vps_ipv4_address != "" ? var.prod_vps_ipv4_address : data.terraform_remote_state.hetzner_prod.outputs.server_ip
+  prod_vps_ipv6 = var.prod_vps_ipv6_address != "" ? var.prod_vps_ipv6_address : try(data.terraform_remote_state.hetzner_prod.outputs.server_ipv6, "")
+  stg_vps_ipv4  = var.stg_vps_ipv4_address != "" ? var.stg_vps_ipv4_address : data.terraform_remote_state.hetzner_stg.outputs.server_ip
+  stg_vps_ipv6  = var.stg_vps_ipv6_address != "" ? var.stg_vps_ipv6_address : try(data.terraform_remote_state.hetzner_stg.outputs.server_ipv6, "")
+}
+
+# ---------------------------------------------------------------------------
 # SSL/TLS configuration — applies to every record in the zone.
 # Full (Strict) — Cloudflare verifies the origin certificate.
 # Caddy on each VPS provides a valid Let's Encrypt cert, so strict works.
@@ -27,7 +73,7 @@ resource "cloudflare_zone_settings_override" "ssl" {
 resource "cloudflare_record" "prod_apex_a" {
   zone_id = var.cloudflare_zone_id
   name    = "@"
-  content = var.prod_vps_ipv4_address
+  content = local.prod_vps_ipv4
   type    = "A"
   ttl     = 1
   proxied = false
@@ -35,10 +81,10 @@ resource "cloudflare_record" "prod_apex_a" {
 
 # Root apex IPv6 — optional. `prod_vps_ipv6_address = ""` disables the record.
 resource "cloudflare_record" "prod_apex_aaaa" {
-  count   = var.prod_vps_ipv6_address == "" ? 0 : 1
+  count   = local.prod_vps_ipv6 == "" ? 0 : 1
   zone_id = var.cloudflare_zone_id
   name    = "@"
-  content = var.prod_vps_ipv6_address
+  content = local.prod_vps_ipv6
   type    = "AAAA"
   ttl     = 1
   proxied = false
@@ -64,10 +110,12 @@ resource "cloudflare_record" "prod_isnad_cname" {
   proxied = false
 }
 
-# auth.noorinalabs.com → prod apex (user-service in prod).
-resource "cloudflare_record" "prod_auth_cname" {
+# users.noorinalabs.com → prod apex (user-service in prod).
+# Per main#212 Q2 ruling 2026-04-25: hostname is `users.*` (matches the
+# noorinalabs-user-service repo and reflects combined auth + account-mgmt scope).
+resource "cloudflare_record" "prod_users_cname" {
   zone_id = var.cloudflare_zone_id
-  name    = "auth"
+  name    = "users"
   content = var.domain
   type    = "CNAME"
   ttl     = 1
@@ -96,7 +144,7 @@ resource "cloudflare_record" "legacy_subdomains" {
 resource "cloudflare_record" "stg_apex_a" {
   zone_id = var.cloudflare_zone_id
   name    = "stg"
-  content = var.stg_vps_ipv4_address
+  content = local.stg_vps_ipv4
   type    = "A"
   ttl     = 1
   proxied = false
@@ -104,10 +152,10 @@ resource "cloudflare_record" "stg_apex_a" {
 
 # Stg subdomain apex IPv6 — optional.
 resource "cloudflare_record" "stg_apex_aaaa" {
-  count   = var.stg_vps_ipv6_address == "" ? 0 : 1
+  count   = local.stg_vps_ipv6 == "" ? 0 : 1
   zone_id = var.cloudflare_zone_id
   name    = "stg"
-  content = var.stg_vps_ipv6_address
+  content = local.stg_vps_ipv6
   type    = "AAAA"
   ttl     = 1
   proxied = false
@@ -123,10 +171,10 @@ resource "cloudflare_record" "stg_isnad_cname" {
   proxied = false
 }
 
-# auth.stg.noorinalabs.com → stg subdomain apex (user-service in stg).
-resource "cloudflare_record" "stg_auth_cname" {
+# users.stg.noorinalabs.com → stg subdomain apex (user-service in stg).
+resource "cloudflare_record" "stg_users_cname" {
   zone_id = var.cloudflare_zone_id
-  name    = "auth.stg"
+  name    = "users.stg"
   content = "stg.${var.domain}"
   type    = "CNAME"
   ttl     = 1
