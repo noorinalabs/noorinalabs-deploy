@@ -4,7 +4,7 @@ output "prod_hostnames" {
     landing = cloudflare_record.prod_apex_a.hostname
     www     = cloudflare_record.www_cname.hostname
     isnad   = cloudflare_record.prod_isnad_cname.hostname
-    auth    = cloudflare_record.prod_auth_cname.hostname
+    users   = cloudflare_record.prod_users_cname.hostname
   }
 }
 
@@ -13,7 +13,7 @@ output "stg_hostnames" {
   value = {
     landing = cloudflare_record.stg_apex_a.hostname
     isnad   = cloudflare_record.stg_isnad_cname.hostname
-    auth    = cloudflare_record.stg_auth_cname.hostname
+    users   = cloudflare_record.stg_users_cname.hostname
   }
 }
 

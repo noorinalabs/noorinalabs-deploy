@@ -64,10 +64,12 @@ resource "cloudflare_record" "prod_isnad_cname" {
   proxied = false
 }
 
-# auth.noorinalabs.com → prod apex (user-service in prod).
-resource "cloudflare_record" "prod_auth_cname" {
+# users.noorinalabs.com → prod apex (user-service in prod).
+# Per main#212 Q2 ruling 2026-04-25: hostname is `users.*` (matches the
+# noorinalabs-user-service repo and reflects combined auth + account-mgmt scope).
+resource "cloudflare_record" "prod_users_cname" {
   zone_id = var.cloudflare_zone_id
-  name    = "auth"
+  name    = "users"
   content = var.domain
   type    = "CNAME"
   ttl     = 1
@@ -123,10 +125,10 @@ resource "cloudflare_record" "stg_isnad_cname" {
   proxied = false
 }
 
-# auth.stg.noorinalabs.com → stg subdomain apex (user-service in stg).
-resource "cloudflare_record" "stg_auth_cname" {
+# users.stg.noorinalabs.com → stg subdomain apex (user-service in stg).
+resource "cloudflare_record" "stg_users_cname" {
   zone_id = var.cloudflare_zone_id
-  name    = "auth.stg"
+  name    = "users.stg"
   content = "stg.${var.domain}"
   type    = "CNAME"
   ttl     = 1
