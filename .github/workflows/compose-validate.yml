@@ -4,12 +4,14 @@ on:
     paths:
       - 'compose/**'
       - 'infra/**'
+      - 'scripts/**'
       - '.github/workflows/**'
   push:
     branches: [main]
     paths:
       - 'compose/**'
       - 'infra/**'
+      - 'scripts/**'
       - '.github/workflows/**'
 
 permissions:

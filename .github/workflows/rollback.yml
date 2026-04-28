@@ -60,6 +60,8 @@ jobs:
       - name: Report rollback status
         if: always()
         run: |
-          echo "## Rollback: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Service:** ${{ inputs.service }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Target tag:** ${{ inputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Rollback: ${{ job.status }}"
+            echo "- **Service:** ${{ inputs.service }}"
+            echo "- **Target tag:** ${{ inputs.image_tag }}"
+          } >> "$GITHUB_STEP_SUMMARY"

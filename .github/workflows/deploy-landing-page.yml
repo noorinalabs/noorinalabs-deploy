@@ -57,7 +57,9 @@ jobs:
       - name: Report deployment status
         if: always()
         run: |
-          echo "## Deploy noorinalabs-landing-page: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Image tag:** ${{ inputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Triggered by:** ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Deploy noorinalabs-landing-page: ${{ job.status }}"
+            echo ""
+            echo "- **Image tag:** ${{ inputs.image_tag }}"
+            echo "- **Triggered by:** ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"
