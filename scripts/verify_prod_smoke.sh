@@ -17,12 +17,14 @@
 #   6. /auth/login            → HTTP 3xx redirect to OAuth provider
 #                                (proves user-service auth wiring alive)
 #
-# Env:
-#   ISNAD_BASE_URL          (default: https://isnad.noorinalabs.com)
-#   USER_SERVICE_BASE_URL   (default: https://users.noorinalabs.com — currently
-#                            unused; user-service is reached via Caddy on
-#                            ISNAD_BASE_URL today, but kept for forward
-#                            compat with subdomain-split topology)
+# Env (defaults reflect TODAY's prod Caddy — caddy/Caddyfile:18 serves
+# `isnad-graph.noorinalabs.com` and routes user-service traffic in the
+# same site block. When deploy#156 lands, update defaults to
+# `isnad.noorinalabs.com` + `users.noorinalabs.com`):
+#   ISNAD_BASE_URL          (default: https://isnad-graph.noorinalabs.com)
+#   USER_SERVICE_BASE_URL   (default: https://isnad-graph.noorinalabs.com —
+#                            same host as ISNAD_BASE_URL today; cleaves
+#                            into a separate subdomain at #156)
 #   LANDING_BASE_URL        (default: https://noorinalabs.com)
 #   SMOKE_REPORT            Path to write GH-summary-formatted markdown
 #                           (default: smoke-report.md)
@@ -30,8 +32,8 @@
 
 set -euo pipefail
 
-ISNAD_BASE_URL="${ISNAD_BASE_URL:-https://isnad.noorinalabs.com}"
-USER_SERVICE_BASE_URL="${USER_SERVICE_BASE_URL:-https://users.noorinalabs.com}"
+ISNAD_BASE_URL="${ISNAD_BASE_URL:-https://isnad-graph.noorinalabs.com}"
+USER_SERVICE_BASE_URL="${USER_SERVICE_BASE_URL:-https://isnad-graph.noorinalabs.com}"
 LANDING_BASE_URL="${LANDING_BASE_URL:-https://noorinalabs.com}"
 SMOKE_REPORT="${SMOKE_REPORT:-smoke-report.md}"
 TIMEOUT="${TIMEOUT:-5}"

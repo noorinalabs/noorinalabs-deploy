@@ -49,16 +49,23 @@ jobs:
     name: Verify stg (full integration suite)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: staging
     if: >-
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.name == 'Deploy to staging' &&
        github.event.workflow_run.conclusion == 'success') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'stg')
     steps:
+      # ref pin matters: workflow_run defaults checkout to the default
+      # branch (main), which would silently run a wave-branch deploy's
+      # verify against main's revision. Pin to the upstream deploy's
+      # head_sha (sha is more stable than head_branch — branch may have
+      # moved between trigger and run). See deploy#181 review (Weronika).
       - name: Checkout noorinalabs-deploy
         uses: actions/checkout@v4
         with:
           path: noorinalabs-deploy
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       # Wave-aware sibling-repo ref resolution (mirrors integration-tests.yml
       # pattern; needed so a wave-branch deploy verifies against matching
@@ -232,15 +239,27 @@ jobs:
        github.event.workflow_run.conclusion == 'success') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
     steps:
+      # ref pin matters: workflow_run defaults checkout to the default
+      # branch (main), which would silently run a wave-branch deploy's
+      # verify against main's revision. Same fix as verify-stg above.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Wait briefly for services to settle
         run: sleep 10
 
+      # Hostname defaults reflect TODAY's prod Caddy (caddy/Caddyfile:18 —
+      # `isnad-graph.noorinalabs.com`). User-service routes are wrapped
+      # in the same site block via Caddy `handle /auth/*`, `/api/v1/users`,
+      # etc., so USER_SERVICE_BASE_URL points at the same host today.
+      # When deploy#156 lands (cutover to `isnad.noorinalabs.com` +
+      # `users.noorinalabs.com`), update these defaults in that PR's diff.
+      # See deploy#181 review (Weronika).
       - name: Run prod smoke battery
         env:
-          ISNAD_BASE_URL: https://isnad.noorinalabs.com
-          USER_SERVICE_BASE_URL: https://users.noorinalabs.com
+          ISNAD_BASE_URL: https://isnad-graph.noorinalabs.com
+          USER_SERVICE_BASE_URL: https://isnad-graph.noorinalabs.com
           LANDING_BASE_URL: https://noorinalabs.com
           SMOKE_REPORT: smoke-report.md
         run: |

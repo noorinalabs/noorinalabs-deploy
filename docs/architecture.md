@@ -266,14 +266,16 @@ artifact (schema: `{result, commit_sha, timestamp, run_id}`) consumed by
 ### Prod verify — smoke battery (<60s)
 
 Job: `verify-prod`. Runs `scripts/verify_prod_smoke.sh` against the live
-prod URLs. Checks:
+prod URLs. Defaults reflect today's prod Caddy
+(`isnad-graph.noorinalabs.com` per `caddy/Caddyfile:18`); will be updated
+to `isnad.*` / `users.*` when the deploy#156 cutover lands. Checks:
 
-1. `isnad.noorinalabs.com/health` — HTTP 200, JSON `.status`
-2. `isnad.noorinalabs.com/api/v1/user-service/health` — HTTP 200 (Caddy rewrite)
+1. `isnad-graph.noorinalabs.com/health` — HTTP 200, JSON `.status`
+2. `isnad-graph.noorinalabs.com/api/v1/user-service/health` — HTTP 200 (Caddy rewrite)
 3. `noorinalabs.com/` — HTTP 200 (landing)
-4. `isnad.noorinalabs.com/api/v1/narrators?limit=1` — HTTP 401 + JSON-shaped body (proves user-service answers, not Caddy bypass)
-5. `isnad.noorinalabs.com/.well-known/jwks.json` — HTTP 200 with `.keys[]` populated
-6. `isnad.noorinalabs.com/auth/login` — HTTP 3xx redirect to OAuth provider (route reachability only — no creds in prod)
+4. `isnad-graph.noorinalabs.com/api/v1/narrators?limit=1` — HTTP 401 + JSON-shaped body (proves user-service answers, not Caddy bypass)
+5. `isnad-graph.noorinalabs.com/.well-known/jwks.json` — HTTP 200 with `.keys[]` populated
+6. `isnad-graph.noorinalabs.com/auth/login` — HTTP 3xx redirect to OAuth provider (route reachability only — no creds in prod)
 
 Failure semantics: emits `::error::` annotation. There is no auto-rollback
 (no rollback policy currently defined; owner investigates).
