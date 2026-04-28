@@ -85,7 +85,7 @@ All workflows support `workflow_dispatch` for manual triggering via the GitHub A
 |----------|---------|------------|
 | `deploy-isnad-graph.yml` | Deploy isnad-graph services | `image_tag` (default: `latest`) |
 | `deploy-all.yml` | Full-stack deploy (all 13 services) | `isnad_image_tag` (default: `latest`) |
-| `verify-deploy.yml` | Run verification checks | (none) |
+| `verify-deploy.yml` | Run verification checks (split: stg full integration suite + prod smoke battery) | `target` (`stg` or `prod`) |
 | `rollback.yml` | Roll back to a previous image | `image_tag` (required), `service` (all/api/frontend) |
 
 All deploy and rollback workflows share a concurrency group (`deploy-production`) that limits to one deployment at a time without cancelling in-progress runs.
@@ -242,20 +242,53 @@ Caddy automatically obtains and renews certificates via ACME (Let's Encrypt).
 
 ## Post-Deployment Verification
 
-The `verify-deploy.yml` workflow runs automatically after a successful deploy (via `workflow_run` trigger) and can also be triggered manually.
+The `verify-deploy.yml` workflow runs automatically after a successful deploy (via `workflow_run` trigger on `Deploy to staging` and `Deploy to production`) and can also be triggered manually with a `target` input (`stg` or `prod`).
 
-Verification is performed by `scripts/verify_deployment.sh`, which checks:
+Verification is **split by environment** (deploy#87):
 
-1. **Live site reachability** — HTTP 200 from the root URL
-2. **API health endpoint** — `/health` or `/api/v1/health` returns a healthy status
-3. **API status endpoint** — `/status` reports operational state
-4. **Endpoint smoke tests** — requests to `/api/v1/narrators`, `/api/v1/hadiths`, `/api/v1/collections`, `/api/v1/search`, `/api/v1/parallels`, `/api/v1/timeline` (expects 200, 401, or 403)
-5. **Security headers** — validates all six required headers are present
-6. **Caddy config verification** — confirms security headers originate from Caddy
-7. **SSL certificate** — checks validity period and subject match
-8. **Response time** — health endpoint must respond within 500ms (warning) / 2000ms (failure)
+### Stg verify — full integration suite
 
-Results are uploaded as a GitHub Actions artifact and written to the job summary.
+Job: `verify-stg`. Runs the full cross-repo integration suite in
+`integration-tests/run-tests.sh` (delivered in deploy#81). Hermetic — spins
+up its own docker-compose stack from sibling-repo checkouts of
+`noorinalabs-user-service` and `noorinalabs-isnad-graph` (wave-aware ref
+resolution). Validates auth flow, RBAC, subscriptions, sessions, 2FA,
+verification flow, network isolation, and performance baselines.
+
+Failure semantics: blocking gate. Emits a `stg-verify-result-{run_id}.json`
+artifact (schema: `{result, commit_sha, timestamp, run_id}`) consumed by
+`promote.yml`'s prod-promote gate (deploy#179, follow-up).
+
+> Limitation: today's stg verify validates "the code on the wave branch
+> passes integration", not "the bits actually running on the stg VPS pass
+> integration". Remote-mode against live stg URLs is tracked in deploy#178.
+
+### Prod verify — smoke battery (<60s)
+
+Job: `verify-prod`. Runs `scripts/verify_prod_smoke.sh` against the live
+prod URLs. Defaults reflect today's prod Caddy
+(`isnad-graph.noorinalabs.com` per `caddy/Caddyfile:18`); will be updated
+to `isnad.*` / `users.*` when the deploy#156 cutover lands. Checks:
+
+1. `isnad-graph.noorinalabs.com/health` — HTTP 200, JSON `.status`
+2. `isnad-graph.noorinalabs.com/api/v1/user-service/health` — HTTP 200 (Caddy rewrite)
+3. `noorinalabs.com/` — HTTP 200 (landing)
+4. `isnad-graph.noorinalabs.com/api/v1/narrators?limit=1` — HTTP 401 + JSON-shaped body (proves user-service answers, not Caddy bypass)
+5. `isnad-graph.noorinalabs.com/.well-known/jwks.json` — HTTP 200 with `.keys[]` populated
+6. `isnad-graph.noorinalabs.com/auth/login` — HTTP 3xx redirect to OAuth provider (route reachability only — no creds in prod)
+
+Failure semantics: emits `::error::` annotation. There is no auto-rollback
+(no rollback policy currently defined; owner investigates).
+
+### Legacy / manual verification
+
+`scripts/verify_deployment.sh` is retained for manual operator use against
+arbitrary environments (notably by `docs/runbooks/user-service-migration.md`)
+and is intentionally NOT invoked by CI anymore. It is the broader
+verification script that pre-dates the env split.
+
+Results from both jobs are uploaded as GitHub Actions artifacts and
+written to the job summary.
 
 ## Rollback
 

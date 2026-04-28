@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# verify_deployment.sh — Production deployment verification for noorinalabs-isnad-graph
+# verify_deployment.sh — Generic deployment verification (legacy / manual).
 # Checks deploy workflow, live site, API health, security headers, and SSL.
+#
+# Note (deploy#87): Post-deploy verification in CI is now split by env:
+#   - Stg verify (full integration suite) lives in `verify-deploy.yml`'s
+#     `verify-stg` job and runs `integration-tests/run-tests.sh`.
+#   - Prod verify (smoke battery, <60s) lives in `verify-deploy.yml`'s
+#     `verify-prod` job and runs `scripts/verify_prod_smoke.sh`.
+# This script is retained for manual/operator use against arbitrary
+# environments (used by `docs/runbooks/user-service-migration.md`) and is
+# intentionally NOT invoked by `verify-deploy.yml` anymore.
 #
 # Usage:
 #   ./scripts/verify_deployment.sh [--site URL] [--skip-workflow] [--skip-ssl]
