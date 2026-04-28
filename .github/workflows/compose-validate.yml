@@ -4,13 +4,13 @@ on:
     paths:
       - 'compose/**'
       - 'infra/**'
-      - '.github/workflows/compose-validate.yml'
+      - '.github/workflows/**'
   push:
     branches: [main]
     paths:
       - 'compose/**'
       - 'infra/**'
-      - '.github/workflows/compose-validate.yml'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
