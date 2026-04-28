@@ -12,8 +12,11 @@
 # Optional environment variables:
 #   POSTGRES_USER   — PostgreSQL user (default: isnad)
 #   POSTGRES_DB     — PostgreSQL database (default: isnad_graph)
-#   COMPOSE_FILE    — Docker Compose file (default: docker-compose.prod.yml)
-#   BACKUP_DIR      — Local backup staging directory (default: /tmp/isnad-backups)
+#   COMPOSE_FILE    — Docker Compose file (default: compose/docker-compose.prod.yml,
+#                     resolved relative to /opt/noorinalabs-deploy/)
+#   BACKUP_DIR      — Local backup staging root (default: /var/lib/noorinalabs-backups,
+#                     a persistent path managed via tmpfiles.d to survive reboots —
+#                     see deploy#121 Bug A for the /tmp/-namespace failure this avoids)
 #   DAILY_RETAIN    — Number of daily backups to keep (default: 7)
 #   WEEKLY_RETAIN   — Number of weekly backups to keep (default: 4)
 #   DRY_RUN         — Set to "true" to show what would be pruned without deleting
@@ -32,8 +35,8 @@ umask 077
 # ---------------------------------------------------------------------------
 POSTGRES_USER="${POSTGRES_USER:-isnad}"
 POSTGRES_DB="${POSTGRES_DB:-isnad_graph}"
-COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
-BACKUP_DIR="${BACKUP_DIR:-$(mktemp -d /tmp/isnad-backups.XXXXXXXXXX)}"
+COMPOSE_FILE="${COMPOSE_FILE:-compose/docker-compose.prod.yml}"
+BACKUP_DIR="${BACKUP_DIR:-/var/lib/noorinalabs-backups}"
 DAILY_RETAIN="${DAILY_RETAIN:-7}"
 WEEKLY_RETAIN="${WEEKLY_RETAIN:-4}"
 DRY_RUN="${DRY_RUN:-false}"
@@ -68,7 +71,11 @@ export RCLONE_CONFIG_ISNAD_KEY="${B2_APP_KEY}"
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-LOG_FILE="${BACKUP_DIR}/backup-${TIMESTAMP}.log"
+# Log file lives under LOCAL_BACKUP_PATH (the per-run dir) so cleanup() removes
+# it along with the dump artifacts. Long-term log retention is the journal's
+# job — under systemd, StandardOutput=journal already captures everything.
+mkdir -p "$LOCAL_BACKUP_PATH"
+LOG_FILE="${LOCAL_BACKUP_PATH}/backup-${TIMESTAMP}.log"
 
 log() {
     local level="$1"
@@ -83,13 +90,19 @@ log() {
 # ---------------------------------------------------------------------------
 cleanup() {
     local exit_code=$?
+    # Order matters: emit our last log lines BEFORE rm-ing the directory the
+    # log file lives in, otherwise tee fails silently with "No such file or
+    # directory" and we lose the cleanup confirmation.
     if [[ $exit_code -ne 0 ]]; then
         log "ERROR" "Backup script exited with code ${exit_code}"
     fi
-    # Clean up entire staging directory to avoid leaving sensitive dumps on disk
-    if [[ -d "$BACKUP_DIR" ]]; then
-        rm -rf "$BACKUP_DIR"
-        log "INFO" "Cleaned up backup staging directory: ${BACKUP_DIR}"
+    if [[ -n "${LOCAL_BACKUP_PATH:-}" && -d "$LOCAL_BACKUP_PATH" ]]; then
+        log "INFO" "Cleaning up per-run staging directory: ${LOCAL_BACKUP_PATH}"
+        # Remove only the per-run staging directory (LOCAL_BACKUP_PATH), never the
+        # persistent BACKUP_DIR root. BACKUP_DIR is now /var/lib/noorinalabs-backups,
+        # provisioned by tmpfiles.d and shared across runs — wiping it would also
+        # destroy the tmpfiles.d-managed permissions/ownership we rely on.
+        rm -rf "$LOCAL_BACKUP_PATH"
     fi
 }
 trap cleanup EXIT
@@ -108,9 +121,6 @@ if ! docker compose -f "$COMPOSE_FILE" ps --format json &>/dev/null; then
     log "ERROR" "Cannot reach Docker Compose services (is Docker running?)"
     exit 1
 fi
-
-mkdir -p "$LOCAL_BACKUP_PATH"
-mkdir -p "$(dirname "$LOG_FILE")"
 
 log "INFO" "=== Backup started (${BACKUP_CATEGORY}) ==="
 log "INFO" "Timestamp: ${TIMESTAMP}"

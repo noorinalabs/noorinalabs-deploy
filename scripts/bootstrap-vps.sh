@@ -175,14 +175,31 @@ else
   echo "    rclone installed: $(rclone version --check 2>/dev/null | head -1 || echo 'installed')"
 fi
 
-# ── Step 7: Install backup systemd timer ────────────────────────────────────
+# ── Step 7: Install backup systemd timer + persistent staging dir ───────────
 echo "==> [7/7] Installing backup timer..."
 if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
-  cp "$INSTALL_DIR/systemd/isnad-backup.service" /etc/systemd/system/
-  cp "$INSTALL_DIR/systemd/isnad-backup.timer" /etc/systemd/system/
+  # Install the unit + timer + the OnFailure=-target failure-marker unit.
+  install -m 644 "$INSTALL_DIR/systemd/isnad-backup.service"               /etc/systemd/system/
+  install -m 644 "$INSTALL_DIR/systemd/isnad-backup.timer"                 /etc/systemd/system/
+  install -m 644 "$INSTALL_DIR/systemd/isnad-backup-failure-marker.service" /etc/systemd/system/
+
+  # Provision the persistent staging directory via tmpfiles.d. Without this,
+  # the unit's ReadWritePaths=/var/lib/noorinalabs-backups would fail the
+  # mount-namespace setup with status=226/NAMESPACE before ExecStart fires
+  # — the original deploy#121 Bug A failure mode against /tmp/isnad-backups.
+  install -m 644 "$INSTALL_DIR/systemd/tmpfiles.d/noorinalabs-backups.conf" /etc/tmpfiles.d/
+  systemd-tmpfiles --create /etc/tmpfiles.d/noorinalabs-backups.conf
+
+  # Provision the node-exporter textfile-collector directory so the
+  # failure-marker unit can drop *.prom files there. Idempotent: install -d
+  # is a no-op when the directory already exists with the right mode.
+  install -d -m 0755 /var/lib/node_exporter
+
   systemctl daemon-reload
   systemctl enable isnad-backup.timer
   echo "    Backup timer installed (daily at 03:00 UTC)."
+  echo "    Failure marker unit installed (OnFailure= → /var/lib/node_exporter/*.prom + journal)."
+  echo "    Persistent staging dir provisioned: /var/lib/noorinalabs-backups (mode 0700, root)."
   echo "    Start with: systemctl start isnad-backup.timer"
 else
   echo "    Backup systemd files not found, skipping."
