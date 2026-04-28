@@ -8,7 +8,7 @@ locals {
 
 resource "hcloud_ssh_key" "deploy" {
   name       = "${local.name_prefix}-deploy"
-  public_key = file(var.ssh_public_key_path)
+  public_key = sensitive(chomp(file(var.ssh_public_key_path)))
   labels     = local.labels
 }
 
@@ -53,7 +53,7 @@ resource "hcloud_server" "app" {
   firewall_ids = [hcloud_firewall.web.id]
 
   user_data = templatefile("${path.module}/cloud-init.yaml.tpl", {
-    ssh_public_key          = file(var.ssh_public_key_path)
+    ssh_public_key          = sensitive(chomp(file(var.ssh_public_key_path)))
     ghcr_auth_b64           = var.ghcr_auth_b64
     user_postgres_password  = var.user_postgres_password
     user_redis_password     = var.user_redis_password
