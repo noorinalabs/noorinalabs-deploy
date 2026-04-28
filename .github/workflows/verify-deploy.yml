@@ -1,58 +1,288 @@
+# Verify Deployment — split by environment.
+#
+# Two jobs, two triggers, two failure semantics:
+#
+#   verify-stg  — runs the full cross-repo integration suite (deploy#81)
+#                 on every successful stg deploy. Failure blocks any
+#                 prod-promote attempt that consumes the stg artifact
+#                 (gate enforcement is deploy#179).
+#
+#   verify-prod — runs a tight (<60s) smoke battery on every successful
+#                 prod deploy. Failure surfaces a `::error::` annotation
+#                 for owner investigation; no auto-rollback (no rollback
+#                 policy currently exists).
+#
+# Why split (vs. matrix.env):
+#   - Different upstream `workflow_run.workflows` triggers per env
+#   - Different runtime budgets (stg ~10–15min, prod <60s)
+#   - Different failure semantics (stg blocks promote, prod alerts)
+#   - Different `environment:` scopes (stg URLs vs prod URLs)
+#
+# Trigger note: the previous version watched "Deploy noorinalabs-isnad-graph"
+# which is now LEGACY (deploy-isnad-graph.yml line 1). Active deploys are
+# "Deploy to staging" and "Deploy to production" — repointed below as part
+# of deploy#87 (the split is unimplementable otherwise; trigger today fires
+# on a workflow nobody runs).
+
 name: Verify Deployment
 
 on:
   workflow_run:
-    workflows: ["Deploy noorinalabs-isnad-graph"]
+    workflows: ["Deploy to staging", "Deploy to production"]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Which env to verify (stg|prod). Required for manual dispatch."
+        required: true
+        default: "stg"
+        type: choice
+        options: [stg, prod]
 
 jobs:
-  verify:
+  # ─────────────────────────────────────────────────────────────────
+  # Stg: full cross-repo integration suite (hermetic, in-CI compose).
+  # See deploy#178 for the follow-up that adds remote-mode against
+  # the deployed stg URLs.
+  # ─────────────────────────────────────────────────────────────────
+  verify-stg:
+    name: Verify stg (full integration suite)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.name == 'Deploy to staging' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'stg')
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout noorinalabs-deploy
+        uses: actions/checkout@v4
+        with:
+          path: noorinalabs-deploy
 
-      - name: Wait for services to stabilize
-        run: sleep 30
-
-      - name: Run deployment verification
-        env:
-          SITE_URL: https://isnad-graph.noorinalabs.com
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Wave-aware sibling-repo ref resolution (mirrors integration-tests.yml
+      # pattern; needed so a wave-branch deploy verifies against matching
+      # wave branches of user-service + isnad-graph). See feedback memory
+      # "Cross-repo wave-aware sibling checkout" 2026-04-24.
+      - name: Resolve sibling-repo refs (wave-aware)
+        id: sibling-refs
         run: |
-          set -o pipefail
-          chmod +x scripts/verify_deployment.sh
-          ./scripts/verify_deployment.sh --skip-workflow 2>&1 | tee verify-output.txt
+          set -euo pipefail
+          # On workflow_run the head_branch of the upstream deploy is most
+          # accurate; on workflow_dispatch, fall back to ref_name of this
+          # workflow's invocation context.
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            BASE="${{ github.event.workflow_run.head_branch }}"
+          else
+            BASE="${{ github.ref_name }}"
+          fi
+          [ -n "$BASE" ] || BASE="main"
 
-      - name: Upload verification output
+          resolve_ref() {
+            local repo="$1"
+            if [[ "$BASE" == deployments/* ]] && \
+               git ls-remote --exit-code "https://github.com/noorinalabs/${repo}.git" "refs/heads/${BASE}" >/dev/null 2>&1; then
+              echo "$BASE"
+            else
+              echo "main"
+            fi
+          }
+
+          US_REF=$(resolve_ref noorinalabs-user-service)
+          IG_REF=$(resolve_ref noorinalabs-isnad-graph)
+
+          echo "user_service_ref=${US_REF}" >> "$GITHUB_OUTPUT"
+          echo "isnad_graph_ref=${IG_REF}"  >> "$GITHUB_OUTPUT"
+          {
+            echo "## Resolved sibling refs (verify-stg)"
+            echo "- upstream branch: \`${BASE}\`"
+            echo "- noorinalabs-user-service: \`${US_REF}\`"
+            echo "- noorinalabs-isnad-graph:  \`${IG_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout noorinalabs-user-service
+        uses: actions/checkout@v4
+        with:
+          repository: noorinalabs/noorinalabs-user-service
+          path: noorinalabs-user-service
+          ref: ${{ steps.sibling-refs.outputs.user_service_ref }}
+
+      - name: Checkout noorinalabs-isnad-graph
+        uses: actions/checkout@v4
+        with:
+          repository: noorinalabs/noorinalabs-isnad-graph
+          path: noorinalabs-isnad-graph
+          ref: ${{ steps.sibling-refs.outputs.isnad_graph_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run full integration suite
+        working-directory: noorinalabs-deploy/integration-tests
+        run: ./run-tests.sh --junit-xml=reports/junit.xml
+
+      - name: Upload junit report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: verify-output
-          path: verify-output.txt
-          retention-days: 7
+          name: verify-stg-junit
+          path: noorinalabs-deploy/integration-tests/reports/
 
-      - name: Write verification summary
+      - name: Dump compose logs on failure
+        if: failure()
+        working-directory: noorinalabs-deploy/integration-tests
+        run: docker compose -f docker-compose.test.yml --env-file .env.test logs --no-color > reports/compose.log || true
+
+      # Artifact consumed by deploy#179 (promote.yml gate). Schema:
+      # { "result": "success"|"failure", "commit_sha": "...", "timestamp": "...", "run_id": "..." }
+      # Filename includes run_id so promote.yml can validate freshness.
+      - name: Emit verify-stg-result artifact
         if: always()
         run: |
-          if [ -f verify-output.txt ]; then
+          set -euo pipefail
+          if [ "${{ job.status }}" = "success" ]; then
+            RESULT="success"
+          else
+            RESULT="failure"
+          fi
+          # On workflow_run, prefer the upstream deploy's head_sha; otherwise
+          # fall back to this workflow's GITHUB_SHA.
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            COMMIT_SHA="${{ github.sha }}"
+          fi
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          OUT="stg-verify-result-${{ github.run_id }}.json"
+          printf '{"result":"%s","commit_sha":"%s","timestamp":"%s","run_id":"%s"}\n' \
+            "$RESULT" "$COMMIT_SHA" "$TS" "${{ github.run_id }}" > "$OUT"
+          echo "Wrote $OUT:"
+          cat "$OUT"
+
+      - name: Upload verify-stg-result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stg-verify-result
+          path: stg-verify-result-${{ github.run_id }}.json
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Verify stg — ${{ job.status }}"
+            echo ""
+            echo "Full cross-repo integration suite (hermetic Option A; deploy#178 tracks remote-mode against live stg URLs)."
+            echo ""
+            if [ -f noorinalabs-deploy/integration-tests/reports/junit.xml ]; then
+              echo "### Test counts"
+              python3 - <<'PY' || true
+          import xml.etree.ElementTree as ET
+          try:
+              t = ET.parse("noorinalabs-deploy/integration-tests/reports/junit.xml")
+              r = t.getroot()
+              tests = r.attrib.get("tests", "?")
+              fails = r.attrib.get("failures", "?")
+              errs = r.attrib.get("errors", "?")
+              skips = r.attrib.get("skipped", "?")
+              time = r.attrib.get("time", "?")
+              print("| Metric | Value |")
+              print("|--------|-------|")
+              print(f"| Tests | {tests} |")
+              print(f"| Failures | {fails} |")
+              print(f"| Errors | {errs} |")
+              print(f"| Skipped | {skips} |")
+              print(f"| Duration | {time}s |")
+          except Exception as e:
+              print(f"_Could not parse junit.xml: {e}_")
+          PY
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-stg-failure:
+    name: Notify stg verify failure
+    runs-on: ubuntu-latest
+    needs: verify-stg
+    if: always() && needs.verify-stg.result == 'failure'
+    steps:
+      - name: Surface stg failure
+        run: |
+          echo "::error::Stg verify-deploy failed — prod-promote will be blocked once deploy#179 lands."
+          {
+            echo "## Stg verify FAILED"
+            echo ""
+            echo "The full integration suite did not pass against the stg deployment context."
+            echo "Investigate before promoting to prod. The promote.yml gate (deploy#179) will hard-block prod-promote on this state."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────
+  # Prod: tight smoke battery (<60s).
+  # Health endpoints, narrator query (expect 401), auth wiring (route
+  # reachability only — no creds in prod, per Bereket sign-off).
+  # ─────────────────────────────────────────────────────────────────
+  verify-prod:
+    name: Verify prod (smoke battery)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    environment: production
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.name == 'Deploy to production' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait briefly for services to settle
+        run: sleep 10
+
+      - name: Run prod smoke battery
+        env:
+          ISNAD_BASE_URL: https://isnad.noorinalabs.com
+          USER_SERVICE_BASE_URL: https://users.noorinalabs.com
+          LANDING_BASE_URL: https://noorinalabs.com
+          SMOKE_REPORT: smoke-report.md
+        run: |
+          set -o pipefail
+          chmod +x scripts/verify_prod_smoke.sh
+          ./scripts/verify_prod_smoke.sh 2>&1 | tee smoke-output.txt
+
+      - name: Upload smoke output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-prod-smoke-output
+          path: |
+            smoke-output.txt
+            smoke-report.md
+          retention-days: 14
+
+      - name: Append smoke report to job summary
+        if: always()
+        run: |
+          if [ -f smoke-report.md ]; then
+            cat smoke-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
             {
-              echo "## Deployment Verification Results"
-              echo '```'
-              cat verify-output.txt
-              echo '```'
+              echo "## Verify prod — ${{ job.status }}"
+              echo ""
+              echo "_smoke-report.md not produced; see smoke-output.txt artifact._"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-  notify-failure:
+  notify-prod-failure:
+    name: Notify prod smoke failure
     runs-on: ubuntu-latest
-    needs: verify
-    if: always() && needs.verify.result == 'failure'
+    needs: verify-prod
+    if: always() && needs.verify-prod.result == 'failure'
     steps:
-      - name: Report verification failure
+      - name: Surface prod smoke failure
         run: |
-          echo "::error::Deployment verification failed — check verify job for details"
-          echo "## Deployment Verification Failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Prod verify-deploy smoke battery FAILED — owner investigate immediately."
+          {
+            echo "## Prod smoke FAILED"
+            echo ""
+            echo "One or more checks in the prod smoke battery did not pass. There is no auto-rollback policy."
+            echo "Investigate via the verify-prod-smoke-output artifact and the upstream prod deploy logs."
+          } >> "$GITHUB_STEP_SUMMARY"
