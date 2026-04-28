@@ -19,17 +19,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Download actionlint
+      - name: Download and verify actionlint
         env:
-          # Pinned to actionlint v1.7.12 release tag SHA. The downloader script
-          # verifies the binary's SHA256 against the official release manifest.
-          ACTIONLINT_REF: 914e7df21a07ef503a81201c76d2b11c789d3fca
+          # Pinned: version + linux_amd64 tarball SHA256 from upstream's
+          # signed release manifest (actionlint_1.7.12_checksums.txt at
+          # https://github.com/rhysd/actionlint/releases/tag/v1.7.12).
+          # `sha256sum -c` aborts the job on mismatch — bytes-on-runner are
+          # exactly what was published at release time.
           ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
+          cd "$RUNNER_TEMP"
           curl --fail --silent --show-error --location \
-            "https://raw.githubusercontent.com/rhysd/actionlint/${ACTIONLINT_REF}/scripts/download-actionlint.bash" \
-            -o /tmp/download-actionlint.bash
-          bash /tmp/download-actionlint.bash "${ACTIONLINT_VERSION}" /usr/local/bin
+            -o "actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" | sha256sum -c -
+          tar -xzf "actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint
+          install -m 0755 actionlint /usr/local/bin/actionlint
           actionlint -version
       - name: Lint workflows
         run: actionlint -color
