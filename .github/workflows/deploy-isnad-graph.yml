@@ -163,12 +163,14 @@ jobs:
       - name: Report deployment status
         if: always()
         run: |
-          echo "## Deploy noorinalabs-isnad-graph: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "- **Source repo:** ${{ github.event.client_payload.repo }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Source SHA:** ${{ github.event.client_payload.sha }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- **Source ref:** ${{ github.event.client_payload.ref }}" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo "- **Image tag:** ${{ steps.tag.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Triggered by:** ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Deploy noorinalabs-isnad-graph: ${{ job.status }}"
+            echo ""
+            if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+              echo "- **Source repo:** ${{ github.event.client_payload.repo }}"
+              echo "- **Source SHA:** ${{ github.event.client_payload.sha }}"
+              echo "- **Source ref:** ${{ github.event.client_payload.ref }}"
+            fi
+            echo "- **Image tag:** ${{ steps.tag.outputs.tag }}"
+            echo "- **Triggered by:** ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"

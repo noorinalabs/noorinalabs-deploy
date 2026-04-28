@@ -39,10 +39,12 @@ jobs:
         if: always()
         run: |
           if [ -f verify-output.txt ]; then
-            echo "## Deployment Verification Results" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
-            cat verify-output.txt >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "## Deployment Verification Results"
+              echo '```'
+              cat verify-output.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
   notify-failure:
