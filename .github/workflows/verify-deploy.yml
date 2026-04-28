@@ -124,9 +124,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # run-tests.sh already passes --junit-xml=/app/reports/junit.xml to
+      # pytest internally; re-passing the flag here would duplicate it
+      # (latter-wins works by accident with WORKDIR=/app + the ./reports
+      # mount, but is brittle to refactor). Let the script own the flag.
+      # See deploy#181 review (Nurul).
       - name: Run full integration suite
         working-directory: noorinalabs-deploy/integration-tests
-        run: ./run-tests.sh --junit-xml=reports/junit.xml
+        run: ./run-tests.sh
 
       - name: Upload junit report
         if: always()
@@ -140,9 +145,15 @@ jobs:
         working-directory: noorinalabs-deploy/integration-tests
         run: docker compose -f docker-compose.test.yml --env-file .env.test logs --no-color > reports/compose.log || true
 
-      # Artifact consumed by deploy#179 (promote.yml gate). Schema:
-      # { "result": "success"|"failure", "commit_sha": "...", "timestamp": "...", "run_id": "..." }
+      # Artifact consumed by deploy#179 (promote.yml gate). Schema v1:
+      # { "schema_version": 1,
+      #   "result": "success"|"failure",
+      #   "commit_sha": "...",
+      #   "timestamp": "...",
+      #   "run_id": "..." }
       # Filename includes run_id so promote.yml can validate freshness.
+      # `schema_version` lets future #179 consumers do graceful evolution
+      # (deploy#181 review, Nurul).
       - name: Emit verify-stg-result artifact
         if: always()
         run: |
@@ -161,7 +172,7 @@ jobs:
           fi
           TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           OUT="stg-verify-result-${{ github.run_id }}.json"
-          printf '{"result":"%s","commit_sha":"%s","timestamp":"%s","run_id":"%s"}\n' \
+          printf '{"schema_version":1,"result":"%s","commit_sha":"%s","timestamp":"%s","run_id":"%s"}\n' \
             "$RESULT" "$COMMIT_SHA" "$TS" "${{ github.run_id }}" > "$OUT"
           echo "Wrote $OUT:"
           cat "$OUT"
