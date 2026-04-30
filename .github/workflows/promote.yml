@@ -52,6 +52,21 @@ on:
         description: "Comma-separated image set to promote (default: all)."
         required: false
         default: "api,frontend,user-service,landing"
+      skip_stg_verify:
+        description: >-
+          BREAK-GLASS: skip the stg-verify gate. Only set true when the
+          gate is broken and you need an emergency promotion. A warning
+          annotation + job-summary entry are emitted on use.
+        required: false
+        default: false
+        type: boolean
+      stg_verify_max_age_hours:
+        description: >-
+          Maximum age (hours) of the stg-verify-result artifact. Older
+          artifacts cause the gate to fail with "stg verify is stale".
+        required: false
+        default: "24"
+        type: string
 
 concurrency:
   # All promotions serialize globally — we never want two promotions racing
@@ -214,9 +229,235 @@ jobs:
           print("[plan] matrix:", json.dumps(data, indent=2))
           PY3
 
+  # ─────────────────────────────────────────────────────────────────
+  # Stg-verify gate (deploy#179).
+  #
+  # Hard-blocks promotion unless the most recent `verify-deploy.yml`
+  # run triggered by "Deploy to staging" concluded success AND its
+  # emitted artifact is fresh (default: <24h old).
+  #
+  # Why "most recent" instead of "per image SHA":
+  #   verify-deploy.yml emits its artifact's `commit_sha` from the
+  #   triggering deploy-stg run's `head_sha`, which for a
+  #   repository_dispatch is the deploy-repo HEAD, NOT the service
+  #   image's SHA. The plan job resolves per-service image short SHAs
+  #   from each service's GHCR `stg-latest` digest — these two
+  #   identifiers do not share a namespace, so per-image SHA equality
+  #   isn't achievable without modifying verify-deploy.yml's schema
+  #   (out of scope for this issue per the issue body).
+  #
+  #   Operationally, the unit of stg verification IS the compose stack
+  #   as a whole at a moment in time. One successful verify-stg run
+  #   validates the cumulative state of every `stg-latest` pointer at
+  #   trigger time. If `stg-latest` hasn't moved since, that verify
+  #   covers what plan resolved. The freshness window enforces the
+  #   "hasn't moved" assumption probabilistically.
+  #
+  # Override: `inputs.skip_stg_verify: true` skips the gate. A warning
+  # annotation + job-summary entry surface the break-glass use.
+  # ─────────────────────────────────────────────────────────────────
+  gate-stg-verify:
+    name: Gate — stg verify-deploy success
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      gate_result: ${{ steps.gate.outputs.gate_result }}
+    steps:
+      - name: Break-glass override (skip_stg_verify)
+        if: ${{ inputs.skip_stg_verify }}
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "::warning::stg-verify gate SKIPPED via break-glass input by $ACTOR"
+          {
+            echo "## ⚠ stg-verify gate SKIPPED (break-glass)"
+            echo ""
+            echo "- **Actor:** $ACTOR"
+            echo "- **Input:** \`skip_stg_verify=true\`"
+            echo ""
+            echo "This promotion proceeded WITHOUT confirming the latest stg verify-deploy succeeded."
+            echo "Use only when the gate itself is broken; otherwise investigate the gate failure first."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Locate recent verify-deploy runs
+        if: ${{ !inputs.skip_stg_verify }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Heuristic: the verify-stg job is the only path that emits the
+          # `stg-verify-result` artifact, so we scan up to 50 most recent
+          # `verify-deploy.yml` runs newest-first and stop at the first
+          # one carrying that artifact (gate step picks it up below).
+          # We don't pre-filter by upstream workflow name because gh's
+          # workflow_runs payload doesn't surface the triggering workflow
+          # title at this level reliably; the artifact's existence is the
+          # clean signal.
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/actions/workflows/verify-deploy.yml/runs?per_page=50" \
+            --jq '.workflow_runs[] | [.id, .event] | @tsv' \
+            > /tmp/verify_runs.tsv
+          echo "Found $(wc -l < /tmp/verify_runs.tsv) recent verify-deploy runs."
+
+      - name: Validate stg-verify artifact (gate)
+        id: gate
+        if: ${{ !inputs.skip_stg_verify }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          MAX_AGE_HOURS: ${{ inputs.stg_verify_max_age_hours }}
+          API_SHORT:          ${{ needs.plan.outputs.api_short }}
+          FRONTEND_SHORT:     ${{ needs.plan.outputs.frontend_short }}
+          USER_SERVICE_SHORT: ${{ needs.plan.outputs.user_service_short }}
+          LANDING_SHORT:      ${{ needs.plan.outputs.landing_short }}
+        run: |
+          set -euo pipefail
+
+          # Validate freshness window input is a positive integer.
+          if ! printf '%s' "${MAX_AGE_HOURS}" | grep -qE '^[1-9][0-9]*$'; then
+            echo "::error::stg_verify_max_age_hours must be a positive integer. Got: ${MAX_AGE_HOURS}"
+            exit 1
+          fi
+
+          # Walk recent verify-deploy runs newest-first; for each one,
+          # try to download the `stg-verify-result` artifact and parse it.
+          # Stop at the first artifact that parses cleanly — that is the
+          # most recent stg-verify outcome. Then evaluate result + age.
+          mkdir -p /tmp/verify_artifacts
+          chosen_run_id=""
+          chosen_artifact=""
+          while IFS=$'\t' read -r run_id event; do
+            # Only workflow_run-triggered verify runs matter (those are
+            # auto-fired post-deploy). workflow_dispatch runs may target
+            # prod or have no stg artifact at all.
+            if [ "$event" != "workflow_run" ]; then
+              continue
+            fi
+            # List artifacts for this run; look for `stg-verify-result`.
+            artifacts_json=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/actions/runs/${run_id}/artifacts" \
+              --jq '.artifacts[] | select(.name=="stg-verify-result") | .id' \
+              2>/dev/null || true)
+            if [ -z "$artifacts_json" ]; then
+              continue
+            fi
+            artifact_id=$(printf '%s\n' "$artifacts_json" | head -n1)
+            dl_dir="/tmp/verify_artifacts/${run_id}"
+            mkdir -p "$dl_dir"
+            # Use gh api to download the zip, then unzip.
+            if ! gh api \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${REPO}/actions/artifacts/${artifact_id}/zip" \
+                > "${dl_dir}/artifact.zip" 2>/dev/null; then
+              continue
+            fi
+            if ! unzip -q -o "${dl_dir}/artifact.zip" -d "$dl_dir" 2>/dev/null; then
+              continue
+            fi
+            # Filename is `stg-verify-result-<run_id>.json` per
+            # verify-deploy.yml. Use a glob to be tolerant.
+            json_file=$(find "$dl_dir" -maxdepth 1 -name 'stg-verify-result-*.json' | head -n1)
+            if [ -z "$json_file" ] || [ ! -f "$json_file" ]; then
+              continue
+            fi
+            # Sanity-check schema_version. Fail loud on unknown schema —
+            # do NOT silently treat unrecognized as success.
+            schema_version=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('schema_version',''))" "$json_file" 2>/dev/null || echo "")
+            if [ "$schema_version" != "1" ]; then
+              echo "::error::stg-verify-result artifact for run ${run_id} has unknown schema_version=${schema_version}; refusing to gate."
+              echo "::error::This gate understands only schema_version=1. Update the gate before publishing schema v2."
+              exit 1
+            fi
+            chosen_run_id="$run_id"
+            chosen_artifact="$json_file"
+            break
+          done < /tmp/verify_runs.tsv
+
+          if [ -z "$chosen_run_id" ]; then
+            echo "::error::No verify-deploy.yml run with a stg-verify-result artifact was found in the last 50 runs."
+            echo "::error::Cannot gate prod-promote without a recent stg-verify outcome. Investigate verify-deploy.yml or run it manually before retrying promotion."
+            {
+              echo "## stg-verify gate FAILED — no artifact"
+              echo ""
+              echo "Searched 50 most-recent runs of \`verify-deploy.yml\`; none produced a \`stg-verify-result\` artifact."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "Using stg-verify-result from run ${chosen_run_id}"
+          echo "Artifact: ${chosen_artifact}"
+          cat "$chosen_artifact"
+          echo ""
+
+          # Parse fields.
+          result=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('result',''))" "$chosen_artifact")
+          commit_sha=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('commit_sha',''))" "$chosen_artifact")
+          timestamp=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('timestamp',''))" "$chosen_artifact")
+
+          # Freshness check.
+          age_seconds=$(python3 - "$timestamp" <<'PY'
+          import sys, datetime
+          ts = sys.argv[1]
+          try:
+              when = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+          except ValueError:
+              print(-1)
+              sys.exit(0)
+          now = datetime.datetime.now(datetime.timezone.utc)
+          print(int((now - when).total_seconds()))
+          PY
+          )
+          if [ "$age_seconds" = "-1" ]; then
+            echo "::error::stg-verify-result timestamp could not be parsed: ${timestamp}"
+            exit 1
+          fi
+          max_age_seconds=$(( MAX_AGE_HOURS * 3600 ))
+          age_hours=$(python3 -c "print(round(${age_seconds}/3600.0, 2))")
+
+          # Decision.
+          {
+            echo "## stg-verify gate"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Source verify-deploy run | [${chosen_run_id}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${chosen_run_id}) |"
+            echo "| Artifact result | \`${result}\` |"
+            echo "| Artifact commit_sha | \`${commit_sha}\` |"
+            echo "| Artifact timestamp | \`${timestamp}\` (age ${age_hours}h, max ${MAX_AGE_HOURS}h) |"
+            echo ""
+            echo "### Plan-resolved per-service shorts (for audit)"
+            echo "- api:          \`${API_SHORT:-<not in promotion set>}\`"
+            echo "- frontend:     \`${FRONTEND_SHORT:-<not in promotion set>}\`"
+            echo "- user-service: \`${USER_SERVICE_SHORT:-<not in promotion set>}\`"
+            echo "- landing:      \`${LANDING_SHORT:-<not in promotion set>}\`"
+            echo ""
+            echo "_Note: per-service shorts and \`commit_sha\` come from different namespaces (image SHA vs deploy-repo HEAD). Identity match is informational only — the gate semantics are 'latest stg verify succeeded within freshness window'._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$result" != "success" ]; then
+            echo "::error::Latest stg-verify-result is \`${result}\` (not success). Blocking prod-promote."
+            echo "gate_result=blocked-failed-verify" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$age_seconds" -gt "$max_age_seconds" ]; then
+            echo "::error::stg verify is stale: artifact age=${age_hours}h exceeds max ${MAX_AGE_HOURS}h. Re-run verify-deploy.yml against current stg state, or raise stg_verify_max_age_hours if accepting risk."
+            echo "gate_result=blocked-stale" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "stg-verify gate PASSED."
+          echo "gate_result=passed" >> "$GITHUB_OUTPUT"
+
   retag:
     name: Retag ${{ matrix.key }} (stg → prod)
-    needs: plan
+    needs: [plan, gate-stg-verify]
     runs-on: ubuntu-latest
     # The production GH Environment carries the manual-approval reviewer rule.
     # This job does NOT touch a VPS — it only rewrites tags at GHCR. The
