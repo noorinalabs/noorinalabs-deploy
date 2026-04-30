@@ -156,22 +156,57 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 
 ## Observability
 
-**Status: aspirational — deferred to W11 follow-up [`deploy#161`](https://github.com/noorinalabs/noorinalabs-deploy/issues/161).**
+**Status: implemented — [`deploy#161`](https://github.com/noorinalabs/noorinalabs-deploy/issues/161) (P3W1) wired the textfile-collector plumbing and landed the Prometheus alert.**
 
-The intended end state is a Prometheus alert `UserServiceAlembicGateFailure` that fires when the gate fails — short `for:` interval because the gate is one-shot and a miss is always actionable. The infrastructure to support this (textfile-collector writeout in `db-migrate.yml`, `--collector.textfile.directory=` flag + volume mount on `node-exporter` in `compose/docker-compose.prod.yml`) is **not** in place today. That plumbing is tracked in `deploy#161`.
+Gate runs emit two gauges to node-exporter's textfile collector via an `if: always()` SSH step in `db-migrate.yml`. The metric file lives at `/var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom` on the VPS (mode 0644, written by the `deploy` user via temp + atomic rename). The host directory is provisioned as a one-time runbook step on each VPS (`mkdir -p /var/lib/node_exporter/textfile_collector && chown deploy:deploy && chmod 0775`); the `node-exporter` service in `compose/docker-compose.prod.yml` mounts that directory read-only and reads the file on each scrape.
 
-Until #161 lands, gate failures surface via:
+Metric schema:
 
-1. **GitHub Actions UI** — the `Report migration result` step in `db-migrate.yml` writes a structured summary to `$GITHUB_STEP_SUMMARY` for every run (success or failure) including env, image tag, expected head, and the `migrated` boolean. The runbook link is included on failure.
-2. **Caller workflow signal** — the reusable workflow's `migrated` output is `false` (and the job result is `failure`) on any gate failure, which the promotion workflow (#155 → `promote.yml`) gates on. A failed stg gate hard-stops before prod manual-approval is even offered.
-3. **On-call escalation** — the table above (§ Escalation) lists primary/secondary owners per failure class. Until the Prometheus alert exists, the on-call engineer learns of a failure when the promotion workflow surfaces a failed run.
+```
+user_service_alembic_gate_last_run_success{env="..."} <0|1>
+user_service_alembic_gate_last_run_timestamp_seconds{env="..."} <unix-ts>
+```
+
+Alerts (`infra/prometheus/alerts.yml` group `db_migrate`) — two distinct rules so on-call can discriminate failure modes at first sight:
+
+| Alert | Expression | Fires when | Operator action |
+|-------|-----------|-----------|------------------|
+| `UserServiceAlembicGateFailure` | `_success == 0` | The most recent gate run returned `_success=0` (and has not been replaced by a successful run since) | Walk § Failure Modes above to discriminate heads-count vs `alembic upgrade head` failure; fix upstream and re-promote. |
+| `UserServiceAlembicGateStale` | `(time() - _timestamp) > 86400` | The most recent gate timestamp is older than 24h | Check `Deploy to staging` / `Promote to production` workflow runs first. If they ran but the metric didn't move, the textfile emission step or node-exporter scrape is broken. If they didn't run, the upstream pipeline (notify-deploy / repository_dispatch / ghcr-publish) is broken. |
+
+Both severities are `critical` and `for: 0m` — the gate is one-shot and every signal is operator-actionable; flap suppression isn't needed at this layer. Severity matches the § Escalation table above.
+
+Gate failures surface via:
+
+1. **Prometheus alert** (above) — routed through Alertmanager per `infra/alertmanager/alertmanager.yml` warning-severity rules.
+2. **GitHub Actions UI** — the `Report migration result` step in `db-migrate.yml` writes a structured summary to `$GITHUB_STEP_SUMMARY` for every run (success or failure) including env, image tag, expected head, and the `migrated` boolean. The runbook link is included on failure.
+3. **Caller workflow signal** — the reusable workflow's `migrated` output is `false` (and the job result is `failure`) on any gate failure, which the promotion workflow (#155 → `promote.yml`) gates on. A failed stg gate hard-stops before prod manual-approval is even offered.
+4. **On-call escalation** — the table above (§ Escalation) lists primary/secondary owners per failure class.
+
+### Operator: recovering the textfile_collector directory
+
+The host directory is provisioned automatically by Terraform cloud-init on every VPS — see `terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl` (the `runcmd:` block creates `/var/lib/node_exporter/textfile_collector` at first boot, owned `deploy:deploy` mode `0755`). **This recipe is for recovery only**, not bootstrap. Reach for it if:
+
+- The directory is missing or has wrong perms on a long-lived VPS (someone manually deleted it, partial restore from backup, etc.).
+- The cloud-init template was changed in a way that didn't run on existing VPSes (cloud-init only fires once on first boot).
+- An ad-hoc rebuild of the alert plumbing without re-running terraform.
+
+The most common observable symptom is the `Emit textfile-collector metrics on VPS` step in `db-migrate.yml` failing with `ERROR: /var/lib/node_exporter/textfile_collector is not writable by deploy user.` — this means cloud-init didn't fire (or its provisioning was overwritten). On the affected VPS, check `cloud-init status --long` first to confirm the diagnosis, then apply the recovery recipe:
+
+```bash
+sudo mkdir -p /var/lib/node_exporter/textfile_collector
+sudo chown deploy:deploy /var/lib/node_exporter/textfile_collector
+sudo chmod 0755 /var/lib/node_exporter/textfile_collector
+```
+
+Note: as of #210 the `Emit` step **fails loud** rather than silently auto-creating a wrong-perm directory. If the directory is missing OR exists but is not writable by `deploy`, the SSH step exits non-zero and the gate run is marked failed. This catches Docker's default-create-on-bind behavior (root:root 0755) on a fresh VPS where cloud-init didn't run — without fail-loud, the metric would silently never land and the alert would be silently dark.
 
 ## Related issues
 
-- **deploy#85** — this PR.
-- **deploy#155** — promotion workflow that will call this gate (merged 2026-04-23, produced `promote.yml` + `deploy-stg.yml` + `deploy-prod.yml`). Issue #84.
-- **deploy#160** — wires `promote.yml` to `uses: ./.github/workflows/db-migrate.yml`. Follow-up.
-- **deploy#161** — textfile-collector plumbing for the deferred `UserServiceAlembicGateFailure` Prometheus alert. P2W11.
+- **deploy#85** — original gate PR (this runbook authored alongside).
+- **deploy#155** — promotion workflow that calls this gate (merged 2026-04-23, produced `promote.yml` + `deploy-stg.yml` + `deploy-prod.yml`). Issue #84.
+- **deploy#160** — wired `promote.yml` to `uses: ./.github/workflows/db-migrate.yml` (P3W1, merged).
+- **deploy#161** — this section's textfile-collector plumbing + `UserServiceAlembicGate{Failure,Stale}` alerts (P3W1).
 - **user-service#80** — alembic merge migration producing revision `0040`. Upstream unblock.
 - **user-service#63** — original alembic merge migration issue (closed by #80).
 - **deploy#141** — fresh-volume alembic-in-compose-up init container. Out of scope here.

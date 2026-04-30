@@ -216,6 +216,91 @@ jobs:
             exit 1
           fi
 
+      # Textfile-collector emission (deploy#161). Writes a .prom file on the
+      # VPS host that node-exporter scrapes via its textfile collector. Both
+      # success AND failure paths emit (`if: always()`); the heads-count
+      # assertion failure and the `alembic upgrade head` failure both result
+      # in `steps.record.outputs.migrated == 'false'`, which we map to
+      # `_success=0`. Prometheus alert `UserServiceAlembicGateFailure` reads
+      # the `_success` gauge with a `_timestamp` freshness filter so a
+      # promotion-less hour doesn't fire.
+      #
+      # Atomic write discipline: writes go to a `.prom.$$` temp path in the
+      # same directory and `mv` (atomic on the same filesystem) into place.
+      # node-exporter's textfile collector reads files lazily; without atomic
+      # rename it could read a half-written file and parse-fail.
+      #
+      # Schema (mode 0644, env label matches `inputs.env`):
+      #   user_service_alembic_gate_last_run_success{env="..."} <0|1>
+      #   user_service_alembic_gate_last_run_timestamp_seconds{env="..."} <unix-ts>
+      - name: Emit textfile-collector metrics on VPS
+        if: always()
+        uses: appleboy/ssh-action@v1
+        env:
+          ENV_NAME: ${{ inputs.env }}
+          MIGRATED: ${{ steps.record.outputs.migrated }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: ENV_NAME,MIGRATED
+          script: |
+            set -euo pipefail
+            TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+            FINAL="${TEXTFILE_DIR}/user_service_alembic_gate.prom"
+            TMP="${FINAL}.$$"
+
+            # Bootstrap-permissions check (Bereket #210 manager-direct
+            # review, 2026-04-30). The host dir is provisioned by
+            # cloud-init for fresh VPSes (terraform/hetzner/modules/
+            # hetzner-vps/cloud-init.yaml.tpl) — but if cloud-init didn't
+            # fire (DR-restore that bypassed TF, blue-green VPS swap with
+            # an older snapshot), Docker's default-create-on-bind behavior
+            # creates the dir as root:root 0755. A simple `if [ ! -d ... ]`
+            # would see the dir as "present" and fall through to a
+            # permission-denied `mv` later — silent metric loss.
+            #
+            # Check write access explicitly. Fail loud rather than silent
+            # fall-through so on-call notices via the failed SSH step
+            # rather than silently-stale `_success=1` from yesterday.
+            if ! [ -w "${TEXTFILE_DIR}" ]; then
+              echo "ERROR: ${TEXTFILE_DIR} is not writable by deploy user." >&2
+              echo "       This usually means cloud-init did not fire (fresh VPS" >&2
+              echo "       provisioning issue, or DR-restored VPS that bypassed TF)." >&2
+              echo "       Investigate via 'cloud-init status --long' on the VPS;" >&2
+              echo "       fix per docs/runbooks/user-service-alembic.md#observability" >&2
+              echo "       (recovery section)." >&2
+              exit 1
+            fi
+
+            # Map the runner-side `migrated` boolean to a 0|1 gauge value.
+            # Anything other than the literal string "true" → 0 (failure),
+            # which covers both the heads-count assertion failure path and
+            # the `alembic upgrade head` failure path (record step sets
+            # migrated=false in both cases). An empty MIGRATED (e.g., the
+            # record step itself crashed) also maps to 0 — fail-loud default.
+            if [ "${MIGRATED}" = "true" ]; then
+              SUCCESS=1
+            else
+              SUCCESS=0
+            fi
+            NOW="$(date -u +%s)"
+
+            {
+              echo "# HELP user_service_alembic_gate_last_run_success 1 if the most recent alembic pre-deploy gate run succeeded for the labeled env, else 0."
+              echo "# TYPE user_service_alembic_gate_last_run_success gauge"
+              echo "user_service_alembic_gate_last_run_success{env=\"${ENV_NAME}\"} ${SUCCESS}"
+              echo "# HELP user_service_alembic_gate_last_run_timestamp_seconds Unix timestamp of the most recent alembic pre-deploy gate run for the labeled env."
+              echo "# TYPE user_service_alembic_gate_last_run_timestamp_seconds gauge"
+              echo "user_service_alembic_gate_last_run_timestamp_seconds{env=\"${ENV_NAME}\"} ${NOW}"
+            } > "${TMP}"
+            chmod 0644 "${TMP}"
+            # Atomic rename — safe against node-exporter read race. Same fs
+            # by construction (both paths under TEXTFILE_DIR).
+            mv -f "${TMP}" "${FINAL}"
+            echo "Wrote ${FINAL}: success=${SUCCESS} timestamp=${NOW} env=${ENV_NAME}"
+            cat "${FINAL}"
+
       - name: Report migration result
         if: always()
         run: |

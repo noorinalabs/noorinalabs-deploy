@@ -109,6 +109,81 @@ groups:
             The last successful backup was more than 24 hours ago.
           runbook: "docs/deployment/alerting.md#backupfailure"
 
+  # Alerts for the alembic pre-deploy gate (deploy#161). Two distinct
+  # failure modes share the same metric source but warrant separate alerts
+  # so on-call can disambiguate at first sight (Bereket's manager-direct
+  # review call):
+  #
+  #   - Failure: gate ran, returned _success=0. Promotion blocked at the
+  #     pre-deploy step. Severity critical, for: 0m — the gate is one-shot
+  #     and every miss is operator-actionable.
+  #
+  #   - Stale: gate hasn't run in 24h. Could mean a broken promotion
+  #     pipeline upstream (e.g., notify-deploy.yml not firing, GHCR auth
+  #     drift), or simply a quiet 24h with no user-service pushes. On-call
+  #     should check the upstream signal before assuming a fault.
+  #
+  # The metrics are emitted to the host-side textfile collector at
+  # /var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom
+  # by db-migrate.yml's `Emit textfile-collector metrics on VPS` step
+  # (`if: always()`, atomic temp+rename, mode 0644). Both heads-count and
+  # `alembic upgrade head` failure paths produce _success=0.
+  #
+  # These alerts were originally drafted in deploy#153 but deferred during
+  # review (commit 76d7d7f) pending textfile plumbing; this group lands
+  # alongside the plumbing in #161 as one atomic delivery.
+  - name: db_migrate
+    rules:
+      - alert: UserServiceAlembicGateFailure
+        # Bare equality on _success — no freshness filter. Bereket's
+        # truth-table on the manager-direct review (PR #210 review,
+        # 2026-04-30) showed an `< 3600` AND clause silenced exactly the
+        # failures we want to catch: a stuck `_success=0` after the
+        # deduplication window aged out (e.g., a gate that failed hours
+        # ago and nothing has re-run it since) would silently clear, even
+        # though promotion is still blocked. Staleness doesn't make
+        # `_success=0` less true. The orthogonal "nothing has run"
+        # concern is captured by `UserServiceAlembicGateStale` below.
+        expr: |
+          user_service_alembic_gate_last_run_success == 0
+        for: 0m
+        labels:
+          severity: critical
+          service: user-service
+        annotations:
+          summary: "user-service alembic gate FAILED in {{ $labels.env }}"
+          description: >-
+            The most recent db-migrate run for user-service in {{ $labels.env }}
+            reported _success=0. Promotion is blocked at the pre-deploy gate
+            until a successful run replaces this metric. Both the heads-count
+            assertion failure path and the `alembic upgrade head` failure
+            path land here — see the runbook's Failure Modes section to
+            discriminate.
+          runbook: "docs/runbooks/user-service-alembic.md#observability"
+
+      - alert: UserServiceAlembicGateStale
+        # Distinct from Failure: the gate hasn't even run in 24h. Either the
+        # promotion pipeline upstream is broken (notify-deploy not firing,
+        # GHCR auth drift, etc.) or there have been no user-service pushes
+        # for a day. On-call should check upstream first before assuming a
+        # fault. `> 86400` flags silence beyond a day.
+        expr: |
+          (time() - user_service_alembic_gate_last_run_timestamp_seconds) > 86400
+        for: 0m
+        labels:
+          severity: critical
+          service: user-service
+        annotations:
+          summary: "user-service alembic gate has not run in {{ $labels.env }} for >24h"
+          description: >-
+            The pre-deploy gate metric for {{ $labels.env }} is older than
+            24 hours. Either no user-service push has triggered a promotion
+            in the last day (benign — confirm via the recent PR list and
+            ghcr-publish runs), or the promotion pipeline upstream is
+            broken. Check the latest `Deploy to staging` and `Promote to
+            production` runs before assuming the gate itself is at fault.
+          runbook: "docs/runbooks/user-service-alembic.md#observability"
+
   - name: blackbox_probes
     rules:
       # Any of the 6 prod-route probes failing for >2m. Companion to the
