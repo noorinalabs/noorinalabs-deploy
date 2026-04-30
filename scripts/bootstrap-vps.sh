@@ -153,6 +153,16 @@ RATE_LIMIT_WINDOW_SECONDS=60
 DATA_RAW_DIR=./data/raw
 DATA_STAGING_DIR=./data/staging
 DATA_CURATED_DIR=./data/curated
+
+# Backblaze B2 — backup credentials [REQUIRED for backup timer]
+# Consumed by scripts/backup.sh:59-61. Scope: read+write+delete on the
+# isnad-graph-backups bucket only (separate from PIPELINE_B2_* ingest scope
+# and TF_STATE_B2_* terraform backend scope). The deploy-{stg,prod}.yml
+# workflows populate these from BACKUP_B2_* GH secrets; manual operators
+# bootstrapping a new VPS must fill these in by hand. See deploy#188.
+B2_KEY_ID=CHANGE-ME
+B2_APP_KEY=CHANGE-ME
+B2_BUCKET=isnad-graph-backups
 ENVEOF
   chmod 600 "$ENV_FILE"
   chown $DEPLOY_USER:$DEPLOY_USER "$ENV_FILE"
