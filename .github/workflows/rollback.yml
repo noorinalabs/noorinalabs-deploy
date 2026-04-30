@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag to roll back to (e.g., sha-a1b2c3d, phase12-wave1)'
+        description: 'Image tag to roll back to (e.g., sha-a1b2c3d, phase12-wave1). Drives api+frontend (which share IMAGE_TAG) and is the default for user-service / landing if their per-service override is left blank.'
         required: true
       service:
         description: 'Service to roll back'
@@ -13,7 +13,17 @@ on:
           - all
           - api
           - frontend
+          - user-service
+          - landing
         default: 'all'
+      user_service_image_tag:
+        description: 'Override tag for user-service (optional, defaults to image_tag). user-service is independently tagged via USER_SERVICE_IMAGE_TAG.'
+        required: false
+        default: ''
+      landing_image_tag:
+        description: 'Override tag for landing (optional, defaults to image_tag). landing is independently tagged via LANDING_IMAGE_TAG.'
+        required: false
+        default: ''
 
 concurrency:
   group: deploy-production
@@ -31,31 +41,68 @@ jobs:
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
           ROLLBACK_SERVICE: ${{ inputs.service }}
+          USER_SERVICE_IMAGE_TAG_OVERRIDE: ${{ inputs.user_service_image_tag }}
+          LANDING_IMAGE_TAG_OVERRIDE: ${{ inputs.landing_image_tag }}
         with:
           host: ${{ vars.VPS_HOST }}
           username: deploy
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          envs: IMAGE_TAG,ROLLBACK_SERVICE
+          envs: IMAGE_TAG,ROLLBACK_SERVICE,USER_SERVICE_IMAGE_TAG_OVERRIDE,LANDING_IMAGE_TAG_OVERRIDE
           script: |
             set -euo pipefail
             cd /opt/noorinalabs-deploy
 
             echo "==> Rolling back ${ROLLBACK_SERVICE} to image tag: ${IMAGE_TAG}"
 
-            # Update IMAGE_TAG in .env
-            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=\"${IMAGE_TAG}\"/" .env
-
             if [ "$ROLLBACK_SERVICE" = "all" ]; then
-              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull api frontend 2>/dev/null || true
-              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate api frontend
+              SERVICES=(api frontend user-service landing)
             else
-              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull "$ROLLBACK_SERVICE" 2>/dev/null || true
-              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate "$ROLLBACK_SERVICE"
+              SERVICES=("$ROLLBACK_SERVICE")
             fi
+
+            # Resolve which env vars in .env need updating, given that:
+            #   - api + frontend share IMAGE_TAG (compose: ${IMAGE_TAG:-latest})
+            #   - user-service uses USER_SERVICE_IMAGE_TAG
+            #   - landing uses LANDING_IMAGE_TAG
+            US_TAG="${USER_SERVICE_IMAGE_TAG_OVERRIDE:-$IMAGE_TAG}"
+            LD_TAG="${LANDING_IMAGE_TAG_OVERRIDE:-$IMAGE_TAG}"
+
+            update_env_var() {
+              local var="$1" val="$2"
+              if grep -qE "^${var}=" .env; then
+                sed -i "s/^${var}=.*/${var}=\"${val}\"/" .env
+              else
+                printf '%s="%s"\n' "$var" "$val" >> .env
+              fi
+            }
+
+            for svc in "${SERVICES[@]}"; do
+              case "$svc" in
+                api|frontend)
+                  update_env_var IMAGE_TAG "$IMAGE_TAG"
+                  echo "  ${svc} -> ${IMAGE_TAG} (via IMAGE_TAG)"
+                  ;;
+                user-service)
+                  update_env_var USER_SERVICE_IMAGE_TAG "$US_TAG"
+                  echo "  ${svc} -> ${US_TAG} (via USER_SERVICE_IMAGE_TAG)"
+                  ;;
+                landing)
+                  update_env_var LANDING_IMAGE_TAG "$LD_TAG"
+                  echo "  ${svc} -> ${LD_TAG} (via LANDING_IMAGE_TAG)"
+                  ;;
+              esac
+            done
+
+            for svc in "${SERVICES[@]}"; do
+              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull "$svc" 2>/dev/null || true
+              docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate "$svc"
+            done
 
             sleep 15
             echo "==> Rollback complete. Verifying health..."
-            docker compose -p noorinalabs -f compose/docker-compose.prod.yml ps --format '{{.Name}}\t{{.Status}}'
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml ps \
+              --format '{{.Name}}\t{{.Status}}' \
+              api frontend user-service landing
 
       - name: Report rollback status
         if: always()
@@ -64,4 +111,10 @@ jobs:
             echo "## Rollback: ${{ job.status }}"
             echo "- **Service:** ${{ inputs.service }}"
             echo "- **Target tag:** ${{ inputs.image_tag }}"
+            if [ -n "${{ inputs.user_service_image_tag }}" ]; then
+              echo "- **user-service override:** ${{ inputs.user_service_image_tag }}"
+            fi
+            if [ -n "${{ inputs.landing_image_tag }}" ]; then
+              echo "- **landing override:** ${{ inputs.landing_image_tag }}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
