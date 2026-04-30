@@ -171,7 +171,7 @@ Alerts (`infra/prometheus/alerts.yml` group `db_migrate`) — two distinct rules
 
 | Alert | Expression | Fires when | Operator action |
 |-------|-----------|-----------|------------------|
-| `UserServiceAlembicGateFailure` | `_success == 0 and on (env) (time() - _timestamp < 3600)` | A gate run in the last hour returned `_success=0` | Walk § Failure Modes above to discriminate heads-count vs `alembic upgrade head` failure; fix upstream and re-promote. |
+| `UserServiceAlembicGateFailure` | `_success == 0` | The most recent gate run returned `_success=0` (and has not been replaced by a successful run since) | Walk § Failure Modes above to discriminate heads-count vs `alembic upgrade head` failure; fix upstream and re-promote. |
 | `UserServiceAlembicGateStale` | `(time() - _timestamp) > 86400` | The most recent gate timestamp is older than 24h | Check `Deploy to staging` / `Promote to production` workflow runs first. If they ran but the metric didn't move, the textfile emission step or node-exporter scrape is broken. If they didn't run, the upstream pipeline (notify-deploy / repository_dispatch / ghcr-publish) is broken. |
 
 Both severities are `critical` and `for: 0m` — the gate is one-shot and every signal is operator-actionable; flap suppression isn't needed at this layer. Severity matches the § Escalation table above.
