@@ -12,7 +12,9 @@
 # intentionally NOT invoked by `verify-deploy.yml` anymore.
 #
 # Usage:
-#   ./scripts/verify_deployment.sh [--site URL] [--skip-workflow] [--skip-ssl]
+#   ./scripts/verify_deployment.sh [--site=URL] [--landing=URL]
+#                                  [--user-service=URL] [--skip-workflow]
+#                                  [--skip-ssl]
 #
 # Environment:
 #   SITE_URL              Override the default API host URL
@@ -59,7 +61,9 @@ for arg in "$@"; do
     --skip-workflow) SKIP_WORKFLOW=true ;;
     --skip-ssl) SKIP_SSL=true ;;
     --help|-h)
-      head -22 "$0" | tail -20
+      # Print the leading comment block (Usage + Environment sections).
+      # Stops at the first non-comment, non-blank line.
+      awk '/^#!/ {next} /^#/ {print substr($0,3); next} {exit}' "$0"
       exit 0
       ;;
   esac
@@ -157,16 +161,30 @@ fi
 
 # ---------- 3b. User-Service Health (deploy#73) ----------
 
-# Two routes are tried in order, mirroring the prod-smoke script:
-#   1. ${USER_SERVICE_URL}/api/v1/user-service/health  (Caddy rewrite path,
-#      used today while user-service traffic shares the API host)
-#   2. ${USER_SERVICE_URL}/health                       (direct subdomain
-#      path that becomes canonical post-deploy#156 cutover)
-# Whichever returns HTTP 200 first wins. If neither responds, fail loud.
+# Two routes exist depending on the deploy#156 cutover state:
+#   1. /api/v1/user-service/health — Caddy rewrite at caddy/Caddyfile:88-89
+#      that proxies to user-service:8000. Used today while user-service
+#      traffic shares the API host with isnad-graph.
+#   2. /health — direct path on the user-service subdomain after the #156
+#      cutover lands `users.noorinalabs.com` as a separate site block.
+#
+# IMPORTANT: pre-#156, /health on the SHARED host hits **isnad-graph's**
+# /health (caddy/Caddyfile:101 — `handle /health { reverse_proxy api:8000 }`),
+# NOT user-service. So the second-route fallback is only correct when an
+# explicit subdomain URL was passed via --user-service= or the
+# USER_SERVICE_URL env var; if USER_SERVICE_URL == SITE_URL, that fallback
+# would falsely report user-service healthy when only isnad-graph is up
+# (Aisha review on PR #206, hot spot 4 — flagged 2026-04-30).
 if [ -n "$USER_SERVICE_URL" ]; then
   section "User-Service Health Check"
   us_resolved=false
   for us_path in "/api/v1/user-service/health" "/health"; do
+    # Skip the /health fallback on the shared host — it routes to
+    # isnad-graph, not user-service. Only safe to probe /health when an
+    # explicit user-service subdomain (post-#156) was passed.
+    if [ "$us_path" = "/health" ] && [ "$USER_SERVICE_URL" = "$SITE_URL" ]; then
+      continue
+    fi
     us_url="${USER_SERVICE_URL}${us_path}"
     us_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "$us_url" 2>/dev/null || echo "000")
     if [ "$us_code" = "200" ]; then
@@ -176,7 +194,11 @@ if [ -n "$USER_SERVICE_URL" ]; then
     fi
   done
   if [ "$us_resolved" = "false" ]; then
-    fail "User-service health unreachable at $USER_SERVICE_URL (tried /api/v1/user-service/health and /health)"
+    if [ "$USER_SERVICE_URL" = "$SITE_URL" ]; then
+      fail "User-service health unreachable at ${USER_SERVICE_URL}/api/v1/user-service/health (Caddy rewrite path; the /health fallback only applies post-#156 with a separate user-service subdomain)"
+    else
+      fail "User-service health unreachable at $USER_SERVICE_URL (tried /api/v1/user-service/health and /health)"
+    fi
   fi
 fi
 
