@@ -138,13 +138,17 @@ groups:
   - name: db_migrate
     rules:
       - alert: UserServiceAlembicGateFailure
-        # Single PromQL expression with the freshness filter inline (Bereket
-        # spec). `< 3600` ensures we only fire on gate failures that
-        # actually happened in the last hour — a stale _success=0 from a
-        # past incident doesn't re-fire here.
+        # Bare equality on _success — no freshness filter. Bereket's
+        # truth-table on the manager-direct review (PR #210 review,
+        # 2026-04-30) showed an `< 3600` AND clause silenced exactly the
+        # failures we want to catch: a stuck `_success=0` after the
+        # deduplication window aged out (e.g., a gate that failed hours
+        # ago and nothing has re-run it since) would silently clear, even
+        # though promotion is still blocked. Staleness doesn't make
+        # `_success=0` less true. The orthogonal "nothing has run"
+        # concern is captured by `UserServiceAlembicGateStale` below.
         expr: |
           user_service_alembic_gate_last_run_success == 0
-          and on (env) (time() - user_service_alembic_gate_last_run_timestamp_seconds < 3600)
         for: 0m
         labels:
           severity: critical
@@ -153,11 +157,11 @@ groups:
           summary: "user-service alembic gate FAILED in {{ $labels.env }}"
           description: >-
             The most recent db-migrate run for user-service in {{ $labels.env }}
-            reported _success=0 within the last hour. Promotion is blocked at
-            the pre-deploy gate. Investigate via the runbook before retrying.
-            Both the heads-count assertion failure path and the
-            `alembic upgrade head` failure path land here — see the runbook's
-            Failure Modes section to discriminate.
+            reported _success=0. Promotion is blocked at the pre-deploy gate
+            until a successful run replaces this metric. Both the heads-count
+            assertion failure path and the `alembic upgrade head` failure
+            path land here — see the runbook's Failure Modes section to
+            discriminate.
           runbook: "docs/runbooks/user-service-alembic.md#observability"
 
       - alert: UserServiceAlembicGateStale

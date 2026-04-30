@@ -187,11 +187,11 @@ Gate failures surface via:
 
 The host directory is provisioned automatically by Terraform cloud-init on every VPS — see `terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl` (the `runcmd:` block creates `/var/lib/node_exporter/textfile_collector` at first boot, owned `deploy:deploy` mode `0755`). **This recipe is for recovery only**, not bootstrap. Reach for it if:
 
-- The directory is missing on a long-lived VPS (e.g., someone manually deleted `/var/lib/node_exporter/...`, or a partial restore from backup didn't include it).
+- The directory is missing or has wrong perms on a long-lived VPS (someone manually deleted it, partial restore from backup, etc.).
 - The cloud-init template was changed in a way that didn't run on existing VPSes (cloud-init only fires once on first boot).
 - An ad-hoc rebuild of the alert plumbing without re-running terraform.
 
-Recipe:
+The most common observable symptom is the `Emit textfile-collector metrics on VPS` step in `db-migrate.yml` failing with `ERROR: /var/lib/node_exporter/textfile_collector is not writable by deploy user.` — this means cloud-init didn't fire (or its provisioning was overwritten). On the affected VPS, check `cloud-init status --long` first to confirm the diagnosis, then apply the recovery recipe:
 
 ```bash
 sudo mkdir -p /var/lib/node_exporter/textfile_collector
@@ -199,7 +199,7 @@ sudo chown deploy:deploy /var/lib/node_exporter/textfile_collector
 sudo chmod 0755 /var/lib/node_exporter/textfile_collector
 ```
 
-The `Emit textfile-collector metrics on VPS` step in `db-migrate.yml` also self-heals if the directory is missing (logs a `WARN` and creates it `0775`), so a missed-or-deleted dir degrades gracefully. But the canonical bootstrap path is cloud-init, not the workflow's defensive auto-create — if you find the workflow auto-creating on a long-lived VPS, that's an alert in itself: investigate why the cloud-init-provisioned dir disappeared.
+Note: as of #210 the `Emit` step **fails loud** rather than silently auto-creating a wrong-perm directory. If the directory is missing OR exists but is not writable by `deploy`, the SSH step exits non-zero and the gate run is marked failed. This catches Docker's default-create-on-bind behavior (root:root 0755) on a fresh VPS where cloud-init didn't run — without fail-loud, the metric would silently never land and the alert would be silently dark.
 
 ## Related issues
 

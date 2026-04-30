@@ -250,16 +250,27 @@ jobs:
             FINAL="${TEXTFILE_DIR}/user_service_alembic_gate.prom"
             TMP="${FINAL}.$$"
 
-            # Defensive: the host dir should already exist (runbook
-            # provisioning step). If it doesn't, create it 0775 so subsequent
-            # writes succeed; node-exporter compose mount is read-only so it
-            # cannot create. Failing this step quietly would mean the alert
-            # silently never fires; we'd rather log loudly and let on-call
-            # notice via the surrounding job summary.
-            if [ ! -d "${TEXTFILE_DIR}" ]; then
-              echo "WARN: ${TEXTFILE_DIR} missing; creating (one-time)."
-              mkdir -p "${TEXTFILE_DIR}"
-              chmod 0775 "${TEXTFILE_DIR}"
+            # Bootstrap-permissions check (Bereket #210 manager-direct
+            # review, 2026-04-30). The host dir is provisioned by
+            # cloud-init for fresh VPSes (terraform/hetzner/modules/
+            # hetzner-vps/cloud-init.yaml.tpl) — but if cloud-init didn't
+            # fire (DR-restore that bypassed TF, blue-green VPS swap with
+            # an older snapshot), Docker's default-create-on-bind behavior
+            # creates the dir as root:root 0755. A simple `if [ ! -d ... ]`
+            # would see the dir as "present" and fall through to a
+            # permission-denied `mv` later — silent metric loss.
+            #
+            # Check write access explicitly. Fail loud rather than silent
+            # fall-through so on-call notices via the failed SSH step
+            # rather than silently-stale `_success=1` from yesterday.
+            if ! [ -w "${TEXTFILE_DIR}" ]; then
+              echo "ERROR: ${TEXTFILE_DIR} is not writable by deploy user." >&2
+              echo "       This usually means cloud-init did not fire (fresh VPS" >&2
+              echo "       provisioning issue, or DR-restored VPS that bypassed TF)." >&2
+              echo "       Investigate via 'cloud-init status --long' on the VPS;" >&2
+              echo "       fix per docs/runbooks/user-service-alembic.md#observability" >&2
+              echo "       (recovery section)." >&2
+              exit 1
             fi
 
             # Map the runner-side `migrated` boolean to a 0|1 gauge value.
