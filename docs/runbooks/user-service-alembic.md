@@ -167,9 +167,14 @@ user_service_alembic_gate_last_run_success{env="..."} <0|1>
 user_service_alembic_gate_last_run_timestamp_seconds{env="..."} <unix-ts>
 ```
 
-Alert (`infra/prometheus/alerts.yml` group `db_migrate`):
+Alerts (`infra/prometheus/alerts.yml` group `db_migrate`) — two distinct rules so on-call can discriminate failure modes at first sight:
 
-`UserServiceAlembicGateFailure` fires when `_success == 0` AND `(time() - _timestamp) < 3600` for 2 minutes. The freshness clause prevents firing on a promotion-less hour — with no recent run, the timestamp is stale and the AND clause fails.
+| Alert | Expression | Fires when | Operator action |
+|-------|-----------|-----------|------------------|
+| `UserServiceAlembicGateFailure` | `_success == 0 and on (env) (time() - _timestamp < 3600)` | A gate run in the last hour returned `_success=0` | Walk § Failure Modes above to discriminate heads-count vs `alembic upgrade head` failure; fix upstream and re-promote. |
+| `UserServiceAlembicGateStale` | `(time() - _timestamp) > 86400` | The most recent gate timestamp is older than 24h | Check `Deploy to staging` / `Promote to production` workflow runs first. If they ran but the metric didn't move, the textfile emission step or node-exporter scrape is broken. If they didn't run, the upstream pipeline (notify-deploy / repository_dispatch / ghcr-publish) is broken. |
+
+Both severities are `critical` and `for: 0m` — the gate is one-shot and every signal is operator-actionable; flap suppression isn't needed at this layer. Severity matches the § Escalation table above.
 
 Gate failures surface via:
 
@@ -178,17 +183,23 @@ Gate failures surface via:
 3. **Caller workflow signal** — the reusable workflow's `migrated` output is `false` (and the job result is `failure`) on any gate failure, which the promotion workflow (#155 → `promote.yml`) gates on. A failed stg gate hard-stops before prod manual-approval is even offered.
 4. **On-call escalation** — the table above (§ Escalation) lists primary/secondary owners per failure class.
 
-### Operator: provisioning the textfile_collector directory
+### Operator: recovering the textfile_collector directory
 
-The host directory is NOT created automatically by Terraform/cloud-init today (deferred follow-up). On a fresh VPS, run once as the `deploy` user (or root, then chown):
+The host directory is provisioned automatically by Terraform cloud-init on every VPS — see `terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl` (the `runcmd:` block creates `/var/lib/node_exporter/textfile_collector` at first boot, owned `deploy:deploy` mode `0755`). **This recipe is for recovery only**, not bootstrap. Reach for it if:
+
+- The directory is missing on a long-lived VPS (e.g., someone manually deleted `/var/lib/node_exporter/...`, or a partial restore from backup didn't include it).
+- The cloud-init template was changed in a way that didn't run on existing VPSes (cloud-init only fires once on first boot).
+- An ad-hoc rebuild of the alert plumbing without re-running terraform.
+
+Recipe:
 
 ```bash
 sudo mkdir -p /var/lib/node_exporter/textfile_collector
 sudo chown deploy:deploy /var/lib/node_exporter/textfile_collector
-sudo chmod 0775 /var/lib/node_exporter/textfile_collector
+sudo chmod 0755 /var/lib/node_exporter/textfile_collector
 ```
 
-The `Emit textfile-collector metrics on VPS` step in `db-migrate.yml` self-heals if the directory is missing (logs a `WARN` and creates it 0775), so a missed runbook step degrades gracefully — the first gate run after a fresh provision lands cleanly.
+The `Emit textfile-collector metrics on VPS` step in `db-migrate.yml` also self-heals if the directory is missing (logs a `WARN` and creates it `0775`), so a missed-or-deleted dir degrades gracefully. But the canonical bootstrap path is cloud-init, not the workflow's defensive auto-create — if you find the workflow auto-creating on a long-lived VPS, that's an alert in itself: investigate why the cloud-init-provisioned dir disappeared.
 
 ## Related issues
 

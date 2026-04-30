@@ -131,6 +131,20 @@ runcmd:
   - docker volume create user-postgres-data
   - docker volume create user-redis-data
 
+  # node-exporter textfile_collector input directory (deploy#161).
+  # Owned by deploy:deploy because the alembic pre-deploy gate's SSH step
+  # (.github/workflows/db-migrate.yml) writes .prom files here as the
+  # `deploy` user. Mode 0755 so the node-exporter container — which runs
+  # as image-default uid (nobody) inside its container — can read the
+  # files via its read-only bind mount in compose/docker-compose.prod.yml.
+  # No host-side `node_exporter` system user is required: node-exporter
+  # is a container, not a system service. Provisioning this here (TF
+  # cloud-init) rather than as a runbook step prevents silent drift on
+  # fresh VPSes — a missed mkdir would leave the alert silently dark.
+  - mkdir -p /var/lib/node_exporter/textfile_collector
+  - chown deploy:deploy /var/lib/node_exporter/textfile_collector
+  - chmod 0755 /var/lib/node_exporter/textfile_collector
+
   # Install Caddy via official apt repo
   - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   - echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" > /etc/apt/sources.list.d/caddy-stable.list

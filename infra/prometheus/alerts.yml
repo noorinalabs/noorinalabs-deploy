@@ -109,36 +109,76 @@ groups:
             The last successful backup was more than 24 hours ago.
           runbook: "docs/deployment/alerting.md#backupfailure"
 
-  # Alert for the alembic pre-deploy gate (deploy#161). Fires when the most
-  # recent gate run reported _success=0 within the last hour. The 3600s
-  # freshness filter prevents firing on a promotion-less hour: with no
-  # recent run, `time() - last_run_timestamp >= 3600` fails the AND clause
-  # and the alert stays silent. Both heads-count and `alembic upgrade head`
-  # failure paths in `db-migrate.yml` produce _success=0 — see the
-  # textfile-collector emission step there for the metric source.
+  # Alerts for the alembic pre-deploy gate (deploy#161). Two distinct
+  # failure modes share the same metric source but warrant separate alerts
+  # so on-call can disambiguate at first sight (Bereket's manager-direct
+  # review call):
+  #
+  #   - Failure: gate ran, returned _success=0. Promotion blocked at the
+  #     pre-deploy step. Severity critical, for: 0m — the gate is one-shot
+  #     and every miss is operator-actionable. The freshness filter
+  #     (< 3600s on the timestamp gauge) ensures we only fire when there's
+  #     a *recent* failure to act on; a stale _success=0 from yesterday is
+  #     not the same incident as today's gate failing.
+  #
+  #   - Stale: gate hasn't run in 24h. Could mean a broken promotion
+  #     pipeline upstream (e.g., notify-deploy.yml not firing, GHCR auth
+  #     drift), or simply a quiet 24h with no user-service pushes. On-call
+  #     should check the upstream signal before assuming a fault.
   #
   # The metrics are emitted to the host-side textfile collector at
   # /var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom
-  # and scraped by node-exporter (compose/docker-compose.prod.yml).
+  # by db-migrate.yml's `Emit textfile-collector metrics on VPS` step
+  # (`if: always()`, atomic temp+rename, mode 0644). Both heads-count and
+  # `alembic upgrade head` failure paths produce _success=0.
   #
-  # The alert was originally drafted in deploy#153 but deferred during
+  # These alerts were originally drafted in deploy#153 but deferred during
   # review (commit 76d7d7f) pending textfile plumbing; this group lands
   # alongside the plumbing in #161 as one atomic delivery.
   - name: db_migrate
     rules:
       - alert: UserServiceAlembicGateFailure
+        # Single PromQL expression with the freshness filter inline (Bereket
+        # spec). `< 3600` ensures we only fire on gate failures that
+        # actually happened in the last hour — a stale _success=0 from a
+        # past incident doesn't re-fire here.
         expr: |
           user_service_alembic_gate_last_run_success == 0
-          and on (env)
-          (time() - user_service_alembic_gate_last_run_timestamp_seconds < 3600)
-        for: 2m
+          and on (env) (time() - user_service_alembic_gate_last_run_timestamp_seconds < 3600)
+        for: 0m
         labels:
-          severity: warning
+          severity: critical
           service: user-service
         annotations:
-          summary: "user-service alembic gate failed in {{ $labels.env }}"
+          summary: "user-service alembic gate FAILED in {{ $labels.env }}"
           description: >-
             The most recent db-migrate run for user-service in {{ $labels.env }}
             reported _success=0 within the last hour. Promotion is blocked at
             the pre-deploy gate. Investigate via the runbook before retrying.
-          runbook: "docs/runbooks/user-service-alembic.md"
+            Both the heads-count assertion failure path and the
+            `alembic upgrade head` failure path land here — see the runbook's
+            Failure Modes section to discriminate.
+          runbook: "docs/runbooks/user-service-alembic.md#observability"
+
+      - alert: UserServiceAlembicGateStale
+        # Distinct from Failure: the gate hasn't even run in 24h. Either the
+        # promotion pipeline upstream is broken (notify-deploy not firing,
+        # GHCR auth drift, etc.) or there have been no user-service pushes
+        # for a day. On-call should check upstream first before assuming a
+        # fault. `> 86400` flags silence beyond a day.
+        expr: |
+          (time() - user_service_alembic_gate_last_run_timestamp_seconds) > 86400
+        for: 0m
+        labels:
+          severity: critical
+          service: user-service
+        annotations:
+          summary: "user-service alembic gate has not run in {{ $labels.env }} for >24h"
+          description: >-
+            The pre-deploy gate metric for {{ $labels.env }} is older than
+            24 hours. Either no user-service push has triggered a promotion
+            in the last day (benign — confirm via the recent PR list and
+            ghcr-publish runs), or the promotion pipeline upstream is
+            broken. Check the latest `Deploy to staging` and `Promote to
+            production` runs before assuming the gate itself is at fault.
+          runbook: "docs/runbooks/user-service-alembic.md#observability"
