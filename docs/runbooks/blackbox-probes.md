@@ -37,6 +37,15 @@ Investigation steps:
    - SSH to prod and run `docker compose logs --tail 200 blackbox-exporter`.
    - Check for DNS-resolution errors (the container is on `frontend` +
      `backend`; only `frontend` has internet egress).
+   - **Suspect hairpin-NAT** if logs show no DNS errors and the host
+     itself can reach the route (`curl -sSI https://<route>` from the
+     prod shell). blackbox runs on the same prod box that Caddy serves,
+     so it probes its own public FQDN — egress works on Ubuntu 24.04
+     via standard MASQUERADE today, but a future kernel / netfilter /
+     docker-network change can break self-targeted SNAT. Reproduce from
+     inside the container with `docker compose exec blackbox-exporter wget -qO- -S https://<route>`.
+     If hairpin is the cause, do NOT pre-emptively re-shape the
+     topology — file an issue and we'll revisit.
 3. If the route is genuinely down:
    - For `isnad-health` / `user-service-health`: pivot to the
      `ServiceDown` / `ContainerUnhealthy` runbooks — those alerts

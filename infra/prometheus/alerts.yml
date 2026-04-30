@@ -164,8 +164,16 @@ groups:
       # Let's Encrypt, but a renewal failure (rate-limit, ACME outage,
       # disk-full on /data) would silently approach expiry — we want
       # ~7d of warning before the cert dies in prod.
+      #
+      # The `> 0` guard skips probes where the metric is unset (HTTP
+      # targets, or HTTPS probes that never reached TLS handshake) —
+      # without it, the alert fires forever on any non-HTTPS target if
+      # one is ever added to this scrape job.
       - alert: BlackboxCertExpiringSoon
-        expr: probe_ssl_earliest_cert_expiry - time() < 7 * 86400
+        expr: |
+          probe_ssl_earliest_cert_expiry > 0
+          and
+          (probe_ssl_earliest_cert_expiry - time()) < 7 * 86400
         for: 1h
         labels:
           severity: warning
