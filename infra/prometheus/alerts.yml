@@ -108,3 +108,37 @@ groups:
           description: >-
             The last successful backup was more than 24 hours ago.
           runbook: "docs/deployment/alerting.md#backupfailure"
+
+  # Alert for the alembic pre-deploy gate (deploy#161). Fires when the most
+  # recent gate run reported _success=0 within the last hour. The 3600s
+  # freshness filter prevents firing on a promotion-less hour: with no
+  # recent run, `time() - last_run_timestamp >= 3600` fails the AND clause
+  # and the alert stays silent. Both heads-count and `alembic upgrade head`
+  # failure paths in `db-migrate.yml` produce _success=0 — see the
+  # textfile-collector emission step there for the metric source.
+  #
+  # The metrics are emitted to the host-side textfile collector at
+  # /var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom
+  # and scraped by node-exporter (compose/docker-compose.prod.yml).
+  #
+  # The alert was originally drafted in deploy#153 but deferred during
+  # review (commit 76d7d7f) pending textfile plumbing; this group lands
+  # alongside the plumbing in #161 as one atomic delivery.
+  - name: db_migrate
+    rules:
+      - alert: UserServiceAlembicGateFailure
+        expr: |
+          user_service_alembic_gate_last_run_success == 0
+          and on (env)
+          (time() - user_service_alembic_gate_last_run_timestamp_seconds < 3600)
+        for: 2m
+        labels:
+          severity: warning
+          service: user-service
+        annotations:
+          summary: "user-service alembic gate failed in {{ $labels.env }}"
+          description: >-
+            The most recent db-migrate run for user-service in {{ $labels.env }}
+            reported _success=0 within the last hour. Promotion is blocked at
+            the pre-deploy gate. Investigate via the runbook before retrying.
+          runbook: "docs/runbooks/user-service-alembic.md"

@@ -156,15 +156,39 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 
 ## Observability
 
-**Status: aspirational — deferred to W11 follow-up [`deploy#161`](https://github.com/noorinalabs/noorinalabs-deploy/issues/161).**
+**Status: implemented — [`deploy#161`](https://github.com/noorinalabs/noorinalabs-deploy/issues/161) (P3W1) wired the textfile-collector plumbing and landed the Prometheus alert.**
 
-The intended end state is a Prometheus alert `UserServiceAlembicGateFailure` that fires when the gate fails — short `for:` interval because the gate is one-shot and a miss is always actionable. The infrastructure to support this (textfile-collector writeout in `db-migrate.yml`, `--collector.textfile.directory=` flag + volume mount on `node-exporter` in `compose/docker-compose.prod.yml`) is **not** in place today. That plumbing is tracked in `deploy#161`.
+Gate runs emit two gauges to node-exporter's textfile collector via an `if: always()` SSH step in `db-migrate.yml`. The metric file lives at `/var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom` on the VPS (mode 0644, written by the `deploy` user via temp + atomic rename). The host directory is provisioned as a one-time runbook step on each VPS (`mkdir -p /var/lib/node_exporter/textfile_collector && chown deploy:deploy && chmod 0775`); the `node-exporter` service in `compose/docker-compose.prod.yml` mounts that directory read-only and reads the file on each scrape.
 
-Until #161 lands, gate failures surface via:
+Metric schema:
 
-1. **GitHub Actions UI** — the `Report migration result` step in `db-migrate.yml` writes a structured summary to `$GITHUB_STEP_SUMMARY` for every run (success or failure) including env, image tag, expected head, and the `migrated` boolean. The runbook link is included on failure.
-2. **Caller workflow signal** — the reusable workflow's `migrated` output is `false` (and the job result is `failure`) on any gate failure, which the promotion workflow (#155 → `promote.yml`) gates on. A failed stg gate hard-stops before prod manual-approval is even offered.
-3. **On-call escalation** — the table above (§ Escalation) lists primary/secondary owners per failure class. Until the Prometheus alert exists, the on-call engineer learns of a failure when the promotion workflow surfaces a failed run.
+```
+user_service_alembic_gate_last_run_success{env="..."} <0|1>
+user_service_alembic_gate_last_run_timestamp_seconds{env="..."} <unix-ts>
+```
+
+Alert (`infra/prometheus/alerts.yml` group `db_migrate`):
+
+`UserServiceAlembicGateFailure` fires when `_success == 0` AND `(time() - _timestamp) < 3600` for 2 minutes. The freshness clause prevents firing on a promotion-less hour — with no recent run, the timestamp is stale and the AND clause fails.
+
+Gate failures surface via:
+
+1. **Prometheus alert** (above) — routed through Alertmanager per `infra/alertmanager/alertmanager.yml` warning-severity rules.
+2. **GitHub Actions UI** — the `Report migration result` step in `db-migrate.yml` writes a structured summary to `$GITHUB_STEP_SUMMARY` for every run (success or failure) including env, image tag, expected head, and the `migrated` boolean. The runbook link is included on failure.
+3. **Caller workflow signal** — the reusable workflow's `migrated` output is `false` (and the job result is `failure`) on any gate failure, which the promotion workflow (#155 → `promote.yml`) gates on. A failed stg gate hard-stops before prod manual-approval is even offered.
+4. **On-call escalation** — the table above (§ Escalation) lists primary/secondary owners per failure class.
+
+### Operator: provisioning the textfile_collector directory
+
+The host directory is NOT created automatically by Terraform/cloud-init today (deferred follow-up). On a fresh VPS, run once as the `deploy` user (or root, then chown):
+
+```bash
+sudo mkdir -p /var/lib/node_exporter/textfile_collector
+sudo chown deploy:deploy /var/lib/node_exporter/textfile_collector
+sudo chmod 0775 /var/lib/node_exporter/textfile_collector
+```
+
+The `Emit textfile-collector metrics on VPS` step in `db-migrate.yml` self-heals if the directory is missing (logs a `WARN` and creates it 0775), so a missed runbook step degrades gracefully — the first gate run after a fresh provision lands cleanly.
 
 ## Related issues
 

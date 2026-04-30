@@ -611,11 +611,25 @@ services:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/rootfs:ro
+      # Textfile collector input directory (deploy#161). The host path is
+      # owned by the `deploy` user (mode 0775) and populated by the alembic
+      # pre-deploy gate in db-migrate.yml on every run via `if: always()`.
+      # Read-only mount so a compromised node-exporter cannot clobber the
+      # written .prom files. Provisioning of the host directory is a runbook
+      # step today (`mkdir -p /var/lib/node_exporter/textfile_collector &&
+      # chown deploy:deploy && chmod 0775`); cloud-init bake-in is tracked as
+      # a follow-up if Nurul prefers it move to TF.
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro
     command:
       - "--path.procfs=/host/proc"
       - "--path.rootfs=/rootfs"
       - "--path.sysfs=/host/sys"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      # Enable the textfile collector with the directory mounted above.
+      # Files matching `*.prom` are scraped at the interval set by Prometheus
+      # for the node-exporter job. Atomic writes (temp + rename) on the
+      # producer side prevent half-written reads.
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9100/metrics || exit 1"]
       interval: 10s
