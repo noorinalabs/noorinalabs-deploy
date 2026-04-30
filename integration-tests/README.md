@@ -31,10 +31,18 @@ Part of [noorinalabs-main#49](https://github.com/noorinalabs/noorinalabs-main/is
 | Real OAuth provider code-exchange | Hardcoded provider URLs in `src/app/services/oauth.py`; needs a `OAUTH_PROVIDER_BASE_URL` override before a fake-provider container can sit in front | noorinalabs-main#135 |
 | Pipeline worker scenarios | Pipeline (#105–#108) not yet live on wave-9 at the time this harness was written | noorinalabs-main#136 |
 
-## Running locally
+## Run modes
+
+The harness supports two run modes via `RUN_MODE`:
+
+| Mode | Default? | What it does |
+|------|----------|--------------|
+| `hermetic` | yes | Local docker-compose stack, builds from sibling checkouts, full DB+Redis seeding via `seeded_user_factory`. Used by PR CI. |
+| `remote` | no | Skip stack-up; run pytest against env-supplied stg URLs. DB/Redis-direct fixtures auto-skip — effective remote-runnable set today is health + JWKS. |
+
+### Running locally — hermetic (PR-CI default)
 
 ```bash
-# One command
 cd integration-tests
 ./run-tests.sh
 ```
@@ -47,6 +55,31 @@ The script will:
 2. Wait for all health checks to pass
 3. Run the pytest suite inside the `test-runner` container
 4. Tear down the stack on exit (pass `KEEP_STACK=1` to leave it up for debugging)
+
+### Running remotely against stg
+
+```bash
+cd integration-tests
+RUN_MODE=remote \
+  ISNAD_BASE_URL=https://isnad.stg.noorinalabs.com \
+  USER_SERVICE_BASE_URL=https://auth.stg.noorinalabs.com \
+  ./run-tests.sh
+```
+
+Remote mode:
+- Refuses to run against `ENVIRONMENT=prod` (hard guardrail — refuses with
+  exit code 3). Defaults `ENVIRONMENT=stg` if unset.
+- Requires `ISNAD_BASE_URL` and `USER_SERVICE_BASE_URL` (both validated up
+  front via /health probes).
+- Builds the runner image and `docker run`s it directly — no compose
+  stack-up, no sibling-repo checkouts needed.
+- Auto-skips tests that depend on `user_pg`, `user_redis`, or
+  `seeded_user_factory` because direct stg DB/Redis access is not
+  available from outside the VPS. The current effective remote set is
+  `test_health.py` (health endpoints + JWKS publication).
+- Per-test refactors to use stg test-user creds delivered via secrets
+  (so RBAC / sessions / 2FA / subscription flows can run remotely too)
+  are downstream follow-up work — see deploy#178 body.
 
 ## Architecture
 

@@ -20,6 +20,14 @@ import pytest
 
 @pytest.mark.isolation
 def test_isnad_graph_cannot_reach_user_postgres() -> None:
+    # Topology assertion — only meaningful in hermetic mode where we
+    # control the docker-compose network layout. In remote mode the
+    # equivalent invariant is enforced at the VPS firewall + docker
+    # network layer in compose/docker-compose.prod.yml; this in-cluster
+    # probe has no remote analogue.
+    if os.environ.get("RUN_MODE", "hermetic") != "hermetic":
+        pytest.skip("network isolation is a hermetic-only topology assertion")
+
     result = os.environ.get("ISOLATION_CHECK_RESULT", "unknown")
     assert result == "pass", (
         f"Isolation probe result = {result!r}. "
