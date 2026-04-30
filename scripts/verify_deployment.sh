@@ -15,15 +15,35 @@
 #   ./scripts/verify_deployment.sh [--site URL] [--skip-workflow] [--skip-ssl]
 #
 # Environment:
-#   SITE_URL      Override the default site URL (default: https://isnad-graph.noorinalabs.com)
-#   GH_REPO       Override the GitHub repo for workflow checks (default: noorinalabs/noorinalabs-deploy)
-#   ROLLBACK_TAG  If set, tag the current deployment for rollback reference
+#   SITE_URL              Override the default API host URL
+#                         (default: https://isnad-graph.noorinalabs.com)
+#   LANDING_URL           Landing-page URL to check. Empty disables the
+#                         landing reachability check.
+#                         (default: https://noorinalabs.com)
+#   USER_SERVICE_URL      Base URL whose `/health` is hit for the
+#                         user-service auth-plane check. Empty disables.
+#                         (default: $SITE_URL — caddy/Caddyfile routes
+#                         user-service via the same host today; the
+#                         deploy#156 cutover will move it to its own
+#                         subdomain.)
+#   GH_REPO               Override the GitHub repo for workflow checks
+#                         (default: noorinalabs/noorinalabs-deploy)
+#   ROLLBACK_TAG          If set, tag the current deployment for rollback
+#                         reference
 
 set -euo pipefail
 
 # ---------- Configuration ----------
 
 SITE_URL="${SITE_URL:-https://isnad-graph.noorinalabs.com}"
+# Landing-page reachability check (deploy#73). Empty = skip.
+LANDING_URL="${LANDING_URL:-https://noorinalabs.com}"
+# user-service auth-plane health (deploy#73). Empty = skip. Defaults to
+# SITE_URL because today Caddy routes user-service traffic via the same
+# host as the API (caddy/Caddyfile site block); the deploy#156 cutover
+# will move it to https://users.noorinalabs.com — at that point operators
+# pass USER_SERVICE_URL=https://users.noorinalabs.com explicitly.
+USER_SERVICE_URL="${USER_SERVICE_URL:-$SITE_URL}"
 GH_REPO="${GH_REPO:-noorinalabs/noorinalabs-deploy}"
 SKIP_WORKFLOW="${SKIP_WORKFLOW:-false}"
 SKIP_SSL="${SKIP_SSL:-false}"
@@ -34,10 +54,12 @@ TIMEOUT=10
 for arg in "$@"; do
   case "$arg" in
     --site=*) SITE_URL="${arg#*=}" ;;
+    --landing=*) LANDING_URL="${arg#*=}" ;;
+    --user-service=*) USER_SERVICE_URL="${arg#*=}" ;;
     --skip-workflow) SKIP_WORKFLOW=true ;;
     --skip-ssl) SKIP_SSL=true ;;
     --help|-h)
-      head -12 "$0" | tail -10
+      head -22 "$0" | tail -20
       exit 0
       ;;
   esac
@@ -116,6 +138,45 @@ if [ "$health_resolved" = "false" ]; then
     pass "Health endpoint returned HTTP 200 (non-JSON response)"
   else
     fail "Health endpoint unreachable or invalid (HTTP $health_code)"
+  fi
+fi
+
+# ---------- 3a. Landing-Page Reachability (deploy#73) ----------
+
+if [ -n "$LANDING_URL" ]; then
+  section "Landing-Page Reachability"
+  landing_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "$LANDING_URL" 2>/dev/null || echo "000")
+  if [ "$landing_code" = "200" ]; then
+    pass "Landing returns HTTP 200 at $LANDING_URL"
+  elif [ "$landing_code" = "000" ]; then
+    fail "Landing unreachable (timeout/connection error) at $LANDING_URL"
+  else
+    fail "Landing returned HTTP $landing_code at $LANDING_URL"
+  fi
+fi
+
+# ---------- 3b. User-Service Health (deploy#73) ----------
+
+# Two routes are tried in order, mirroring the prod-smoke script:
+#   1. ${USER_SERVICE_URL}/api/v1/user-service/health  (Caddy rewrite path,
+#      used today while user-service traffic shares the API host)
+#   2. ${USER_SERVICE_URL}/health                       (direct subdomain
+#      path that becomes canonical post-deploy#156 cutover)
+# Whichever returns HTTP 200 first wins. If neither responds, fail loud.
+if [ -n "$USER_SERVICE_URL" ]; then
+  section "User-Service Health Check"
+  us_resolved=false
+  for us_path in "/api/v1/user-service/health" "/health"; do
+    us_url="${USER_SERVICE_URL}${us_path}"
+    us_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "$us_url" 2>/dev/null || echo "000")
+    if [ "$us_code" = "200" ]; then
+      pass "User-service health endpoint (${us_path}) returned HTTP 200"
+      us_resolved=true
+      break
+    fi
+  done
+  if [ "$us_resolved" = "false" ]; then
+    fail "User-service health unreachable at $USER_SERVICE_URL (tried /api/v1/user-service/health and /health)"
   fi
 fi
 

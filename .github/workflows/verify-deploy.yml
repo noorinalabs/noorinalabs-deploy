@@ -23,12 +23,33 @@
 # "Deploy to staging" and "Deploy to production" — repointed below as part
 # of deploy#87 (the split is unimplementable otherwise; trigger today fires
 # on a workflow nobody runs).
+#
+# Trigger expansion (deploy#73, P3W1 Round 2):
+#   - "Deploy All Services" — manual-dispatch full-stack prod deploy. Same
+#     environment: production as deploy-prod.yml; benefits from the same
+#     post-deploy smoke battery.
+#   - "Rollback" — manual-dispatch prod tag rollback. A rollback IS a deploy
+#     for verification purposes; the prod stack just changed so smoke-test it.
+#
+# Why NOT add legacy/manual workflows:
+#   - "Deploy noorinalabs-isnad-graph (LEGACY — manual only)" and
+#     "Deploy noorinalabs-landing-page (LEGACY — manual only)" target the
+#     legacy single-VPS box that deploy#86 will decommission. Auto-verify
+#     against legacy-VPS endpoints would smoke against URLs that no longer
+#     resolve once #86 lands. Operators running the legacy paths invoke
+#     scripts/verify_deployment.sh manually if they want post-deploy checks
+#     against the legacy host (the script grew landing + user-service checks
+#     in this same PR for that purpose).
 
 name: Verify Deployment
 
 on:
   workflow_run:
-    workflows: ["Deploy to staging", "Deploy to production"]
+    workflows:
+      - "Deploy to staging"
+      - "Deploy to production"
+      - "Deploy All Services"
+      - "Rollback"
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -244,9 +265,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     environment: production
+    # Multi-trigger acceptance (deploy#73): three prod-touching upstream
+    # workflows now share verify-prod. All produce the same post-state
+    # invariant (prod stack just got rolled forward or back), so the same
+    # smoke battery is the right post-condition for all three. The
+    # workflow_run.name check enumerates them rather than allow-everything
+    # so a future stg-targeting workflow accidentally hitting this trigger
+    # list does not run prod smoke against itself.
     if: >-
       (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.name == 'Deploy to production' &&
+       (github.event.workflow_run.name == 'Deploy to production' ||
+        github.event.workflow_run.name == 'Deploy All Services' ||
+        github.event.workflow_run.name == 'Rollback') &&
        github.event.workflow_run.conclusion == 'success') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'prod')
     steps:
