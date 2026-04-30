@@ -203,10 +203,10 @@ Note: as of #210 the `Emit` step **fails loud** rather than silently auto-creati
 
 ## Related issues
 
-- **deploy#85** — this PR.
-- **deploy#155** — promotion workflow that will call this gate (merged 2026-04-23, produced `promote.yml` + `deploy-stg.yml` + `deploy-prod.yml`). Issue #84.
-- **deploy#160** — wires `promote.yml` to `uses: ./.github/workflows/db-migrate.yml`. Follow-up.
-- **deploy#161** — textfile-collector plumbing for the deferred `UserServiceAlembicGateFailure` Prometheus alert. P2W11.
+- **deploy#85** — original gate PR (this runbook authored alongside).
+- **deploy#155** — promotion workflow that calls this gate (merged 2026-04-23, produced `promote.yml` + `deploy-stg.yml` + `deploy-prod.yml`). Issue #84.
+- **deploy#160** — wired `promote.yml` to `uses: ./.github/workflows/db-migrate.yml` (P3W1, merged).
+- **deploy#161** — this section's textfile-collector plumbing + `UserServiceAlembicGate{Failure,Stale}` alerts (P3W1).
 - **user-service#80** — alembic merge migration producing revision `0040`. Upstream unblock.
 - **user-service#63** — original alembic merge migration issue (closed by #80).
 - **deploy#141** — fresh-volume alembic-in-compose-up init container. Out of scope here.

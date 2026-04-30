@@ -23,3 +23,40 @@ scrape_configs:
   - job_name: "postgres-exporter"
     static_configs:
       - targets: ["postgres-exporter:9187"]
+
+  # blackbox-exporter — continuous external probe of the same 6 prod
+  # routes covered by the post-deploy smoke battery
+  # (scripts/verify_prod_smoke.sh). Each target carries a `route` label
+  # so alerts and dashboards can identify the probed endpoint without
+  # having to URL-decode the __param_target.
+  #
+  # The relabel pipeline is the standard blackbox pattern:
+  #   1. instance label = the URL itself (visible in alerts)
+  #   2. __param_target = URL passed to /probe?target=…
+  #   3. __address__   = blackbox-exporter:9115 (the actual scrape target)
+  - job_name: "blackbox"
+    metrics_path: /probe
+    scrape_interval: 60s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["https://isnad-graph.noorinalabs.com/health"]
+        labels: { route: "isnad-health", module: "http_2xx_json" }
+      - targets: ["https://isnad-graph.noorinalabs.com/api/v1/user-service/health"]
+        labels: { route: "user-service-health", module: "http_2xx" }
+      - targets: ["https://noorinalabs.com/"]
+        labels: { route: "landing-root", module: "http_2xx" }
+      - targets: ["https://isnad-graph.noorinalabs.com/api/v1/narrators?limit=1"]
+        labels: { route: "narrator-401", module: "http_401_json" }
+      - targets: ["https://isnad-graph.noorinalabs.com/.well-known/jwks.json"]
+        labels: { route: "jwks", module: "http_2xx_json" }
+      - targets: ["https://isnad-graph.noorinalabs.com/auth/login"]
+        labels: { route: "auth-login-redirect", module: "http_3xx" }
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [module]
+        target_label: __param_module
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

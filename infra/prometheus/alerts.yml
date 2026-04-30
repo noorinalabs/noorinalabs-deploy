@@ -116,10 +116,7 @@ groups:
   #
   #   - Failure: gate ran, returned _success=0. Promotion blocked at the
   #     pre-deploy step. Severity critical, for: 0m — the gate is one-shot
-  #     and every miss is operator-actionable. The freshness filter
-  #     (< 3600s on the timestamp gauge) ensures we only fire when there's
-  #     a *recent* failure to act on; a stale _success=0 from yesterday is
-  #     not the same incident as today's gate failing.
+  #     and every miss is operator-actionable.
   #
   #   - Stale: gate hasn't run in 24h. Could mean a broken promotion
   #     pipeline upstream (e.g., notify-deploy.yml not firing, GHCR auth
@@ -186,3 +183,80 @@ groups:
             broken. Check the latest `Deploy to staging` and `Promote to
             production` runs before assuming the gate itself is at fault.
           runbook: "docs/runbooks/user-service-alembic.md#observability"
+
+  - name: blackbox_probes
+    rules:
+      # Any of the 6 prod-route probes failing for >2m. Companion to the
+      # post-deploy smoke battery — smoke validates the deploy worked,
+      # this alerts when it stops working between deploys (deploy#183).
+      - alert: BlackboxProbeFailing
+        expr: probe_success == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Blackbox probe failing for {{ $labels.route }}"
+          description: >-
+            The blackbox probe for {{ $labels.route }} ({{ $labels.instance }})
+            has reported probe_success=0 for more than 2 minutes. Smoke
+            battery covers this route post-deploy; this alert catches
+            mid-deploy-window regressions.
+          runbook: "docs/runbooks/blackbox-probes.md#probe-failing"
+
+      # Routes where the smoke battery enforces a specific HTTP status
+      # (e.g. 401 on the narrator check, 3xx on /auth/login). The
+      # blackbox modules already encode "valid" status sets, so a
+      # mismatch surfaces as probe_success=0 — but we still alert
+      # explicitly on the status-code metric so the description tells
+      # operators *what* code came back rather than just "probe failed".
+      - alert: BlackboxUnexpectedStatus
+        expr: |
+          (
+            probe_http_status_code{route="isnad-health"}        != 200
+          ) or (
+            probe_http_status_code{route="user-service-health"} != 200
+          ) or (
+            probe_http_status_code{route="landing-root"}        != 200
+          ) or (
+            probe_http_status_code{route="jwks"}                != 200
+          ) or (
+            probe_http_status_code{route="narrator-401"}        != 401
+            and
+            probe_http_status_code{route="narrator-401"}        != 403
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unexpected HTTP status on {{ $labels.route }}"
+          description: >-
+            Route {{ $labels.route }} returned HTTP {{ $value }}, which is
+            outside the expected set defined in the smoke battery
+            (scripts/verify_prod_smoke.sh).
+          runbook: "docs/runbooks/blackbox-probes.md#unexpected-status"
+
+      # Defense-in-depth cert-expiry warning. Caddy auto-renews via
+      # Let's Encrypt, but a renewal failure (rate-limit, ACME outage,
+      # disk-full on /data) would silently approach expiry — we want
+      # ~7d of warning before the cert dies in prod.
+      #
+      # The `> 0` guard skips probes where the metric is unset (HTTP
+      # targets, or HTTPS probes that never reached TLS handshake) —
+      # without it, the alert fires forever on any non-HTTPS target if
+      # one is ever added to this scrape job.
+      - alert: BlackboxCertExpiringSoon
+        expr: |
+          probe_ssl_earliest_cert_expiry > 0
+          and
+          (probe_ssl_earliest_cert_expiry - time()) < 7 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS cert for {{ $labels.route }} expires in <7 days"
+          description: >-
+            The TLS certificate served at {{ $labels.instance }} expires in
+            {{ $value | humanizeDuration }}. Caddy normally auto-renews
+            ~30 days before expiry, so reaching this threshold indicates
+            renewal is failing.
+          runbook: "docs/runbooks/blackbox-probes.md#cert-expiring-soon"
