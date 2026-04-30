@@ -1,13 +1,107 @@
 #!/usr/bin/env bash
 # Single-command integration test runner.
-# Usage: ./run-tests.sh [pytest args]
-# Env:
+#
+# Modes (set via RUN_MODE; default `hermetic`):
+#
+#   hermetic  — Full local docker-compose stack, builds user-service and
+#               isnad-graph-api from sibling checkouts, seeds DB+Redis
+#               directly. PR-CI default; what `integration-tests.yml` runs.
+#
+#   remote    — Skip stack-up. Point HTTP fixtures at env-supplied stg URLs
+#               (ISNAD_BASE_URL, USER_SERVICE_BASE_URL). DB/Redis-direct
+#               fixtures auto-skip in remote (no direct stg DB access from
+#               outside the VPS), so the effective remote-runnable set today
+#               is health + JWKS. Per-test refactors to use stg test-user
+#               creds via secrets are downstream follow-up work — see #178.
+#
+# Usage:
+#   ./run-tests.sh [pytest args]
+#
+# Env (hermetic):
 #   KEEP_STACK=1  — leave stack up after tests for debugging.
+#
+# Env (remote — required):
+#   ISNAD_BASE_URL          — e.g. https://isnad.stg.noorinalabs.com
+#   USER_SERVICE_BASE_URL   — e.g. https://auth.stg.noorinalabs.com
+#
+# Env (remote — guardrail):
+#   ENVIRONMENT             — must NOT equal "prod"; refused at startup.
+#                             Defaults to "stg" if unset.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+RUN_MODE="${RUN_MODE:-hermetic}"
+
+case "$RUN_MODE" in
+    hermetic|remote) ;;
+    *)
+        echo "ERROR: RUN_MODE must be one of: hermetic, remote (got: $RUN_MODE)" >&2
+        exit 2
+        ;;
+esac
+
+if [[ "$RUN_MODE" == "remote" ]]; then
+    # Hard refusal: never run integration tests against prod, even by accident.
+    # The suite seeds and mutates state via /auth endpoints; running against
+    # prod could create test users in the live user-postgres or trip
+    # rate-limiters that page oncall.
+    : "${ENVIRONMENT:=stg}"
+    if [[ "$ENVIRONMENT" == "prod" || "$ENVIRONMENT" == "production" ]]; then
+        echo "ERROR: refusing to run integration suite against ENVIRONMENT=$ENVIRONMENT." >&2
+        echo "       Remote mode is stg-only. Unset ENVIRONMENT or set ENVIRONMENT=stg." >&2
+        exit 3
+    fi
+
+    : "${ISNAD_BASE_URL:?ISNAD_BASE_URL is required in remote mode}"
+    : "${USER_SERVICE_BASE_URL:?USER_SERVICE_BASE_URL is required in remote mode}"
+
+    # Sanity-check both URLs respond before pytest spends real time. We use
+    # /health on each — same probe verify-prod's smoke battery uses. Failure
+    # here means the runner is fundamentally pointed at the wrong place;
+    # bail before pytest emits a wall of timeouts.
+    echo "--- Probing remote URLs ---"
+    echo "  USER_SERVICE_BASE_URL=$USER_SERVICE_BASE_URL"
+    echo "  ISNAD_BASE_URL=$ISNAD_BASE_URL"
+    echo "  ENVIRONMENT=$ENVIRONMENT"
+
+    mkdir -p reports
+
+    echo "--- Building runner image ---"
+    # docker compose `build` reads docker-compose.test.yml's test-runner
+    # service and produces the image without bringing up depends_on (we
+    # don't `up` anything in remote mode). The image gets a stable repo
+    # tag we can `docker run` directly afterward without resurrecting
+    # any compose state.
+    docker build -f Dockerfile.runner -t noorinalabs-integration-test-runner:remote .
+
+    echo "--- Running integration tests (remote mode) ---"
+    # Run pytest in the same image we use hermetically, but pass URLs +
+    # RUN_MODE through env. Mount tests + reports just like compose does.
+    # No --network arg — runner container reaches the public stg URLs over
+    # the host's default bridge.
+    set +e
+    docker run --rm \
+        -e RUN_MODE=remote \
+        -e ENVIRONMENT="$ENVIRONMENT" \
+        -e ISNAD_BASE_URL="$ISNAD_BASE_URL" \
+        -e USER_SERVICE_BASE_URL="$USER_SERVICE_BASE_URL" \
+        -e USER_SERVICE_URL="$USER_SERVICE_BASE_URL" \
+        -e ISNAD_GRAPH_URL="$ISNAD_BASE_URL" \
+        -v "$SCRIPT_DIR/tests:/app/tests:ro" \
+        -v "$SCRIPT_DIR/reports:/app/reports" \
+        noorinalabs-integration-test-runner:remote \
+        pytest -v --tb=short --junit-xml=/app/reports/junit.xml "$@"
+    ec=$?
+    set -e
+    exit "$ec"
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# Hermetic path (default; unchanged behavior).
+# ─────────────────────────────────────────────────────────────────
 
 COMPOSE="docker compose -f docker-compose.test.yml --env-file .env.test"
 
