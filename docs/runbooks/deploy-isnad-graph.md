@@ -51,18 +51,32 @@ To deploy all 13 services (including infrastructure):
 
 ## Post-Deployment Verification
 
-The `verify-deploy.yml` workflow runs automatically. To run manually:
+`verify-deploy.yml` is split by environment (deploy#87) and runs
+automatically after a successful deploy:
+
+- **Stg deploy** → `verify-stg` job runs the full cross-repo integration
+  suite (`integration-tests/run-tests.sh`). Failure blocks prod-promote
+  (gate enforcement: deploy#179, follow-up).
+- **Prod deploy** → `verify-prod` job runs `scripts/verify_prod_smoke.sh`
+  (<60s smoke battery: health 200s, narrator query, JWKS, auth wiring).
+  Failure surfaces a `::error::` annotation; no auto-rollback.
+
+To run manually:
 
 1. Go to [Actions > Verify Deployment](https://github.com/noorinalabs/noorinalabs-deploy/actions/workflows/verify-deploy.yml)
-2. Click **Run workflow**
+2. Click **Run workflow**, select `target` (`stg` or `prod`)
 
-Or run the script directly on any machine with network access:
+For broader manual verification against an arbitrary env (legacy/operator
+script, not invoked by CI anymore — used by the user-service migration
+runbook):
 
 ```bash
 SITE_URL=https://isnad-graph.noorinalabs.com ./scripts/verify_deployment.sh --skip-workflow
 ```
 
-The script checks: site reachability (HTTP 200), API health endpoint, API status, endpoint smoke tests, security headers, Caddy config, SSL certificate, and response time.
+This broader script checks: site reachability (HTTP 200), API health
+endpoint, API status, endpoint smoke tests, security headers, Caddy
+config, SSL certificate, and response time.
 
 ## Rollback
 

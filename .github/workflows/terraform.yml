@@ -23,16 +23,23 @@ jobs:
         run: terraform fmt -check -recursive terraform/
 
   validate:
-    name: Validate (${{ matrix.module }})
+    # Validates the child module and each env root module independently.
+    # No backend is configured here (-backend=false) so this runs without credentials.
+    name: Validate (${{ matrix.path }})
     needs: fmt
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        module: [hetzner, cloudflare, backblaze]
+        path:
+          - terraform/hetzner/modules/hetzner-vps
+          - terraform/hetzner/envs/stg
+          - terraform/hetzner/envs/prod
+          - terraform/cloudflare
+          - terraform/backblaze
     defaults:
       run:
-        working-directory: terraform/${{ matrix.module }}
+        working-directory: ${{ matrix.path }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -44,14 +51,18 @@ jobs:
         run: terraform validate
 
   plan:
-    name: Plan
+    name: Plan (${{ matrix.env }})
     needs: validate
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [stg, prod]
+    environment: ${{ matrix.env == 'prod' && 'production' || 'staging' }}
     defaults:
       run:
-        working-directory: terraform/hetzner
+        working-directory: terraform/hetzner/envs/${{ matrix.env }}
     env:
       TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
@@ -75,7 +86,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const output = `#### Terraform Plan (hetzner)
+            const envName = '${{ matrix.env }}';
+            const output = `#### Terraform Plan (hetzner/${envName})
             \`\`\`
             ${{ steps.plan.outputs.stdout }}
             \`\`\`
@@ -91,14 +103,22 @@ jobs:
         run: exit 1
 
   apply:
-    name: Apply
+    name: Apply (${{ matrix.env }})
     needs: validate
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: production
+    strategy:
+      fail-fast: false
+      # Apply stg first, then prod — never both in parallel. Matches the
+      # promotion sequencing deploy#84 will codify. Within this workflow, the
+      # max-parallel=1 + ordered matrix gives us stg-before-prod for free.
+      max-parallel: 1
+      matrix:
+        env: [stg, prod]
+    environment: ${{ matrix.env == 'prod' && 'production' || 'staging' }}
     defaults:
       run:
-        working-directory: terraform/hetzner
+        working-directory: terraform/hetzner/envs/${{ matrix.env }}
     env:
       TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}

@@ -1,14 +1,20 @@
-provider "hcloud" {
-  token = var.hcloud_token
+locals {
+  name_prefix = "noorinalabs-${var.env}"
+  labels = {
+    project     = "noorinalabs"
+    environment = var.env
+  }
 }
 
 resource "hcloud_ssh_key" "deploy" {
-  name       = "${var.server_name}-deploy"
-  public_key = file(var.ssh_public_key_path)
+  name       = "${local.name_prefix}-deploy"
+  public_key = sensitive(chomp(file(var.ssh_public_key_path)))
+  labels     = local.labels
 }
 
 resource "hcloud_firewall" "web" {
-  name = "${var.server_name}-firewall"
+  name   = "${local.name_prefix}-firewall"
+  labels = local.labels
 
   # PRODUCTION: restrict ssh_source_ips to your operator IPs or VPN CIDR.
   # The default (0.0.0.0/0) is intentionally open for initial setup only.
@@ -38,25 +44,21 @@ resource "hcloud_firewall" "web" {
 }
 
 resource "hcloud_server" "app" {
-  name        = var.server_name
+  name        = local.name_prefix
   server_type = var.server_type
   location    = var.location
-  image       = "ubuntu-24.04"
+  image       = var.image
 
-  ssh_keys = [hcloud_ssh_key.deploy.id]
-
+  ssh_keys     = [hcloud_ssh_key.deploy.id]
   firewall_ids = [hcloud_firewall.web.id]
 
   user_data = templatefile("${path.module}/cloud-init.yaml.tpl", {
-    ssh_public_key          = file(var.ssh_public_key_path)
+    ssh_public_key          = sensitive(chomp(file(var.ssh_public_key_path)))
     ghcr_auth_b64           = var.ghcr_auth_b64
     user_postgres_password  = var.user_postgres_password
     user_redis_password     = var.user_redis_password
     user_service_jwt_secret = var.user_service_jwt_secret
   })
 
-  labels = {
-    project     = "noorinalabs"
-    environment = "production"
-  }
+  labels = local.labels
 }

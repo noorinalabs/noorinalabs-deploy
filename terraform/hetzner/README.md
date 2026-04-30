@@ -1,149 +1,149 @@
-# Terraform — Hetzner Cloud Provisioning
+# Terraform — Hetzner Cloud per-env provisioning
 
-Provisions a Hetzner Cloud VPS (CPX41) for the NoorinALabs production deployment. All application services (isnad-graph, user-service) run on this single VPS via Docker Compose.
+Provisions two Hetzner Cloud VPS instances:
+
+| Env | Server name | Type | Location | State key |
+|---|---|---|---|---|
+| `stg` | `noorinalabs-stg` | CPX21 (3 vCPU, 4 GB) | Ashburn (ash) | `hetzner/stg.tfstate` |
+| `prod` | `noorinalabs-prod` | CPX41 (8 vCPU, 16 GB) | Ashburn (ash) | `hetzner/prod.tfstate` |
+
+Both envs run the same cloud-init bootstrap (Docker, Caddy, fail2ban, ufw, GHCR auth, user-service env file). All application services run via Docker Compose on the resulting VPS.
+
+## Layout
+
+```
+terraform/hetzner/
+├── README.md                          # this file
+├── modules/
+│   └── hetzner-vps/                   # shared child module
+│       ├── main.tf                    # hcloud_server + firewall + ssh_key
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── versions.tf                # provider constraints ONLY
+│       ├── cloud-init.yaml.tpl
+│       └── README.md
+└── envs/
+    ├── stg/                           # root module — state: hetzner/stg.tfstate
+    │   ├── main.tf                    # provider + module "vps" call
+    │   ├── backend.tf                 # B2 S3 backend, key=hetzner/stg.tfstate
+    │   ├── variables.tf
+    │   ├── outputs.tf
+    │   ├── versions.tf
+    │   └── terraform.tfvars.example
+    └── prod/                          # root module — state: hetzner/prod.tfstate
+        ├── main.tf
+        ├── backend.tf                 # B2 S3 backend, key=hetzner/prod.tfstate
+        ├── variables.tf
+        ├── outputs.tf
+        ├── versions.tf
+        └── terraform.tfvars.example
+```
+
+Each env is a self-contained Terraform root module. **Working directory IS the env selector** — `cd envs/stg` vs `cd envs/prod`. There is no Terraform workspace used; see `docs/adr/0001-tf-hetzner-per-env-state-strategy.md` for why.
 
 ## Deployment Model
 
 ```
-Terraform manages:                Docker Compose manages:
-├── VPS (hcloud_server)           ├── isnad-graph (FastAPI + React)
-├── Firewall (hcloud_firewall)    ├── neo4j
-├── SSH Key (hcloud_ssh_key)      ├── user-service (FastAPI)
-└── cloud-init bootstrap          ├── user-postgres
-                                  ├── user-redis
-                                  └── caddy (reverse proxy)
+Terraform manages:                    Docker Compose manages:
+├── VPS (hcloud_server)               ├── isnad-graph (FastAPI + React)
+├── Firewall (hcloud_firewall)        ├── neo4j
+├── SSH Key (hcloud_ssh_key)          ├── user-service (FastAPI)
+└── cloud-init bootstrap              ├── user-postgres
+                                      ├── user-redis
+                                      └── caddy (reverse proxy)
 ```
-
-- **Terraform** provisions the VPS, firewall rules, SSH keys, and runs cloud-init on first boot.
-- **cloud-init** installs Docker, hardens the OS, writes environment/secret files, and pre-creates Docker volumes.
-- **Docker Compose** (in the deploy repo) manages all application containers, networks, and runtime config.
 
 Terraform does NOT manage individual containers — that is Docker Compose's responsibility.
 
-## Resources Created
-
-- **VPS**: CPX41 (8 vCPU, 16 GB RAM) running Ubuntu 24.04 in Ashburn (ash)
-- **Firewall**: Allows inbound TCP on ports 22 (SSH), 80 (HTTP), 443 (HTTPS); denies all else
-- **SSH Key**: Uploaded from a local public key file
-
 ## Prerequisites
 
-- [Terraform >= 1.5](https://developer.hashicorp.com/terraform/install)
+- [Terraform >= 1.6](https://developer.hashicorp.com/terraform/install)
 - A Hetzner Cloud API token (create one at https://console.hetzner.cloud)
 - An SSH key pair
+- Backblaze B2 application key scoped to the `noorinalabs-terraform-state` bucket
 
-## Usage
+## Backend credentials
 
-```bash
-cd terraform/hetzner
-
-# Initialize providers
-terraform init
-
-# Preview changes
-terraform plan -var="hcloud_token=YOUR_TOKEN"
-
-# Apply
-terraform apply -var="hcloud_token=YOUR_TOKEN"
-
-# Destroy when no longer needed
-terraform destroy -var="hcloud_token=YOUR_TOKEN"
-```
-
-To avoid passing secrets on every command, create a `terraform.tfvars` file (git-ignored):
-
-```hcl
-hcloud_token            = "your-token-here"
-ssh_public_key_path     = "~/.ssh/id_ed25519.pub"
-user_postgres_password  = "a-strong-password-at-least-16-chars"
-user_redis_password     = "a-strong-password-at-least-16-chars"
-user_service_jwt_secret = "a-strong-secret-at-least-32-chars"
-```
-
-## Variables
-
-| Name | Description | Sensitive | Default |
-|------|-------------|-----------|---------|
-| `hcloud_token` | Hetzner Cloud API token | Yes | — |
-| `ssh_public_key_path` | Path to SSH public key | No | `~/.ssh/id_ed25519.pub` |
-| `server_type` | Hetzner server type | No | `cpx41` |
-| `server_name` | Instance name | No | `noorinalabs-isnad-graph-prod` |
-| `location` | Hetzner location | No | `ash` |
-| `ssh_source_ips` | CIDR ranges allowed to SSH | No | `["0.0.0.0/0", "::/0"]` |
-| `ghcr_auth_b64` | Base64 `username:token` for GHCR auth | Yes | `""` |
-| `user_postgres_password` | Password for user-service PostgreSQL (min 16 chars) | Yes | `""` |
-| `user_redis_password` | Password for user-service Redis (min 16 chars) | Yes | `""` |
-| `user_service_jwt_secret` | JWT signing secret for user-service (min 32 chars) | Yes | `""` |
-
-## Outputs
-
-| Name | Description |
-|------|-------------|
-| `server_ip` | Public IPv4 address for DNS setup |
-| `server_ipv6` | Public IPv6 address |
-| `server_status` | Current server status |
-
-## Secrets Management
-
-Secrets flow through two paths:
-
-1. **CI/CD (GitHub Actions):** Encrypted repository secrets are passed as `-var` flags during `terraform plan`/`apply`.
-2. **VPS runtime:** cloud-init writes secrets to `/opt/noorinalabs-deploy/.env.user-service` (mode 0600, owned by `deploy`). Docker Compose reads this env file at container startup.
-
-To add a new secret:
-1. Add a `variable` block in `variables.tf` (with `sensitive = true`)
-2. Pass it through `templatefile()` in `main.tf`
-3. Write it to the appropriate env file in `cloud-init.yaml.tpl`
-4. Add the GitHub Actions secret in the repo settings
-5. Reference the variable in the CI workflow's `terraform apply` step
-
-## Remote State Backend
-
-State is stored remotely in a Backblaze B2 bucket (`noorinalabs-terraform-state`) using the S3-compatible backend. This provides:
-
-- **Team collaboration** — multiple operators can plan/apply without passing state files around
-- **State locking** — prevents concurrent applies from corrupting state
-- **Automatic backups** — B2 retains object versions
-
-### Backend Credentials
-
-The backend authenticates via standard AWS environment variables. Set these before running any Terraform commands:
+The S3-compatible backend authenticates via standard AWS environment variables. Set these before any Terraform command (in both envs):
 
 ```bash
 export AWS_ACCESS_KEY_ID="your-b2-application-key-id"
 export AWS_SECRET_ACCESS_KEY="your-b2-application-key"
 ```
 
-To generate B2 application keys:
-1. Log in to [Backblaze B2](https://secure.backblaze.com/b2_buckets.htm)
-2. Go to **App Keys** > **Add a New Application Key**
-3. Restrict the key to the `noorinalabs-terraform-state` bucket
-4. Copy the `keyID` as `AWS_ACCESS_KEY_ID` and `applicationKey` as `AWS_SECRET_ACCESS_KEY`
-
-### Migrating from Local State
-
-If you have an existing local `terraform.tfstate` file, migrate it to the remote backend:
+## Usage
 
 ```bash
-cd terraform/hetzner
-
-# Initialize the new backend — Terraform will detect the change and offer to migrate
-terraform init -migrate-state
-
-# Verify the migration succeeded
-terraform plan   # should show no changes
-
-# Remove the local state file (now safe — state lives in B2)
-rm terraform.tfstate terraform.tfstate.backup
-```
-
-### First-Time Setup (No Existing State)
-
-If this is a fresh checkout with no local state:
-
-```bash
-cd terraform/hetzner
+# stg
+cd terraform/hetzner/envs/stg
 terraform init
+terraform plan   -var-file=terraform.tfvars
+terraform apply  -var-file=terraform.tfvars
+
+# prod (independent state — separate apply)
+cd terraform/hetzner/envs/prod
+terraform init
+terraform plan   -var-file=terraform.tfvars
+terraform apply  -var-file=terraform.tfvars
 ```
 
-Terraform will configure the S3 backend and pull any existing remote state automatically.
+Copy `terraform.tfvars.example` → `terraform.tfvars` in each env and fill in real values. `terraform.tfvars` is git-ignored.
+
+## Outputs
+
+Both envs expose the same output shape:
+
+| Output | Description | Consumer |
+|---|---|---|
+| `env` | Environment tag (`stg` or `prod`) | All |
+| `server_name` | `noorinalabs-stg` / `noorinalabs-prod` | `deploy#83` (Cloudflare) |
+| `server_ip` | Public IPv4 | `deploy#83`, `deploy#84` |
+| `server_ipv6` | Public IPv6 | Optional AAAA target |
+| `ssh_target` | `deploy@<ipv4>` | `deploy#84` promotion workflow |
+| `labels` | `{ project, environment }` map | Tooling that queries Hetzner by label |
+| `server_status` | `running` / etc. | Debugging |
+
+## State isolation
+
+- `stg` → B2 object `noorinalabs-terraform-state/hetzner/stg.tfstate`
+- `prod` → B2 object `noorinalabs-terraform-state/hetzner/prod.tfstate`
+
+A `terraform destroy` in `envs/stg` **cannot** touch prod state, and vice versa. This is the primary failure-mode guard — see ADR 0001.
+
+## Migrating the existing prod state
+
+The pre-refactor root at `terraform/hetzner/` used state key `hetzner/terraform.tfstate`. One-time migration (performed by an SRE, not automated in code):
+
+```bash
+# 1. Back up
+aws s3 cp s3://noorinalabs-terraform-state/hetzner/terraform.tfstate ./hetzner-terraform.tfstate.backup \
+  --endpoint-url https://s3.us-east-005.backblazeb2.com
+
+# 2. Rename the B2 object
+aws s3 mv s3://noorinalabs-terraform-state/hetzner/terraform.tfstate \
+          s3://noorinalabs-terraform-state/hetzner/prod.tfstate \
+  --endpoint-url https://s3.us-east-005.backblazeb2.com
+
+# 3. Init the new prod env
+cd terraform/hetzner/envs/prod
+terraform init
+terraform plan   # MUST show changes only for the rename (noorinalabs-isnad-graph-prod → noorinalabs-prod)
+```
+
+Per issue #82 and the owner's confirmation, the existing `noorinalabs-isnad-graph-prod` resources may be destroyed/recreated — no data preservation required. The currently live production site runs on a hand-made VPS outside Terraform (`isnad-graph-prod`), tracked for decommission in `deploy#86`.
+
+## Secrets flow
+
+Same as before — sensitive Terraform variables are passed via `-var` flags in CI (GitHub Actions repository secrets) or via a git-ignored `terraform.tfvars`. Cloud-init writes them to `/opt/noorinalabs-deploy/.env.user-service` (mode 0600, owned by `deploy`) on the VPS; Docker Compose reads that file at container startup.
+
+To add a new secret:
+1. Add a `variable` block in `modules/hetzner-vps/variables.tf` (with `sensitive = true`).
+2. Thread it through `templatefile()` in `modules/hetzner-vps/main.tf`.
+3. Write it to the appropriate env file in `modules/hetzner-vps/cloud-init.yaml.tpl`.
+4. Add a matching `variable` in each env's `variables.tf`.
+5. Pass it into the `module "vps"` block in each env's `main.tf`.
+6. Add the GitHub Actions secret in the repo settings (per-env if they differ).
+
+## ADRs
+
+- [`docs/adr/0001-tf-hetzner-per-env-state-strategy.md`](../../docs/adr/0001-tf-hetzner-per-env-state-strategy.md) — rationale for `envs/{stg,prod}/` layout over Terraform workspaces.

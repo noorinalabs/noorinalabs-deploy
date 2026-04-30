@@ -1,18 +1,36 @@
 [Unit]
 Description=noorinalabs-isnad-graph automated database backup
+Documentation=https://github.com/noorinalabs/noorinalabs-deploy/blob/main/scripts/backup.sh
 After=docker.service
 Requires=docker.service
+OnFailure=isnad-backup-failure-marker.service
 
 [Service]
 Type=oneshot
-ExecStart=/opt/noorinalabs-isnad-graph/scripts/backup.sh
-WorkingDirectory=/opt/noorinalabs-isnad-graph
-EnvironmentFile=/opt/noorinalabs-isnad-graph/.env
+WorkingDirectory=/opt/noorinalabs-deploy
+EnvironmentFile=/opt/noorinalabs-deploy/.env
+Environment=BACKUP_DIR=/var/lib/noorinalabs-backups
+Environment=COMPOSE_FILE=compose/docker-compose.prod.yml
+ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=isnad-backup
 
-# Security hardening
+# Security hardening.
+#
+# We deliberately do NOT set PrivateTmp=yes here. The previous unit combined
+# PrivateTmp=yes with ReadWritePaths=/tmp/isnad-backups, which caused systemd
+# to bind-mount the host path into the private namespace before ExecStart;
+# the host path didn't exist and namespace setup failed with status=226/NAMESPACE
+# on every run. backup.sh does its own `mktemp -d` inside BACKUP_DIR, so a
+# private /tmp namespace is not needed. See deploy#121 Bug A.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/tmp/isnad-backups /opt/noorinalabs-isnad-graph
-PrivateTmp=yes
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/noorinalabs-backups /opt/noorinalabs-deploy /var/lib/node_exporter

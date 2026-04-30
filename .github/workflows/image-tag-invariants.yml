@@ -1,0 +1,70 @@
+# Tag-count invariant smoke test for the Contract-v6 image tag scheme
+# (canonical per Khoury ruling:
+# https://github.com/noorinalabs/noorinalabs-isnad-graph/issues/815#issuecomment-4301538921).
+# v6 shape is identical to v5 / v3; v6 is the canonical citation target.
+#
+# Per Khoury 2026-04-23: guard against future refactors silently dropping or
+# adding a tag in the publish-side (ghcr-publish.yml) or the promotion-side
+# (deploy#84 promote.yml).
+#
+# Invariants asserted per image:
+#   publish-side  — exactly FOUR tags per push point at the digest of the
+#                   latest main HEAD: sha-<short>, latest, stg-<short>,
+#                   stg-latest.
+#   promote-side  — exactly TWO tags per promotion point at the digest of
+#                   the most recently promoted image: prod-<short>,
+#                   prod-latest. (Skipped if no promotion has ever run.)
+#
+# The check uses the GHCR v2 API to list tags, then groups tags by the
+# digest they resolve to. It does NOT need to SSH anywhere.
+#
+# Triggers:
+#   - on every push to wave branches + main so a refactor to either
+#     ghcr-publish.yml or promote.yml that drops a tag is caught at CI.
+#   - schedule: daily, so a state drift in the registry (e.g. a manual tag
+#     deletion) is caught without waiting for a commit.
+#   - workflow_dispatch for operator-initiated runs.
+
+name: Image tag invariants
+
+on:
+  push:
+    branches:
+      - main
+      - "deployments/phase-*/wave-*"
+    paths:
+      - ".github/workflows/ghcr-publish.yml"
+      - ".github/workflows/promote.yml"
+      - ".github/workflows/image-tag-invariants.yml"
+      - "integration-tests/scripts/check_tag_invariants.py"
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  check:
+    name: Check tag invariants
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - noorinalabs/noorinalabs-isnad-graph
+          - noorinalabs/noorinalabs-isnad-graph-frontend
+          - noorinalabs/noorinalabs-user-service
+          - noorinalabs/noorinalabs-landing-page
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check publish + promote tag invariants
+        env:
+          IMAGE: ${{ matrix.image }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 integration-tests/scripts/check_tag_invariants.py "$IMAGE"

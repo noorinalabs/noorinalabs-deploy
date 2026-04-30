@@ -64,14 +64,9 @@ services:
         condition: service_healthy
       fake_oauth:
         condition: service_healthy
-    # NOTE: `alembic upgrade heads` (plural) is a temporary work-around —
-    # user-service's migration history has three unmerged heads (0003, 0020, 0030
-    # all off 0001) so `upgrade head` refuses. Tracked in
-    # noorinalabs/noorinalabs-user-service#63; revert to `head` (singular) once
-    # that merge migration lands.
     command: >
       sh -c "
-      /app/.venv/bin/alembic upgrade heads &&
+      /app/.venv/bin/alembic upgrade head &&
       /app/.venv/bin/uvicorn src.app.main:create_app --factory --host 0.0.0.0 --port 8000
       "
     networks:

@@ -153,6 +153,16 @@ RATE_LIMIT_WINDOW_SECONDS=60
 DATA_RAW_DIR=./data/raw
 DATA_STAGING_DIR=./data/staging
 DATA_CURATED_DIR=./data/curated
+
+# Backblaze B2 — backup credentials [REQUIRED for backup timer]
+# Consumed by scripts/backup.sh:59-61. Scope: read+write+delete on the
+# isnad-graph-backups bucket only (separate from PIPELINE_B2_* ingest scope
+# and TF_STATE_B2_* terraform backend scope). The deploy-{stg,prod}.yml
+# workflows populate these from BACKUP_B2_* GH secrets; manual operators
+# bootstrapping a new VPS must fill these in by hand. See deploy#188.
+B2_KEY_ID=CHANGE-ME
+B2_APP_KEY=CHANGE-ME
+B2_BUCKET=isnad-graph-backups
 ENVEOF
   chmod 600 "$ENV_FILE"
   chown $DEPLOY_USER:$DEPLOY_USER "$ENV_FILE"
@@ -175,14 +185,31 @@ else
   echo "    rclone installed: $(rclone version --check 2>/dev/null | head -1 || echo 'installed')"
 fi
 
-# ── Step 7: Install backup systemd timer ────────────────────────────────────
+# ── Step 7: Install backup systemd timer + persistent staging dir ───────────
 echo "==> [7/7] Installing backup timer..."
 if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
-  cp "$INSTALL_DIR/systemd/isnad-backup.service" /etc/systemd/system/
-  cp "$INSTALL_DIR/systemd/isnad-backup.timer" /etc/systemd/system/
+  # Install the unit + timer + the OnFailure=-target failure-marker unit.
+  install -m 644 "$INSTALL_DIR/systemd/isnad-backup.service"               /etc/systemd/system/
+  install -m 644 "$INSTALL_DIR/systemd/isnad-backup.timer"                 /etc/systemd/system/
+  install -m 644 "$INSTALL_DIR/systemd/isnad-backup-failure-marker.service" /etc/systemd/system/
+
+  # Provision the persistent staging directory via tmpfiles.d. Without this,
+  # the unit's ReadWritePaths=/var/lib/noorinalabs-backups would fail the
+  # mount-namespace setup with status=226/NAMESPACE before ExecStart fires
+  # — the original deploy#121 Bug A failure mode against /tmp/isnad-backups.
+  install -m 644 "$INSTALL_DIR/systemd/tmpfiles.d/noorinalabs-backups.conf" /etc/tmpfiles.d/
+  systemd-tmpfiles --create /etc/tmpfiles.d/noorinalabs-backups.conf
+
+  # Provision the node-exporter textfile-collector directory so the
+  # failure-marker unit can drop *.prom files there. Idempotent: install -d
+  # is a no-op when the directory already exists with the right mode.
+  install -d -m 0755 /var/lib/node_exporter
+
   systemctl daemon-reload
   systemctl enable isnad-backup.timer
   echo "    Backup timer installed (daily at 03:00 UTC)."
+  echo "    Failure marker unit installed (OnFailure= → /var/lib/node_exporter/*.prom + journal)."
+  echo "    Persistent staging dir provisioned: /var/lib/noorinalabs-backups (mode 0700, root)."
   echo "    Start with: systemctl start isnad-backup.timer"
 else
   echo "    Backup systemd files not found, skipping."
@@ -198,10 +225,12 @@ echo "Next steps:"
 echo "  1. Edit the .env file with your production credentials:"
 echo "     nano $ENV_FILE"
 echo ""
-echo "  2. Start the stack as the deploy user:"
+echo "  2. Start the stack as the deploy user (services are GHCR-only — no local builds):"
 echo "     su - $DEPLOY_USER"
 echo "     cd $INSTALL_DIR"
-echo "     docker compose -f docker-compose.prod.yml up -d --build"
+echo "     docker login ghcr.io -u noorinalabs --password-stdin <<< \"\$GH_PACKAGES_TOKEN\""
+echo "     docker compose -f compose/docker-compose.prod.yml --env-file .env pull"
+echo "     docker compose -f compose/docker-compose.prod.yml --env-file .env up -d"
 echo ""
 echo "  3. Verify:"
 echo "     curl http://localhost:8000/health"

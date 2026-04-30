@@ -1,0 +1,26 @@
+[Unit]
+Description=Emit node-exporter textfile + journal marker on isnad-backup.service failure
+Documentation=https://github.com/noorinalabs/noorinalabs-deploy/blob/main/systemd/isnad-backup.service
+
+[Service]
+Type=oneshot
+# OnFailure= passes the failed unit name to the helper as %i.
+#
+# We deliberately use a helper script rather than an inline ExecStart= sh -c.
+# The inline form requires escaping systemd specifiers (%%) AND shell-PID
+# expansion ($$) inside single-quoted ExecStart= — both are easy to get wrong
+# and an early version produced "isnad_backup_last_failure_timestamp_seconds /usr/bin/bash"
+# in the .prom file. See deploy#121 Bug D for the rendering failure.
+SyslogIdentifier=BACKUP_FAILURE
+# The helper reads $MONITOR_UNIT from its process environment — systemd
+# populates this for any unit triggered via OnFailure= (see systemd.exec(5)
+# § "ENVIRONMENT VARIABLES IN SPAWNED PROCESSES"). Argv-side ${VAR} expansion
+# only resolves variables declared via Environment=/EnvironmentFile= in this
+# unit, NOT inherited process env, so we must consume MONITOR_UNIT inside the
+# script. See deploy#121 Bug E.
+ExecStart=/opt/noorinalabs-deploy/scripts/emit-backup-failure-marker.sh
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/node_exporter
