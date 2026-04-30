@@ -40,7 +40,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Pre-deploy alembic gate (deploy#160). Only fires for the user-service
+  # dispatch path so isnad-graph / landing fan-ins don't pay alembic latency
+  # or contend on the user-postgres advisory lock. Discrimination: the
+  # repository_dispatch `event.action` carries the dispatched repo name (one
+  # of the three `deploy-noorinalabs-<service>` types declared in `on:`).
+  #
+  # workflow_dispatch path is intentionally excluded — the manual operator
+  # tag may target any image; running alembic against an arbitrary stg-latest
+  # would be confusing. Operators wanting a manual stg migrate run dispatch
+  # db-migrate.yml directly with env=stg.
+  migrate:
+    name: alembic upgrade head (stg, user-service only)
+    if: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'deploy-noorinalabs-user-service' }}
+    # Reusable workflow accepts an empty string and falls back to `<env>-latest`
+    # (db-migrate.yml § Resolve image tag). Passing empty here is safer than
+    # synthesising a tag client-side: if the dispatch payload's `sha` is
+    # missing or malformed the gate still runs against stg-latest, which is
+    # what the user-service push fan-in already pointed at by the time its
+    # ghcr-publish.yml fired this repository_dispatch.
+    uses: ./.github/workflows/db-migrate.yml
+    with:
+      env: stg
+      image_tag: ""
+    secrets: inherit
+
   deploy:
+    # Gate the existing deploy job on the alembic outcome — but ONLY when
+    # the migrate job actually ran (success). For non-user-service dispatches
+    # and workflow_dispatch the migrate job is skipped via its `if:` and we
+    # still want deploy to proceed; GH Actions treats `needs: [migrate]` with
+    # a skipped dependency as not-satisfied by default, so we re-allow via the
+    # explicit `if:` below.
+    needs: [migrate]
+    if: ${{ always() && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped') }}
     runs-on: ubuntu-latest
     environment: staging
     permissions:

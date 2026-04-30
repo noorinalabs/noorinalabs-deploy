@@ -455,9 +455,53 @@ jobs:
           echo "stg-verify gate PASSED."
           echo "gate_result=passed" >> "$GITHUB_OUTPUT"
 
+  # ─────────────────────────────────────────────────────────────────
+  # Pre-retag alembic gate (deploy#160).
+  #
+  # Runs `alembic upgrade head` on prod's user-postgres BEFORE retag
+  # writes `prod-<short>` and `prod-latest`. Sequencing rationale
+  # (Bereket spec, P3W1 Round 2):
+  #
+  #   plan → gate-stg-verify → migrate-prod → retag → trigger-prod-deploy
+  #
+  # `retag` is the irreversible commit-to-prod step. A migration
+  # failure AFTER retag would leave prod with a forward-pinned image
+  # but a half-migrated DB — recoverable only via manual rollback of
+  # both image and schema. Running migrate-prod BEFORE retag keeps
+  # failure recovery to "fix the migration, re-promote".
+  #
+  # Image tag passed: `stg-<short>` resolved by `plan` from the
+  # promotion source. The `prod-<short>` tag does NOT yet exist at
+  # this stage (retag is what writes it). The `stg-<short>` tag
+  # points at the same digest the retag will promote, so alembic
+  # runs against the exact image about to be made the prod pointer.
+  #
+  # Skip semantics: this job is gated on user-service being in the
+  # promotion set (plan emits `user_service_short=""` when not). When
+  # user-service is excluded the job is skipped and `retag` proceeds
+  # via the explicit `if:` below allowing skipped-or-success.
+  # ─────────────────────────────────────────────────────────────────
+  migrate-prod:
+    name: alembic upgrade head (prod, user-service only)
+    needs: [plan, gate-stg-verify]
+    # Skip if user-service is not in this promotion's image set.
+    if: ${{ needs.plan.outputs.user_service_short != '' }}
+    uses: ./.github/workflows/db-migrate.yml
+    with:
+      env: prod
+      # plan emits the bare 7-char short; alembic runs from the stg-tagged
+      # image (prod-<short> doesn't exist until retag below).
+      image_tag: stg-${{ needs.plan.outputs.user_service_short }}
+    secrets: inherit
+
   retag:
     name: Retag ${{ matrix.key }} (stg → prod)
-    needs: [plan, gate-stg-verify]
+    needs: [plan, gate-stg-verify, migrate-prod]
+    # `migrate-prod` is gated on user-service being in the promotion set; for
+    # promotions that exclude user-service it is skipped, and retag must still
+    # proceed. GH Actions defaults a `needs:` to satisfied only on `success`,
+    # so the explicit allow-skipped predicate is required.
+    if: ${{ always() && needs.gate-stg-verify.result == 'success' && (needs.migrate-prod.result == 'success' || needs.migrate-prod.result == 'skipped') }}
     runs-on: ubuntu-latest
     # The production GH Environment carries the manual-approval reviewer rule.
     # This job does NOT touch a VPS — it only rewrites tags at GHCR. The
