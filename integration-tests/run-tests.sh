@@ -138,6 +138,57 @@ export TOTP_ENCRYPTION_KEY="$(cat secrets/totp.key)"
 
 mkdir -p reports
 
+# Pull images with per-image retry-with-backoff (closes #214).
+# `docker compose up -d --build` pulls images implicitly, but a single-image
+# Docker Hub registry timeout (e.g., neo4j:5-community on 2026-05-01 P3W1
+# wave-merge run 25196318721) hard-fails the entire run with no retry.
+# Pulling explicitly first with bounded retry absorbs single-image transient
+# Docker Hub jitter without changing the test suite or compose layout.
+echo "--- Pulling images (with retry-with-backoff) ---"
+pull_with_retry() {
+    local image="$1"
+    local delay=1
+    for attempt in 1 2 3; do
+        if docker pull "$image" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ $attempt -lt 3 ]]; then
+            echo "  retry $attempt failed for $image — backing off ${delay}s" >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+    done
+    echo "  ERROR: docker pull $image failed after 3 attempts" >&2
+    return 1
+}
+# Identify pull targets via structured compose-config parse: a pull target
+# is a service with `image:` and NO `build:`. Services with `build:` are
+# locally built by the `up --build` step below — pulling them would hit
+# Docker Hub for a non-existent tag.
+#
+# Why not `docker compose config --images` + a glob filter? Compose emits
+# short-form Docker Hub references (`neo4j:5-community`, `postgres:16-alpine`)
+# without a registry-path slash; a `*/*` filter silently skips them.
+# JSON-parse-by-shape avoids that whole class of false-positive miss.
+mapfile -t PULL_IMAGES < <(
+    $COMPOSE config --format json 2>/dev/null | python3 -c "
+import json, sys
+config = json.load(sys.stdin)
+seen = set()
+for name, svc in config.get('services', {}).items():
+    if 'image' in svc and 'build' not in svc:
+        img = svc['image']
+        if img not in seen:
+            seen.add(img)
+            print(img)
+"
+)
+for image in "${PULL_IMAGES[@]}"; do
+    [[ -z "$image" ]] && continue
+    echo "  pull: $image"
+    pull_with_retry "$image"
+done
+
 echo "--- Building and starting stack ---"
 $COMPOSE up -d --build \
     user-postgres user-redis user-service \
