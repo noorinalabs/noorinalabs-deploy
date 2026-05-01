@@ -108,3 +108,155 @@ groups:
           description: >-
             The last successful backup was more than 24 hours ago.
           runbook: "docs/deployment/alerting.md#backupfailure"
+
+  # Alerts for the alembic pre-deploy gate (deploy#161). Two distinct
+  # failure modes share the same metric source but warrant separate alerts
+  # so on-call can disambiguate at first sight (Bereket's manager-direct
+  # review call):
+  #
+  #   - Failure: gate ran, returned _success=0. Promotion blocked at the
+  #     pre-deploy step. Severity critical, for: 0m — the gate is one-shot
+  #     and every miss is operator-actionable.
+  #
+  #   - Stale: gate hasn't run in 24h. Could mean a broken promotion
+  #     pipeline upstream (e.g., notify-deploy.yml not firing, GHCR auth
+  #     drift), or simply a quiet 24h with no user-service pushes. On-call
+  #     should check the upstream signal before assuming a fault.
+  #
+  # The metrics are emitted to the host-side textfile collector at
+  # /var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom
+  # by db-migrate.yml's `Emit textfile-collector metrics on VPS` step
+  # (`if: always()`, atomic temp+rename, mode 0644). Both heads-count and
+  # `alembic upgrade head` failure paths produce _success=0.
+  #
+  # These alerts were originally drafted in deploy#153 but deferred during
+  # review (commit 76d7d7f) pending textfile plumbing; this group lands
+  # alongside the plumbing in #161 as one atomic delivery.
+  - name: db_migrate
+    rules:
+      - alert: UserServiceAlembicGateFailure
+        # Bare equality on _success — no freshness filter. Bereket's
+        # truth-table on the manager-direct review (PR #210 review,
+        # 2026-04-30) showed an `< 3600` AND clause silenced exactly the
+        # failures we want to catch: a stuck `_success=0` after the
+        # deduplication window aged out (e.g., a gate that failed hours
+        # ago and nothing has re-run it since) would silently clear, even
+        # though promotion is still blocked. Staleness doesn't make
+        # `_success=0` less true. The orthogonal "nothing has run"
+        # concern is captured by `UserServiceAlembicGateStale` below.
+        expr: |
+          user_service_alembic_gate_last_run_success == 0
+        for: 0m
+        labels:
+          severity: critical
+          service: user-service
+        annotations:
+          summary: "user-service alembic gate FAILED in {{ $labels.env }}"
+          description: >-
+            The most recent db-migrate run for user-service in {{ $labels.env }}
+            reported _success=0. Promotion is blocked at the pre-deploy gate
+            until a successful run replaces this metric. Both the heads-count
+            assertion failure path and the `alembic upgrade head` failure
+            path land here — see the runbook's Failure Modes section to
+            discriminate.
+          runbook: "docs/runbooks/user-service-alembic.md#observability"
+
+      - alert: UserServiceAlembicGateStale
+        # Distinct from Failure: the gate hasn't even run in 24h. Either the
+        # promotion pipeline upstream is broken (notify-deploy not firing,
+        # GHCR auth drift, etc.) or there have been no user-service pushes
+        # for a day. On-call should check upstream first before assuming a
+        # fault. `> 86400` flags silence beyond a day.
+        expr: |
+          (time() - user_service_alembic_gate_last_run_timestamp_seconds) > 86400
+        for: 0m
+        labels:
+          severity: critical
+          service: user-service
+        annotations:
+          summary: "user-service alembic gate has not run in {{ $labels.env }} for >24h"
+          description: >-
+            The pre-deploy gate metric for {{ $labels.env }} is older than
+            24 hours. Either no user-service push has triggered a promotion
+            in the last day (benign — confirm via the recent PR list and
+            ghcr-publish runs), or the promotion pipeline upstream is
+            broken. Check the latest `Deploy to staging` and `Promote to
+            production` runs before assuming the gate itself is at fault.
+          runbook: "docs/runbooks/user-service-alembic.md#observability"
+
+  - name: blackbox_probes
+    rules:
+      # Any of the 6 prod-route probes failing for >2m. Companion to the
+      # post-deploy smoke battery — smoke validates the deploy worked,
+      # this alerts when it stops working between deploys (deploy#183).
+      - alert: BlackboxProbeFailing
+        expr: probe_success == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Blackbox probe failing for {{ $labels.route }}"
+          description: >-
+            The blackbox probe for {{ $labels.route }} ({{ $labels.instance }})
+            has reported probe_success=0 for more than 2 minutes. Smoke
+            battery covers this route post-deploy; this alert catches
+            mid-deploy-window regressions.
+          runbook: "docs/runbooks/blackbox-probes.md#probe-failing"
+
+      # Routes where the smoke battery enforces a specific HTTP status
+      # (e.g. 401 on the narrator check, 3xx on /auth/login). The
+      # blackbox modules already encode "valid" status sets, so a
+      # mismatch surfaces as probe_success=0 — but we still alert
+      # explicitly on the status-code metric so the description tells
+      # operators *what* code came back rather than just "probe failed".
+      - alert: BlackboxUnexpectedStatus
+        expr: |
+          (
+            probe_http_status_code{route="isnad-health"}        != 200
+          ) or (
+            probe_http_status_code{route="user-service-health"} != 200
+          ) or (
+            probe_http_status_code{route="landing-root"}        != 200
+          ) or (
+            probe_http_status_code{route="jwks"}                != 200
+          ) or (
+            probe_http_status_code{route="narrator-401"}        != 401
+            and
+            probe_http_status_code{route="narrator-401"}        != 403
+          )
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Unexpected HTTP status on {{ $labels.route }}"
+          description: >-
+            Route {{ $labels.route }} returned HTTP {{ $value }}, which is
+            outside the expected set defined in the smoke battery
+            (scripts/verify_prod_smoke.sh).
+          runbook: "docs/runbooks/blackbox-probes.md#unexpected-status"
+
+      # Defense-in-depth cert-expiry warning. Caddy auto-renews via
+      # Let's Encrypt, but a renewal failure (rate-limit, ACME outage,
+      # disk-full on /data) would silently approach expiry — we want
+      # ~7d of warning before the cert dies in prod.
+      #
+      # The `> 0` guard skips probes where the metric is unset (HTTP
+      # targets, or HTTPS probes that never reached TLS handshake) —
+      # without it, the alert fires forever on any non-HTTPS target if
+      # one is ever added to this scrape job.
+      - alert: BlackboxCertExpiringSoon
+        expr: |
+          probe_ssl_earliest_cert_expiry > 0
+          and
+          (probe_ssl_earliest_cert_expiry - time()) < 7 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS cert for {{ $labels.route }} expires in <7 days"
+          description: >-
+            The TLS certificate served at {{ $labels.instance }} expires in
+            {{ $value | humanizeDuration }}. Caddy normally auto-renews
+            ~30 days before expiry, so reaching this threshold indicates
+            renewal is failing.
+          runbook: "docs/runbooks/blackbox-probes.md#cert-expiring-soon"

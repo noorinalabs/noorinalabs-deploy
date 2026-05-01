@@ -1,0 +1,70 @@
+# blackbox-exporter modules — continuous prod-route probing (deploy#183).
+#
+# Module naming convention: <protocol>_<expected-status>[_<flavour>].
+# Each route in infra/prometheus/prometheus.yml chooses the module that
+# matches its smoke-battery expectation in scripts/verify_prod_smoke.sh.
+#
+# Probes are intentionally narrow: HTTP-status + (where useful) regex on
+# response body shape. Auth-flow synthetic probes are explicitly out of
+# scope (no prod creds — Bereket sign-off, deploy#87).
+modules:
+  # 200 + JSON body. Used by isnad /health (.status field) and JWKS
+  # (.keys[] array). The fail_if_body_not_matches_regexp keeps the
+  # plaintext-from-Caddy failure mode out of the green-state set.
+  http_2xx_json:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      fail_if_body_not_matches_regexp:
+        - '[{\[]'  # response begins with '{' or '[' — JSON shape
+      tls_config:
+        insecure_skip_verify: false
+      follow_redirects: true
+
+  # Plain 200 (no body shape assertion). Used by landing /.
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200]
+      tls_config:
+        insecure_skip_verify: false
+
+  # 401 + JSON body. Used by /api/v1/narrators?limit=1 — the JSON-shape
+  # check is the load-bearing assertion (Caddy returning plaintext "401
+  # Unauthorized" while user-service is silently down would otherwise
+  # pass — same trap the smoke battery is designed around).
+  http_401_json:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      valid_status_codes: [401, 403]
+      fail_if_body_not_matches_regexp:
+        - '[{\[]'  # JSON-shaped error envelope (.detail / .error / .message)
+      tls_config:
+        insecure_skip_verify: false
+
+  # 3xx redirect. Used by /auth/login. We do NOT follow the redirect —
+  # we just want to confirm the user-service auth wiring still hands off
+  # to an OAuth provider. The smoke battery inspects the Location
+  # header itself for OAuth-host substring; here we settle for the
+  # weaker "any 3xx is acceptable" assertion (200 also acceptable for
+  # interstitial-page handlers, mirroring smoke #6).
+  http_3xx:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200, 301, 302, 303, 307, 308]
+      follow_redirects: false
+      tls_config:
+        insecure_skip_verify: false

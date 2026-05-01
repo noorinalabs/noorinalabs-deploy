@@ -611,11 +611,25 @@ services:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/rootfs:ro
+      # Textfile collector input directory (deploy#161). The host path is
+      # owned by the `deploy` user (mode 0775) and populated by the alembic
+      # pre-deploy gate in db-migrate.yml on every run via `if: always()`.
+      # Read-only mount so a compromised node-exporter cannot clobber the
+      # written .prom files. Provisioning of the host directory is a runbook
+      # step today (`mkdir -p /var/lib/node_exporter/textfile_collector &&
+      # chown deploy:deploy && chmod 0775`); cloud-init bake-in is tracked as
+      # a follow-up if Nurul prefers it move to TF.
+      - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro
     command:
       - "--path.procfs=/host/proc"
       - "--path.rootfs=/rootfs"
       - "--path.sysfs=/host/sys"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      # Enable the textfile collector with the directory mounted above.
+      # Files matching `*.prom` are scraped at the interval set by Prometheus
+      # for the node-exporter job. Atomic writes (temp + rename) on the
+      # producer side prevent half-written reads.
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9100/metrics || exit 1"]
       interval: 10s
@@ -652,6 +666,43 @@ services:
         limits:
           memory: 128M
           cpus: "0.25"
+
+  # blackbox-exporter — continuous external probing of prod public routes
+  # (companion to scripts/verify_prod_smoke.sh post-deploy battery, see deploy#183).
+  # Two-network topology:
+  #   - frontend: real-DNS / real-TLS path to the public Caddy endpoints
+  #     (`internal: false`, so the container has egress to the public internet).
+  #   - backend:  Prometheus scrapes /probe + /metrics on this internal network.
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    volumes:
+      - ../infra/blackbox-exporter/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    command:
+      - "--config.file=/etc/blackbox_exporter/config.yml"
+    expose:
+      - "9115"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9115/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - backend
+      - frontend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+        reservations:
+          memory: 32M
+          cpus: "0.05"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # --- Pipeline messaging (Kafka KRaft, single-node) ---
   #

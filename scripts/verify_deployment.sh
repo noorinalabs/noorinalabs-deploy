@@ -12,18 +12,40 @@
 # intentionally NOT invoked by `verify-deploy.yml` anymore.
 #
 # Usage:
-#   ./scripts/verify_deployment.sh [--site URL] [--skip-workflow] [--skip-ssl]
+#   ./scripts/verify_deployment.sh [--site=URL] [--landing=URL]
+#                                  [--user-service=URL] [--skip-workflow]
+#                                  [--skip-ssl]
 #
 # Environment:
-#   SITE_URL      Override the default site URL (default: https://isnad-graph.noorinalabs.com)
-#   GH_REPO       Override the GitHub repo for workflow checks (default: noorinalabs/noorinalabs-deploy)
-#   ROLLBACK_TAG  If set, tag the current deployment for rollback reference
+#   SITE_URL              Override the default API host URL
+#                         (default: https://isnad-graph.noorinalabs.com)
+#   LANDING_URL           Landing-page URL to check. Empty disables the
+#                         landing reachability check.
+#                         (default: https://noorinalabs.com)
+#   USER_SERVICE_URL      Base URL whose `/health` is hit for the
+#                         user-service auth-plane check. Empty disables.
+#                         (default: $SITE_URL — caddy/Caddyfile routes
+#                         user-service via the same host today; the
+#                         deploy#156 cutover will move it to its own
+#                         subdomain.)
+#   GH_REPO               Override the GitHub repo for workflow checks
+#                         (default: noorinalabs/noorinalabs-deploy)
+#   ROLLBACK_TAG          If set, tag the current deployment for rollback
+#                         reference
 
 set -euo pipefail
 
 # ---------- Configuration ----------
 
 SITE_URL="${SITE_URL:-https://isnad-graph.noorinalabs.com}"
+# Landing-page reachability check (deploy#73). Empty = skip.
+LANDING_URL="${LANDING_URL:-https://noorinalabs.com}"
+# user-service auth-plane health (deploy#73). Empty = skip. Defaults to
+# SITE_URL because today Caddy routes user-service traffic via the same
+# host as the API (caddy/Caddyfile site block); the deploy#156 cutover
+# will move it to https://users.noorinalabs.com — at that point operators
+# pass USER_SERVICE_URL=https://users.noorinalabs.com explicitly.
+USER_SERVICE_URL="${USER_SERVICE_URL:-$SITE_URL}"
 GH_REPO="${GH_REPO:-noorinalabs/noorinalabs-deploy}"
 SKIP_WORKFLOW="${SKIP_WORKFLOW:-false}"
 SKIP_SSL="${SKIP_SSL:-false}"
@@ -34,10 +56,14 @@ TIMEOUT=10
 for arg in "$@"; do
   case "$arg" in
     --site=*) SITE_URL="${arg#*=}" ;;
+    --landing=*) LANDING_URL="${arg#*=}" ;;
+    --user-service=*) USER_SERVICE_URL="${arg#*=}" ;;
     --skip-workflow) SKIP_WORKFLOW=true ;;
     --skip-ssl) SKIP_SSL=true ;;
     --help|-h)
-      head -12 "$0" | tail -10
+      # Print the leading comment block (Usage + Environment sections).
+      # Stops at the first non-comment, non-blank line.
+      awk '/^#!/ {next} /^#/ {print substr($0,3); next} {exit}' "$0"
       exit 0
       ;;
   esac
@@ -116,6 +142,63 @@ if [ "$health_resolved" = "false" ]; then
     pass "Health endpoint returned HTTP 200 (non-JSON response)"
   else
     fail "Health endpoint unreachable or invalid (HTTP $health_code)"
+  fi
+fi
+
+# ---------- 3a. Landing-Page Reachability (deploy#73) ----------
+
+if [ -n "$LANDING_URL" ]; then
+  section "Landing-Page Reachability"
+  landing_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "$LANDING_URL" 2>/dev/null || echo "000")
+  if [ "$landing_code" = "200" ]; then
+    pass "Landing returns HTTP 200 at $LANDING_URL"
+  elif [ "$landing_code" = "000" ]; then
+    fail "Landing unreachable (timeout/connection error) at $LANDING_URL"
+  else
+    fail "Landing returned HTTP $landing_code at $LANDING_URL"
+  fi
+fi
+
+# ---------- 3b. User-Service Health (deploy#73) ----------
+
+# Two routes exist depending on the deploy#156 cutover state:
+#   1. /api/v1/user-service/health — Caddy rewrite at caddy/Caddyfile:88-89
+#      that proxies to user-service:8000. Used today while user-service
+#      traffic shares the API host with isnad-graph.
+#   2. /health — direct path on the user-service subdomain after the #156
+#      cutover lands `users.noorinalabs.com` as a separate site block.
+#
+# IMPORTANT: pre-#156, /health on the SHARED host hits **isnad-graph's**
+# /health (caddy/Caddyfile:101 — `handle /health { reverse_proxy api:8000 }`),
+# NOT user-service. So the second-route fallback is only correct when an
+# explicit subdomain URL was passed via --user-service= or the
+# USER_SERVICE_URL env var; if USER_SERVICE_URL == SITE_URL, that fallback
+# would falsely report user-service healthy when only isnad-graph is up
+# (Aisha review on PR #206, hot spot 4 — flagged 2026-04-30).
+if [ -n "$USER_SERVICE_URL" ]; then
+  section "User-Service Health Check"
+  us_resolved=false
+  for us_path in "/api/v1/user-service/health" "/health"; do
+    # Skip the /health fallback on the shared host — it routes to
+    # isnad-graph, not user-service. Only safe to probe /health when an
+    # explicit user-service subdomain (post-#156) was passed.
+    if [ "$us_path" = "/health" ] && [ "$USER_SERVICE_URL" = "$SITE_URL" ]; then
+      continue
+    fi
+    us_url="${USER_SERVICE_URL}${us_path}"
+    us_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "$us_url" 2>/dev/null || echo "000")
+    if [ "$us_code" = "200" ]; then
+      pass "User-service health endpoint (${us_path}) returned HTTP 200"
+      us_resolved=true
+      break
+    fi
+  done
+  if [ "$us_resolved" = "false" ]; then
+    if [ "$USER_SERVICE_URL" = "$SITE_URL" ]; then
+      fail "User-service health unreachable at ${USER_SERVICE_URL}/api/v1/user-service/health (Caddy rewrite path; the /health fallback only applies post-#156 with a separate user-service subdomain)"
+    else
+      fail "User-service health unreachable at $USER_SERVICE_URL (tried /api/v1/user-service/health and /health)"
+    fi
   fi
 fi
 
