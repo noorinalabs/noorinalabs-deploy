@@ -138,6 +138,43 @@ export TOTP_ENCRYPTION_KEY="$(cat secrets/totp.key)"
 
 mkdir -p reports
 
+# Pull images with per-image retry-with-backoff (closes #214).
+# `docker compose up -d --build` pulls images implicitly, but a single-image
+# Docker Hub registry timeout (e.g., neo4j:5-community on 2026-05-01 P3W1
+# wave-merge run 25196318721) hard-fails the entire run with no retry.
+# Pulling explicitly first with bounded retry absorbs single-image transient
+# Docker Hub jitter without changing the test suite or compose layout.
+echo "--- Pulling images (with retry-with-backoff) ---"
+pull_with_retry() {
+    local image="$1"
+    local delay=1
+    for attempt in 1 2 3; do
+        if docker pull "$image" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ $attempt -lt 3 ]]; then
+            echo "  retry $attempt failed for $image — backing off ${delay}s" >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+    done
+    echo "  ERROR: docker pull $image failed after 3 attempts" >&2
+    return 1
+}
+# Iterate the resolved image list. `docker compose config --images` emits one
+# image per line for every service in the compose file (build-only services
+# like test-runner emit their resolved local tag, which `docker pull` will
+# reject as not-in-registry — that's fine, the compose `up --build` path
+# below builds them directly; we just skip non-pullable images here).
+$COMPOSE config --images | sort -u | while read -r image; do
+    [[ -z "$image" ]] && continue
+    # Skip locally-built service tags (no registry path component).
+    case "$image" in
+        */*) pull_with_retry "$image" ;;
+        *)   echo "  skip (build-only): $image" ;;
+    esac
+done
+
 echo "--- Building and starting stack ---"
 $COMPOSE up -d --build \
     user-postgres user-redis user-service \
