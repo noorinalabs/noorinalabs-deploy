@@ -26,9 +26,9 @@ variable "image" {
 }
 
 variable "ssh_public_key_path" {
-  description = "Path to SSH public key file uploaded to Hetzner and authorized for the deploy user."
+  description = "Path to SSH public key file uploaded to Hetzner and authorized for the deploy user. Resolved relative to the env root module's working directory (envs always pass `../../modules/hetzner-vps/deploy.pub`); the module-local default is for module-only `terraform validate` runs."
   type        = string
-  default     = "~/.ssh/id_ed25519.pub"
+  default     = "./deploy.pub"
 }
 
 variable "ssh_source_ips" {
