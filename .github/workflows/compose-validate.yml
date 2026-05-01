@@ -39,6 +39,9 @@ jobs:
             echo "JWT_PUBLIC_KEY=ci-placeholder"
             # Kafka KRaft cluster id must look like a base64-encoded UUID (22 chars).
             echo "KAFKA_CLUSTER_ID=MkU3OEVCNTcwNTJENDM2Qk"
+            # Caddy per-env hostname root (deploy#218). Real value written by
+            # deploy-{stg,prod}.yml — `noorinalabs.com` for prod, `stg.noorinalabs.com` for stg.
+            echo "BASE_DOMAIN=ci.example"
           } >> .env
       - name: Validate compose config
         working-directory: compose
