@@ -161,18 +161,32 @@ pull_with_retry() {
     echo "  ERROR: docker pull $image failed after 3 attempts" >&2
     return 1
 }
-# Iterate the resolved image list. `docker compose config --images` emits one
-# image per line for every service in the compose file (build-only services
-# like test-runner emit their resolved local tag, which `docker pull` will
-# reject as not-in-registry — that's fine, the compose `up --build` path
-# below builds them directly; we just skip non-pullable images here).
-$COMPOSE config --images | sort -u | while read -r image; do
+# Identify pull targets via structured compose-config parse: a pull target
+# is a service with `image:` and NO `build:`. Services with `build:` are
+# locally built by the `up --build` step below — pulling them would hit
+# Docker Hub for a non-existent tag.
+#
+# Why not `docker compose config --images` + a glob filter? Compose emits
+# short-form Docker Hub references (`neo4j:5-community`, `postgres:16-alpine`)
+# without a registry-path slash; a `*/*` filter silently skips them.
+# JSON-parse-by-shape avoids that whole class of false-positive miss.
+mapfile -t PULL_IMAGES < <(
+    $COMPOSE config --format json 2>/dev/null | python3 -c "
+import json, sys
+config = json.load(sys.stdin)
+seen = set()
+for name, svc in config.get('services', {}).items():
+    if 'image' in svc and 'build' not in svc:
+        img = svc['image']
+        if img not in seen:
+            seen.add(img)
+            print(img)
+"
+)
+for image in "${PULL_IMAGES[@]}"; do
     [[ -z "$image" ]] && continue
-    # Skip locally-built service tags (no registry path component).
-    case "$image" in
-        */*) pull_with_retry "$image" ;;
-        *)   echo "  skip (build-only): $image" ;;
-    esac
+    echo "  pull: $image"
+    pull_with_retry "$image"
 done
 
 echo "--- Building and starting stack ---"
