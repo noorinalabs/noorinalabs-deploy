@@ -264,6 +264,8 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    environment:
+      BASE_DOMAIN: "${BASE_DOMAIN:?BASE_DOMAIN must be set — env-templated Caddyfile expects {$BASE_DOMAIN}}"
     volumes:
       - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

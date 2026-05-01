@@ -169,6 +169,9 @@ jobs:
               printf "%s='%s'\n" "$var" "$val" >> "$env_file"
             done
             printf "%s='%s'\n" "IMAGE_TAG" "${IMAGE_TAG}" >> "$env_file"
+            # Per-env Caddyfile hostname root (deploy#218). Caddy interpolates
+            # {$BASE_DOMAIN} for the apex/www/isnad-graph virtual hosts.
+            printf "%s='%s'\n" "BASE_DOMAIN" "stg.noorinalabs.com" >> "$env_file"
             # Backup B2 creds (deploy#188): rename BACKUP_B2_* secrets to the
             # bare B2_* names that scripts/backup.sh:59-61 expects. Empty values
             # are written as empty so backup.sh fails fast at preflight rather
