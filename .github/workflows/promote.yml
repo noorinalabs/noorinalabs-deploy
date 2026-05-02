@@ -67,6 +67,18 @@ on:
         required: false
         default: "24"
         type: string
+      skip_alembic_gate:
+        description: >-
+          BREAK-GLASS: skip the alembic pre-retag migration gate. The
+          gate requires a running user-postgres + user-service stack on
+          prod; on first-deploy / DR-restore the stack does not yet
+          exist (chicken-and-egg). Use ONLY when restoring prod from a
+          state where the alembic gate cannot run by definition. Mirrors
+          the skip_stg_verify break-glass discipline: emits a warning
+          annotation + job-summary entry on use.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # All promotions serialize globally — we never want two promotions racing
@@ -484,8 +496,9 @@ jobs:
   migrate-prod:
     name: alembic upgrade head (prod, user-service only)
     needs: [plan, gate-stg-verify]
-    # Skip if user-service is not in this promotion's image set.
-    if: ${{ needs.plan.outputs.user_service_short != '' }}
+    # Skip if user-service is not in this promotion's image set, OR if the
+    # break-glass `skip_alembic_gate` input is set.
+    if: ${{ !inputs.skip_alembic_gate && needs.plan.outputs.user_service_short != '' }}
     uses: ./.github/workflows/db-migrate.yml
     with:
       env: prod
