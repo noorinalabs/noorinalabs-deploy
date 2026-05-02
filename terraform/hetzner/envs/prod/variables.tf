@@ -5,9 +5,9 @@ variable "hcloud_token" {
 }
 
 variable "ssh_public_key_path" {
-  description = "Path to SSH public key file."
+  description = "Path to SSH public key file. Default points at the canonical CI/operator deploy pubkey checked into modules/hetzner-vps/deploy.pub (matches DEPLOY_SSH_PRIVATE_KEY org-secret + workstation ~/.ssh/noorinalabs_deploy)."
   type        = string
-  default     = "~/.ssh/id_ed25519.pub"
+  default     = "../../modules/hetzner-vps/deploy.pub"
 }
 
 variable "ssh_source_ips" {

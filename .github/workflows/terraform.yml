@@ -72,10 +72,6 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
-      - name: Generate CI SSH key
-        run: |
-          ssh-keygen -t ed25519 -f /tmp/ci_key -N ""
-          echo "TF_VAR_ssh_public_key_path=/tmp/ci_key.pub" >> "$GITHUB_ENV"
       - name: Init
         run: terraform init
       - name: Plan
@@ -128,10 +124,6 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
-      - name: Generate CI SSH key
-        run: |
-          ssh-keygen -t ed25519 -f /tmp/ci_key -N ""
-          echo "TF_VAR_ssh_public_key_path=/tmp/ci_key.pub" >> "$GITHUB_ENV"
       - name: Init
         run: terraform init
       - name: Apply

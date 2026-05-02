@@ -61,4 +61,15 @@ resource "hcloud_server" "app" {
   })
 
   labels = local.labels
+
+  # ssh_keys + user_data are creation-time-only on Hetzner. Once the server is
+  # running, changes to either don't affect the live box (cloud-init has long
+  # since finished). Without ignore_changes, Terraform plans a destructive
+  # replace whenever the deploy pubkey or cloud-init template content changes
+  # — e.g., when this PR (#216) lands and replaces the runner-ephemeral pubkey
+  # with the canonical checked-in one. Out-of-band rotations on the live box's
+  # /home/deploy/.ssh/authorized_keys are the operator's job, not Terraform's.
+  lifecycle {
+    ignore_changes = [ssh_keys, user_data]
+  }
 }
