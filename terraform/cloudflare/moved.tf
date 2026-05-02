@@ -17,13 +17,11 @@ moved {
 
 moved {
   from = cloudflare_record.www
-  to   = cloudflare_record.www_cname
+  to   = cloudflare_record.www_a
 }
 
-moved {
-  from = cloudflare_record.subdomains
-  to   = cloudflare_record.legacy_subdomains
-}
+# subdomains/legacy_subdomains rename block dropped in #192 — legacy isnad-graph
+# records are destroyed by this PR's apply, so there's nothing to rename to.
 
 # auth → users rename (deploy#167, P2W10) — per main#212 Q2 owner ruling.
 # Defensive: the auth records were defined in #157 but not yet applied to the

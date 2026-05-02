@@ -2,7 +2,7 @@ output "prod_hostnames" {
   description = "Prod hostname map — consumed by deploy#87 verify and the cutover issue #156. Keys are canonical service identifiers."
   value = {
     landing = cloudflare_record.prod_apex_a.hostname
-    www     = cloudflare_record.www_cname.hostname
+    www     = cloudflare_record.www_a.hostname
     isnad   = cloudflare_record.prod_isnad_cname.hostname
     users   = cloudflare_record.prod_users_cname.hostname
   }
@@ -17,10 +17,8 @@ output "stg_hostnames" {
   }
 }
 
-output "legacy_subdomain_hostnames" {
-  description = "Legacy subdomains (e.g., isnad-graph.noorinalabs.com) preserved during cutover. Retired via #156."
-  value       = { for k, v in cloudflare_record.legacy_subdomains : k => v.hostname }
-}
+# legacy_subdomain_hostnames output removed in #192 — legacy isnad-graph
+# records are destroyed by this PR's apply (drop-legacy-immediately).
 
 output "ssl_mode" {
   description = "Current SSL/TLS mode for the zone."
