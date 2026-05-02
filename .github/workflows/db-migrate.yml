@@ -144,10 +144,17 @@ jobs:
             echo "==> Pulling ${IMAGE}..."
             docker pull "${IMAGE}"
 
-            # DATABASE_URL — psycopg driver, sync, because alembic's env.py
-            # is synchronous. user-postgres resolves on the user-backend
-            # docker network which this one-shot container joins explicitly.
-            DATABASE_URL="postgresql+psycopg://${USER_POSTGRES_USER}:${USER_POSTGRES_PASSWORD}@user-postgres:5432/${USER_POSTGRES_DB}"
+            # DATABASE_URL — asyncpg driver. user-service's alembic/env.py
+            # uses create_async_engine + asyncio.run, so the async driver is
+            # what alembic actually consumes. The image only ships asyncpg
+            # in pyproject.toml (no psycopg), and the runtime
+            # docker-compose.prod.yml DATABASE_URL also uses +asyncpg —
+            # so this aligns the gate's URL with the rest of the stack.
+            # Earlier "psycopg, sync" comment was wrong about env.py; closes
+            # #235 (was the cause of `ModuleNotFoundError: psycopg` on
+            # 2026-05-02). user-postgres resolves on the user-backend docker
+            # network which this one-shot container joins explicitly.
+            DATABASE_URL="postgresql+asyncpg://${USER_POSTGRES_USER}:${USER_POSTGRES_PASSWORD}@user-postgres:5432/${USER_POSTGRES_DB}"
 
             # -------- Belt-and-suspenders head-count assertion (Anya, 2026-04-23) --------
             echo "==> [${ENV_NAME}] alembic heads — heads-count assertion"
