@@ -41,6 +41,16 @@ users:
 # Write configuration files
 # ---------------------------------------------------------------------------
 write_files:
+  # Root authorized_keys — the canonical operator/CI deploy key. Replaces the
+  # role previously played by Hetzner's `ssh_keys` server argument (removed
+  # in #222 because per-env resources couldn't share one pubkey). Operators
+  # who want their personal id_ed25519 on root can append it post-provision.
+  - path: /root/.ssh/authorized_keys
+    owner: root:root
+    permissions: '0600'
+    content: |
+      ${ssh_public_key}
+
   # fail2ban jail for SSH brute force
   - path: /etc/fail2ban/jail.local
     content: |

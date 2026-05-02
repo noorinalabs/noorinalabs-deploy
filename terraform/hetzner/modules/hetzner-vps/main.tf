@@ -6,11 +6,11 @@ locals {
   }
 }
 
-resource "hcloud_ssh_key" "deploy" {
-  name       = "${local.name_prefix}-deploy"
-  public_key = sensitive(chomp(file(var.ssh_public_key_path)))
-  labels     = local.labels
-}
+# hcloud_ssh_key.deploy was removed in #222 — Hetzner enforces SSH-key content
+# uniqueness across the project, so per-env resources sharing one canonical
+# pubkey hit `uniqueness_error 409`. cloud-init's user_data is now the sole
+# path for injecting authorized_keys (writes both /home/deploy/.ssh/authorized_keys
+# and /root/.ssh/authorized_keys with var.ssh_public_key_path content).
 
 resource "hcloud_firewall" "web" {
   name   = "${local.name_prefix}-firewall"
@@ -49,7 +49,6 @@ resource "hcloud_server" "app" {
   location    = var.location
   image       = var.image
 
-  ssh_keys     = [hcloud_ssh_key.deploy.id]
   firewall_ids = [hcloud_firewall.web.id]
 
   user_data = templatefile("${path.module}/cloud-init.yaml.tpl", {
@@ -62,13 +61,13 @@ resource "hcloud_server" "app" {
 
   labels = local.labels
 
-  # ssh_keys + user_data are creation-time-only on Hetzner. Once the server is
-  # running, changes to either don't affect the live box (cloud-init has long
-  # since finished). Without ignore_changes, Terraform plans a destructive
-  # replace whenever the deploy pubkey or cloud-init template content changes
-  # — e.g., when this PR (#216) lands and replaces the runner-ephemeral pubkey
-  # with the canonical checked-in one. Out-of-band rotations on the live box's
-  # /home/deploy/.ssh/authorized_keys are the operator's job, not Terraform's.
+  # ssh_keys + user_data are creation-time-only on Hetzner. The ssh_keys arg
+  # was removed in #222 (cloud-init handles authorized_keys for both root and
+  # deploy users via user_data — see cloud-init.yaml.tpl). The ignore_changes
+  # entry is retained so the existing live-state ssh_keys reference (a now-
+  # deleted hcloud_ssh_key.deploy id from #217's apply) doesn't cause
+  # spurious reconciliation. user_data is ignored so cloud-init template
+  # edits don't trigger destructive server replace on already-provisioned VPSes.
   lifecycle {
     ignore_changes = [ssh_keys, user_data]
   }
