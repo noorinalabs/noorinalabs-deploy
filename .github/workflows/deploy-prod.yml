@@ -47,6 +47,16 @@ on:
         description: "Prod tag for landing (prod-* shape; empty = prod-latest)."
         required: false
         default: ""
+      allow_stg_tags:
+        description: >-
+          BREAK-GLASS: accept stg-* shape tags directly (skip the prod-*
+          shape check). Only use when the promote.yml retag path is
+          broken and prod must be restored. Mirrors skip_stg_verify /
+          skip_alembic_gate discipline. Surfaced 2026-05-02 emergency
+          restore — GHCR cross-repo write blocked at token-scope level.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: deploy-production
@@ -75,15 +85,25 @@ jobs:
           us="${USER_SERVICE_TAG:-prod-latest}"
           ld="${LANDING_TAG:-prod-latest}"
 
-          # Validate prod-* shape on each resolved tag.
+          # Validate tag shape on each resolved tag. Default: prod-* only.
+          # `allow_stg_tags=true` (break-glass) also accepts stg-* shape.
+          allow_stg="${{ inputs.allow_stg_tags }}"
           for pair in "api+frontend:$af" "user-service:$us" "landing:$ld"; do
             svc="${pair%%:*}"
             tag="${pair#*:}"
             case "$tag" in
               prod-*) ;;
+              stg-*)
+                if [ "$allow_stg" = "true" ]; then
+                  echo "::warning::deploy-prod accepting stg-* tag via allow_stg_tags break-glass: $svc=$tag"
+                else
+                  echo "::error::deploy-prod refuses non-prod-* tags for $svc. Got: $tag"
+                  echo "::error::Use promote.yml to produce a prod-<short> tag from a stg digest first, or pass allow_stg_tags=true for emergency restore."
+                  exit 1
+                fi
+                ;;
               *)
-                echo "::error::deploy-prod refuses non-prod-* tags for $svc. Got: $tag"
-                echo "::error::Use promote.yml to produce a prod-<short> tag from a stg digest first."
+                echo "::error::deploy-prod refuses non-prod-* / non-stg-* tags for $svc. Got: $tag"
                 exit 1
                 ;;
             esac
