@@ -1,8 +1,8 @@
-www.noorinalabs.com {
-    redir https://noorinalabs.com{uri} permanent
+www.{$BASE_DOMAIN} {
+    redir https://{$BASE_DOMAIN}{uri} permanent
 }
 
-noorinalabs.com {
+{$BASE_DOMAIN} {
     reverse_proxy landing:80
 
     header {
@@ -15,7 +15,7 @@ noorinalabs.com {
     }
 }
 
-isnad-graph.noorinalabs.com {
+isnad-graph.{$BASE_DOMAIN} {
     # ── User service routes ──────────────────────────────────────────
 
     # OAuth post-login redirect target lives on the frontend (React Router
