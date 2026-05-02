@@ -145,20 +145,15 @@ isnad.{$BASE_DOMAIN} {
     }
 }
 
-# users.{$BASE_DOMAIN} — auth + account management surface (user-service).
-# Carved out from isnad.{$BASE_DOMAIN} in #220. The OAuth flow's
-# `redirect_uri` (set via AUTH_OAUTH_REDIRECT_BASE_URL on user-service)
-# and the post-login frontend callback path both live here.
+# users.{$BASE_DOMAIN} — pure user-service API surface.
+# Carved out from isnad.{$BASE_DOMAIN} in #220. user-service receives the
+# OAuth provider redirect at /auth/oauth/{provider}/callback (set via
+# AUTH_OAUTH_REDIRECT_BASE_URL on user-service) and after token exchange
+# redirects the browser CROSS-ORIGIN to isnad.{$BASE_DOMAIN}/auth/callback/
+# {provider} (set via AUTH_OAUTH_POST_LOGIN_URL on user-service). The
+# AuthCallbackPage and all other frontend rendering happen on isnad.* —
+# users.* is purely an API surface.
 users.{$BASE_DOMAIN} {
-    # OAuth post-login frontend page (React Router AuthCallbackPage). The
-    # browser is sent here by user-service after a successful OAuth
-    # exchange — see user-service config.AUTH_OAUTH_POST_LOGIN_URL.
-    # Carve out before /auth/* which goes to user-service. See deploy#133,
-    # user-service#67.
-    handle /auth/callback/* {
-        reverse_proxy frontend:80
-    }
-
     # User service — auth endpoints (login, OAuth, logout, refresh, etc.)
     # NOTE: rate limiting on /auth/* should be enforced at the app layer.
     handle /auth/* {
@@ -224,14 +219,14 @@ users.{$BASE_DOMAIN} {
         reverse_proxy user-service:8000
     }
 
-    # Default — catch-all to frontend for SPA assets (/assets/*, /theme-init.js,
-    # favicon, fonts, etc.) needed when /auth/callback/{provider} loads the
-    # React AuthCallbackPage on this vhost. The user-service explicit handlers
-    # above match first; only unmapped paths fall here. Was originally routed
-    # to user-service, but that broke the post-OAuth callback page (blank
-    # page — bundle assets returned user-service 404 JSON instead of the JS).
+    # Default — catch-all to user-service for any unmapped path on this
+    # vhost. The vhost is purely an API surface post-#247 (OAuth callback
+    # redirects cross-origin to isnad.{$BASE_DOMAIN}/auth/callback rather
+    # than rendering the AuthCallbackPage here), so SPA-asset fallthrough
+    # is no longer needed. Direct hits to users.{base}/foo (no explicit
+    # handler) get a clean user-service 404 JSON.
     handle {
-        reverse_proxy frontend:80
+        reverse_proxy user-service:8000
     }
 
     # Security headers
