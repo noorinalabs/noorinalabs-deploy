@@ -19,52 +19,72 @@ resource "cloudflare_zone_settings_override" "ssl" {
 }
 
 # ===========================================================================
-# PROD records — point at `noorinalabs-prod` (VPS provisioned by
-# terraform/hetzner/envs/prod, see #82).
+# PROD records — point at the prod Hetzner VPS. Currently the hand-made
+# 1box-prod (87.99.134.161 / 2a01:4ff:f0:be57::1); cuts over to the new
+# TF-managed noorinalabs-prod via deploy#86. All proxied through Cloudflare
+# for DDoS / WAF / edge cache (per owner ruling 2026-05-02). ssl=strict
+# (set at zone level above) requires origin Caddy to present a valid LE
+# cert — works through the proxy via ACME HTTP-01 path-passthrough.
 # ===========================================================================
 
-# Root apex — noorinalabs.com → prod VPS IPv4 (DNS only, not proxied).
+# Root apex — noorinalabs.com (proxied A + AAAA to prod origin).
+# `name = var.domain` (FQDN) instead of `"@"` — Cloudflare's API normalizes
+# `@` to the FQDN on read, so using FQDN here keeps the diff clean post-import.
 resource "cloudflare_record" "prod_apex_a" {
   zone_id = var.cloudflare_zone_id
-  name    = "@"
+  name    = var.domain
   content = var.prod_vps_ipv4_address
   type    = "A"
   ttl     = 1
-  proxied = false
+  proxied = true
 }
 
-# Root apex IPv6 — optional. `prod_vps_ipv6_address = ""` disables the record.
 resource "cloudflare_record" "prod_apex_aaaa" {
   count   = var.prod_vps_ipv6_address == "" ? 0 : 1
   zone_id = var.cloudflare_zone_id
-  name    = "@"
+  name    = var.domain
   content = var.prod_vps_ipv6_address
   type    = "AAAA"
   ttl     = 1
-  proxied = false
+  proxied = true
 }
 
-# www → apex redirect (Caddy does the actual redirect; DNS just resolves).
-resource "cloudflare_record" "www_cname" {
+# www.noorinalabs.com — A/AAAA mirrors of apex (matches live; Caddy redirects
+# to apex). Was a CNAME in earlier drafts; A/AAAA matches the hand-managed
+# state in production and is the shape Cloudflare uses when imported.
+resource "cloudflare_record" "www_a" {
   zone_id = var.cloudflare_zone_id
   name    = "www"
-  content = var.domain
-  type    = "CNAME"
+  content = var.prod_vps_ipv4_address
+  type    = "A"
   ttl     = 1
-  proxied = false
+  proxied = true
 }
 
-# isnad.noorinalabs.com → prod apex (isnad-graph app in prod).
+resource "cloudflare_record" "www_aaaa" {
+  count   = var.prod_vps_ipv6_address == "" ? 0 : 1
+  zone_id = var.cloudflare_zone_id
+  name    = "www"
+  content = var.prod_vps_ipv6_address
+  type    = "AAAA"
+  ttl     = 1
+  proxied = true
+}
+
+# isnad.noorinalabs.com → apex (isnad-graph app in prod, new-shaped name).
+# Replaces the legacy isnad-graph.noorinalabs.com — Caddy binding moved to
+# isnad.{$BASE_DOMAIN} in this same PR; legacy DNS records destroyed by
+# this apply (drop-legacy-immediately per owner choice 2026-05-02).
 resource "cloudflare_record" "prod_isnad_cname" {
   zone_id = var.cloudflare_zone_id
   name    = "isnad"
   content = var.domain
   type    = "CNAME"
   ttl     = 1
-  proxied = false
+  proxied = true
 }
 
-# users.noorinalabs.com → prod apex (user-service in prod).
+# users.noorinalabs.com → apex (user-service in prod).
 # Per main#212 Q2 ruling 2026-04-25: hostname is `users.*` (matches the
 # noorinalabs-user-service repo and reflects combined auth + account-mgmt scope).
 resource "cloudflare_record" "prod_users_cname" {
@@ -73,38 +93,22 @@ resource "cloudflare_record" "prod_users_cname" {
   content = var.domain
   type    = "CNAME"
   ttl     = 1
-  proxied = false
-}
-
-# Legacy subdomains (isnad-graph.noorinalabs.com currently) — CNAME to apex.
-# Preserved by #83 to avoid traffic disruption; retired in #156 cutover.
-resource "cloudflare_record" "legacy_subdomains" {
-  for_each = var.legacy_subdomains
-
-  zone_id = var.cloudflare_zone_id
-  name    = each.key
-  content = var.domain
-  type    = "CNAME"
-  ttl     = 1
-  proxied = each.value
+  proxied = true
 }
 
 # ===========================================================================
-# STG records — point at `noorinalabs-stg` (VPS provisioned by
-# terraform/hetzner/envs/stg, see #82).
+# STG records — point at noorinalabs-stg (TF-managed Hetzner VPS).
 # ===========================================================================
 
-# Stg subdomain apex — stg.noorinalabs.com → stg VPS IPv4.
 resource "cloudflare_record" "stg_apex_a" {
   zone_id = var.cloudflare_zone_id
   name    = "stg"
   content = var.stg_vps_ipv4_address
   type    = "A"
   ttl     = 1
-  proxied = false
+  proxied = true
 }
 
-# Stg subdomain apex IPv6 — optional.
 resource "cloudflare_record" "stg_apex_aaaa" {
   count   = var.stg_vps_ipv6_address == "" ? 0 : 1
   zone_id = var.cloudflare_zone_id
@@ -112,25 +116,23 @@ resource "cloudflare_record" "stg_apex_aaaa" {
   content = var.stg_vps_ipv6_address
   type    = "AAAA"
   ttl     = 1
-  proxied = false
+  proxied = true
 }
 
-# isnad.stg.noorinalabs.com → stg subdomain apex (isnad-graph app in stg).
 resource "cloudflare_record" "stg_isnad_cname" {
   zone_id = var.cloudflare_zone_id
   name    = "isnad.stg"
   content = "stg.${var.domain}"
   type    = "CNAME"
   ttl     = 1
-  proxied = false
+  proxied = true
 }
 
-# users.stg.noorinalabs.com → stg subdomain apex (user-service in stg).
 resource "cloudflare_record" "stg_users_cname" {
   zone_id = var.cloudflare_zone_id
   name    = "users.stg"
   content = "stg.${var.domain}"
   type    = "CNAME"
   ttl     = 1
-  proxied = false
+  proxied = true
 }

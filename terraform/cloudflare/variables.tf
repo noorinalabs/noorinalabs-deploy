@@ -43,16 +43,7 @@ variable "stg_vps_ipv6_address" {
   default     = ""
 }
 
-# ---------------------------------------------------------------------------
-# Legacy subdomain map (for `isnad-graph.noorinalabs.com` and any ad-hoc
-# CNAMEs that should alias to the prod apex). Preserved untouched by #83 —
-# retirement of `isnad-graph` is tracked in #156 (cutover follow-up).
-# ---------------------------------------------------------------------------
-
-variable "legacy_subdomains" {
-  description = "Map of legacy subdomain names → proxied flag. All CNAME to the prod apex. Empty the map to drop a legacy name once its cutover is complete."
-  type        = map(bool)
-  default = {
-    "isnad-graph" = false
-  }
-}
+# Legacy subdomains variable removed in #192 (drop-legacy-immediately per
+# owner ruling 2026-05-02). isnad-graph.noorinalabs.com A/AAAA records are
+# imported and then destroyed by this PR's apply; Caddy binding moved to
+# isnad.{$BASE_DOMAIN} in the same PR.
