@@ -67,6 +67,18 @@ on:
         required: false
         default: "24"
         type: string
+      skip_alembic_gate:
+        description: >-
+          BREAK-GLASS: skip the alembic pre-retag migration gate. The
+          gate requires a running user-postgres + user-service stack on
+          prod; on first-deploy / DR-restore the stack does not yet
+          exist (chicken-and-egg). Use ONLY when restoring prod from a
+          state where the alembic gate cannot run by definition. Mirrors
+          the skip_stg_verify break-glass discipline: emits a warning
+          annotation + job-summary entry on use.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # All promotions serialize globally — we never want two promotions racing
@@ -484,8 +496,9 @@ jobs:
   migrate-prod:
     name: alembic upgrade head (prod, user-service only)
     needs: [plan, gate-stg-verify]
-    # Skip if user-service is not in this promotion's image set.
-    if: ${{ needs.plan.outputs.user_service_short != '' }}
+    # Skip if user-service is not in this promotion's image set, OR if the
+    # break-glass `skip_alembic_gate` input is set.
+    if: ${{ !inputs.skip_alembic_gate && needs.plan.outputs.user_service_short != '' }}
     uses: ./.github/workflows/db-migrate.yml
     with:
       env: prod
@@ -518,11 +531,17 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          # GITHUB_TOKEN needs `packages: write` on this repo for the image
-          # namespace. Cross-repo GHCR writes work because all images live
-          # under the same org (noorinalabs) — GitHub resolves org-scoped
-          # package permissions from the workflow's repo token.
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # The retag job writes prod-* tags onto packages owned by OTHER
+          # repos (noorinalabs-isnad-graph, noorinalabs-user-service,
+          # noorinalabs-landing-page). The default GITHUB_TOKEN scoped to
+          # noorinalabs-deploy does NOT have write access to those
+          # packages — earlier comment claiming "GitHub resolves
+          # org-scoped package permissions from the workflow's repo token"
+          # is wrong and was the cause of the 2026-05-02 emergency-restore
+          # 403 permission_denied failures. Use the org-scoped
+          # GH_PACKAGES_TOKEN (org secret) which has write:packages on all
+          # noorinalabs/* container packages.
+          password: ${{ secrets.GH_PACKAGES_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
