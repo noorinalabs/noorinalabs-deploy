@@ -224,10 +224,14 @@ users.{$BASE_DOMAIN} {
         reverse_proxy user-service:8000
     }
 
-    # Default — catch-all to user-service for any unmapped path on this
-    # vhost. user-service returns 404 cleanly.
+    # Default — catch-all to frontend for SPA assets (/assets/*, /theme-init.js,
+    # favicon, fonts, etc.) needed when /auth/callback/{provider} loads the
+    # React AuthCallbackPage on this vhost. The user-service explicit handlers
+    # above match first; only unmapped paths fall here. Was originally routed
+    # to user-service, but that broke the post-OAuth callback page (blank
+    # page — bundle assets returned user-service 404 JSON instead of the JS).
     handle {
-        reverse_proxy user-service:8000
+        reverse_proxy frontend:80
     }
 
     # Security headers
