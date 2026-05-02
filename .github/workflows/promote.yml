@@ -549,23 +549,20 @@ jobs:
       - name: Resolve source tag
         id: src
         env:
-          # Matrix short is plan-resolved; if plan received an explicit
-          # source_sha, `short` is that SHA and source tag is `sha-<short>`.
-          # If plan walked from stg-latest, `short` is the matched sha-<short>
-          # and we still source from `stg-latest` (same digest; using the
-          # short-tag gives slightly better audit trace).
+          # Always source from sha-${SHORT}. The plan job resolved SHORT from
+          # whatever drove this run (explicit source_sha input or stg-latest
+          # digest at plan time), and sha-<short> is digest-stable per the
+          # Contract v6 invariant. Sourcing from a floating tag like
+          # stg-latest creates a TOCTOU race between plan, retag, and the
+          # digest-parity step — surfaced 2026-05-02 (#234) when a
+          # concurrent service-repo ghcr-publish caused the parity check to
+          # observe three different digests across that window. sha-<short>
+          # closes the race.
           SHORT: ${{ matrix.short }}
           IMAGE: ${{ env.REGISTRY }}/${{ matrix.image }}
-          EXPLICIT: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          if [ -n "$EXPLICIT" ]; then
-            # Operator-provided sha: pin to that specific sha-<short>.
-            source_tag="sha-${SHORT}"
-          else
-            # Auto-promote from stg-latest. Same digest as sha-${SHORT}.
-            source_tag="stg-latest"
-          fi
+          source_tag="sha-${SHORT}"
           echo "Using source tag: $IMAGE:$source_tag (matches short=$SHORT)"
           echo "source_tag=$source_tag" >> "$GITHUB_OUTPUT"
 
