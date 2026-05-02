@@ -16,13 +16,93 @@ www.{$BASE_DOMAIN} {
 }
 
 isnad.{$BASE_DOMAIN} {
-    # User-service routes carved out to users.{$BASE_DOMAIN} in #220 — see
-    # the dedicated vhost block below. Anything user-related (auth, accounts,
-    # sessions, subscriptions, JWKS, 2FA, etc.) is served from there.
+    # User-service routes are ALSO served from this vhost (in addition to
+    # the dedicated users.{$BASE_DOMAIN} block below). The frontend hard-
+    # codes relative URLs (`/auth/oauth/{provider}/login`, `/api/v1/users`,
+    # etc.) — see frontend/src/{hooks/useAuth.ts,pages/LoginPage.tsx} —
+    # so removing these entirely from isnad.* breaks login. Restored
+    # 2026-05-02 mid-emergency-restore as the pragmatic two-phase
+    # migration completion: phase 1 is dual-binding both vhosts (this
+    # state); phase 2 is updating frontend to absolute URLs targeting
+    # users.{$BASE_DOMAIN}, then dropping the user-service routes from
+    # isnad.* (filed as deploy#NNN).
+
+    # ── User service routes (transitional — see comment above) ──────
+
+    # OAuth post-login redirect target lives on the frontend (React Router
+    # AuthCallbackPage), NOT user-service. Carve out before /auth/* which
+    # goes to user-service. See deploy#133, user-service#67.
+    handle /auth/callback/* {
+        reverse_proxy frontend:80
+    }
+
+    # User service — auth endpoints
+    handle /auth/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — JWKS public keys (IETF well-known)
+    handle /.well-known/jwks.json {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — user management API
+    handle /api/v1/users {
+        reverse_proxy user-service:8000
+    }
+    handle /api/v1/users/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — session management
+    handle /api/v1/sessions {
+        reverse_proxy user-service:8000
+    }
+    handle /api/v1/sessions/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — subscription management
+    handle /api/v1/subscriptions {
+        reverse_proxy user-service:8000
+    }
+    handle /api/v1/subscriptions/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — email verification
+    handle /api/v1/verification {
+        reverse_proxy user-service:8000
+    }
+    handle /api/v1/verification/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — roles
+    handle /api/v1/roles {
+        reverse_proxy user-service:8000
+    }
+    handle /api/v1/roles/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — 2FA (TOTP)
+    handle /api/v1/2fa {
+        reverse_proxy user-service:8000
+    }
+    handle /api/v1/2fa/* {
+        reverse_proxy user-service:8000
+    }
+
+    # User service — health check (rewrite to /health)
+    handle /api/v1/user-service/health {
+        rewrite * /health
+        reverse_proxy user-service:8000
+    }
 
     # ── isnad-graph API routes ───────────────────────────────────────
 
-    # API routes (versioned) — catch-all for isnad-graph
+    # API routes (versioned) — catch-all for non-user-service paths
     handle /api/* {
         reverse_proxy api:8000
     }
