@@ -6,7 +6,7 @@ module "vps" {
   source = "../../modules/hetzner-vps"
 
   env         = "stg"
-  server_type = "cpx21"
+  server_type = "cpx41"
   location    = "ash"
 
   ssh_public_key_path = var.ssh_public_key_path
