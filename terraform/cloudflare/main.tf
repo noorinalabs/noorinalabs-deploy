@@ -98,6 +98,15 @@ resource "cloudflare_record" "prod_users_cname" {
 
 # ===========================================================================
 # STG records — point at noorinalabs-stg (TF-managed Hetzner VPS).
+#
+# All stg records are gray-cloud (proxied=false). Cloudflare Universal SSL
+# only covers `*.noorinalabs.com` (one level deep), so 3rd-level subdomains
+# like `isnad.stg.noorinalabs.com` get a TLS handshake failure at the CF
+# edge. Until/unless we enable Cloudflare Advanced Certificate Manager (paid,
+# wildcard at any depth), stg lives outside the CF proxy. Origin Caddy has
+# valid LE certs for the stg hostnames and serves directly. Stg loses the
+# CF DDoS / WAF / cache benefits — acceptable for non-prod. Tracked as a
+# tech-debt followup if owner ever wants to revisit ACM.
 # ===========================================================================
 
 resource "cloudflare_record" "stg_apex_a" {
@@ -106,7 +115,7 @@ resource "cloudflare_record" "stg_apex_a" {
   content = var.stg_vps_ipv4_address
   type    = "A"
   ttl     = 1
-  proxied = true
+  proxied = false
 }
 
 resource "cloudflare_record" "stg_apex_aaaa" {
@@ -116,7 +125,7 @@ resource "cloudflare_record" "stg_apex_aaaa" {
   content = var.stg_vps_ipv6_address
   type    = "AAAA"
   ttl     = 1
-  proxied = true
+  proxied = false
 }
 
 resource "cloudflare_record" "stg_isnad_cname" {
@@ -125,7 +134,7 @@ resource "cloudflare_record" "stg_isnad_cname" {
   content = "stg.${var.domain}"
   type    = "CNAME"
   ttl     = 1
-  proxied = true
+  proxied = false
 }
 
 resource "cloudflare_record" "stg_users_cname" {
@@ -134,5 +143,5 @@ resource "cloudflare_record" "stg_users_cname" {
   content = "stg.${var.domain}"
   type    = "CNAME"
   ttl     = 1
-  proxied = true
+  proxied = false
 }
