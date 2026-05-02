@@ -16,17 +16,71 @@ www.{$BASE_DOMAIN} {
 }
 
 isnad.{$BASE_DOMAIN} {
-    # ── User service routes ──────────────────────────────────────────
+    # User-service routes carved out to users.{$BASE_DOMAIN} in #220 — see
+    # the dedicated vhost block below. Anything user-related (auth, accounts,
+    # sessions, subscriptions, JWKS, 2FA, etc.) is served from there.
 
-    # OAuth post-login redirect target lives on the frontend (React Router
-    # AuthCallbackPage), NOT user-service. Carve out before /auth/* which
-    # goes to user-service. See deploy#133, user-service#67.
+    # ── isnad-graph API routes ───────────────────────────────────────
+
+    # API routes (versioned) — catch-all for isnad-graph
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+
+    # API routes (top-level health/status — no /api prefix)
+    handle /health {
+        reverse_proxy api:8000
+    }
+    handle /status {
+        reverse_proxy api:8000
+    }
+
+    # Metrics — not publicly proxied; Prometheus scrapes api:8000
+    # directly via the Docker backend network (see prometheus.yml).
+    handle /metrics {
+        respond 403
+    }
+
+    # ── Other services ───────────────────────────────────────────────
+
+    # Grafana
+    handle /grafana/* {
+        reverse_proxy grafana:3000
+    }
+
+    # Frontend (default)
+    handle {
+        reverse_proxy frontend:80
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "0"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'"
+        -Server
+    }
+}
+
+# users.{$BASE_DOMAIN} — auth + account management surface (user-service).
+# Carved out from isnad.{$BASE_DOMAIN} in #220. The OAuth flow's
+# `redirect_uri` (set via AUTH_OAUTH_REDIRECT_BASE_URL on user-service)
+# and the post-login frontend callback path both live here.
+users.{$BASE_DOMAIN} {
+    # OAuth post-login frontend page (React Router AuthCallbackPage). The
+    # browser is sent here by user-service after a successful OAuth
+    # exchange — see user-service config.AUTH_OAUTH_POST_LOGIN_URL.
+    # Carve out before /auth/* which goes to user-service. See deploy#133,
+    # user-service#67.
     handle /auth/callback/* {
         reverse_proxy frontend:80
     }
 
-    # User service — auth endpoints
-    # NOTE: rate limiting on /auth/* should be enforced at the app layer
+    # User service — auth endpoints (login, OAuth, logout, refresh, etc.)
+    # NOTE: rate limiting on /auth/* should be enforced at the app layer.
     handle /auth/* {
         reverse_proxy user-service:8000
     }
@@ -90,37 +144,10 @@ isnad.{$BASE_DOMAIN} {
         reverse_proxy user-service:8000
     }
 
-    # ── isnad-graph API routes ───────────────────────────────────────
-
-    # API routes (versioned) — catch-all for non-user-service paths
-    handle /api/* {
-        reverse_proxy api:8000
-    }
-
-    # API routes (top-level health/status — no /api prefix)
-    handle /health {
-        reverse_proxy api:8000
-    }
-    handle /status {
-        reverse_proxy api:8000
-    }
-
-    # Metrics — not publicly proxied; Prometheus scrapes api:8000
-    # directly via the Docker backend network (see prometheus.yml).
-    handle /metrics {
-        respond 403
-    }
-
-    # ── Other services ───────────────────────────────────────────────
-
-    # Grafana
-    handle /grafana/* {
-        reverse_proxy grafana:3000
-    }
-
-    # Frontend (default)
+    # Default — catch-all to user-service for any unmapped path on this
+    # vhost. user-service returns 404 cleanly.
     handle {
-        reverse_proxy frontend:80
+        reverse_proxy user-service:8000
     }
 
     # Security headers
@@ -130,7 +157,6 @@ isnad.{$BASE_DOMAIN} {
         X-Frame-Options "DENY"
         X-XSS-Protection "0"
         Referrer-Policy "strict-origin-when-cross-origin"
-        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; frame-ancestors 'none'"
         -Server
     }
 }
