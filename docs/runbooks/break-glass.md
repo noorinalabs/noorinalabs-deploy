@@ -183,11 +183,13 @@ Replace `<input>` with the value from the alert's `input` label.
 
 As of 2026-05-03, Alertmanager's `critical` receiver webhook is a
 localhost placeholder (`http://localhost:9095/webhook`) pending real
-Slack/email routing — tracked in deploy#127. The `BreakGlassUsed` rule
+Slack/email routing — tracked in deploy#262 (post-#251 sequel; the
+parse-error fix for `${VAR}` interpolation that landed the placeholder
+itself was deploy#127, closed 2026-04-19). The `BreakGlassUsed` rule
 fires correctly inside Prometheus + Alertmanager, but the human-facing
-notification path requires #127 to land first.
+notification path requires #262 to land first.
 
-Until #127 is resolved, on-call should grep the audit-log issue + check
+Until #262 is resolved, on-call should grep the audit-log issue + check
 the Alertmanager UI directly:
 `https://noorinalabs.com/alertmanager/` (behind admin auth).
 
@@ -205,6 +207,7 @@ the Alertmanager UI directly:
 
 - deploy#251 — this audit/alert layer (this PR)
 - deploy#232 — original break-glass inputs landing
-- deploy#127 — Alertmanager receiver webhook (localhost placeholder)
+- deploy#262 — wire Alertmanager receivers to a real human surface (post-#251 sequel)
+- deploy#127 — alertmanager.yml `${VAR}` parse-error fix that landed the localhost placeholder (closed 2026-04-19; historical reference)
 - deploy#161 — alembic-gate textfile pattern (template for our metric emit)
 - charter/emergency-mode.md — `[OWNER-ACTION]` discipline this audit complements

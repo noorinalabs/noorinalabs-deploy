@@ -335,6 +335,13 @@ jobs:
     permissions:
       actions: read
       contents: read
+      # `issues: write` required by the break-glass-audit composite action
+      # invoked from this job when `inputs.skip_stg_verify` is true. The
+      # job-level `permissions:` block fully replaces the workflow-level
+      # one at YAML resolution time — so without this line the audit
+      # step would 403 from the GitHub Issues API on the exact path
+      # the audit instrumentation exists for. (Bereket-261-rev catch.)
+      issues: write
     outputs:
       gate_result: ${{ steps.gate.outputs.gate_result }}
     steps:
