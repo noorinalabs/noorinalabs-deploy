@@ -9,19 +9,27 @@ Source of truth for the route list: `infra/prometheus/prometheus.yml`
 (scrape_config `blackbox`). Modules and HTTP-status expectations live in
 `infra/blackbox-exporter/blackbox.yml`.
 
-| Route label             | URL                                                                       | Module          | Expected |
-|-------------------------|---------------------------------------------------------------------------|-----------------|----------|
-| `isnad-health`          | `https://isnad-graph.noorinalabs.com/health`                              | `http_2xx_json` | 200, JSON body |
-| `user-service-health`   | `https://isnad-graph.noorinalabs.com/api/v1/user-service/health`          | `http_2xx`      | 200 |
-| `landing-root`          | `https://noorinalabs.com/`                                                | `http_2xx`      | 200 |
-| `narrator-401`          | `https://isnad-graph.noorinalabs.com/api/v1/narrators?limit=1`            | `http_401_json` | 401/403 + JSON body |
-| `jwks`                  | `https://isnad-graph.noorinalabs.com/.well-known/jwks.json`               | `http_2xx_json` | 200, JSON `.keys[]` |
-| `auth-login-redirect`   | `https://isnad-graph.noorinalabs.com/auth/login`                          | `http_3xx`      | 3xx (or 200 for interstitial) |
+| Route label             | URL                                                                  | Module          | Expected |
+|-------------------------|----------------------------------------------------------------------|-----------------|----------|
+| `isnad-health`          | `https://isnad.noorinalabs.com/health`                               | `http_2xx_json` | 200, JSON body |
+| `user-service-health`   | `https://isnad.noorinalabs.com/api/v1/user-service/health`           | `http_2xx`      | 200 |
+| `landing-root`          | `https://noorinalabs.com/`                                           | `http_2xx`      | 200 |
+| `narrator-401`          | `https://isnad.noorinalabs.com/api/v1/narrators?limit=1`             | `http_401_json` | 401/403 + JSON body |
+| `jwks`                  | `https://isnad.noorinalabs.com/.well-known/jwks.json`                | `http_2xx_json` | 200, JSON `.keys[]` |
+| `auth-login-redirect`   | `https://isnad.noorinalabs.com/auth/login`                           | `http_3xx`      | 3xx (or 200 for interstitial) |
 
-When deploy#156 cleaves user-service onto its own subdomain
-(`users.noorinalabs.com`) and isnad onto `isnad.noorinalabs.com`,
-update the URLs in `infra/prometheus/prometheus.yml` and the smoke
-battery defaults in lockstep.
+The hostnames moved to `isnad.noorinalabs.com` (frontend + isnad-graph
+API + dual-bound user-service routes) and `users.noorinalabs.com`
+(pure user-service API surface) during the 2026-05-02 emergency CF DNS
+reconciliation (#226) and were applied to this scrape config in
+deploy#255. The post-deploy smoke battery
+(`scripts/verify_prod_smoke.sh`) was updated in lockstep via
+deploy#252 / PR#254. The five routes above all sit on the dual-bound
+isnad vhost (see `caddy/Caddyfile`); the de-duplication of those
+routes onto `users.*` only is a transitional follow-up tracked in
+that file's comment block — when it lands, swap the relevant probe
+host here and in the smoke battery in lockstep, same as we did this
+time.
 
 ## Alerts
 
