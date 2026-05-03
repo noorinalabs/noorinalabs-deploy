@@ -3,6 +3,58 @@ provider "cloudflare" {
 }
 
 # ---------------------------------------------------------------------------
+# Per-env Hetzner VPS IPs — read from the hetzner env-root tfstates instead of
+# input variables. Eliminates the manual var-passing footgun (cloudflare apply
+# would otherwise drift whenever a hetzner apply changed an IP). The CI apply
+# job orders `apply-cloudflare needs: apply` so the hetzner state we read here
+# is always freshly converged.
+#
+# Backend config mirrors `terraform/hetzner/envs/{prod,stg}/versions.tf` —
+# same B2 bucket, same S3-compat skip flags. Reader auth uses the same
+# `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars (mapped from
+# `TF_STATE_B2_KEY_ID` / `TF_STATE_B2_APP_KEY`) that the cloudflare module's
+# own backend already needs.
+# ---------------------------------------------------------------------------
+data "terraform_remote_state" "hetzner_prod" {
+  backend = "s3"
+  config = {
+    bucket = "noorinalabs-terraform-state"
+    key    = "hetzner/prod.tfstate"
+    region = "us-east-005"
+    endpoints = {
+      s3 = "https://s3.us-east-005.backblazeb2.com"
+    }
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_region_validation      = true
+    skip_requesting_account_id  = true
+  }
+}
+
+data "terraform_remote_state" "hetzner_stg" {
+  backend = "s3"
+  config = {
+    bucket = "noorinalabs-terraform-state"
+    key    = "hetzner/stg.tfstate"
+    region = "us-east-005"
+    endpoints = {
+      s3 = "https://s3.us-east-005.backblazeb2.com"
+    }
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_region_validation      = true
+    skip_requesting_account_id  = true
+  }
+}
+
+locals {
+  prod_vps_ipv4 = data.terraform_remote_state.hetzner_prod.outputs.server_ip
+  prod_vps_ipv6 = data.terraform_remote_state.hetzner_prod.outputs.server_ipv6
+  stg_vps_ipv4  = data.terraform_remote_state.hetzner_stg.outputs.server_ip
+  stg_vps_ipv6  = data.terraform_remote_state.hetzner_stg.outputs.server_ipv6
+}
+
+# ---------------------------------------------------------------------------
 # SSL/TLS configuration — applies to every record in the zone.
 # Full (Strict) — Cloudflare verifies the origin certificate.
 # Caddy on each VPS provides a valid Let's Encrypt cert, so strict works.
@@ -33,17 +85,17 @@ resource "cloudflare_zone_settings_override" "ssl" {
 resource "cloudflare_record" "prod_apex_a" {
   zone_id = var.cloudflare_zone_id
   name    = var.domain
-  content = var.prod_vps_ipv4_address
+  content = local.prod_vps_ipv4
   type    = "A"
   ttl     = 1
   proxied = true
 }
 
 resource "cloudflare_record" "prod_apex_aaaa" {
-  count   = var.prod_vps_ipv6_address == "" ? 0 : 1
+  count   = local.prod_vps_ipv6 == "" ? 0 : 1
   zone_id = var.cloudflare_zone_id
   name    = var.domain
-  content = var.prod_vps_ipv6_address
+  content = local.prod_vps_ipv6
   type    = "AAAA"
   ttl     = 1
   proxied = true
@@ -55,17 +107,17 @@ resource "cloudflare_record" "prod_apex_aaaa" {
 resource "cloudflare_record" "www_a" {
   zone_id = var.cloudflare_zone_id
   name    = "www"
-  content = var.prod_vps_ipv4_address
+  content = local.prod_vps_ipv4
   type    = "A"
   ttl     = 1
   proxied = true
 }
 
 resource "cloudflare_record" "www_aaaa" {
-  count   = var.prod_vps_ipv6_address == "" ? 0 : 1
+  count   = local.prod_vps_ipv6 == "" ? 0 : 1
   zone_id = var.cloudflare_zone_id
   name    = "www"
-  content = var.prod_vps_ipv6_address
+  content = local.prod_vps_ipv6
   type    = "AAAA"
   ttl     = 1
   proxied = true
@@ -112,17 +164,17 @@ resource "cloudflare_record" "prod_users_cname" {
 resource "cloudflare_record" "stg_apex_a" {
   zone_id = var.cloudflare_zone_id
   name    = "stg"
-  content = var.stg_vps_ipv4_address
+  content = local.stg_vps_ipv4
   type    = "A"
   ttl     = 1
   proxied = false
 }
 
 resource "cloudflare_record" "stg_apex_aaaa" {
-  count   = var.stg_vps_ipv6_address == "" ? 0 : 1
+  count   = local.stg_vps_ipv6 == "" ? 0 : 1
   zone_id = var.cloudflare_zone_id
   name    = "stg"
-  content = var.stg_vps_ipv6_address
+  content = local.stg_vps_ipv6
   type    = "AAAA"
   ttl     = 1
   proxied = false

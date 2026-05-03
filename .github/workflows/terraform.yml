@@ -110,10 +110,9 @@ jobs:
     env:
       TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
-      TF_VAR_prod_vps_ipv4_address: ${{ vars.PROD_VPS_IPV4_ADDRESS }}
-      TF_VAR_prod_vps_ipv6_address: ${{ vars.PROD_VPS_IPV6_ADDRESS }}
-      TF_VAR_stg_vps_ipv4_address: ${{ vars.STG_VPS_IPV4_ADDRESS }}
-      TF_VAR_stg_vps_ipv6_address: ${{ vars.STG_VPS_IPV6_ADDRESS }}
+      # AWS_* env vars serve double duty: cloudflare's own B2 backend AND the
+      # `terraform_remote_state` data sources that read the hetzner tfstates
+      # (same bucket, same auth — see terraform/cloudflare/main.tf).
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
@@ -221,11 +220,11 @@ jobs:
       - name: Apply
         run: terraform apply -auto-approve
 
-  # Cloudflare apply runs after hetzner apply — ensures DNS records always
-  # point at IPs from a freshly-converged hetzner state. If the hetzner apply
-  # changes a VPS IP, the cloudflare apply that follows picks up the new
-  # vars.{PROD,STG}_VPS_IPV4_ADDRESS values (which the owner updates
-  # alongside any IP-changing hetzner change).
+  # Cloudflare apply runs after hetzner apply — load-bearing because the
+  # cloudflare module reads VPS IPs from the hetzner env tfstates via
+  # `data "terraform_remote_state"`. Hetzner must converge first so the IPs
+  # we read are fresh; otherwise an IP-changing hetzner apply would leave
+  # cloudflare DNS pointing at the prior IP until the *next* push.
   apply-cloudflare:
     name: Apply (cloudflare)
     needs: [validate, apply]
@@ -238,10 +237,9 @@ jobs:
     env:
       TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
-      TF_VAR_prod_vps_ipv4_address: ${{ vars.PROD_VPS_IPV4_ADDRESS }}
-      TF_VAR_prod_vps_ipv6_address: ${{ vars.PROD_VPS_IPV6_ADDRESS }}
-      TF_VAR_stg_vps_ipv4_address: ${{ vars.STG_VPS_IPV4_ADDRESS }}
-      TF_VAR_stg_vps_ipv6_address: ${{ vars.STG_VPS_IPV6_ADDRESS }}
+      # AWS_* env vars serve double duty: cloudflare's own B2 backend AND the
+      # `terraform_remote_state` data sources that read the hetzner tfstates
+      # (same bucket, same auth — see terraform/cloudflare/main.tf).
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
