@@ -229,13 +229,33 @@ users.{$BASE_DOMAIN} {
         reverse_proxy user-service:8000
     }
 
-    # Security headers
+    # Security headers — API-surface tuned (closes #243).
+    #
+    # CSP: this vhost only serves JSON from user-service (no HTML, no
+    # scripts, no styles). `default-src 'none'` is the strict OWASP
+    # JSON-API lockdown; `frame-ancestors 'none'` is the CSP-native
+    # successor to X-Frame-Options: DENY (modern browsers prefer it);
+    # `base-uri 'none'` blocks <base> injection on the off-chance an
+    # endpoint regresses to text/html. script-src/style-src/img-src etc.
+    # are subsumed by default-src 'none' and intentionally omitted.
+    #
+    # COOP `same-origin`: isolates this browsing context from any
+    # cross-origin window.opener — defensive against Spectre-class side-
+    # channels and OAuth-flow popup leakage.
+    #
+    # CORP `same-site`: the frontend (isnad.{$BASE_DOMAIN}) fetches
+    # auth/user-service resources cross-origin but same-site. `same-site`
+    # permits these reads while blocking cross-site embeds. `same-origin`
+    # would be too strict and break frontend → user-service fetches.
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
         X-Frame-Options "DENY"
         X-XSS-Protection "0"
         Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+        Cross-Origin-Opener-Policy "same-origin"
+        Cross-Origin-Resource-Policy "same-site"
         -Server
     }
 }
