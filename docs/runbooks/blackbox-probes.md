@@ -16,7 +16,7 @@ Source of truth for the route list: `infra/prometheus/prometheus.yml`
 | `landing-root`          | `https://noorinalabs.com/`                                           | `http_2xx`      | 200 |
 | `narrator-401`          | `https://isnad.noorinalabs.com/api/v1/narrators?limit=1`             | `http_401_json` | 401/403 + JSON body |
 | `jwks`                  | `https://isnad.noorinalabs.com/.well-known/jwks.json`                | `http_2xx_json` | 200, JSON `.keys[]` |
-| `auth-login-redirect`   | `https://isnad.noorinalabs.com/auth/login`                           | `http_3xx`      | 3xx (or 200 for interstitial) |
+| `auth-login-redirect`   | `https://isnad.noorinalabs.com/auth/oauth/google/login`              | `http_2xx_json` | 200 + JSON `.authorization_url` (label retained as historical name — see deploy#256 / PR#258) |
 
 The hostnames moved to `isnad.noorinalabs.com` (frontend + isnad-graph
 API + dual-bound user-service routes) and `users.noorinalabs.com`

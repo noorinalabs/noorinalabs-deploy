@@ -62,8 +62,18 @@ scrape_configs:
         labels: { route: "narrator-401", module: "http_401_json" }
       - targets: ["https://isnad.noorinalabs.com/.well-known/jwks.json"]
         labels: { route: "jwks", module: "http_2xx_json" }
-      - targets: ["https://isnad.noorinalabs.com/auth/login"]
-        labels: { route: "auth-login-redirect", module: "http_3xx" }
+      # Path corrected 2026-05-03 (deploy#255 ChangesRequested) lockstep
+      # with deploy#256 / PR#258 (Aisha): user-service exposes
+      # `/auth/oauth/{provider}/{login,callback}`, never had a flat
+      # `/auth/login`. Response shape is HTTP 200 + JSON body with
+      # `.authorization_url` (the SPA reads the JSON and navigates the
+      # browser — NOT a 302 redirect) so the module is `http_2xx_json`,
+      # not `http_3xx`. The label `auth-login-redirect` is kept as the
+      # historical name to avoid churning `alerts.yml`'s
+      # BlackboxUnexpectedStatus matcher; the implicit "expect HTTP
+      # 200" branch in that alert is correct for this route post-fix.
+      - targets: ["https://isnad.noorinalabs.com/auth/oauth/google/login"]
+        labels: { route: "auth-login-redirect", module: "http_2xx_json" }
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
