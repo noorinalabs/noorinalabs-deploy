@@ -3,7 +3,7 @@
 # bootstrap-vps.sh — First-time VPS setup for Noorina Labs
 #
 # Run as root on a fresh Hetzner VPS:
-#   ssh -i ~/.ssh/isnad_deploy root@isnad-graph.noorinalabs.com
+#   ssh -i ~/.ssh/isnad_deploy root@isnad.noorinalabs.com
 #   curl -sL https://raw.githubusercontent.com/noorinalabs/noorinalabs-deploy/main/scripts/bootstrap-vps.sh | bash
 #
 # Or copy this script to the VPS and run:
@@ -136,10 +136,10 @@ REDIS_PASSWORD=CHANGE-ME
 # Grafana [REQUIRED]
 GRAFANA_ADMIN_USER=admin
 GRAFANA_ADMIN_PASSWORD=CHANGE-ME
-GRAFANA_ROOT_URL=https://isnad-graph.noorinalabs.com/grafana
+GRAFANA_ROOT_URL=https://isnad.noorinalabs.com/grafana
 
 # CORS
-CORS_ORIGINS=["https://isnad-graph.noorinalabs.com"]
+CORS_ORIGINS=["https://isnad.noorinalabs.com"]
 
 # Logging
 LOG_LEVEL=INFO
@@ -236,7 +236,7 @@ echo "  3. Verify:"
 echo "     curl http://localhost:8000/health"
 echo ""
 echo "  4. Add VPS_HOST variable in GitHub repo settings:"
-echo "     Settings → Variables → New: VPS_HOST = isnad-graph.noorinalabs.com"
+echo "     Settings → Variables → New: VPS_HOST = isnad.noorinalabs.com"
 echo ""
 echo "  5. Start the backup timer:"
 echo "     systemctl start isnad-backup.timer"

@@ -18,16 +18,17 @@
 #
 # Environment:
 #   SITE_URL              Override the default API host URL
-#                         (default: https://isnad-graph.noorinalabs.com)
+#                         (default: https://isnad.noorinalabs.com)
 #   LANDING_URL           Landing-page URL to check. Empty disables the
 #                         landing reachability check.
 #                         (default: https://noorinalabs.com)
 #   USER_SERVICE_URL      Base URL whose `/health` is hit for the
 #                         user-service auth-plane check. Empty disables.
-#                         (default: $SITE_URL — caddy/Caddyfile routes
-#                         user-service via the same host today; the
-#                         deploy#156 cutover will move it to its own
-#                         subdomain.)
+#                         (default: $SITE_URL — auth-plane routes are
+#                         dual-bound on isnad.* and users.* during the
+#                         #245 absolute-URL frontend cutover; pass
+#                         USER_SERVICE_URL=https://users.noorinalabs.com
+#                         to hit the pure user-service surface directly.)
 #   GH_REPO               Override the GitHub repo for workflow checks
 #                         (default: noorinalabs/noorinalabs-deploy)
 #   ROLLBACK_TAG          If set, tag the current deployment for rollback
@@ -37,14 +38,15 @@ set -euo pipefail
 
 # ---------- Configuration ----------
 
-SITE_URL="${SITE_URL:-https://isnad-graph.noorinalabs.com}"
+SITE_URL="${SITE_URL:-https://isnad.noorinalabs.com}"
 # Landing-page reachability check (deploy#73). Empty = skip.
 LANDING_URL="${LANDING_URL:-https://noorinalabs.com}"
 # user-service auth-plane health (deploy#73). Empty = skip. Defaults to
-# SITE_URL because today Caddy routes user-service traffic via the same
-# host as the API (caddy/Caddyfile site block); the deploy#156 cutover
-# will move it to https://users.noorinalabs.com — at that point operators
-# pass USER_SERVICE_URL=https://users.noorinalabs.com explicitly.
+# SITE_URL because the auth-plane routes are currently dual-bound on
+# isnad.* and users.* during the #245 absolute-URL frontend cutover, so
+# /api/v1/user-service/health resolves via either. Operators wanting to
+# hit the pure user-service surface pass
+# USER_SERVICE_URL=https://users.noorinalabs.com explicitly.
 USER_SERVICE_URL="${USER_SERVICE_URL:-$SITE_URL}"
 GH_REPO="${GH_REPO:-noorinalabs/noorinalabs-deploy}"
 SKIP_WORKFLOW="${SKIP_WORKFLOW:-false}"

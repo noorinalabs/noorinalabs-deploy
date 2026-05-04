@@ -17,14 +17,15 @@
 #   6. /auth/login            → HTTP 3xx redirect to OAuth provider
 #                                (proves user-service auth wiring alive)
 #
-# Env (defaults reflect TODAY's prod Caddy — caddy/Caddyfile:18 serves
-# `isnad-graph.noorinalabs.com` and routes user-service traffic in the
-# same site block. When deploy#156 lands, update defaults to
-# `isnad.noorinalabs.com` + `users.noorinalabs.com`):
-#   ISNAD_BASE_URL          (default: https://isnad-graph.noorinalabs.com)
-#   USER_SERVICE_BASE_URL   (default: https://isnad-graph.noorinalabs.com —
-#                            same host as ISNAD_BASE_URL today; cleaves
-#                            into a separate subdomain at #156)
+# Env (post-cutover topology, #226 + emergency 2026-05-02): frontend +
+# isnad-graph API live on `isnad.noorinalabs.com`; the pure user-service
+# API surface lives on `users.noorinalabs.com`. The auth-plane routes
+# (/auth/*, /.well-known/jwks.json) are dual-bound on both vhosts during
+# the absolute-URL frontend cutover (#245 phase 2), so the script's
+# auth-plane checks currently route via ISNAD_BASE_URL — see check 6:
+#   ISNAD_BASE_URL          (default: https://isnad.noorinalabs.com)
+#   USER_SERVICE_BASE_URL   (default: https://users.noorinalabs.com —
+#                            canonical pure user-service API surface)
 #   LANDING_BASE_URL        (default: https://noorinalabs.com)
 #   SMOKE_REPORT            Path to write GH-summary-formatted markdown
 #                           (default: smoke-report.md)
@@ -32,8 +33,8 @@
 
 set -euo pipefail
 
-ISNAD_BASE_URL="${ISNAD_BASE_URL:-https://isnad-graph.noorinalabs.com}"
-USER_SERVICE_BASE_URL="${USER_SERVICE_BASE_URL:-https://isnad-graph.noorinalabs.com}"
+ISNAD_BASE_URL="${ISNAD_BASE_URL:-https://isnad.noorinalabs.com}"
+USER_SERVICE_BASE_URL="${USER_SERVICE_BASE_URL:-https://users.noorinalabs.com}"
 LANDING_BASE_URL="${LANDING_BASE_URL:-https://noorinalabs.com}"
 SMOKE_REPORT="${SMOKE_REPORT:-smoke-report.md}"
 TIMEOUT="${TIMEOUT:-5}"
