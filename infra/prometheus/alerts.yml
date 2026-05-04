@@ -260,3 +260,74 @@ groups:
             ~30 days before expiry, so reaching this threshold indicates
             renewal is failing.
           runbook: "docs/runbooks/blackbox-probes.md#cert-expiring-soon"
+
+  # Break-glass workflow input usage alerts (deploy#251).
+  #
+  # The audit composite action `.github/actions/break-glass-audit` writes a
+  # textfile-collector metric on the prod VPS at
+  # /var/lib/node_exporter/textfile_collector/break_glass_invocation_<input>.prom
+  # whenever a break-glass workflow input is consumed by promote.yml or
+  # deploy-prod.yml. Schema (one-line gauge per filename, labels carry which
+  # input + actor + workflow):
+  #
+  #   break_glass_invocation_timestamp_seconds{input="...",actor="...",workflow="...",run_id="..."} <unix-ts>
+  #
+  # The audit-log issue (label `break-glass-audit-log`) carries the free-text
+  # reason; this alert exists so the on-call surface fires within ~5min of
+  # invocation rather than waiting for someone to read the issue thread.
+  #
+  # Receiver: routes through Alertmanager `critical` (alertmanager.yml). Note
+  # the receiver webhook is currently a localhost placeholder pending real
+  # Slack/email routing per #127. This rule lands the durable detection now;
+  # connecting it to a human surface is #127's job.
+  - name: break_glass
+    rules:
+      - alert: BreakGlassUsed
+        # `for: 0m` — every break-glass invocation is operator-actionable.
+        # The audit composite emits the metric synchronously during the
+        # workflow run, so the metric appears within seconds of operator
+        # input. We want a page on first appearance, not after a hold-down.
+        #
+        # Freshness window: fire when the most recent invocation timestamp
+        # is within the last 10 minutes. Above that, the alert resolves so
+        # we don't keep paging for an event hours-old. The audit-log issue
+        # carries the durable record — Alertmanager fires on the recency.
+        expr: |
+          (time() - break_glass_invocation_timestamp_seconds) < 600
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Break-glass workflow input used: {{ $labels.input }}"
+          description: >-
+            A workflow_dispatch run set break-glass input
+            `{{ $labels.input }}=true` (workflow {{ $labels.workflow }},
+            actor @{{ $labels.actor }}, run_id {{ $labels.run_id }}). This
+            bypasses a documented safety gate. The operator-supplied
+            reason + run URL are appended to the pinned audit-log issue
+            (label `break-glass-audit-log`). Verify the bypass was
+            authorized + appropriate per the runbook.
+          runbook: "docs/runbooks/break-glass.md#alert-investigation"
+
+      - alert: BreakGlassMetricStale
+        # Defense-in-depth: detects the metric file existing on disk but
+        # not being updated. If a break-glass invocation wrote the file
+        # ages ago and nothing has touched it since, the freshness window
+        # in BreakGlassUsed won't fire — but we don't want stale gauges
+        # silently sitting there suggesting a gap. Fire if any invocation
+        # metric is older than 30 days, prompting cleanup.
+        expr: |
+          (time() - break_glass_invocation_timestamp_seconds) > 30 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Break-glass metric stale: {{ $labels.input }} (>30d old)"
+          description: >-
+            A `break_glass_invocation_timestamp_seconds` gauge for
+            input `{{ $labels.input }}` is more than 30 days old. The
+            metric is informational at this point — clean up the
+            textfile collector entry on the prod VPS:
+            `rm /var/lib/node_exporter/textfile_collector/break_glass_invocation_{{ $labels.input }}.prom`.
+            See the audit-log issue for the historical record.
+          runbook: "docs/runbooks/break-glass.md#metric-stale-cleanup"
