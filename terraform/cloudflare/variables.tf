@@ -15,34 +15,11 @@ variable "domain" {
   default     = "noorinalabs.com"
 }
 
-# ---------------------------------------------------------------------------
-# Per-env Hetzner VPS IPs — consumed from terraform/hetzner/envs/{prod,stg}
-# outputs (`server_ip`, `server_ipv6`). Passed in at plan/apply time as
-# -var flags in CI, or via terraform.tfvars locally.
-# ---------------------------------------------------------------------------
-
-variable "prod_vps_ipv4_address" {
-  description = "Public IPv4 of the prod Hetzner VPS (from terraform/hetzner/envs/prod output server_ip)."
-  type        = string
-}
-
-variable "prod_vps_ipv6_address" {
-  description = "Public IPv6 of the prod Hetzner VPS (from terraform/hetzner/envs/prod output server_ipv6). Empty string disables the AAAA record."
-  type        = string
-  default     = ""
-}
-
-variable "stg_vps_ipv4_address" {
-  description = "Public IPv4 of the stg Hetzner VPS (from terraform/hetzner/envs/stg output server_ip)."
-  type        = string
-}
-
-variable "stg_vps_ipv6_address" {
-  description = "Public IPv6 of the stg Hetzner VPS (from terraform/hetzner/envs/stg output server_ipv6). Empty string disables the AAAA record."
-  type        = string
-  default     = ""
-}
-
+# Per-env Hetzner VPS IPs are read from the hetzner env-root tfstates via
+# `data "terraform_remote_state"` in main.tf — no input vars. Eliminates
+# the manual var-passing footgun where cloudflare DNS could drift from a
+# hetzner IP change. See main.tf locals block.
+#
 # Legacy subdomains variable removed in #192 (drop-legacy-immediately per
 # owner ruling 2026-05-02). isnad-graph.noorinalabs.com A/AAAA records are
 # imported and then destroyed by this PR's apply; Caddy binding moved to

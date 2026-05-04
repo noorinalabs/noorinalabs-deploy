@@ -51,7 +51,7 @@ jobs:
         run: terraform validate
 
   plan:
-    name: Plan (${{ matrix.env }})
+    name: Plan (hetzner/${{ matrix.env }})
     needs: validate
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -98,8 +98,99 @@ jobs:
         if: steps.plan.outcome == 'failure'
         run: exit 1
 
+  plan-cloudflare:
+    name: Plan (cloudflare)
+    needs: validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform/cloudflare
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+      # AWS_* env vars serve double duty: cloudflare's own B2 backend AND the
+      # `terraform_remote_state` data sources that read the hetzner tfstates
+      # (same bucket, same auth — see terraform/cloudflare/main.tf).
+      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+      - name: Init
+        run: terraform init
+      - name: Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+      - name: Comment PR with plan
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan (cloudflare)
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            *Triggered by @${{ github.actor }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  plan-backblaze:
+    name: Plan (backblaze)
+    needs: validate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform/backblaze
+    env:
+      TF_VAR_b2_application_key_id: ${{ secrets.B2_MASTER_KEY_ID }}
+      TF_VAR_b2_application_key: ${{ secrets.B2_MASTER_APP_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+      - name: Init
+        run: terraform init
+      - name: Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+      - name: Comment PR with plan
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `#### Terraform Plan (backblaze)
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            *Triggered by @${{ github.actor }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
   apply:
-    name: Apply (${{ matrix.env }})
+    name: Apply (hetzner/${{ matrix.env }})
     needs: validate
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -117,6 +208,62 @@ jobs:
         working-directory: terraform/hetzner/envs/${{ matrix.env }}
     env:
       TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+      - name: Init
+        run: terraform init
+      - name: Apply
+        run: terraform apply -auto-approve
+
+  # Cloudflare apply runs after hetzner apply — load-bearing because the
+  # cloudflare module reads VPS IPs from the hetzner env tfstates via
+  # `data "terraform_remote_state"`. Hetzner must converge first so the IPs
+  # we read are fresh; otherwise an IP-changing hetzner apply would leave
+  # cloudflare DNS pointing at the prior IP until the *next* push.
+  apply-cloudflare:
+    name: Apply (cloudflare)
+    needs: [validate, apply]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform/cloudflare
+    env:
+      TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+      # AWS_* env vars serve double duty: cloudflare's own B2 backend AND the
+      # `terraform_remote_state` data sources that read the hetzner tfstates
+      # (same bucket, same auth — see terraform/cloudflare/main.tf).
+      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+      - name: Init
+        run: terraform init
+      - name: Apply
+        run: terraform apply -auto-approve
+
+  apply-backblaze:
+    name: Apply (backblaze)
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform/backblaze
+    env:
+      TF_VAR_b2_application_key_id: ${{ secrets.B2_MASTER_KEY_ID }}
+      TF_VAR_b2_application_key: ${{ secrets.B2_MASTER_APP_KEY }}
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
