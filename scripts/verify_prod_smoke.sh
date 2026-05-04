@@ -14,8 +14,13 @@
 #                                  user-service auth is in the path, not
 #                                  Caddy bypass returning plaintext)
 #   5. /.well-known/jwks.json → HTTP 200 + valid JWKS shape (.keys[])
-#   6. /auth/login            → HTTP 3xx redirect to OAuth provider
-#                                (proves user-service auth wiring alive)
+#   6. /auth/oauth/google/login → HTTP 200 + JSON .authorization_url
+#                                  pointing at accounts.google.com
+#                                  (proves user-service OAuth wiring
+#                                  alive: env client_id, PKCE generator,
+#                                  Redis state-store all reachable).
+#                                  Hit on USER_SERVICE_BASE_URL directly
+#                                  for honest attribution — see #256.
 #
 # Env (post-cutover topology, #226 + emergency 2026-05-02): frontend +
 # isnad-graph API live on `isnad.noorinalabs.com`; the pure user-service
@@ -156,37 +161,39 @@ ms_from_secs() {
   fi
 }
 
-# --- 6. /auth/login (expect 3xx → OAuth provider) -------------------
-# We use -o /dev/null and inspect Location via a separate -I pass to keep
-# the body tiny but still see the redirect target.
+# --- 6. /auth/oauth/google/login (expect 200 + JSON authorization_url) ----
+# user-service exposes GET /auth/oauth/{provider}/login (see
+# user-service/src/app/routers/auth.py:269) which returns
+# OAuthLoginResponse — a JSON body with `authorization_url` pointing at
+# the OAuth provider. It is NOT a 302 redirect; the SPA reads the JSON
+# and navigates the browser. A 200 + .authorization_url containing the
+# expected provider domain proves the wiring (provider client_id env
+# present, PKCE generation working, Redis state-store reachable).
+#
+# We hit ${USER_SERVICE_BASE_URL} directly rather than ${ISNAD_BASE_URL}
+# so attribution is honest (deploy#256 caveat 4): /auth/* is dual-bound
+# on isnad.* + users.* during the absolute-URL frontend cutover (#245
+# phase 2), but the canonical user-service vhost is users.*.
 {
-  # First: status code only (no follow)
-  read -r code secs <<<"$(http_check "${ISNAD_BASE_URL}/auth/login")"
+  read -r code secs <<<"$(http_check "${USER_SERVICE_BASE_URL}/auth/oauth/google/login")"
+  body="$(read_body)"
   ms="$(ms_from_secs "$secs")"
-  # Then: grab Location header (separate call; cheap, still under budget)
-  loc="$(curl -sSI --max-time "$TIMEOUT" "${ISNAD_BASE_URL}/auth/login" 2>/dev/null \
-          | grep -i '^location:' | head -1 | sed 's/^[Ll]ocation:[[:space:]]*//' | tr -d '\r' || true)"
-  case "$code" in
-    301|302|303|307|308)
-      if [ -n "$loc" ] && echo "$loc" | grep -qiE 'google|github|accounts\.google|github\.com/login'; then
-        # Mask the redirect target for log hygiene (state/nonce in query)
-        host="$(echo "$loc" | sed -E 's|^https?://([^/]+).*|\1|')"
-        record "/auth/login wiring" pass "$ms" "HTTP $code → OAuth provider ($host)"
-      elif [ -n "$loc" ]; then
-        record "/auth/login wiring" pass "$ms" "HTTP $code → $(echo "$loc" | sed -E 's|^(https?://[^/]+).*|\1|') (non-canonical OAuth host)"
+  if [ "$code" = "200" ]; then
+    if echo "$body" | jq -e '.authorization_url' >/dev/null 2>&1; then
+      auth_url="$(echo "$body" | jq -r '.authorization_url')"
+      if echo "$auth_url" | grep -qiE 'accounts\.google\.com|google\.com/o/oauth'; then
+        host="$(echo "$auth_url" | sed -E 's|^https?://([^/]+).*|\1|')"
+        record "/auth/oauth/google/login wiring" pass "$ms" "HTTP 200 + .authorization_url → $host"
       else
-        record "/auth/login wiring" fail "$ms" "HTTP $code but no Location header"
+        host="$(echo "$auth_url" | sed -E 's|^https?://([^/]+).*|\1|')"
+        record "/auth/oauth/google/login wiring" fail "$ms" "HTTP 200 but .authorization_url host=$host (expected accounts.google.com)"
       fi
-      ;;
-    200)
-      # Some OAuth flows render an interstitial page instead of redirect.
-      # Treat as pass only if body looks HTML-ish (route is alive).
-      record "/auth/login wiring" pass "$ms" "HTTP 200 (route alive, non-redirect handler)"
-      ;;
-    *)
-      record "/auth/login wiring" fail "$ms" "HTTP $code (expected 3xx or 200)"
-      ;;
-  esac
+    else
+      record "/auth/oauth/google/login wiring" fail "$ms" "HTTP 200 but body missing .authorization_url"
+    fi
+  else
+    record "/auth/oauth/google/login wiring" fail "$ms" "HTTP $code (expected 200)"
+  fi
 }
 
 # --- Summary --------------------------------------------------------
