@@ -96,9 +96,16 @@ Env-scope secrets are read by the deploy workflow at SSH-step time and written t
 # but a manual run can be forced:
 gh workflow run deploy-stg.yml --repo noorinalabs/noorinalabs-deploy
 
-# prod requires manual approval through the production GH Environment
-gh workflow run promote.yml --repo noorinalabs/noorinalabs-deploy -f image_tag=stg-latest
+# prod requires manual approval through the production GH Environment.
+# Default invocation: promote.yml resolves stg-latest at plan-time and threads
+# the resolved sha-<short> through to retag — no input needed.
+gh workflow run promote.yml --repo noorinalabs/noorinalabs-deploy
+
+# Or pin to a specific immutable SHA (rollback / specific-build promotion):
+gh workflow run promote.yml --repo noorinalabs/noorinalabs-deploy -f source_sha=<short-sha>
 ```
+
+**Do not pass `-f source_sha=stg-latest` or any other floating-tag string.** The `promote-no-floating-source` static guard added by [deploy#260](https://github.com/noorinalabs/noorinalabs-deploy/pull/260) (cold-rebuild dryrun) catches floating-source values as a regression. `source_sha` must be an immutable `sha-<short>` (or bare `<short>`) — leaving it empty is the correct way to mean "whatever stg-latest currently points at."
 
 After the redeploy completes, smoke-test the OAuth flow end-to-end on the env's frontend:
 
@@ -195,14 +202,48 @@ Google occasionally requires re-verification when sensitive scopes change or the
 2. Confirming the privacy-policy and terms-of-service URLs in the consent screen still 200 (`curl -sSI <url>`).
 3. Re-submitting for verification. Until approved, prod logs in via the stg-class `Testing` interstitial — degraded UX but not broken.
 
+### 5. `invalid_scope` from Google or GitHub
+
+User-service requested a scope the OAuth app's allow-list does not cover — e.g., user-service code added `https://www.googleapis.com/auth/userinfo.email` but the app was provisioned with only `openid`. The provider returns `invalid_scope` with the offending scope name in `error_description` (Google) or in the redirect body (GitHub).
+
+**Recovery:** open the OAuth app's settings (Google: `OAuth consent screen → Scopes for Google APIs → Add or remove scopes`; GitHub: scopes are requested per-call, no console-side allow-list — symptom there means user-service is requesting a scope the provider doesn't recognize). Add the missing scope or correct the user-service request. Save. No redeploy needed for the provider-side change; user-service code change requires a redeploy.
+
+### 6. User session ends mid-flow / 401 with `invalid_grant`
+
+The provider revoked the refresh token. Triggers vary by provider:
+
+- **Google:** user changed their Google password, user revoked grant via [myaccount.google.com → Security → Third-party access](https://myaccount.google.com/permissions), admin policy revoked, or the OAuth app was deleted/recreated.
+- **GitHub:** user revoked via Settings → Applications → Authorized OAuth Apps, or the env's `CLIENT_SECRET` was rotated past the 7-day grace window (see §Rotating credentials).
+
+Symptom: user-service emits `401 invalid_grant` on the token-refresh exchange; the user is forced back to the login button.
+
+**Recovery is per-user:** the user re-completes the OAuth flow from the SPA. No on-call action for individual occurrences. **If a fleet-wide pattern emerges** (multiple users hit `invalid_grant` in a short window), check whether the env's `AUTH_GITHUB_CLIENT_SECRET` was rotated without honoring the 7-day grace window — a same-day double-rotate invalidates all in-flight tokens. Cross-reference §Rotating credentials.
+
+### 7. Prod OAuth broken right after the org→env-scope cleanup
+
+If the optional cleanup (§"Optional cleanup — move prod secrets org-scope → env-scope") was executed and prod login broke immediately after, the org-scope row was deleted before the `production` env-scope row was populated and verified. This is the order-of-operations hazard called out at §"Optional cleanup" — calling it out here too because §Failure modes is where on-call greps first.
+
+**Recovery:**
+
+1. Re-set the four `AUTH_*` secrets at `production` env-scope (`gh secret set ... --env production` per §"Optional cleanup" recipe). The owner is the only one who can do this — see §Escalation row "OAuth `AUTH_*` cleanup ordering issue."
+2. Redeploy prod via `promote.yml`.
+3. Verify the OAuth flow recovers end-to-end before declaring resolved.
+
 ## Escalation
 
-| Failure | Primary | Secondary |
-|---|---|---|
-| `redirect_uri_mismatch` | Aisha.Idrissi (SRE — owns this runbook) | Lucas.Ferreira (SRE) |
-| 500 from user-service after OAuth callback | Aisha.Idrissi | Anya.Kowalczyk (user-service) |
-| Google verification revoked / consent screen broken | parametrization (owner — only one with Google Cloud Console access for org) | Aisha.Idrissi |
-| Suspected leaked secret | Nino.Kavtaradze (Security) | Bereket.Tadesse (IM) |
+| Failure | Primary | Secondary | Tertiary |
+|---|---|---|---|
+| `redirect_uri_mismatch` | Aisha.Idrissi (SRE — owns this runbook) | Lucas.Ferreira (SRE) | — |
+| 500 from user-service after OAuth callback | Aisha.Idrissi | Anya.Kowalczyk (user-service) | — |
+| `invalid_scope` from provider | Aisha.Idrissi | Anya.Kowalczyk (user-service — owns scope-request code) | — |
+| Fleet-wide `invalid_grant` post-rotation | Aisha.Idrissi | Lucas.Ferreira | Nino.Kavtaradze (Security) |
+| Google verification revoked / consent screen broken | parametrization (owner — sole Google Cloud Console admin) | Aisha.Idrissi (acts as owner liaison; cannot self-resolve until owner reachable — see SPOF note below) | Lucas.Ferreira / Bereket.Tadesse (deploy-team-on-call if Aisha unavailable) |
+| OAuth `AUTH_*` cleanup ordering issue (org→env-scope) | parametrization (owner — only one who has the secret values) | Aisha.Idrissi (procedural support) | — |
+| Suspected leaked secret | Nino.Kavtaradze (deploy-team Senior Security Engineer — see `roster/security_engineer_nino.md`) | Bereket.Tadesse (IM) | — |
+
+**Roster disambiguation:** `Nino.Kavtaradze` is the deploy team's Senior Security Engineer (`noorinalabs-deploy/.claude/team/roster/security_engineer_nino.md`) — escalation-class for OAuth-incident scope. Reviewers from outside the deploy team may not recognize the name; the roster file is the source of truth.
+
+**SPOF note (Google verification revoked row):** until Google Cloud Console IAM is pre-staged with a `roles/oauthconfig.editor` binding for a deploy-team teammate (tracked outside this runbook's scope), an outage in this class is owner-blocked and may persist until owner is reachable. Aisha's secondary role is "owner liaison + procedural readiness," not "self-resolve." Tertiary escalation to Lucas/Bereket is for the case where Aisha is also unavailable; they can take over the liaison role but cannot bypass the owner-only console access either. Honest framing — this is the operational reality today.
 
 ## Refs
 
