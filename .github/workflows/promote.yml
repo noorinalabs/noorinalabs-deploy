@@ -75,10 +75,23 @@ on:
           exist (chicken-and-egg). Use ONLY when restoring prod from a
           state where the alembic gate cannot run by definition. Mirrors
           the skip_stg_verify break-glass discipline: emits a warning
-          annotation + job-summary entry on use.
+          annotation + job-summary entry on use. REQUIRES a non-empty
+          `break_glass_reason` input — see deploy#251.
         required: false
         default: false
         type: boolean
+      break_glass_reason:
+        description: >-
+          REQUIRED when skip_stg_verify=true OR skip_alembic_gate=true.
+          Free-text operator-supplied reason. Logged in job summary,
+          appended to the pinned audit-log issue (label
+          `break-glass-audit-log`), and surfaced in Slack/email via
+          Alertmanager. Empty value with any break-glass input set will
+          fail the run at the validate-break-glass-reason job. See
+          deploy#251 + docs/runbooks/break-glass.md.
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   # All promotions serialize globally — we never want two promotions racing
@@ -89,13 +102,60 @@ concurrency:
 permissions:
   contents: read
   packages: write
+  # `issues: write` is required by the break-glass-audit composite action
+  # to find-or-create + comment on the pinned audit-log issue. Scoped at the
+  # workflow level because the audit step runs from inside the `gate-stg-verify`
+  # and (TBD downstream of skip_alembic_gate) jobs which both need it on the
+  # break-glass branch only. Non-break-glass runs never invoke `gh issue`,
+  # so the additional scope is unused for the common path.
+  issues: write
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # Break-glass reason validation (deploy#251). When ANY break-glass
+  # input is set true, `break_glass_reason` MUST be non-empty. This
+  # job runs before any other and short-circuits the entire promotion
+  # if the operator forgot to document why they're bypassing a gate.
+  #
+  # The audit composite action also re-validates non-empty reason at
+  # call time as defense-in-depth, but failing here is faster + clearer.
+  # ─────────────────────────────────────────────────────────────────
+  validate-break-glass-reason:
+    name: Validate break-glass reason
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reason is required when any break-glass input is set
+        env:
+          SKIP_STG_VERIFY: ${{ inputs.skip_stg_verify }}
+          SKIP_ALEMBIC_GATE: ${{ inputs.skip_alembic_gate }}
+          REASON: ${{ inputs.break_glass_reason }}
+        run: |
+          set -euo pipefail
+          if [ "${SKIP_STG_VERIFY}" = "true" ] || [ "${SKIP_ALEMBIC_GATE}" = "true" ]; then
+            # Strip whitespace before checking — operators sometimes type a
+            # space hoping to satisfy a "required" check. Fail those too.
+            stripped="${REASON//[$' \t\r\n']/}"
+            if [ -z "${stripped}" ]; then
+              echo "::error::A break-glass input was set true but \`break_glass_reason\` is empty."
+              echo "::error::Set \`break_glass_reason\` to a free-text reason describing WHY the bypass is needed."
+              echo "::error::Example: 'DR restore — prod stack does not exist, alembic gate cannot run by definition'."
+              echo "::error::See docs/runbooks/break-glass.md (deploy#251)."
+              exit 1
+            fi
+            echo "Break-glass inputs:"
+            echo "  skip_stg_verify  = ${SKIP_STG_VERIFY}"
+            echo "  skip_alembic_gate = ${SKIP_ALEMBIC_GATE}"
+            echo "Reason supplied (length=${#REASON})."
+          else
+            echo "No break-glass inputs set — reason validation N/A."
+          fi
+
   plan:
     name: Plan promotion
+    needs: validate-break-glass-reason
     runs-on: ubuntu-latest
     outputs:
       # Each matrix cell of `retag` picks its per-image short from here.
@@ -275,25 +335,29 @@ jobs:
     permissions:
       actions: read
       contents: read
+      # `issues: write` required by the break-glass-audit composite action
+      # invoked from this job when `inputs.skip_stg_verify` is true. The
+      # job-level `permissions:` block fully replaces the workflow-level
+      # one at YAML resolution time — so without this line the audit
+      # step would 403 from the GitHub Issues API on the exact path
+      # the audit instrumentation exists for. (Bereket-261-rev catch.)
+      issues: write
     outputs:
       gate_result: ${{ steps.gate.outputs.gate_result }}
     steps:
-      - name: Break-glass override (skip_stg_verify)
+      - name: Checkout (for local composite action)
         if: ${{ inputs.skip_stg_verify }}
-        env:
-          ACTOR: ${{ github.actor }}
-        run: |
-          set -euo pipefail
-          echo "::warning::stg-verify gate SKIPPED via break-glass input by $ACTOR"
-          {
-            echo "## ⚠ stg-verify gate SKIPPED (break-glass)"
-            echo ""
-            echo "- **Actor:** $ACTOR"
-            echo "- **Input:** \`skip_stg_verify=true\`"
-            echo ""
-            echo "This promotion proceeded WITHOUT confirming the latest stg verify-deploy succeeded."
-            echo "Use only when the gate itself is broken; otherwise investigate the gate failure first."
-          } >> "$GITHUB_STEP_SUMMARY"
+        uses: actions/checkout@v4
+      - name: Break-glass audit (skip_stg_verify)
+        if: ${{ inputs.skip_stg_verify }}
+        uses: ./.github/actions/break-glass-audit
+        with:
+          input_name: skip_stg_verify
+          reason: ${{ inputs.break_glass_reason }}
+          bypassed: "stg-verify gate (verify-deploy.yml stg-verify-result artifact freshness check)"
+          vps_host: ${{ vars.VPS_HOST }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Locate recent verify-deploy runs
         if: ${{ !inputs.skip_stg_verify }}
@@ -506,6 +570,42 @@ jobs:
       # image (prod-<short> doesn't exist until retag below).
       image_tag: stg-${{ needs.plan.outputs.user_service_short }}
     secrets: inherit
+
+  # ─────────────────────────────────────────────────────────────────
+  # Break-glass audit for skip_alembic_gate (deploy#251).
+  #
+  # When `migrate-prod` is skipped because `skip_alembic_gate=true`, no
+  # natural job runs to record the bypass. This job fires only on that
+  # branch and emits the full audit set (job summary, warning,
+  # audit-issue comment, prom textfile metric) via the composite action.
+  #
+  # Runs in parallel with `retag` — does NOT gate retag because the
+  # bypass decision was already made operationally; this job records
+  # the fact for post-hoc audit. If THIS job fails (e.g. SSH down,
+  # GH token issue), it's a noisy signal but must not block the
+  # emergency promotion that the bypass was for in the first place.
+  # `retag` does not depend on this job.
+  # ─────────────────────────────────────────────────────────────────
+  audit-skip-alembic-gate:
+    name: Audit — skip_alembic_gate break-glass
+    needs: [plan, gate-stg-verify]
+    if: ${{ inputs.skip_alembic_gate }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout (for local composite action)
+        uses: actions/checkout@v4
+      - name: Break-glass audit (skip_alembic_gate)
+        uses: ./.github/actions/break-glass-audit
+        with:
+          input_name: skip_alembic_gate
+          reason: ${{ inputs.break_glass_reason }}
+          bypassed: "alembic pre-retag migration gate (db-migrate.yml on prod user-postgres)"
+          vps_host: ${{ vars.VPS_HOST }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
   retag:
     name: Retag ${{ matrix.key }} (stg → prod)

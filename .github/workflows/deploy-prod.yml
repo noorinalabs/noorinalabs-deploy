@@ -54,16 +54,87 @@ on:
           broken and prod must be restored. Mirrors skip_stg_verify /
           skip_alembic_gate discipline. Surfaced 2026-05-02 emergency
           restore — GHCR cross-repo write blocked at token-scope level.
+          REQUIRES a non-empty `break_glass_reason` input — see deploy#251.
         required: false
         default: false
         type: boolean
+      break_glass_reason:
+        description: >-
+          REQUIRED when allow_stg_tags=true. Free-text operator-supplied
+          reason. Logged in job summary, appended to the pinned audit-log
+          issue (label `break-glass-audit-log`), and surfaced via the
+          BreakGlassUsed Alertmanager rule. Empty value with
+          allow_stg_tags=true fails the run at validate-break-glass-reason.
+          See deploy#251 + docs/runbooks/break-glass.md.
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────
+  # Break-glass reason validation (deploy#251). When allow_stg_tags=true
+  # the operator MUST supply a non-empty break_glass_reason. Runs first
+  # to fail-fast before any deploy machinery starts.
+  # ─────────────────────────────────────────────────────────────────
+  validate-break-glass-reason:
+    name: Validate break-glass reason
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reason is required when allow_stg_tags=true
+        env:
+          ALLOW_STG_TAGS: ${{ inputs.allow_stg_tags }}
+          REASON: ${{ inputs.break_glass_reason }}
+        run: |
+          set -euo pipefail
+          if [ "${ALLOW_STG_TAGS}" = "true" ]; then
+            stripped="${REASON//[$' \t\r\n']/}"
+            if [ -z "${stripped}" ]; then
+              echo "::error::allow_stg_tags=true but \`break_glass_reason\` is empty."
+              echo "::error::Set \`break_glass_reason\` to a free-text reason describing WHY stg-* tags are being accepted in prod."
+              echo "::error::Example: 'DR restore — promote.yml retag path blocked by GHCR cross-repo write 403'."
+              echo "::error::See docs/runbooks/break-glass.md (deploy#251)."
+              exit 1
+            fi
+            echo "Break-glass: allow_stg_tags=true, reason supplied (length=${#REASON})."
+          else
+            echo "allow_stg_tags=false — reason validation N/A."
+          fi
+
+  # ─────────────────────────────────────────────────────────────────
+  # Break-glass audit (deploy#251). Fires only when allow_stg_tags=true.
+  # Records the bypass in the pinned audit-log issue, emits the textfile-
+  # collector metric for Prometheus, and writes the job-summary block.
+  # Runs in parallel with `deploy` — does NOT gate the deploy itself,
+  # since a failed audit must not block an emergency restore. The audit
+  # exists to record the fact, not to gate the action.
+  # ─────────────────────────────────────────────────────────────────
+  audit-allow-stg-tags:
+    name: Audit — allow_stg_tags break-glass
+    needs: validate-break-glass-reason
+    if: ${{ inputs.allow_stg_tags }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout (for local composite action)
+        uses: actions/checkout@v4
+      - name: Break-glass audit (allow_stg_tags)
+        uses: ./.github/actions/break-glass-audit
+        with:
+          input_name: allow_stg_tags
+          reason: ${{ inputs.break_glass_reason }}
+          bypassed: "deploy-prod prod-* tag-shape check (accepting stg-* digests directly)"
+          vps_host: ${{ vars.VPS_HOST }}
+          ssh_key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
   deploy:
+    needs: validate-break-glass-reason
     runs-on: ubuntu-latest
     environment: production
     permissions:

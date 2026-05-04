@@ -1,0 +1,254 @@
+# Break-glass audit composite action (deploy#251).
+#
+# Centralizes the audit emissions for any workflow that consumes a break-glass
+# input (skip_alembic_gate, allow_stg_tags, skip_stg_verify). When invoked, it:
+#
+#   1. Writes a `## ⚠ BREAK-GLASS USED` block to $GITHUB_STEP_SUMMARY.
+#   2. Emits a `::warning::` annotation so the run lists the bypass at a glance.
+#   3. Appends a comment to the pinned audit-log issue (label
+#      `break-glass-audit-log`) — find-or-create on first use.
+#   4. SSHes to the prod VPS and writes a node-exporter textfile-collector
+#      metric `break_glass_invocation_*.prom` so Prometheus can fire
+#      `BreakGlassUsed` (infra/prometheus/alerts.yml).
+#
+# Reason input MUST be non-empty — callers validate that before invoking
+# (single source of truth is the workflow input definition + a `validate-reason`
+# step the caller emits early). This action assumes reason is already
+# validated; passing an empty reason is a programming error and the action
+# will fail loudly to surface that.
+#
+# Why centralized: drift across the three break-glass invocation sites
+# (promote.yml skip_alembic_gate, deploy-prod.yml allow_stg_tags, the
+# pre-existing skip_stg_verify path) is the exact failure mode #251 is meant
+# to prevent. One implementation, three call sites.
+
+name: Break-glass audit
+description: Emit job summary, warning, audit issue comment, and Prometheus textfile metric for a break-glass workflow input usage.
+
+inputs:
+  input_name:
+    description: "The break-glass input that was set true (e.g., skip_alembic_gate, allow_stg_tags, skip_stg_verify)."
+    required: true
+  reason:
+    description: "Non-empty operator-supplied reason. Caller validates non-empty before invoking; passing empty here will fail the action."
+    required: true
+  bypassed:
+    description: "Short human-readable description of what gate was bypassed (e.g., 'alembic pre-retag migration gate')."
+    required: true
+  vps_host:
+    description: "Prod VPS host for textfile-collector metric. Pass vars.VPS_HOST."
+    required: true
+  ssh_key:
+    description: "Deploy SSH private key. Pass secrets.DEPLOY_SSH_PRIVATE_KEY."
+    required: true
+  github_token:
+    description: "Token with issues:write scope for audit-log issue comment. Pass secrets.GITHUB_TOKEN (caller grants the permission)."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate reason is non-empty
+      shell: bash
+      env:
+        REASON: ${{ inputs.reason }}
+        INPUT_NAME: ${{ inputs.input_name }}
+      run: |
+        set -euo pipefail
+        if [ -z "${REASON// /}" ]; then
+          echo "::error::break-glass-audit invoked with empty reason for input ${INPUT_NAME}." >&2
+          echo "::error::Callers MUST validate a non-empty reason BEFORE invoking this action." >&2
+          echo "::error::See docs/runbooks/break-glass.md and deploy#251." >&2
+          exit 1
+        fi
+
+    - name: Job summary + warning annotation
+      shell: bash
+      env:
+        INPUT_NAME: ${{ inputs.input_name }}
+        REASON: ${{ inputs.reason }}
+        BYPASSED: ${{ inputs.bypassed }}
+        ACTOR: ${{ github.actor }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        echo "::warning::BREAK-GLASS used: ${INPUT_NAME}=true by ${ACTOR}. Bypassed: ${BYPASSED}. See audit-log issue."
+        {
+          echo "## ⚠ BREAK-GLASS USED"
+          echo ""
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| **Input** | \`${INPUT_NAME}=true\` |"
+          echo "| **Actor** | ${ACTOR} |"
+          echo "| **Reason** | ${REASON} |"
+          echo "| **Bypassed** | ${BYPASSED} |"
+          echo "| **Run** | ${RUN_URL} |"
+          echo ""
+          echo "This run proceeded with a documented safety bypass. Audit trail:"
+          echo "comment appended to the pinned audit-log issue (label \`break-glass-audit-log\`)"
+          echo "and \`break_glass_invocation\` Prometheus metric on the prod VPS."
+          echo ""
+          echo "Runbook: \`docs/runbooks/break-glass.md\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Append to pinned audit-log issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ github.repository }}
+        INPUT_NAME: ${{ inputs.input_name }}
+        REASON: ${{ inputs.reason }}
+        BYPASSED: ${{ inputs.bypassed }}
+        ACTOR: ${{ github.actor }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        WORKFLOW: ${{ github.workflow }}
+      run: |
+        set -euo pipefail
+
+        # Find or create the singleton audit-log issue. Identified by the
+        # `break-glass-audit-log` label, which is created on demand. We do
+        # not search by title because operators may rename the issue —
+        # the label is the durable identity.
+        AUDIT_LABEL="break-glass-audit-log"
+
+        # Ensure label exists (idempotent — `gh label create` errors on
+        # duplicate; we swallow that one specific error and re-raise others).
+        if ! gh label list --repo "${REPO}" --json name --jq '.[].name' | grep -qx "${AUDIT_LABEL}"; then
+          gh label create "${AUDIT_LABEL}" \
+            --repo "${REPO}" \
+            --color "B60205" \
+            --description "Pinned thread for every break-glass workflow input invocation (deploy#251)."
+        fi
+
+        # Find the open audit-log issue. There MUST be at most one; if two
+        # exist (operator error), pick the lowest-numbered (oldest) and
+        # warn — keeping the comment thread linear is more important than
+        # which-of-two we pick.
+        ISSUE_NUMBER="$(
+          gh issue list \
+            --repo "${REPO}" \
+            --state open \
+            --label "${AUDIT_LABEL}" \
+            --json number \
+            --jq 'sort_by(.number) | .[0].number // empty'
+        )"
+
+        if [ -z "${ISSUE_NUMBER}" ]; then
+          # Create the audit-log issue. Body explains the convention so an
+          # operator landing here cold understands what they're looking at.
+          INIT_BODY_FILE="$(mktemp)"
+          {
+            printf '%s\n' "This issue is the audit thread for every workflow run that used a break-glass input"
+            printf '%s\n' "(\`skip_alembic_gate\`, \`allow_stg_tags\`, \`skip_stg_verify\`). One comment per"
+            printf '%s\n' "invocation. Do not close — the audit composite action (\`.github/actions/break-glass-audit\`)"
+            printf '%s\n' "auto-creates a replacement if closed, but the comment history is then split."
+            printf '\n'
+            printf '%s\n' "See \`docs/runbooks/break-glass.md\` for the policy + acceptance criteria of when"
+            printf '%s\n' "each input is appropriate. Filed by deploy#251."
+          } > "${INIT_BODY_FILE}"
+          # `gh issue create --label X` requires the label to already exist
+          # (it does — we ensured it above). Capture the URL and parse the
+          # number from the trailing path segment; this works on every gh
+          # version we support.
+          ISSUE_URL="$(
+            gh issue create \
+              --repo "${REPO}" \
+              --title "audit: break-glass usage log (pinned)" \
+              --label "${AUDIT_LABEL}" \
+              --body-file "${INIT_BODY_FILE}"
+          )"
+          rm -f "${INIT_BODY_FILE}"
+          ISSUE_NUMBER="${ISSUE_URL##*/}"
+          if ! printf '%s' "${ISSUE_NUMBER}" | grep -qE '^[0-9]+$'; then
+            echo "::error::Could not parse issue number from gh issue create output: ${ISSUE_URL}"
+            exit 1
+          fi
+          echo "Created audit-log issue #${ISSUE_NUMBER} (${ISSUE_URL})"
+        else
+          echo "Reusing audit-log issue #${ISSUE_NUMBER}"
+        fi
+
+        # Append the per-invocation comment. Use a body file so newlines +
+        # quoting survive (operator-supplied REASON is free text).
+        BODY_FILE="$(mktemp)"
+        trap 'rm -f "$BODY_FILE"' EXIT
+        {
+          echo "### ⚠ Break-glass invocation"
+          echo ""
+          echo "- **Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "- **Workflow:** ${WORKFLOW}"
+          echo "- **Input:** \`${INPUT_NAME}=true\`"
+          echo "- **Actor:** @${ACTOR}"
+          echo "- **Bypassed:** ${BYPASSED}"
+          echo "- **Run:** ${RUN_URL}"
+          echo ""
+          echo "**Reason:**"
+          echo ""
+          # Quote the reason as a code block to neutralize markdown injection
+          # via operator-supplied free text.
+          echo '```'
+          printf '%s\n' "${REASON}"
+          echo '```'
+        } > "${BODY_FILE}"
+
+        gh issue comment "${ISSUE_NUMBER}" \
+          --repo "${REPO}" \
+          --body-file "${BODY_FILE}"
+        echo "Appended audit comment to #${ISSUE_NUMBER}"
+
+    - name: Emit textfile-collector metric on prod VPS
+      uses: appleboy/ssh-action@v1
+      env:
+        INPUT_NAME: ${{ inputs.input_name }}
+        ACTOR: ${{ github.actor }}
+        WORKFLOW: ${{ github.workflow }}
+        RUN_ID: ${{ github.run_id }}
+      with:
+        host: ${{ inputs.vps_host }}
+        username: deploy
+        key: ${{ inputs.ssh_key }}
+        envs: INPUT_NAME,ACTOR,WORKFLOW,RUN_ID
+        script: |
+          set -euo pipefail
+          TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+          # Per-input filename so concurrent break-glass uses on different
+          # inputs don't clobber each other's metric. node-exporter merges
+          # all .prom files in the dir into one scrape response.
+          FINAL="${TEXTFILE_DIR}/break_glass_invocation_${INPUT_NAME}.prom"
+          TMP="${FINAL}.$$"
+
+          # Same bootstrap-permissions discipline as the alembic gate
+          # textfile emit (db-migrate.yml) — fail loud if the dir isn't
+          # writable, since silent metric loss defeats the entire purpose
+          # of this audit.
+          if ! [ -w "${TEXTFILE_DIR}" ]; then
+            echo "ERROR: ${TEXTFILE_DIR} is not writable by deploy user." >&2
+            echo "       This usually means cloud-init did not fire on this VPS." >&2
+            echo "       Investigate per docs/runbooks/break-glass.md." >&2
+            exit 1
+          fi
+
+          NOW="$(date -u +%s)"
+
+          # Sanitize label values for Prometheus exposition format.
+          # Alphanumeric + underscore + dash for input/actor/workflow;
+          # backslashes and double-quotes are escaped per the exposition
+          # format spec. Free-text reason is NOT included as a label
+          # (label-value cardinality risk + free text is in the audit issue).
+          sanitize() {
+            printf '%s' "$1" | tr -c 'A-Za-z0-9_.\-' '_'
+          }
+          INPUT_LABEL="$(sanitize "${INPUT_NAME}")"
+          ACTOR_LABEL="$(sanitize "${ACTOR}")"
+          WORKFLOW_LABEL="$(sanitize "${WORKFLOW}")"
+          RUN_ID_LABEL="$(sanitize "${RUN_ID}")"
+
+          {
+            echo "# HELP break_glass_invocation_timestamp_seconds Unix timestamp of the most recent break-glass workflow input invocation, labeled by input name."
+            echo "# TYPE break_glass_invocation_timestamp_seconds gauge"
+            echo "break_glass_invocation_timestamp_seconds{input=\"${INPUT_LABEL}\",actor=\"${ACTOR_LABEL}\",workflow=\"${WORKFLOW_LABEL}\",run_id=\"${RUN_ID_LABEL}\"} ${NOW}"
+          } > "${TMP}"
+          chmod 0644 "${TMP}"
+          mv -f "${TMP}" "${FINAL}"
+          echo "Wrote ${FINAL}: input=${INPUT_LABEL} actor=${ACTOR_LABEL} timestamp=${NOW}"
+          cat "${FINAL}"
