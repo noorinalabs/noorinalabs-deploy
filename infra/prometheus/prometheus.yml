@@ -38,19 +38,42 @@ scrape_configs:
     metrics_path: /probe
     scrape_interval: 60s
     scrape_timeout: 10s
+    # Hostnames updated 2026-05-03 (deploy#255) post-emergency cutover:
+    # the legacy `isnad-graph.noorinalabs.com` Cloudflare record was
+    # destroyed in the 2026-05-02 emergency reconciliation (#226) and
+    # all 5 routes below were resolving to NXDOMAIN, leaving blackbox
+    # blind on this surface. Companion to deploy#252 / PR#254 which
+    # fixed the same root cause on the post-deploy smoke side. Per
+    # caddy/Caddyfile the user-service routes (`/auth/*`, JWKS, the
+    # `/api/v1/user-service/health` rewrite) are dual-bound on
+    # `isnad.{$BASE_DOMAIN}` AND `users.{$BASE_DOMAIN}`; we keep the
+    # blackbox surface aligned with the smoke battery (single host
+    # `isnad.noorinalabs.com`) so the two probes share an apex. The
+    # eventual de-duplication onto `users.*` is tracked in the
+    # transitional comment block in caddy/Caddyfile.
     static_configs:
-      - targets: ["https://isnad-graph.noorinalabs.com/health"]
+      - targets: ["https://isnad.noorinalabs.com/health"]
         labels: { route: "isnad-health", module: "http_2xx_json" }
-      - targets: ["https://isnad-graph.noorinalabs.com/api/v1/user-service/health"]
+      - targets: ["https://isnad.noorinalabs.com/api/v1/user-service/health"]
         labels: { route: "user-service-health", module: "http_2xx" }
       - targets: ["https://noorinalabs.com/"]
         labels: { route: "landing-root", module: "http_2xx" }
-      - targets: ["https://isnad-graph.noorinalabs.com/api/v1/narrators?limit=1"]
+      - targets: ["https://isnad.noorinalabs.com/api/v1/narrators?limit=1"]
         labels: { route: "narrator-401", module: "http_401_json" }
-      - targets: ["https://isnad-graph.noorinalabs.com/.well-known/jwks.json"]
+      - targets: ["https://isnad.noorinalabs.com/.well-known/jwks.json"]
         labels: { route: "jwks", module: "http_2xx_json" }
-      - targets: ["https://isnad-graph.noorinalabs.com/auth/login"]
-        labels: { route: "auth-login-redirect", module: "http_3xx" }
+      # Path corrected 2026-05-03 (deploy#255 ChangesRequested) lockstep
+      # with deploy#256 / PR#258 (Aisha): user-service exposes
+      # `/auth/oauth/{provider}/{login,callback}`, never had a flat
+      # `/auth/login`. Response shape is HTTP 200 + JSON body with
+      # `.authorization_url` (the SPA reads the JSON and navigates the
+      # browser — NOT a 302 redirect) so the module is `http_2xx_json`,
+      # not `http_3xx`. The label `auth-login-redirect` is kept as the
+      # historical name to avoid churning `alerts.yml`'s
+      # BlackboxUnexpectedStatus matcher; the implicit "expect HTTP
+      # 200" branch in that alert is correct for this route post-fix.
+      - targets: ["https://isnad.noorinalabs.com/auth/oauth/google/login"]
+        labels: { route: "auth-login-redirect", module: "http_2xx_json" }
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
