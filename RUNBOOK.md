@@ -63,10 +63,13 @@ State is stored in Backblaze B2 bucket `noorinalabs-terraform-state`,
 with per-env state keys (`hetzner/stg.tfstate`, `hetzner/prod.tfstate`).
 Apply via CI is the preferred path — see § Apply via CI below.
 
-After `apply`, the new VPS still needs first-time setup:
+After `apply`, the new VPS still needs first-time setup. SSH in as `root`
+using whichever key was authorized at provisioning time (Hetzner cloud-init
+user-data, console password reset, or operator's local key — see the
+`cloud_init_ssh_key_gap` note in [`ontology/repos/deploy.yaml`](ontology/repos/deploy.yaml))
+and run:
 
 ```bash
-ssh -i ~/.ssh/isnad_deploy root@<new-vps-host>
 curl -sL https://raw.githubusercontent.com/noorinalabs/noorinalabs-deploy/main/scripts/bootstrap-vps.sh | bash
 ```
 
@@ -256,8 +259,13 @@ broken code that runs but corrupts state, the rollback procedure is:
 If a Terraform apply broke infrastructure (rare — `terraform.yml`
 gates this), the rollback is **not** `terraform destroy`. Instead:
 
-1. Revert the offending PR via `gh pr revert` and merge the revert.
-2. Let `terraform.yml` re-apply with the prior config.
+1. Open a revert PR for the offending merge:
+   ```bash
+   git revert -m 1 <bad-merge-sha>      # or: git revert <bad-squash-sha>
+   git push -u origin revert-<sha>
+   gh pr create --title "Revert: <original title>" --body "Reverts #<bad-pr>"
+   ```
+2. Merge the revert. `terraform.yml` re-applies with the prior config.
 3. If state is corrupted (apply hung mid-resource), see
    § Terraform state lock under [Common failure modes](#common-failure-modes).
 
@@ -309,37 +317,67 @@ This is destructive — escalate first.
 ### B2 credential rotation
 
 **Symptom:** Backups stop, Terraform state reads start failing, or
-`scripts/backup.sh` returns non-zero. Two distinct credential paths exist:
+`scripts/backup.sh` returns non-zero. Three distinct credential paths
+exist — all stored as GitHub Actions env-scoped secrets, then injected
+onto the VPS via the deploy workflows. None of them live in a
+hand-edited file on the box.
 
-- **Backups** — rclone-native B2 creds (`B2_KEY_ID`, `B2_APPLICATION_KEY`)
-  on the VPS in `/etc/rclone/rclone.conf`.
-- **Terraform state** — S3-protocol B2 creds (`AWS_ACCESS_KEY_ID`,
-  `AWS_SECRET_ACCESS_KEY`) in GitHub Actions secrets at
-  the `staging` and `production` environment scope.
+| Path | GH secret names (env scope) | VPS env-var names | Bucket | Consumer |
+|---|---|---|---|---|
+| Backups | `BACKUP_B2_KEY_ID`, `BACKUP_B2_APP_KEY`, `BACKUP_B2_BUCKET` | `B2_KEY_ID`, `B2_APP_KEY`, `B2_BUCKET` | `isnad-graph-backups` | `scripts/backup.sh`, `scripts/restore.sh` (rclone-native via `RCLONE_CONFIG_ISNAD_*` exports inside the script) |
+| Terraform state | `TF_STATE_B2_KEY_ID`, `TF_STATE_B2_APP_KEY` (also exposed as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` to the S3-protocol backend) | n/a (Actions only) | `noorinalabs-terraform-state` | `terraform.yml` |
+| Pipeline ingest | `PIPELINE_B2_KEY_ID`, `PIPELINE_B2_KEY` | `PIPELINE_B2_KEY_ID`, `PIPELINE_B2_KEY` | (declared in data-acquisition repo) | data-acquisition / ingest workers |
 
-**Rotation procedure:**
+Rotating one path does not affect the others. The local FS path
+`/var/lib/noorinalabs-backups` is the staging directory `backup.sh`
+writes to before the rclone upload — it is **not** a B2 bucket name and
+does not need rotation.
 
-1. Generate a new application key in the Backblaze console with the
-   correct bucket scope (`noorinalabs-backups` for backups,
-   `noorinalabs-terraform-state` for TF state).
-2. For backups: SSH to the prod VPS, edit `/etc/rclone/rclone.conf` as
-   root, restart the next scheduled `isnad-backup.timer` cycle (or run
-   `systemctl start isnad-backup.service` to test immediately).
-3. For TF state: update both `staging` and `production` env-scoped
-   secrets via the repo settings UI or:
+**Rotation procedure (backup path — most common):**
+
+1. Generate a new B2 application key in the Backblaze console scoped to
+   the `isnad-graph-backups` bucket only (read+write+delete).
+2. Update the env-scoped GH secrets:
    ```bash
-   gh secret set AWS_ACCESS_KEY_ID --env staging --body "$NEW_KEY_ID"
-   gh secret set AWS_SECRET_ACCESS_KEY --env staging --body "$NEW_SECRET"
-   # repeat for --env production
+   gh secret set BACKUP_B2_KEY_ID  --env staging    --body "$NEW_KEY_ID"
+   gh secret set BACKUP_B2_APP_KEY --env staging    --body "$NEW_APP_KEY"
+   gh secret set BACKUP_B2_KEY_ID  --env production --body "$NEW_KEY_ID"
+   gh secret set BACKUP_B2_APP_KEY --env production --body "$NEW_APP_KEY"
    ```
-4. Verify by running a no-op `terraform.yml` PR (touch a comment-only
-   line) and confirming both `plan` matrix entries succeed.
-5. Revoke the old keys in the Backblaze console only after the new keys
-   have been confirmed working in CI.
+3. The new credentials reach the VPS on the next `deploy-stg.yml` /
+   `deploy-prod.yml` run (the deploy workflow rewrites
+   `/opt/noorinalabs-deploy/.env`, which `isnad-backup.service` reads
+   via its `EnvironmentFile=` directive). To force a refresh without a
+   real deploy, dispatch the relevant `deploy-*.yml` against the
+   currently-pinned `IMAGE_TAG`.
+4. Verify by SSHing to the VPS and triggering the unit immediately:
+   ```bash
+   sudo systemctl start isnad-backup.service
+   sudo journalctl -u isnad-backup.service -n 200
+   ```
+   Confirm the rclone upload step exits 0 and a new dated subdirectory
+   appears in the B2 bucket.
+5. Revoke the old keys in the Backblaze console only after step 4 has
+   passed on **both** stg and prod.
 
-The two credential paths are independent — rotating one does not affect
-the other. See [`docs/dependencies.md`](docs/dependencies.md) for the
-full required-secrets table.
+**Rotation procedure (TF state path):**
+
+1. Generate a new B2 application key scoped to
+   `noorinalabs-terraform-state` only.
+2. Update the env-scoped GH secrets:
+   ```bash
+   gh secret set TF_STATE_B2_KEY_ID  --env staging    --body "$NEW_KEY_ID"
+   gh secret set TF_STATE_B2_APP_KEY --env staging    --body "$NEW_APP_KEY"
+   gh secret set TF_STATE_B2_KEY_ID  --env production --body "$NEW_KEY_ID"
+   gh secret set TF_STATE_B2_APP_KEY --env production --body "$NEW_APP_KEY"
+   ```
+3. Verify by opening a no-op `terraform.yml` PR (touch a comment-only
+   line) and confirming both `plan` matrix entries (`stg`, `prod`)
+   succeed.
+4. Revoke the old keys after step 3 passes.
+
+See [`docs/dependencies.md`](docs/dependencies.md) for the full
+required-secrets table.
 
 ### VPS connectivity
 
@@ -385,19 +423,43 @@ This repo's on-call rotation is owned by the SRE team in the deploy roster
 SRE on-call; cross-cutting incidents that touch service code escalate to
 the relevant service repo's manager.
 
-### Tier 0 — auto / hooks
+### Tier 0 — Prometheus alerts (firing today, paging not yet wired)
 
-Several alerts are wired to `Alertmanager` and surfaced via the
-break-glass-audit log issue:
+The signals in `infra/prometheus/alerts.yml` that are operationally
+relevant to the deploy lifecycle:
 
-- `BreakGlassUsed` — anyone invoking the four `workflow_dispatch`
-  break-glass inputs.
-- `BackupFailed` — `scripts/emit-backup-failure-marker.sh` writes a
-  textfile-collector marker scraped by node-exporter.
-- `DeployFailed` — `verify-deploy.yml` non-zero exit.
+- `BackupFailure` — fires when `scripts/emit-backup-failure-marker.sh`
+  writes a textfile-collector marker (triggered by the
+  `OnFailure=isnad-backup-failure-marker.service` directive on the
+  backup unit).
+- `BreakGlassUsed` — anyone invoking the break-glass `workflow_dispatch`
+  inputs in `promote.yml` / `deploy-prod.yml` (see
+  [`docs/runbooks/break-glass.md`](docs/runbooks/break-glass.md)).
+- `BreakGlassMetricStale`, `UserServiceAlembicGateFailure`,
+  `UserServiceAlembicGateStale`, `BlackboxProbeFailing`,
+  `BlackboxUnexpectedStatus`, `BlackboxCertExpiringSoon`,
+  `ServiceDown`, `ContainerUnhealthy`, `HighErrorRate`, `HighLatencyP95`,
+  `HighDiskUsage`, `HighMemoryUsage` — see `infra/prometheus/alerts.yml`
+  for the full set.
 
-These page the SRE on-call directly via Alertmanager → the configured
-notifier (see `infra/alertmanager/alertmanager.yml`).
+There is no `DeployFailed` Prometheus alert — `verify-deploy.yml` is a
+GitHub Actions job, not a Prometheus signal source. Workflow failures
+surface as red runs in the Actions tab and as `::error::` annotations.
+
+> **External paging is not yet wired.** Both the `default` and `critical`
+> Alertmanager receivers in `infra/alertmanager/alertmanager.yml` point
+> at the literal URL `http://localhost:9095/webhook` — a non-existent
+> local endpoint chosen so the config loads cleanly until real routing
+> (PagerDuty / Slack / email) is provisioned. Until then, Tier-0 alerts
+> fire only into Alertmanager's UI on the prod VPS — they do **not**
+> page anyone. Treat the Tier-1 SRE on-call as the de-facto first
+> responder for any operational incident, and rely on Grafana
+> dashboards plus manual checks (`gh run list --workflow=verify-deploy.yml`)
+> to surface deploy failures. Receiver wiring is the remaining piece
+> after the `#127` config-load fix; tracked in
+> [`deploy#274`](https://github.com/noorinalabs/noorinalabs-deploy/issues/274)
+> as a load-bearing followup that includes "revise this runbook section"
+> in its acceptance criteria.
 
 ### Tier 1 — SRE on-call
 
