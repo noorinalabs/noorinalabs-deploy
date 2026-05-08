@@ -85,8 +85,8 @@ No in-wave Pattern G fixes were possible: the local copies are unused orphans, s
 
 ## Backport Issues Filed
 
-- deploy#**TBD** — `bug: stale local hook copies diverge from parent canonical versions — delete orphans` (bug, p3-wave-7)
-- deploy#**TBD** — `enhancement: add hooks-lint CI workflow to deploy repo` (enhancement, ci-cd, p3-wave-7)
+- deploy#276 — `bug: stale local hook copies diverge from parent canonical versions — delete orphans` (bug, tech-debt, p3-wave-7)
+- deploy#277 — `enhancement: add hooks-lint CI workflow to deploy repo` (enhancement, ci-cd, p3-wave-7)
 
 ---
 
