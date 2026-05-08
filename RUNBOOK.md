@@ -423,7 +423,7 @@ This repo's on-call rotation is owned by the SRE team in the deploy roster
 SRE on-call; cross-cutting incidents that touch service code escalate to
 the relevant service repo's manager.
 
-### Tier 0 — Prometheus alerts (firing today, paging not yet wired)
+### Tier 0 — Prometheus alerts
 
 The signals in `infra/prometheus/alerts.yml` that are operationally
 relevant to the deploy lifecycle:
@@ -446,20 +446,21 @@ There is no `DeployFailed` Prometheus alert — `verify-deploy.yml` is a
 GitHub Actions job, not a Prometheus signal source. Workflow failures
 surface as red runs in the Actions tab and as `::error::` annotations.
 
-> **External paging is not yet wired.** Both the `default` and `critical`
-> Alertmanager receivers in `infra/alertmanager/alertmanager.yml` point
-> at the literal URL `http://localhost:9095/webhook` — a non-existent
-> local endpoint chosen so the config loads cleanly until real routing
-> (PagerDuty / Slack / email) is provisioned. Until then, Tier-0 alerts
-> fire only into Alertmanager's UI on the prod VPS — they do **not**
-> page anyone. Treat the Tier-1 SRE on-call as the de-facto first
-> responder for any operational incident, and rely on Grafana
-> dashboards plus manual checks (`gh run list --workflow=verify-deploy.yml`)
-> to surface deploy failures. Receiver wiring is the remaining piece
-> after the `#127` config-load fix; tracked in
-> [`deploy#274`](https://github.com/noorinalabs/noorinalabs-deploy/issues/274)
-> as a load-bearing followup that includes "revise this runbook section"
-> in its acceptance criteria.
+**Alertmanager receiver topology** (wired as of deploy#274):
+
+| Severity | Receiver | Notifier |
+|---|---|---|
+| `critical` | `pagerduty-critical` | PagerDuty Events API v2 (on-call page) |
+| `critical` | `slack-critical` | Slack `#alerts-critical` |
+| `warning` | `slack-warning` | Slack `#alerts-warning` |
+
+Credentials are injected at deploy time via `scripts/render-alertmanager-config.sh`
+(GitHub Actions secrets `ALERTMANAGER_PAGERDUTY_INTEGRATION_KEY` and
+`ALERTMANAGER_SLACK_WEBHOOK_URL`). For the full topology, triage path, and
+post-merge runtime test plan see [`docs/alerting-receivers.md`](docs/alerting-receivers.md).
+
+If paging appears broken: SSH to VPS and check `cat /opt/noorinalabs-deploy/infra/alertmanager/alertmanager.yml`
+— CI-placeholder values in the rendered file indicate the render step did not run or secrets were missing.
 
 ### Tier 1 — SRE on-call
 
