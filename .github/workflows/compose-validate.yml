@@ -47,6 +47,37 @@ jobs:
         working-directory: compose
         run: docker compose -f docker-compose.prod.yml --env-file .env config --quiet
 
+  alertmanager-config:
+    name: amtool check-config (Alertmanager)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install amtool
+        run: |
+          set -euo pipefail
+          AMTOOL_VERSION="0.28.1"
+          curl -fsSL "https://github.com/prometheus/alertmanager/releases/download/v${AMTOOL_VERSION}/alertmanager-${AMTOOL_VERSION}.linux-amd64.tar.gz" \
+            -o /tmp/alertmanager.tar.gz
+          # Verify checksum against published SHA256SUMS (deploy#274 integrity discipline).
+          EXPECTED_SHA=$(curl -fsSL "https://github.com/prometheus/alertmanager/releases/download/v${AMTOOL_VERSION}/sha256sums.txt" \
+            | grep "alertmanager-${AMTOOL_VERSION}.linux-amd64.tar.gz" | awk '{print $1}')
+          echo "${EXPECTED_SHA}  /tmp/alertmanager.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/alertmanager.tar.gz -C /tmp
+          sudo mv "/tmp/alertmanager-${AMTOOL_VERSION}.linux-amd64/amtool" /usr/local/bin/amtool
+          amtool --version
+      - name: Check CI placeholder config syntax
+        run: amtool check-config infra/alertmanager/alertmanager.yml
+      - name: Route-tree dry-run (warning severity)
+        run: |
+          amtool config routes test \
+            --config.file=infra/alertmanager/alertmanager.yml \
+            severity=warning
+      - name: Route-tree dry-run (critical severity)
+        run: |
+          amtool config routes test \
+            --config.file=infra/alertmanager/alertmanager.yml \
+            severity=critical
+
   shellcheck:
     name: shellcheck infra & scripts
     runs-on: ubuntu-latest

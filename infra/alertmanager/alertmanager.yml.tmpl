@@ -1,16 +1,8 @@
-##############################################################################
-# THIS FILE IS GENERATED — DO NOT EDIT BY HAND.
-# Source: infra/alertmanager/alertmanager.yml.tmpl
-# Rendered by: scripts/render-alertmanager-config.sh (called in deploy workflows)
-#
-# The values in this file are CI-safe placeholders. On each deploy, the
-# render script replaces them with real secrets sourced from GitHub Actions
-# encrypted secrets. See docs/alerting-receivers.md for the full topology.
-##############################################################################
-
 global:
   resolve_timeout: 5m
-  slack_api_url: "https://hooks.slack.com/services/CI_PLACEHOLDER/CI_PLACEHOLDER/CI_PLACEHOLDER"
+  # Slack API URL is set globally so all Slack receivers share the same
+  # credentials path without repeating it per-receiver.
+  slack_api_url: "$ALERTMANAGER_SLACK_WEBHOOK_URL"
 
 route:
   group_by: ["alertname", "severity"]
@@ -30,9 +22,10 @@ route:
       repeat_interval: 1h
 
 receivers:
+  # critical — pages PagerDuty and posts to #alerts-critical Slack channel
   - name: pagerduty-critical
     pagerduty_configs:
-      - routing_key: "CI_PLACEHOLDER_PAGERDUTY_KEY_32CHARS0000000"
+      - routing_key: "$ALERTMANAGER_PAGERDUTY_INTEGRATION_KEY"
         description: '{{ template "pagerduty.default.description" . }}'
         severity: critical
         send_resolved: true
@@ -44,6 +37,7 @@ receivers:
         text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
         send_resolved: true
 
+  # default (warning) — posts to #alerts-warning Slack channel; no PagerDuty page
   - name: slack-warning
     slack_configs:
       - channel: "#alerts-warning"
