@@ -58,7 +58,7 @@ jobs:
           - noorinalabs/noorinalabs-user-service
           - noorinalabs/noorinalabs-landing-page
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check publish + promote tag invariants
         env:

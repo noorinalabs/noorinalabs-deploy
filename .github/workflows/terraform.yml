@@ -15,7 +15,7 @@ jobs:
     name: Format check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
@@ -41,7 +41,7 @@ jobs:
       run:
         working-directory: ${{ matrix.path }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
@@ -68,7 +68,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
@@ -79,7 +79,7 @@ jobs:
         run: terraform plan -no-color -out=tfplan
         continue-on-error: true
       - name: Comment PR with plan
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const envName = '${{ matrix.env }}';
@@ -116,7 +116,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
@@ -127,7 +127,7 @@ jobs:
         run: terraform plan -no-color -out=tfplan
         continue-on-error: true
       - name: Comment PR with plan
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const output = `#### Terraform Plan (cloudflare)
@@ -160,7 +160,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
@@ -171,7 +171,7 @@ jobs:
         run: terraform plan -no-color -out=tfplan
         continue-on-error: true
       - name: Comment PR with plan
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const output = `#### Terraform Plan (backblaze)
@@ -211,7 +211,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
@@ -243,7 +243,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
@@ -267,7 +267,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
