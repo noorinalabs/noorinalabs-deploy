@@ -347,7 +347,7 @@ jobs:
     steps:
       - name: Checkout (for local composite action)
         if: ${{ inputs.skip_stg_verify }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Break-glass audit (skip_stg_verify)
         if: ${{ inputs.skip_stg_verify }}
         uses: ./.github/actions/break-glass-audit
@@ -596,7 +596,7 @@ jobs:
       issues: write
     steps:
       - name: Checkout (for local composite action)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Break-glass audit (skip_alembic_gate)
         uses: ./.github/actions/break-glass-audit
         with:

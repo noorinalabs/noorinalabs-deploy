@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout noorinalabs-deploy
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: noorinalabs-deploy
 
@@ -56,14 +56,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout noorinalabs-user-service
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: noorinalabs/noorinalabs-user-service
           path: noorinalabs-user-service
           ref: ${{ steps.sibling-refs.outputs.user_service_ref }}
 
       - name: Checkout noorinalabs-isnad-graph
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: noorinalabs/noorinalabs-isnad-graph
           path: noorinalabs-isnad-graph
@@ -78,7 +78,7 @@ jobs:
 
       - name: Upload test report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-junit
           path: noorinalabs-deploy/integration-tests/reports/
