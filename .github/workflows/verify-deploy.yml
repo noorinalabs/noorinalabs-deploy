@@ -108,7 +108,7 @@ jobs:
       # verification is ever revived, restore that sequence from
       # `git show 6e8f450:.github/workflows/verify-deploy.yml`.
       - name: Checkout noorinalabs-deploy
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: noorinalabs-deploy
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
@@ -127,7 +127,7 @@ jobs:
 
       - name: Upload junit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: verify-stg-junit
           path: noorinalabs-deploy/integration-tests/reports/
@@ -171,7 +171,7 @@ jobs:
 
       - name: Upload verify-stg-result artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: stg-verify-result
           path: stg-verify-result-${{ github.run_id }}.json
@@ -254,7 +254,7 @@ jobs:
       # ref pin matters: workflow_run defaults checkout to the default
       # branch (main), which would silently run a wave-branch deploy's
       # verify against main's revision. Same fix as verify-stg above.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
@@ -281,7 +281,7 @@ jobs:
 
       - name: Upload smoke output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: verify-prod-smoke-output
           path: |

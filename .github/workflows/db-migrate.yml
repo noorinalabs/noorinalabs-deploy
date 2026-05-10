@@ -69,7 +69,7 @@ jobs:
       # here means "the migration DAG moved under us" and is a hard stop.
       EXPECTED_MERGE_HEAD: "0040"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Resolve image tag
         id: tag

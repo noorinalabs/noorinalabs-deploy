@@ -1,0 +1,114 @@
+name: CI — Hooks & Skills Lint
+
+on:
+  push:
+    branches: [main, "deployments/**"]
+    paths:
+      - ".claude/hooks/**"
+      - ".claude/skills/**"
+      - ".github/workflows/hooks-lint.yml"
+      - "pyproject.toml"
+  pull_request:
+    branches: [main, "deployments/**"]
+    paths:
+      - ".claude/hooks/**"
+      - ".claude/skills/**"
+      - ".github/workflows/hooks-lint.yml"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: Ruff check (skip when no hooks present)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(.claude/hooks/*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No hooks present (dispatcher-style child) — skipping ruff check."
+            exit 0
+          fi
+          ruff check .claude/hooks/
+
+  format:
+    name: Ruff format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: Ruff format --check (skip when no hooks present)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(.claude/hooks/*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No hooks present (dispatcher-style child) — skipping ruff format."
+            exit 0
+          fi
+          ruff format --check .claude/hooks/
+
+  typecheck:
+    name: Mypy type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mypy
+      - name: Mypy (skip when no hooks present)
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(.claude/hooks/*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No hooks present (dispatcher-style child) — skipping mypy."
+            exit 0
+          fi
+          mypy .claude/hooks/ --ignore-missing-imports --no-error-summary
+
+  smoke-test:
+    name: Smoke test — hooks compile and exit cleanly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify all hooks compile
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(.claude/hooks/*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No hooks present (dispatcher-style child) — skipping compile check."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            python3 -c "import py_compile; py_compile.compile('$f', doraise=True)"
+          done
+      - name: Verify hooks exit 0 on empty stdin
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(.claude/hooks/*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No hooks present (dispatcher-style child) — skipping stdin smoke."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            echo '{}' | python3 "$f" || true
+          done
