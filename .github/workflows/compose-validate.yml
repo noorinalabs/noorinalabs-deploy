@@ -78,47 +78,55 @@ jobs:
     # author + reviewer running `promtool check` locally; CI gate makes
     # this deterministic and closes the local-promtool-version-drift gap.
     # Pinned to the same v3.4.0 image deployed in compose/docker-compose.prod.yml.
+    #
+    # `--entrypoint promtool` overrides the image's default ENTRYPOINT
+    # (`/bin/prometheus`) — without it, docker treats `promtool ...` as
+    # arguments to prometheus and exits with "unexpected promtool".
+    # Verified against prometheus v3.4.0 Dockerfile.
     name: promtool check (rules + config)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Validate alerts.yml
         run: |
-          docker run --rm \
+          docker run --rm --entrypoint promtool \
             -v "$PWD/infra/prometheus:/etc/prometheus:ro" \
             prom/prometheus:v3.4.0 \
-            promtool check rules /etc/prometheus/alerts.yml
+            check rules /etc/prometheus/alerts.yml
       - name: Validate prometheus.prod.yml
         run: |
-          docker run --rm \
+          docker run --rm --entrypoint promtool \
             -v "$PWD/infra/prometheus:/etc/prometheus:ro" \
             prom/prometheus:v3.4.0 \
-            promtool check config /etc/prometheus/prometheus.prod.yml
+            check config /etc/prometheus/prometheus.prod.yml
       - name: Validate prometheus.stg.yml
         run: |
-          docker run --rm \
+          docker run --rm --entrypoint promtool \
             -v "$PWD/infra/prometheus:/etc/prometheus:ro" \
             prom/prometheus:v3.4.0 \
-            promtool check config /etc/prometheus/prometheus.stg.yml
+            check config /etc/prometheus/prometheus.stg.yml
 
   amtool-check:
     # deploy#212 sibling — validate per-env alertmanager configs (deploy#262
     # + #263). amtool ships in the prom/alertmanager image and parses the
     # full config schema, catching typos in receivers/routes/inhibit_rules
     # that Alertmanager would otherwise fail to load at runtime.
+    #
+    # `--entrypoint amtool` overrides the image's default ENTRYPOINT
+    # (`/bin/alertmanager`) — same rationale as promtool above.
     name: amtool check-config
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Validate alertmanager.prod.yml
         run: |
-          docker run --rm \
+          docker run --rm --entrypoint amtool \
             -v "$PWD/infra/alertmanager:/etc/alertmanager:ro" \
             prom/alertmanager:v0.28.1 \
-            amtool check-config /etc/alertmanager/alertmanager.prod.yml
+            check-config /etc/alertmanager/alertmanager.prod.yml
       - name: Validate alertmanager.stg.yml
         run: |
-          docker run --rm \
+          docker run --rm --entrypoint amtool \
             -v "$PWD/infra/alertmanager:/etc/alertmanager:ro" \
             prom/alertmanager:v0.28.1 \
-            amtool check-config /etc/alertmanager/alertmanager.stg.yml
+            check-config /etc/alertmanager/alertmanager.stg.yml
