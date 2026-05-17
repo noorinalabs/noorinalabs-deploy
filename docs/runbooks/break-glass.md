@@ -179,19 +179,25 @@ ssh deploy@noorinalabs-prod \
 
 Replace `<input>` with the value from the alert's `input` label.
 
-## Receiver routing caveat
+## Receiver routing
 
-As of 2026-05-03, Alertmanager's `critical` receiver webhook is a
-localhost placeholder (`http://localhost:9095/webhook`) pending real
-Slack/email routing — tracked in deploy#262 (post-#251 sequel; the
-parse-error fix for `${VAR}` interpolation that landed the placeholder
-itself was deploy#127, closed 2026-04-19). The `BreakGlassUsed` rule
-fires correctly inside Prometheus + Alertmanager, but the human-facing
-notification path requires #262 to land first.
+As of 2026-05-17, Alertmanager routes `default` and `critical` receivers
+to Slack (`#prod-alerts` for prod, `#stg-alerts` for stg) via the
+`api_url_file:` directive (deploy#262). The webhook URL is read at
+container startup from `/etc/alertmanager/slack_webhook_url`, mounted from
+the host file `infra/alertmanager/slack_webhook_url.secret` (gitignored)
+that the deploy workflow writes from the `SLACK_WEBHOOK_URL` GitHub
+Environment secret.
 
-Until #262 is resolved, on-call should grep the audit-log issue + check
-the Alertmanager UI directly:
-`https://noorinalabs.com/alertmanager/` (behind admin auth).
+If the Slack webhook secret is not set in the relevant GitHub Environment,
+the deploy workflow writes a placeholder ("<unset>") and logs a WARNING.
+Alertmanager loads cleanly but webhook posts to "<unset>" fail; on-call
+should grep the audit-log issue + check the Alertmanager UI directly:
+`https://noorinalabs.com/alertmanager/` (behind admin auth) until the
+secret is rotated in.
+
+Full runbook for the Slack routing pattern: see
+`docs/runbooks/alertmanager-slack-routing.md`.
 
 ## What can NOT be tested in CI
 

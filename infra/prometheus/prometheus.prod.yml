@@ -1,6 +1,8 @@
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
+  external_labels:
+    env: prod
 
 rule_files:
   - /etc/prometheus/alerts.yml
@@ -24,6 +26,24 @@ scrape_configs:
     static_configs:
       - targets: ["postgres-exporter:9187"]
 
+  # user-service stack exporters (deploy#64). user-service:8000/metrics is NOT
+  # scraped here because user-service has no /metrics endpoint yet — tracked
+  # in noorinalabs-user-service#124. user-postgres-exporter IS scraped — it
+  # has been running in compose since the user-service stack extraction and
+  # was silently un-scraped until #64 surfaced the gap.
+  - job_name: "user-postgres-exporter"
+    static_configs:
+      - targets: ["user-postgres-exporter:9187"]
+
+  # Promtail self-metrics scrape (deploy#131). The promtail container exposes
+  # its own metrics on :9080 (server.http_listen_port in promtail-config.yml).
+  # The companion `promtail_log_ingestion_drop` alert in alerts.yml fires when
+  # `rate(promtail_sent_entries_total[5m]) == 0` — the documented backstop
+  # for the healthcheck removed in deploy#130 (distroless image, no wget/curl/nc).
+  - job_name: "promtail"
+    static_configs:
+      - targets: ["promtail:9080"]
+
   # blackbox-exporter — continuous external probe of the same 6 prod
   # routes covered by the post-deploy smoke battery
   # (scripts/verify_prod_smoke.sh). Each target carries a `route` label
@@ -34,6 +54,10 @@ scrape_configs:
   #   1. instance label = the URL itself (visible in alerts)
   #   2. __param_target = URL passed to /probe?target=…
   #   3. __address__   = blackbox-exporter:9115 (the actual scrape target)
+  #
+  # PROD-ONLY targets: see prometheus.stg.yml for the stg counterpart (deploy#263
+  # per-env split — stg blackbox was probing prod hostnames pre-split, masking
+  # stg-side signal and polluting prod attribution).
   - job_name: "blackbox"
     metrics_path: /probe
     scrape_interval: 60s
