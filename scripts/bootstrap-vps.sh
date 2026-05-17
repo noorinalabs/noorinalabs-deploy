@@ -155,13 +155,21 @@ DATA_STAGING_DIR=./data/staging
 DATA_CURATED_DIR=./data/curated
 
 # Backblaze B2 — backup credentials [REQUIRED for backup timer]
-# Consumed by scripts/backup.sh:59-61. Scope: read+write+delete on the
-# isnad-graph-backups bucket only (separate from PIPELINE_B2_* ingest scope
-# and TF_STATE_B2_* terraform backend scope). The deploy-{stg,prod}.yml
-# workflows populate these from BACKUP_B2_* GH secrets; manual operators
-# bootstrapping a new VPS must fill these in by hand. See deploy#188.
-B2_KEY_ID=CHANGE-ME
-B2_APP_KEY=CHANGE-ME
+# Consumed by scripts/backup.sh:59-61 which uses `${VAR:?...}` fail-fast.
+# Scope: read+write+delete on the isnad-graph-backups bucket only (separate
+# from PIPELINE_B2_* ingest scope and TF_STATE_B2_* terraform backend scope).
+# The deploy-{stg,prod}.yml workflows populate these from BACKUP_B2_* GH
+# secrets (writing empty strings when unset, so backup.sh fails fast at
+# preflight); manual operators bootstrapping a new VPS must fill these in
+# by hand. See deploy#188 / #191.
+#
+# IMPORTANT: leave B2_KEY_ID and B2_APP_KEY EMPTY (not "CHANGE-ME") at
+# bootstrap. The ${VAR:?} preflight in backup.sh treats unset and empty
+# identically; a literal "CHANGE-ME" satisfies :? and would let backup.sh
+# proceed to rclone, which then fails with an opaque B2 401. Empty values
+# give the operator the actually-useful "B2_KEY_ID must be set" error.
+B2_KEY_ID=
+B2_APP_KEY=
 B2_BUCKET=isnad-graph-backups
 ENVEOF
   chmod 600 "$ENV_FILE"
