@@ -14,6 +14,20 @@
 package_update: true
 package_upgrade: true
 
+# Apt configuration applied to cloud-init's own `packages:` install + the
+# package_upgrade step. Per #173 gap D: cloud-init defaults don't set
+# DEBIAN_FRONTEND, so any package with an interactive postinst (needrestart's
+# whiptail "Pending kernel upgrade" being the most common) creates noise in
+# cloud-init.log and is a hang risk. --force-confold/confdef preserves
+# operator-modified config files on upgrade; matches the apt invocation
+# pattern in bootstrap-vps.sh since deploy#110.
+apt:
+  conf: |
+    DPkg::Options {
+      "--force-confdef";
+      "--force-confold";
+    };
+
 packages:
   - docker.io
   - docker-compose-v2
@@ -72,10 +86,16 @@ write_files:
       Unattended-Upgrade::AutoFixInterruptedDpkg "true";
       Unattended-Upgrade::Remove-Unused-Dependencies "true";
 
-  # GHCR Docker auth config for deploy user
+  # GHCR Docker auth config for deploy user.
+  # defer: true so cloud-init waits until the `users:` module has created
+  # `deploy` before chowning this file — without it, cloud-init's
+  # write_files module runs before users, hits OSError('Unknown user "deploy"'),
+  # aborts the entire write_files stage, and silently drops the remaining
+  # entries (this file, .env.user-service, .cloud-init-provisioned). See #173 gap B.
   - path: /home/deploy/.docker/config.json
     owner: deploy:deploy
     permissions: '0600'
+    defer: true
     content: |
       {
         "auths": {
@@ -89,10 +109,12 @@ write_files:
   # User-service environment file
   # Docker Compose reads this to configure user-postgres, user-redis, and
   # user-service containers. Values are injected from Terraform variables.
+  # defer: true — same reason as the .docker/config.json entry above. See #173 gap B.
   # ---------------------------------------------------------------------------
   - path: /opt/noorinalabs-deploy/.env.user-service
     owner: deploy:deploy
     permissions: '0600'
+    defer: true
     content: |
       # user-service secrets — managed by Terraform cloud-init
       USER_POSTGRES_PASSWORD=${user_postgres_password}
@@ -124,10 +146,14 @@ runcmd:
   - systemctl enable fail2ban
   - systemctl start fail2ban
 
-  # Disable root SSH password login (key-only)
+  # Disable root SSH password login (key-only).
+  # Ubuntu 24.04 unit name is `ssh.service`, not `sshd.service` (debian-style
+  # naming). The old `systemctl restart sshd` silently failed with
+  # "Unit sshd.service not found" — sshd_config edits then only took effect
+  # on the next kernel-upgrade reboot. See #173 gap C.
   - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
   - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-  - systemctl restart sshd
+  - systemctl restart ssh
 
   # Clone deploy repo
   - git clone https://github.com/noorinalabs/noorinalabs-deploy.git /opt/noorinalabs-deploy || true
@@ -155,11 +181,22 @@ runcmd:
   - chown deploy:deploy /var/lib/node_exporter/textfile_collector
   - chmod 0755 /var/lib/node_exporter/textfile_collector
 
-  # Install Caddy via official apt repo
+  # Install Caddy via official apt repo.
+  # DEBIAN_FRONTEND=noninteractive + NEEDRESTART_MODE=a are inlined per-command
+  # because cloud-init's runcmd exec's each entry independently — `export`s in
+  # an earlier entry don't survive to the next. Without these, caddy's apt
+  # install triggers a whiptail "Pending kernel upgrade" dialog from
+  # needrestart, which prints
+  #   debconf: whiptail output the above errors, giving up!
+  # and "Use of uninitialized value $ret in scalar chomp" in cloud-init logs.
+  # The install does NOT block today (whiptail bails when it can't open a
+  # terminal) but is an apt-hang risk under stricter dialog policies and is
+  # noisy in cloud-init.log. Matches the pattern used in bootstrap-vps.sh
+  # since deploy#110. See #173 gap D.
   - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   - echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" > /etc/apt/sources.list.d/caddy-stable.list
-  - apt-get update -qq
-  - apt-get install -y -qq caddy
+  - DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq
+  - DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" caddy
   - systemctl stop caddy
   # Caddy will be run via Docker Compose, not systemd — disable the system service
   - systemctl disable caddy
