@@ -1,0 +1,227 @@
+name: DB Migrate — CI Gate (alembic dry-run)
+
+# CI-side dry-run gate for the alembic pre-deploy mechanic (#237).
+#
+# Closes the loop opened by #234 / #235 / PR #236 — those defects (psycopg
+# URL with no psycopg in the image) shipped because db-migrate.yml is a
+# pure SSH-into-VPS workflow. The SSH path cannot run in CI by definition,
+# so the URL-scheme breakage was only caught when prod tried to invoke it
+# during the 2026-05-02 emergency restore.
+#
+# This workflow replicates the gate's mechanic hermetically in CI:
+#
+#   1. Spin up `postgres:16-alpine` as a GitHub Actions service container,
+#      using the same image the prod compose stack uses for user-postgres.
+#   2. Pull `ghcr.io/noorinalabs/noorinalabs-user-service:<env>-latest`
+#      (or a PR-supplied tag) — the same image the SSH gate runs alembic
+#      from.
+#   3. Run `alembic upgrade head` against the runner-local postgres,
+#      using the same `postgresql+asyncpg://...` URL shape compose +
+#      db-migrate.yml use.
+#   4. After the happy-path run succeeds, run a self-test fixture: invoke
+#      the same image with a deliberately-broken `postgresql+psycopg://`
+#      URL (the exact scheme that caused #235) and assert the gate exits
+#      non-zero. Per feedback_live_trace_over_synthetic_acceptance — this
+#      proves the gate would have caught the real 2026-05-02 incident, not
+#      just that it runs.
+#
+# Runtime budget: ~60-90s steady-state (postgres pull + service-container
+# healthcheck + image pull + happy-path migration + broken-URL fixture).
+# Per the #237 acceptance criterion in the issue.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/db-migrate.yml'
+      - '.github/workflows/db-migrate-ci-gate.yml'
+      - 'compose/docker-compose.prod.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/db-migrate.yml'
+      - '.github/workflows/db-migrate-ci-gate.yml'
+      - 'compose/docker-compose.prod.yml'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "user-service image tag (default: stg-latest)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: db-migrate-ci-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alembic-dryrun:
+    name: alembic upgrade head — CI dry-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # Runner-local postgres as a service container. Same image as prod's
+    # user-postgres (postgres:16-alpine per compose/docker-compose.prod.yml).
+    # The default `postgres` user/db/password works for CI — nothing
+    # production-shaped touches this container.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        # GitHub Actions service-container healthcheck — runner waits for
+        # this to pass before starting the steps. Mirrors the user-postgres
+        # healthcheck in compose/docker-compose.prod.yml.
+        options: >-
+          --health-cmd "pg_isready -U testuser -d testdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      IMAGE_TAG: ${{ inputs.image_tag || 'stg-latest' }}
+      # asyncpg driver — matches alembic/env.py + db-migrate.yml + compose.
+      # On the runner, postgres is reachable via localhost:5432 because of
+      # the `ports:` mapping above. We run alembic in a one-shot container
+      # with `--network host` so it shares the runner's network namespace
+      # and can hit the published port.
+      DATABASE_URL: "postgresql+asyncpg://testuser:testpass@localhost:5432/testdb"
+      BROKEN_DATABASE_URL: "postgresql+psycopg://testuser:testpass@localhost:5432/testdb"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to GHCR (pull user-service image)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull user-service image
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/noorinalabs/noorinalabs-user-service:${IMAGE_TAG}"
+          echo "==> Pulling ${IMAGE}"
+          docker pull "${IMAGE}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Verify image ships asyncpg (negative-import check)
+        # Belt-and-suspenders: if a future user-service image were to ship
+        # WITHOUT asyncpg (regression to #235's root cause), this catches
+        # it before the alembic run produces a confusing traceback.
+        run: |
+          set -euo pipefail
+          docker run --rm "${IMAGE}" \
+            /app/.venv/bin/python -c "import asyncpg; print('asyncpg', asyncpg.__version__)"
+
+      - name: Happy path — alembic upgrade head succeeds on fresh DB
+        run: |
+          set -euo pipefail
+          echo "==> Running alembic upgrade head against runner-local postgres"
+          docker run --rm \
+            --network host \
+            -e DATABASE_URL="${DATABASE_URL}" \
+            "${IMAGE}" \
+            /app/.venv/bin/alembic upgrade head
+          echo "==> Happy-path migration succeeded"
+
+      - name: Verify schema landed (sanity check)
+        run: |
+          set -euo pipefail
+          # alembic_version row must exist and match the workflow's EXPECTED_MERGE_HEAD.
+          # Read EXPECTED_MERGE_HEAD from db-migrate.yml so this stays in sync
+          # without a second source of truth.
+          EXPECTED_HEAD="$(grep -E '^[[:space:]]*EXPECTED_MERGE_HEAD:' .github/workflows/db-migrate.yml \
+                          | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ -z "${EXPECTED_HEAD}" ]; then
+            echo "ERROR: could not parse EXPECTED_MERGE_HEAD from db-migrate.yml" >&2
+            exit 1
+          fi
+          echo "==> Expected head from db-migrate.yml: ${EXPECTED_HEAD}"
+
+          # psql via the postgres image itself (no host psql install needed).
+          ACTUAL="$(docker run --rm --network host \
+            -e PGPASSWORD=testpass \
+            postgres:16-alpine \
+            psql -h localhost -U testuser -d testdb -tA \
+            -c "SELECT version_num FROM alembic_version;")"
+          echo "==> alembic_version.version_num = ${ACTUAL}"
+          if [ "${ACTUAL}" != "${EXPECTED_HEAD}" ]; then
+            echo "ERROR: alembic_version mismatch — got '${ACTUAL}', expected '${EXPECTED_HEAD}'." >&2
+            exit 1
+          fi
+
+      - name: Reset DB for broken-URL fixture
+        run: |
+          set -euo pipefail
+          # Drop everything so the broken-URL run starts from a fresh schema —
+          # otherwise asyncpg would happily connect to the migrated DB and
+          # fail to demonstrate the URL-scheme failure mode.
+          docker run --rm --network host \
+            -e PGPASSWORD=testpass \
+            postgres:16-alpine \
+            psql -h localhost -U testuser -d testdb \
+            -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+
+      - name: Fixture — deliberately-broken psycopg URL must fail loudly
+        # Live-trace evidence (feedback_live_trace_over_synthetic_acceptance):
+        # this step reproduces the exact 2026-05-02 incident URL shape and
+        # asserts the gate would have caught it. If a future image change
+        # accidentally bundles psycopg, this step will PASS the broken URL
+        # and FAIL this assertion — that's the desired behavior; psycopg
+        # shouldn't reappear in the image without a deliberate decision.
+        run: |
+          set -euo pipefail
+          echo "==> Running alembic with deliberately-broken DATABASE_URL: ${BROKEN_DATABASE_URL}"
+          set +e
+          OUTPUT="$(
+            docker run --rm \
+              --network host \
+              -e DATABASE_URL="${BROKEN_DATABASE_URL}" \
+              "${IMAGE}" \
+              /app/.venv/bin/alembic upgrade head 2>&1
+          )"
+          RC=$?
+          set -e
+
+          echo "$OUTPUT"
+          echo "==> alembic exit code: ${RC}"
+
+          if [ "${RC}" -eq 0 ]; then
+            echo "ERROR: alembic succeeded with psycopg URL — image now ships psycopg?" >&2
+            echo "       If this was a deliberate change, update this fixture step." >&2
+            exit 1
+          fi
+
+          # The expected failure shape is ModuleNotFoundError on psycopg
+          # (the 2026-05-02 traceback). Assert that exact signal — a generic
+          # non-zero would not prove we caught the right failure mode.
+          if ! echo "$OUTPUT" | grep -qE "No module named 'psycopg'|ModuleNotFoundError.*psycopg"; then
+            echo "ERROR: alembic failed but not with the expected psycopg ModuleNotFoundError." >&2
+            echo "       The fixture proves a different failure mode than #235 — investigate." >&2
+            exit 1
+          fi
+
+          echo "==> Fixture passed: gate correctly rejects the psycopg URL shape that caused #235."
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## DB Migrate CI Gate — alembic dry-run"
+            echo ""
+            echo "- **Image:** \`${IMAGE:-(not pulled)}\`"
+            echo "- **Postgres:** \`postgres:16-alpine\` (service container)"
+            echo "- **DATABASE_URL (happy path):** \`${DATABASE_URL}\`"
+            echo "- **DATABASE_URL (fixture):** \`${BROKEN_DATABASE_URL}\` — expected to fail loudly"
+            echo ""
+            echo "This workflow is the CI-side complement to \`db-migrate.yml\` (the SSH-into-VPS pre-deploy gate). It does not replace the SSH gate; it proves the mechanic works hermetically before changes to \`db-migrate.yml\` or the compose user-service block ship."
+          } >> "$GITHUB_STEP_SUMMARY"
