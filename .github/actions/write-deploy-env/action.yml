@@ -1,0 +1,233 @@
+# Write .env on the deploy VPS and roll the compose stack.
+#
+# Centralizes the previously-duplicated SSH-into-VPS step from
+# `deploy-stg.yml` and `deploy-prod.yml`. Both workflows now invoke this
+# composite as their single deploy step. The duplicated `eval` env-write
+# loop (deploy#66) is replaced here with indirect expansion that never
+# interprets secret content as shell.
+#
+# Adding a new `.env` var requires editing ONE place — the caller's
+# `env:` block + the comma-separated `env_keys` input. The composite
+# reads each name from its own environment (passed through by
+# appleboy/ssh-action's `envs:`) via `${!var}`, so secret content with
+# quotes, backticks, dollar signs, or backslashes round-trips literally.
+#
+# Stg/prod behavioral asymmetries preserved as composite inputs:
+#   - `extra_image_tags` — newline-separated `NAME=value` pairs prod
+#     uses for USER_SERVICE_IMAGE_TAG + LANDING_IMAGE_TAG. Stg passes
+#     an empty string.
+#   - `base_domain` — `stg.noorinalabs.com` vs `noorinalabs.com`.
+#
+# The shape mirrors `.github/actions/break-glass-audit/action.yml`
+# (the precedent composite added in PR #261). Both live under
+# `.github/actions/` and run as `using: composite`.
+
+name: Write deploy .env + roll compose stack
+description: SSH to the deploy VPS, write .env from passed-through env vars, pull images, recreate compose stack.
+
+inputs:
+  ssh_host:
+    description: "Target VPS host. Pass vars.VPS_HOST."
+    required: true
+  ssh_key:
+    description: "Deploy SSH private key. Pass secrets.DEPLOY_SSH_PRIVATE_KEY."
+    required: true
+  image_tag:
+    description: "Tag for the api + frontend images (IMAGE_TAG in compose)."
+    required: true
+  extra_image_tags:
+    description: >-
+      Newline-separated NAME=value pairs of additional image-tag env vars
+      to write to .env after IMAGE_TAG. Empty string means none.
+      Prod passes USER_SERVICE_IMAGE_TAG + LANDING_IMAGE_TAG here.
+    required: false
+    default: ""
+  base_domain:
+    description: "Caddy {$BASE_DOMAIN} root, e.g. stg.noorinalabs.com or noorinalabs.com."
+    required: true
+  env_keys:
+    description: >-
+      Comma-separated list of env-var names to copy into .env. Each name
+      MUST be present in the caller's `env:` block and listed in the
+      appleboy/ssh-action `envs:` passlist. Reading happens via
+      `${!name}` (indirect expansion) — no eval, so values with shell
+      metacharacters round-trip safely.
+    required: true
+  github_token:
+    description: "GHCR auth token. Pass secrets.GITHUB_TOKEN."
+    required: true
+  github_actor:
+    description: "GHCR auth username. Pass github.repository_owner."
+    required: true
+  pull_services:
+    description: "Whitespace-separated compose service names to pull."
+    required: false
+    default: "api frontend landing user-service"
+  extra_env:
+    description: >-
+      Newline-separated NAME=value pairs of additional non-secret env
+      vars to write to .env. Used for per-env constants the caller knows
+      at workflow-write time (e.g. PROM_CONFIG_FILE=prometheus.stg.yml,
+      ALERTMANAGER_CONFIG_FILE=alertmanager.stg.yml, SLACK_WEBHOOK_FILE).
+      Distinct from `extra_image_tags` (preserved separately for back-
+      compat) and from `env_keys` (which is for caller-passed secrets
+      pulled by name from the caller's `env:` block). Empty string means
+      none.
+    required: false
+    default: ""
+  slack_webhook_url:
+    description: >-
+      Optional Slack webhook URL for alertmanager routing (deploy#262).
+      When non-empty, written to `infra/alertmanager/slack_webhook_url.secret`
+      with mode 0600 so alertmanager's `api_url_file` directive resolves
+      to a real value. When empty, the file is written with the placeholder
+      "<unset>" and a WARNING is logged — alertmanager still loads cleanly
+      but Slack delivery is a no-op until the operator sets the secret in
+      the env's GitHub Environment. The secret name in the caller's `env:`
+      block is `SLACK_WEBHOOK_URL` by convention so the value can also be
+      consumed by env_keys if compose needs to read it directly.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy to VPS
+      uses: appleboy/ssh-action@v1
+      env:
+        # Inputs the remote script reads. Secret-bearing env vars from
+        # the caller's `env:` block are also passed through by
+        # appleboy/ssh-action via its `envs:` parameter — listed by the
+        # caller, not by this composite.
+        IMAGE_TAG: ${{ inputs.image_tag }}
+        EXTRA_IMAGE_TAGS: ${{ inputs.extra_image_tags }}
+        EXTRA_ENV: ${{ inputs.extra_env }}
+        BASE_DOMAIN: ${{ inputs.base_domain }}
+        ENV_KEYS: ${{ inputs.env_keys }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        GITHUB_ACTOR: ${{ inputs.github_actor }}
+        PULL_SERVICES: ${{ inputs.pull_services }}
+        SLACK_WEBHOOK_URL: ${{ inputs.slack_webhook_url }}
+      with:
+        host: ${{ inputs.ssh_host }}
+        username: deploy
+        key: ${{ inputs.ssh_key }}
+        # Composite-defined extras + the caller's secret passlist. The
+        # caller composes its own `envs:` with both sets — this composite
+        # cannot prepend to the caller's appleboy `envs:` parameter, so
+        # the caller is responsible for including everything its
+        # env_keys references. The composite's own pass-throughs below
+        # are appended via the composite action's `env:` block above.
+        envs: IMAGE_TAG,EXTRA_IMAGE_TAGS,EXTRA_ENV,BASE_DOMAIN,ENV_KEYS,GITHUB_TOKEN,GITHUB_ACTOR,PULL_SERVICES,SLACK_WEBHOOK_URL,${{ inputs.env_keys }}
+        script: |
+          set -euo pipefail
+          cd /opt/noorinalabs-deploy
+
+          echo "==> Pulling latest deploy config..."
+          git fetch origin main
+          git reset --hard origin/main
+
+          echo "==> Writing .env for docker-compose (IMAGE_TAG=$IMAGE_TAG)..."
+          env_file=".env"
+          : > "$env_file"
+
+          # Walk the caller-supplied env_keys CSV. Indirect expansion
+          # (`${!var}`) reads the named env var's value as data, never
+          # interpreting it as shell. Replaces the legacy `eval "val=\$$var"`
+          # pattern (deploy#66) which broke on secrets containing quotes,
+          # backticks, dollar signs, or backslashes.
+          IFS=',' read -r -a _keys <<< "$ENV_KEYS"
+          for var in "${_keys[@]}"; do
+            # Strip surrounding whitespace from caller-supplied CSV entries.
+            var="${var#"${var%%[![:space:]]*}"}"
+            var="${var%"${var##*[![:space:]]}"}"
+            [ -z "$var" ] && continue
+            # Quote literal single quotes inside the value so the resulting
+            # .env line `NAME='...'` round-trips through docker compose's
+            # dotenv parser. printf %s avoids any format-string interpretation
+            # of the value.
+            val="${!var-}"
+            escaped="${val//\'/\'\\\'\'}"
+            printf "%s='%s'\n" "$var" "$escaped" >> "$env_file"
+          done
+
+          # IMAGE_TAG is always written.
+          escaped_image_tag="${IMAGE_TAG//\'/\'\\\'\'}"
+          printf "%s='%s'\n" "IMAGE_TAG" "$escaped_image_tag" >> "$env_file"
+
+          # Caller-supplied extra image-tag pairs (e.g. USER_SERVICE_IMAGE_TAG,
+          # LANDING_IMAGE_TAG for prod). Format: NAME=value per line.
+          if [ -n "$EXTRA_IMAGE_TAGS" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              name="${line%%=*}"
+              value="${line#*=}"
+              escaped_value="${value//\'/\'\\\'\'}"
+              printf "%s='%s'\n" "$name" "$escaped_value" >> "$env_file"
+            done <<< "$EXTRA_IMAGE_TAGS"
+          fi
+
+          # Caller-supplied generic per-env constants (deploy#262 + #263 wired
+          # via observability per-env split). Format: NAME=value per line.
+          # Same NAME=value shape as EXTRA_IMAGE_TAGS but semantically distinct —
+          # these are non-secret, non-tag values like PROM_CONFIG_FILE,
+          # ALERTMANAGER_CONFIG_FILE, SLACK_WEBHOOK_FILE.
+          if [ -n "$EXTRA_ENV" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              name="${line%%=*}"
+              value="${line#*=}"
+              escaped_value="${value//\'/\'\\\'\'}"
+              printf "%s='%s'\n" "$name" "$escaped_value" >> "$env_file"
+            done <<< "$EXTRA_ENV"
+          fi
+
+          # Caddy per-env hostname root (deploy#218).
+          escaped_base_domain="${BASE_DOMAIN//\'/\'\\\'\'}"
+          printf "%s='%s'\n" "BASE_DOMAIN" "$escaped_base_domain" >> "$env_file"
+
+          # Backup B2 creds (deploy#188): rename BACKUP_B2_* secrets to the
+          # bare B2_* names that scripts/backup.sh:59-61 expects. The
+          # BACKUP_B2_* secrets are passed by the caller via env_keys.
+          # Empty values are written as empty so backup.sh fails fast at
+          # preflight rather than partially-running with stale or wrong creds.
+          for src in BACKUP_B2_KEY_ID:B2_KEY_ID BACKUP_B2_APP_KEY:B2_APP_KEY BACKUP_B2_BUCKET:B2_BUCKET; do
+            from="${src%%:*}"
+            to="${src##*:}"
+            value="${!from-}"
+            escaped_value="${value//\'/\'\\\'\'}"
+            printf "%s='%s'\n" "$to" "$escaped_value" >> "$env_file"
+          done
+
+          chmod 600 "$env_file"
+
+          # Slack webhook secret file (deploy#262). Alertmanager reads this
+          # at startup via api_url_file directive (path mounted into the
+          # container as /etc/alertmanager/slack_webhook_url). The "<unset>"
+          # placeholder is harmless — alertmanager loads cleanly but routing
+          # fails until the operator sets SLACK_WEBHOOK_URL in the matching
+          # GitHub Environment. The composite always writes the file so the
+          # mounted path exists regardless; absence would crash alertmanager.
+          slack_file="infra/alertmanager/slack_webhook_url.secret"
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            printf "%s" "$SLACK_WEBHOOK_URL" > "$slack_file"
+            echo "==> Slack webhook secret written (real value)."
+          else
+            printf "%s" "<unset>" > "$slack_file"
+            echo "==> WARNING: SLACK_WEBHOOK_URL secret not set — alertmanager will not deliver to Slack."
+          fi
+          chmod 600 "$slack_file"
+
+          echo "==> Authenticating to GHCR..."
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+          echo "==> Pulling images from GHCR..."
+          # shellcheck disable=SC2086 # PULL_SERVICES is deliberately word-split
+          docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull $PULL_SERVICES
+
+          echo "==> Starting services..."
+          docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
+
+          echo "==> Waiting for services to stabilize..."
+          sleep 15
