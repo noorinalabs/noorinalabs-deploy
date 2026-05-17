@@ -166,7 +166,7 @@ First-time setup is performed by `scripts/bootstrap-vps.sh`, which runs as root 
 
 1. Installs Docker, docker-compose-v2, docker-buildx, git, curl
 2. Creates a `deploy` user with Docker group access
-3. Copies SSH authorized keys from root to deploy user
+3. Merges SSH authorized keys from root into the deploy user (append-with-fingerprint-dedup — idempotent across re-runs, never wipes a key already present in `/home/deploy/.ssh/authorized_keys`; see deploy#112)
 4. Clones this repo to `/opt/noorinalabs-deploy`
 5. Creates a template `.env` file with placeholder values
 6. Installs rclone for backups

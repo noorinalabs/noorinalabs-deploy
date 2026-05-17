@@ -57,21 +57,68 @@ else
 fi
 usermod -aG docker "$DEPLOY_USER"
 
-# ── Step 3: Copy SSH authorized_keys to deploy user ─────────────────────────
+# ── Step 3: Merge SSH authorized_keys into deploy user (append-with-dedup) ──
+# Per deploy#112: this used to be a destructive `cp` of root's authorized_keys
+# over the deploy user's file. That wiped the deploy CI key any time an
+# operator added a personal admin key to /root/.ssh/authorized_keys and then
+# re-ran bootstrap (as PR #109 instructs for new aux-repos). The next
+# workflow_dispatch then failed with `ssh: handshake failed`.
+#
+# Fix: append each root key to deploy's file only if its fingerprint isn't
+# already present. Idempotent across any number of re-runs; preserves the
+# deploy CI key and any keys an operator has already added to deploy directly.
+# Owner's manual unblock recipe (`cat key.pub | ssh prod 'tee -a ...'`) is
+# the same shape — append, not overwrite.
 echo "==> [3/7] Setting up SSH for deploy user..."
-mkdir -p /home/$DEPLOY_USER/.ssh
-touch /home/$DEPLOY_USER/.ssh/authorized_keys
-# Copy root's authorized_keys (Terraform puts the deploy key here)
+DEPLOY_AUTH_KEYS="/home/$DEPLOY_USER/.ssh/authorized_keys"
+mkdir -p "/home/$DEPLOY_USER/.ssh"
+touch "$DEPLOY_AUTH_KEYS"
+chown -R "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
+chmod 700 "/home/$DEPLOY_USER/.ssh"
+chmod 600 "$DEPLOY_AUTH_KEYS"
+
+# Fingerprint a single authorized_keys line. Echoes the SHA256 fingerprint
+# or empty on failure. Wrapped in `|| true` so a malformed line in an
+# operator-edited file doesn't trip the script's `set -e`.
+ssh_key_fp() {
+  echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true
+}
+
 if [ -f /root/.ssh/authorized_keys ]; then
-  cp /root/.ssh/authorized_keys /home/$DEPLOY_USER/.ssh/authorized_keys
-  echo "    Copied root authorized_keys to deploy user."
+  # Build the set of fingerprints already authorized for deploy. We fingerprint
+  # each line individually rather than passing the whole file to `ssh-keygen -lf`
+  # because that bails on the first malformed line.
+  declare -A DEPLOY_FPS=()
+  while IFS= read -r existing_line; do
+    case "$existing_line" in ''|\#*) continue ;; esac
+    fp=$(ssh_key_fp "$existing_line")
+    [ -n "$fp" ] && DEPLOY_FPS["$fp"]=1
+  done < "$DEPLOY_AUTH_KEYS"
+
+  added=0
+  skipped=0
+  while IFS= read -r root_line; do
+    case "$root_line" in ''|\#*) continue ;; esac
+    fp=$(ssh_key_fp "$root_line")
+    # Malformed line in root's file — skip rather than copy garbage into
+    # deploy's authorized_keys.
+    [ -z "$fp" ] && continue
+    if [ -n "${DEPLOY_FPS[$fp]:-}" ]; then
+      skipped=$((skipped + 1))
+    else
+      echo "$root_line" >> "$DEPLOY_AUTH_KEYS"
+      DEPLOY_FPS["$fp"]=1
+      added=$((added + 1))
+    fi
+  done < /root/.ssh/authorized_keys
+
+  chown "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_AUTH_KEYS"
+  chmod 600 "$DEPLOY_AUTH_KEYS"
+  echo "    Merged root authorized_keys → deploy: $added added, $skipped already present."
 else
   echo "    WARNING: /root/.ssh/authorized_keys not found."
-  echo "    You'll need to manually add your public key to /home/$DEPLOY_USER/.ssh/authorized_keys"
+  echo "    You'll need to manually add your public key to $DEPLOY_AUTH_KEYS"
 fi
-chown -R $DEPLOY_USER:$DEPLOY_USER /home/$DEPLOY_USER/.ssh
-chmod 700 /home/$DEPLOY_USER/.ssh
-chmod 600 /home/$DEPLOY_USER/.ssh/authorized_keys
 
 # ── Step 4: Clone the repository ────────────────────────────────────────────
 echo "==> [4/7] Cloning repository to $INSTALL_DIR..."
