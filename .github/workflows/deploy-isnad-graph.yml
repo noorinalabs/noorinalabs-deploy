@@ -99,6 +99,11 @@ jobs:
             # SSH transport without escape-eating that strips backslash-escaped double
             # quotes. Limitation: values containing a literal "'" are not supported
             # (none of our current secrets do — see #94).
+            # Indirect expansion (`${!var}`) reads the named env var as data;
+            # values with quotes/backticks/dollars/backslashes round-trip
+            # literally. Replaces legacy `eval "val=\$$var"` (deploy#66).
+            # Embedded literal single quotes are escaped as '\'' so the
+            # `NAME='...'` form survives dotenv parsing.
             for var in NEO4J_PASSWORD POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB \
                        REDIS_PASSWORD AUTH_GOOGLE_CLIENT_ID AUTH_GOOGLE_CLIENT_SECRET \
                        AUTH_GITHUB_CLIENT_ID AUTH_GITHUB_CLIENT_SECRET \
@@ -109,8 +114,9 @@ jobs:
                        PIPELINE_B2_KEY_ID PIPELINE_B2_REGION \
                        USER_POSTGRES_DB USER_POSTGRES_PASSWORD USER_POSTGRES_USER \
                        USER_REDIS_PASSWORD; do
-              eval "val=\$$var"
-              printf "%s='%s'\n" "$var" "$val" >> "$env_file"
+              val="${!var-}"
+              escaped="${val//\'/\'\\\'\'}"
+              printf "%s='%s'\n" "$var" "$escaped" >> "$env_file"
             done
             printf "%s='%s'\n" "IMAGE_TAG" "${IMAGE_TAG}" >> "$env_file"
             chmod 600 "$env_file"

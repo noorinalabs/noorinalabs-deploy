@@ -72,6 +72,84 @@ jobs:
           printf '%s\n' "${files[@]}"
           shellcheck "${files[@]}"
 
+  passlist-drift:
+    # deploy#97: catch drift between compose's :?-required vars and the
+    # deploy-stg/deploy-prod env_keys passlists at PR-review time, before
+    # a missing wire blocks a real deploy. Today the drift is detected
+    # only at compose-up time (e.g. PR #95 + run 24612922259 surfaced
+    # 6 missing vars post-merge).
+    #
+    # Compose vars known NOT to come from secrets — caller writes them
+    # directly inside the .env-write composite (IMAGE_TAG, BASE_DOMAIN)
+    # or via extra_image_tags (USER_SERVICE_IMAGE_TAG, LANDING_IMAGE_TAG).
+    # PROM_CONFIG_FILE + ALERTMANAGER_CONFIG_FILE + SLACK_WEBHOOK_FILE are
+    # also written by the composite (deploy#262 + #263 wired in via the
+    # composite per-env). These are listed in WORKFLOW_WRITTEN so the diff
+    # doesn't false-positive.
+    name: deploy passlist vs compose :?-required drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Diff compose required-vars vs workflow env_keys
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, sys
+          from pathlib import Path
+
+          compose = Path("compose/docker-compose.prod.yml").read_text()
+          # Match ${NAME:?...} — the compose syntax for "required, fail if unset/empty".
+          required = set(re.findall(r"\$\{([A-Z_][A-Z0-9_]*):\?", compose))
+
+          # Vars written by the workflow itself (composite action), not pulled from secrets.
+          workflow_written = {
+              "IMAGE_TAG", "BASE_DOMAIN",
+              "USER_SERVICE_IMAGE_TAG", "LANDING_IMAGE_TAG",
+              "PROM_CONFIG_FILE", "ALERTMANAGER_CONFIG_FILE", "SLACK_WEBHOOK_FILE",
+          }
+          expected_in_passlist = required - workflow_written
+
+          def passlist(workflow_path):
+              text = Path(workflow_path).read_text()
+              # `env_keys: NAME1,NAME2,...` (write-deploy-env composite shape).
+              # We only need the single-line CSV form because that's what the
+              # composite caller uses. Anchor on the leading `env_keys:`.
+              m = re.search(r"^\s*env_keys:\s*([A-Z0-9_,]+)\s*$", text, re.M)
+              if not m:
+                  print(f"::error file={workflow_path}::could not find `env_keys:` CSV line")
+                  sys.exit(1)
+              return {tok.strip() for tok in m.group(1).split(",") if tok.strip()}
+
+          stg = passlist(".github/workflows/deploy-stg.yml")
+          prod = passlist(".github/workflows/deploy-prod.yml")
+
+          failed = False
+          for env_name, passed in (("stg", stg), ("prod", prod)):
+              missing = expected_in_passlist - passed
+              if missing:
+                  failed = True
+                  print(f"::error file=.github/workflows/deploy-{env_name}.yml::"
+                        f"deploy-{env_name} env_keys missing required compose vars: {sorted(missing)}")
+                  print("  Compose declares the var as required for each. Without these in env_keys,")
+                  print(f"  the deploy will fail at `compose up` with 'required variable NAME is missing a value'.")
+
+          # Symmetric direction: vars in passlist that compose doesn't reference at all.
+          # Informational only — extras in passlist aren't a deploy-breaker, just stale-wire potential.
+          # We do NOT fail on extras (workflow may legitimately ship secrets compose doesn't use yet).
+          compose_referenced = set(re.findall(r"\$\{([A-Z_][A-Z0-9_]*)", compose))
+          for env_name, passed in (("stg", stg), ("prod", prod)):
+              extras = (passed - workflow_written) - compose_referenced
+              if extras:
+                  print(f"::warning file=.github/workflows/deploy-{env_name}.yml::"
+                        f"deploy-{env_name} env_keys references vars compose doesn't use: {sorted(extras)}")
+
+          if failed:
+              sys.exit(1)
+          print("Passlist drift check: OK")
+          print(f"  Compose required vars (filtered): {sorted(expected_in_passlist)}")
+          print(f"  Stg passlist size: {len(stg)} | Prod passlist size: {len(prod)}")
+          PY
+
   promtool-check:
     # deploy#212 — PR-time validation of Prometheus alerts.yml + per-env
     # prometheus.{stg,prod}.yml. Previously alert-author PRs relied on

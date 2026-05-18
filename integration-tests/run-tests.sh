@@ -132,9 +132,12 @@ trap cleanup EXIT
 echo "--- Generating fresh test secrets ---"
 ./scripts/generate_test_secrets.sh secrets
 
-export JWT_PRIVATE_KEY="$(cat secrets/jwt.key)"
-export JWT_PUBLIC_KEY="$(cat secrets/jwt.pub)"
-export TOTP_ENCRYPTION_KEY="$(cat secrets/totp.key)"
+# Declare-then-export so `cat` exit codes surface as the script's exit
+# (export's always-zero return would mask a missing secret file). #284 / SC2155.
+JWT_PRIVATE_KEY=$(cat secrets/jwt.key)
+JWT_PUBLIC_KEY=$(cat secrets/jwt.pub)
+TOTP_ENCRYPTION_KEY=$(cat secrets/totp.key)
+export JWT_PRIVATE_KEY JWT_PUBLIC_KEY TOTP_ENCRYPTION_KEY
 
 mkdir -p reports
 
@@ -195,6 +198,12 @@ $COMPOSE up -d --build \
     neo4j isnad-postgres isnad-redis isnad-graph-api
 
 echo "--- Waiting for services to be healthy ---"
+# shellcheck disable=SC2016 # The single-quoted body is intentionally a
+# self-contained script passed to `timeout 180 bash -c '...'`. All $VAR
+# references inside the body (unhealthy, line, d) are LOCAL to that
+# subshell and MUST NOT expand in the parent shell. Switching to double
+# quotes would interpolate `$unhealthy` at script-load time as empty,
+# silently breaking the health-poll loop.
 timeout 180 bash -c '
     while :; do
         unhealthy=$(docker compose -f docker-compose.test.yml --env-file .env.test ps --format json \
