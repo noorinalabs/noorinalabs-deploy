@@ -1,4 +1,4 @@
-# ADR 0002 — SSH-key authorization via cloud-init
+# ADR 0003 — SSH-key authorization via cloud-init
 
 - **Status:** Accepted
 - **Date:** 2026-05-18
