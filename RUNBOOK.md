@@ -17,6 +17,7 @@ own what they build. This repo owns what runs on the server.").
 |---|---|
 | Deploy isnad-graph (per-service) | [`docs/runbooks/deploy-isnad-graph.md`](docs/runbooks/deploy-isnad-graph.md) |
 | Deploy landing-page (per-service) | [`docs/runbooks/deploy-landing-page.md`](docs/runbooks/deploy-landing-page.md) |
+| Add a *new* service to the stack | [`docs/runbooks/new-service-deploy-checklist.md`](docs/runbooks/new-service-deploy-checklist.md) |
 | User-service Alembic migration | [`docs/runbooks/user-service-alembic.md`](docs/runbooks/user-service-alembic.md) |
 | Per-env OAuth provisioning | [`docs/runbooks/oauth-per-env.md`](docs/runbooks/oauth-per-env.md) |
 | Blackbox probes / synthetic checks | [`docs/runbooks/blackbox-probes.md`](docs/runbooks/blackbox-probes.md) |
