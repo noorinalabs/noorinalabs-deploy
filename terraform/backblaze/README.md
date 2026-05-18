@@ -249,7 +249,8 @@ plaintext on disk outside the password manager and GH-secrets store.
 
 ## Lifecycle
 
-The module configures two lifecycle rules:
+The module configures two lifecycle rules **on the pipeline bucket** (this
+module's domain):
 
 1. **Unfinished multipart uploads** — abandoned after
    `lifecycle_days_unfinished_uploads` days (default 7).
@@ -260,6 +261,23 @@ The module configures two lifecycle rules:
 `raw/` is the only stage where the pipeline expects archival retention;
 downstream stages are rebuildable from `raw/` via `/ontology-librarian
 pipeline reset levels`.
+
+### State-bucket lifecycle is a separate concern
+
+The `noorinalabs-terraform-state` bucket referenced by this module's S3
+backend (`versions.tf`) is **not** managed by this module — it predates the
+repo and is currently console-managed pending the
+`terraform/backblaze-bootstrap/` root module (see
+[ADR 0004 Decision A](../../docs/adr/0004-b2-state-bucket-and-key-management.md#decision-a--noorinalabs-terraform-state-bucket-iac-management)).
+Adding a `b2_bucket` resource for the state bucket here would re-introduce the
+chicken-and-egg ADR 0004 explicitly rejects.
+
+The state bucket's lifecycle policy (7-day hidden-version expiry, per
+[#194](https://github.com/noorinalabs/noorinalabs-deploy/issues/194)) is
+documented as an operator-applied procedure in
+[`docs/runbooks/state-bucket-lifecycle.md`](../../docs/runbooks/state-bucket-lifecycle.md).
+The Part-2 implementation of ADR 0004 will adopt that spec verbatim into the
+new bootstrap module's `b2_bucket` resource.
 
 ## Rotating the state-bucket key (CI + workstation)
 
