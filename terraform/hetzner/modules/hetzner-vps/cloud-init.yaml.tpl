@@ -59,6 +59,7 @@ write_files:
   # role previously played by Hetzner's `ssh_keys` server argument (removed
   # in #222 because per-env resources couldn't share one pubkey). Operators
   # who want their personal id_ed25519 on root can append it post-provision.
+  # See docs/adr/0002-ssh-key-authorization-via-cloud-init.md for rationale.
   - path: /root/.ssh/authorized_keys
     owner: root:root
     permissions: '0600'
