@@ -82,5 +82,5 @@ Concretely:
 - [deploy#165](https://github.com/noorinalabs/noorinalabs-deploy/issues/165) — operator-personal-key injection gap (closed; stays manual post-provision).
 - [deploy#118](https://github.com/noorinalabs/noorinalabs-deploy/issues/118) — cloud-init VPS baseline (cluster).
 - [ADR 0001](0001-tf-hetzner-per-env-state-strategy.md) — per-env state strategy this decision composes with.
-- `ontology/repos/deploy.yaml` § `cloud_init_ssh_key_gap` — ontology entry for the original operational gap.
+- `noorinalabs-main:ontology/repos/deploy.yaml` § `cloud_init_ssh_key_gap` — parent-repo ontology entry for the original operational gap.
 - `docs/runbooks/cloud-init-template-changes.md` — the `taint`/`replace` procedure for propagating template edits to live VPSes.
