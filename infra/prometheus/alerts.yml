@@ -209,20 +209,29 @@ groups:
       # mismatch surfaces as probe_success=0 — but we still alert
       # explicitly on the status-code metric so the description tells
       # operators *what* code came back rather than just "probe failed".
+      #
+      # Guarded on `probe_success == 1` (deploy#209) — when a probe fails
+      # due to connectivity loss (TCP-reset, DNS, TLS-handshake), Blackbox
+      # reports probe_http_status_code=0 because no HTTP response was
+      # received. Status 0 fails every `!= <expected>` equality check
+      # below, so a single connectivity-loss incident would fire BOTH
+      # `BlackboxProbeFailing` (probe_success==0) AND this alert —
+      # two pages, one incident. The guard ensures this alert only
+      # fires when a response was received but its status is wrong.
       - alert: BlackboxUnexpectedStatus
         expr: |
+          probe_success == 1
+          and
           (
-            probe_http_status_code{route="isnad-health"}        != 200
-          ) or (
-            probe_http_status_code{route="user-service-health"} != 200
-          ) or (
-            probe_http_status_code{route="landing-root"}        != 200
-          ) or (
-            probe_http_status_code{route="jwks"}                != 200
-          ) or (
-            probe_http_status_code{route="narrator-401"}        != 401
-            and
-            probe_http_status_code{route="narrator-401"}        != 403
+            (probe_http_status_code{route="isnad-health"}        != 200) or
+            (probe_http_status_code{route="user-service-health"} != 200) or
+            (probe_http_status_code{route="landing-root"}        != 200) or
+            (probe_http_status_code{route="jwks"}                != 200) or
+            (
+              probe_http_status_code{route="narrator-401"}        != 401
+              and
+              probe_http_status_code{route="narrator-401"}        != 403
+            )
           )
         for: 5m
         labels:
@@ -331,3 +340,58 @@ groups:
             `rm /var/lib/node_exporter/textfile_collector/break_glass_invocation_{{ $labels.input }}.prom`.
             See the audit-log issue for the historical record.
           runbook: "docs/runbooks/break-glass.md#metric-stale-cleanup"
+
+  # Log-ingestion backstop (deploy#131). #130 removed promtail's healthcheck
+  # because the distroless promtail image lacks wget/curl/nc; the stated
+  # backstop was "restart-policy + Prometheus alerting on log-rate drop."
+  # The restart-policy half landed with #130; this group lands the alert
+  # half. Without it a silent promtail failure (OOM inside its restart loop,
+  # Docker SD breakage on a future daemon bump) goes undetected until an
+  # operator notices Loki has stopped receiving logs.
+  #
+  # `promtail_sent_entries_total` is exposed on promtail's :9080 metrics
+  # endpoint (server.http_listen_port in promtail-config.yml) and is
+  # incremented on every entry shipped to Loki. A 10-minute zero-rate
+  # window across all promtail instances indicates ingestion has stopped.
+  - name: log_ingestion
+    rules:
+      - alert: PromtailLogIngestionStopped
+        # 10-minute hold-down before alerting. Short enough to catch a
+        # real outage well before the 7-day Loki retention starts mattering;
+        # long enough to ride out a normal compose restart (promtail's
+        # 30-60s startup window) or a brief Loki distributor blip.
+        expr: |
+          rate(promtail_sent_entries_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Promtail log ingestion has stopped"
+          description: >-
+            Promtail has not shipped any log entries to Loki in the last
+            10 minutes (rate(promtail_sent_entries_total[5m]) == 0). Either
+            promtail is unhealthy (check `docker compose -p noorinalabs ps
+            promtail` and `docker compose -p noorinalabs logs --tail=50
+            promtail`) or no containers on this VPS are producing log
+            output (rare — usually means the docker_sd discovery broke).
+            Without ingestion, Loki has no logs for the affected window.
+          runbook: "docs/runbooks/log-ingestion.md#promtail-ingestion-stopped"
+
+      - alert: PromtailDown
+        # Companion to the rate-zero alert: catches the case where the
+        # promtail container is fully down (so the metric series itself
+        # disappears, and the rate expression evaluates against an empty
+        # set). `up{job="promtail"}` is set by Prometheus's scrape-success
+        # bookkeeping and is 0 when the target is unreachable.
+        expr: up{job="promtail"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Promtail target is unreachable"
+          description: >-
+            Prometheus has been unable to scrape promtail's /metrics
+            endpoint on :9080 for >5m. This usually means the promtail
+            container is crashed or stuck in a restart loop. Without
+            promtail, no logs reach Loki.
+          runbook: "docs/runbooks/log-ingestion.md#promtail-down"

@@ -42,6 +42,14 @@ jobs:
             # Caddy per-env hostname root (deploy#218). Real value written by
             # deploy-{stg,prod}.yml — `noorinalabs.com` for prod, `stg.noorinalabs.com` for stg.
             echo "BASE_DOMAIN=ci.example"
+            # Observability per-env config selection (deploy#262 + #263).
+            # The .env.example defaults are sufficient (prod variant +
+            # `.example` slack file), but enumerate explicitly so ci-time
+            # validation also exercises the override path readers will see
+            # in deploy-{stg,prod}.yml at runtime.
+            echo "PROM_CONFIG_FILE=prometheus.prod.yml"
+            echo "ALERTMANAGER_CONFIG_FILE=alertmanager.prod.yml"
+            echo "SLACK_WEBHOOK_FILE=slack_webhook_url.secret.example"
           } >> .env
       - name: Validate compose config
         working-directory: compose
@@ -63,3 +71,62 @@ jobs:
           fi
           printf '%s\n' "${files[@]}"
           shellcheck "${files[@]}"
+
+  promtool-check:
+    # deploy#212 — PR-time validation of Prometheus alerts.yml + per-env
+    # prometheus.{stg,prod}.yml. Previously alert-author PRs relied on
+    # author + reviewer running `promtool check` locally; CI gate makes
+    # this deterministic and closes the local-promtool-version-drift gap.
+    # Pinned to the same v3.4.0 image deployed in compose/docker-compose.prod.yml.
+    #
+    # `--entrypoint promtool` overrides the image's default ENTRYPOINT
+    # (`/bin/prometheus`) — without it, docker treats `promtool ...` as
+    # arguments to prometheus and exits with "unexpected promtool".
+    # Verified against prometheus v3.4.0 Dockerfile.
+    name: promtool check (rules + config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate alerts.yml
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/infra/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.4.0 \
+            check rules /etc/prometheus/alerts.yml
+      - name: Validate prometheus.prod.yml
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/infra/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.4.0 \
+            check config /etc/prometheus/prometheus.prod.yml
+      - name: Validate prometheus.stg.yml
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/infra/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.4.0 \
+            check config /etc/prometheus/prometheus.stg.yml
+
+  amtool-check:
+    # deploy#212 sibling — validate per-env alertmanager configs (deploy#262
+    # + #263). amtool ships in the prom/alertmanager image and parses the
+    # full config schema, catching typos in receivers/routes/inhibit_rules
+    # that Alertmanager would otherwise fail to load at runtime.
+    #
+    # `--entrypoint amtool` overrides the image's default ENTRYPOINT
+    # (`/bin/alertmanager`) — same rationale as promtool above.
+    name: amtool check-config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate alertmanager.prod.yml
+        run: |
+          docker run --rm --entrypoint amtool \
+            -v "$PWD/infra/alertmanager:/etc/alertmanager:ro" \
+            prom/alertmanager:v0.28.1 \
+            check-config /etc/alertmanager/alertmanager.prod.yml
+      - name: Validate alertmanager.stg.yml
+        run: |
+          docker run --rm --entrypoint amtool \
+            -v "$PWD/infra/alertmanager:/etc/alertmanager:ro" \
+            prom/alertmanager:v0.28.1 \
+            check-config /etc/alertmanager/alertmanager.stg.yml

@@ -510,8 +510,13 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.4.0
+    # Per-env config selection (deploy#263). `PROM_CONFIG_FILE` is set by the
+    # deploy workflow's .env write step — `prometheus.prod.yml` for prod,
+    # `prometheus.stg.yml` for stg. Default to prod for local `docker compose
+    # config` validation (compose-validate.yml uses the bare .env.example,
+    # which is fine: only one variant is mounted at a time).
     volumes:
-      - ../infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../infra/prometheus/${PROM_CONFIG_FILE:-prometheus.prod.yml}:/etc/prometheus/prometheus.yml:ro
       - ../infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
@@ -536,8 +541,23 @@ services:
 
   alertmanager:
     image: prom/alertmanager:v0.28.1
+    # Per-env config selection (deploy#262 + #263). `ALERTMANAGER_CONFIG_FILE`
+    # picks `alertmanager.prod.yml` or `alertmanager.stg.yml` (set by deploy
+    # workflow .env write); default = prod for compose-validate. The Slack
+    # webhook URL is read at runtime from `/etc/alertmanager/slack_webhook_url`
+    # (api_url_file directive — supported since alertmanager v0.25). The file
+    # is bind-mounted from `../infra/alertmanager/slack_webhook_url.secret`
+    # which is written by the deploy workflow from `${{ secrets.SLACK_WEBHOOK_URL }}`.
+    # If the secret is unset, the file contains the placeholder string
+    # "<unset>" and alerts route to nowhere — alertmanager itself starts
+    # cleanly. See docs/runbooks/alertmanager-slack-routing.md.
     volumes:
-      - ../infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ../infra/alertmanager/${ALERTMANAGER_CONFIG_FILE:-alertmanager.prod.yml}:/etc/alertmanager/alertmanager.yml:ro
+      # `SLACK_WEBHOOK_FILE` defaults to the in-tree `.example` placeholder
+      # (literal "<unset>") so `docker compose config` works in CI and on
+      # fresh clones. The deploy workflow writes the real secret to
+      # `slack_webhook_url.secret` (gitignored) and overrides this var.
+      - ../infra/alertmanager/${SLACK_WEBHOOK_FILE:-slack_webhook_url.secret.example}:/etc/alertmanager/slack_webhook_url:ro
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
