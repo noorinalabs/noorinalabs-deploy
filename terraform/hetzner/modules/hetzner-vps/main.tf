@@ -68,6 +68,11 @@ resource "hcloud_server" "app" {
   # deleted hcloud_ssh_key.deploy id from #217's apply) doesn't cause
   # spurious reconciliation. user_data is ignored so cloud-init template
   # edits don't trigger destructive server replace on already-provisioned VPSes.
+  #
+  # IMPORTANT: changes to cloud-init.yaml.tpl are silently skipped on existing
+  # servers. If a template change represents a baseline shift that must reach
+  # live boxes (e.g., new SSH key, new auditd rule), use the taint/replace
+  # procedure documented in docs/runbooks/cloud-init-template-changes.md.
   lifecycle {
     ignore_changes = [ssh_keys, user_data]
   }
