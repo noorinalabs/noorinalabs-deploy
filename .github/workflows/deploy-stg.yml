@@ -1,11 +1,16 @@
 # Deploy to staging (noorinalabs-stg VPS).
 #
 # Triggers:
-#   - repository_dispatch from any service repo (isnad-graph, user-service,
-#     landing-page) — the auto-deploy fan-in point for stg. Service repos
-#     send `deploy-noorinalabs-<service>` events after their ghcr-publish.yml
-#     has pushed the four stg tags (sha-<short>, latest, stg-<short>,
-#     stg-latest) per Contract v6 (canonical per Khoury ruling).
+#   - repository_dispatch from isnad-graph or user-service — the auto-deploy
+#     fan-in point for stg. Those service repos send
+#     `deploy-noorinalabs-<service>` events after their ghcr-publish.yml has
+#     pushed the four stg tags (sha-<short>, latest, stg-<short>, stg-latest)
+#     per Contract v6 (canonical per Khoury ruling).
+#     Note: landing-page does NOT participate in this fan-in. Its prod
+#     rollout flows through promote.yml registry retag (see promote.yml
+#     § landing_short), not push-time dispatch. Listener type for
+#     `deploy-noorinalabs-landing-page` was dropped in deploy#285 because
+#     no sender ever wired to it.
 #   - workflow_dispatch — manual redeploy, e.g. to re-pull stg-latest after
 #     a registry hiccup.
 #
@@ -28,7 +33,6 @@ on:
     types:
       - deploy-noorinalabs-isnad-graph
       - deploy-noorinalabs-user-service
-      - deploy-noorinalabs-landing-page
   workflow_dispatch:
     inputs:
       image_tag:
