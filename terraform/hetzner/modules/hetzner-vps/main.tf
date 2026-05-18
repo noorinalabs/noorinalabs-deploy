@@ -4,6 +4,13 @@ locals {
     project     = "noorinalabs"
     environment = var.env
   }
+  cloud_init_vars = {
+    ssh_public_key          = sensitive(chomp(file(var.ssh_public_key_path)))
+    ghcr_auth_b64           = var.ghcr_auth_b64
+    user_postgres_password  = var.user_postgres_password
+    user_redis_password     = var.user_redis_password
+    user_service_jwt_secret = var.user_service_jwt_secret
+  }
 }
 
 # hcloud_ssh_key.deploy was removed in #222 — Hetzner enforces SSH-key content
@@ -52,13 +59,7 @@ resource "hcloud_server" "app" {
 
   firewall_ids = [hcloud_firewall.web.id]
 
-  user_data = templatefile("${path.module}/cloud-init.yaml.tpl", {
-    ssh_public_key          = sensitive(chomp(file(var.ssh_public_key_path)))
-    ghcr_auth_b64           = var.ghcr_auth_b64
-    user_postgres_password  = var.user_postgres_password
-    user_redis_password     = var.user_redis_password
-    user_service_jwt_secret = var.user_service_jwt_secret
-  })
+  user_data = templatefile("${path.module}/cloud-init.yaml.tpl", local.cloud_init_vars)
 
   labels = local.labels
 
