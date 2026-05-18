@@ -65,20 +65,35 @@ State is stored in Backblaze B2 bucket `noorinalabs-terraform-state`,
 with per-env state keys (`hetzner/stg.tfstate`, `hetzner/prod.tfstate`).
 Apply via CI is the preferred path — see § Apply via CI below.
 
-After `apply`, the new VPS still needs first-time setup. SSH in as `root`
-using whichever key was authorized at provisioning time (Hetzner cloud-init
-user-data, console password reset, or operator's local key — see the
-`cloud_init_ssh_key_gap` note in [`ontology/repos/deploy.yaml`](ontology/repos/deploy.yaml))
-and run:
+After `apply`, the new VPS is bootstrapped end-to-end by
+[`terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl`](terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl)
+on first boot — Docker, docker-compose, fail2ban, ufw, unattended-upgrades,
+rclone, the `deploy` user, SSH keys (root + deploy), GHCR auth (conditional
+on `ghcr_auth_b64`), `.env.user-service`, root SSH password disable, and
+the repo clone to `/opt/noorinalabs-deploy` are all provisioned without
+operator action. SSH in as `root` (or `deploy`) using the key authorized
+at provisioning time — see the `cloud_init_ssh_key_gap` note in
+[`ontology/repos/deploy.yaml`](ontology/repos/deploy.yaml) for the known
+gap on stg.
+
+[`scripts/bootstrap-vps.sh`](scripts/bootstrap-vps.sh) is the **residual**
+bootstrap, idempotent on re-run, kept for:
+
+- **Pre-cloud-init VPSes** (the hand-made `isnad-graph-prod` box outside
+  Terraform — decom tracked in deploy#86)
+- **Gaps cloud-init does not yet cover** (#163): aux-repo dirs under `/opt/`,
+  the systemd backup units, `git safe.directory` exceptions, and the
+  append-with-dedup SSH key merge for operator-added admin keys
+
+Run only when one of those conditions applies:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/noorinalabs/noorinalabs-deploy/main/scripts/bootstrap-vps.sh | bash
 ```
 
-`scripts/bootstrap-vps.sh` is idempotent: installs Docker, creates the
-`deploy` user, clones this repo to `/opt/noorinalabs-deploy`, configures
-log rotation, and stages the systemd backup units. Re-run it any time the
-bootstrap needs to be re-applied.
+The script preflight-checks for the `deploy` user and `docker` binary and
+exits fast if either is missing — i.e., it will not silently half-bootstrap
+a host that should have been cloud-init'd but wasn't.
 
 ### Apply Terraform via CI
 

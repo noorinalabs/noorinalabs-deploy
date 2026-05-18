@@ -69,11 +69,14 @@ user. The reusable workflows (`deploy-stg.yml`, `db-migrate.yml`,
       on either. (Wave-B failure #1.)
 - [ ] **`secrets.DEPLOY_SSH_PRIVATE_KEY` set** at the org level (or per-env
       override). Public half is in the VPS's `/home/deploy/.ssh/authorized_keys`.
-      *Automated in:* [`scripts/bootstrap-vps.sh`](../../scripts/bootstrap-vps.sh)
-      installs the public key when the VPS is first provisioned. Cloud-init
-      gap surfaced 2026-04-24 (`cloud_init_ssh_key_gap` in
+      *Automated in:* [`cloud-init.yaml.tpl`](../../terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl)
+      seeds both root and deploy authorized_keys with the per-env
+      `ssh_public_key` on first boot (Terraform-provisioned VPSes only).
+      Cloud-init gap surfaced 2026-04-24 (`cloud_init_ssh_key_gap` in
       `ontology/repos/deploy.yaml`) — for TF-provisioned boxes confirm the key
-      actually landed before relying on it.
+      actually landed before relying on it. For pre-cloud-init VPSes or
+      operator-added admin keys, [`scripts/bootstrap-vps.sh`](../../scripts/bootstrap-vps.sh)
+      provides an idempotent append-with-dedup merge from root → deploy (#163).
 - [ ] **Runtime GHCR auth** — the deploy script logs in with the
       auto-provisioned `GITHUB_TOKEN` and `trap`s a logout. No long-lived
       GHCR PAT lives on the VPS for app-service pulls.
