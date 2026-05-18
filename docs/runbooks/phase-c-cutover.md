@@ -60,11 +60,13 @@ Before starting the sequence below, confirm each:
   (or apply manually) and re-verify before proceeding.
 
 - [ ] **DNS records are Terraform-managed.** (Required as of #192.)
-  Confirm `terraform/cloudflare/` contains an apex A/AAAA record set
-  resolved through `var.prod_vps_ipv4_address` /
-  `var.prod_vps_ipv6_address`. Anything still hand-edited in the
-  Cloudflare dashboard MUST be migrated to TF first — Phase C cutover
-  flips DNS via TF apply, not the dashboard.
+  Confirm `terraform/cloudflare/main.tf` contains an apex A/AAAA record
+  set resolved through `local.prod_vps_ipv4` / `local.prod_vps_ipv6`,
+  which in turn read from
+  `data.terraform_remote_state.hetzner_prod.outputs.server_ip` /
+  `server_ipv6`. Anything still hand-edited in the Cloudflare dashboard
+  MUST be migrated to TF first — Phase C cutover flips DNS via TF
+  apply, not the dashboard.
 
 - [ ] **`GH_PACKAGES_TOKEN` has `write:packages` scope.** Required for
   the `promote.yml` retag step. Verify with:
@@ -90,8 +92,14 @@ an owner-class account.
 
 ### 1. Update env-scope `VPS_HOST` for production
 
+`deploy-prod.yml` reads `${{ vars.VPS_HOST }}` (an env-scope **variable**,
+not a secret) at all three SSH/host call sites. Use `gh variable set`
+— `gh secret set` would write a never-read secret while the actual
+variable kept pointing at the old box, so the next prod deploy would
+silently SSH the old host.
+
 ```bash
-gh secret set VPS_HOST \
+gh variable set VPS_HOST \
   --repo noorinalabs/noorinalabs-deploy \
   --env production \
   --body "<new_prod_ipv4>"
@@ -101,26 +109,41 @@ Replace `<new_prod_ipv4>` with the IPv4 of the new TF-managed prod box
 (e.g. `178.156.214.225` for the 2026-05-02 cutover). Confirm with:
 
 ```bash
-gh secret list --repo noorinalabs/noorinalabs-deploy --env production \
+gh variable list --repo noorinalabs/noorinalabs-deploy --env production \
   | grep VPS_HOST
 ```
 
-(Note: `gh secret set` is silent on success; only the `gh secret list`
+(Note: `gh variable set` is silent on success; only the `gh variable list`
 read-back-verify confirms the update landed — see the org-level
 "gh CLI silent-no-op family" feedback for similar gotchas.)
 
-### 2. Update Cloudflare TF DNS targets
+### 2. Confirm Cloudflare TF sees the new prod IP (no tfvars edit)
 
-Edit `terraform/cloudflare/terraform.tfvars` (or the env-specific
-`.tfvars` file the prod CF workspace uses) and set:
+**No tfvars edit is needed.** `terraform/cloudflare/main.tf` reads the
+prod VPS IPs from the hetzner prod remote state via
+`data "terraform_remote_state" "hetzner_prod"` —
+`local.prod_vps_ipv4` and `local.prod_vps_ipv6` resolve to
+`outputs.server_ip` and `outputs.server_ipv6` of the hetzner prod root
+module. `terraform/cloudflare/variables.tf` has no
+`prod_vps_ipv4_address` / `prod_vps_ipv6_address` input, and
+`terraform.tfvars.example` documents this explicitly ("Per-env VPS IPs
+are NOT input variables.").
 
-```hcl
-prod_vps_ipv4_address = "<new_prod_ipv4>"
-prod_vps_ipv6_address = "<new_prod_ipv6>"
+Verify the hetzner prod outputs match the new box before the CF apply
+in step 5:
+
+```bash
+cd terraform/hetzner/envs/prod/
+terraform init -backend=true
+terraform output server_ip
+terraform output server_ipv6
 ```
 
-Do **not** apply yet — the apply happens in step 5 after the new stack
-is verified healthy on the new IP.
+Both values MUST equal the new prod box IPs. If they don't, the hetzner
+state has not been refreshed against the new box — let the wave-merge
+auto-apply settle (or run `terraform apply` here manually) before
+proceeding. The CF apply in step 5 will pick up these outputs
+automatically.
 
 ### 3. Promote images
 
@@ -169,12 +192,22 @@ Expect `HTTP/2 200`. If you see `502`/`503`/connection refused, do
 
 ### 5. Apply Cloudflare TF (DNS flips to new prod)
 
+The CF root module picks up the new prod IPs automatically from the
+hetzner prod remote state (verified in step 2) — no tfvars or HCL
+edit is required here. The `terraform plan` should show the apex and
+www A/AAAA records changing to the new prod IPs purely from the
+upstream state.
+
 ```bash
 cd terraform/cloudflare/
 terraform init -backend=true
 terraform plan   # expect: apex A/AAAA records changing to new prod IPs
 terraform apply
 ```
+
+If the plan does NOT show the IP change, re-check step 2 — the hetzner
+prod remote state is still publishing the old IPs and the CF apply
+would be a no-op (leaving DNS pointed at the old box).
 
 Within ~Cloudflare propagation window (seconds–minutes), prod traffic
 flips. Verify from a non-cached resolver:
@@ -229,15 +262,20 @@ the safety check.
 If any step fails and prod is degraded, roll back in reverse order:
 
 1. **Pre-DNS-flip failure (steps 1–4):** No user-visible impact yet.
-   - Revert the `VPS_HOST` secret to the old IP (`gh secret set ...`)
+   - Revert the `VPS_HOST` env-scope variable to the old IP
+     (`gh variable set VPS_HOST --env production --body "<old_ipv4>"`)
    - Old box is still running the previous stack; no action needed there
    - Investigate the failure, fix root cause, retry the sequence
 
 2. **Post-DNS-flip failure (step 5+):** Prod is on the new box.
-   - **Fastest reversal:** revert the Cloudflare `.tfvars` change and
-     `terraform apply` to flip DNS back to the old box. Old stack is
-     still up (step 7 has not yet run) and will resume serving traffic
-     within propagation window.
+   - **Fastest reversal:** point the hetzner prod state back at the old
+     box (e.g. `terraform state` swap, or `terraform apply -refresh-only`
+     against the old box's resources) and re-run the CF
+     `terraform apply` — the CF root module will re-read the upstream
+     outputs and flip the apex A/AAAA records back. Old stack is still
+     up (step 7 has not yet run) and will resume serving traffic within
+     propagation window. (No CF tfvars edit is involved — IPs are
+     sourced from upstream state, per step 2.)
    - If the old box has already been decommissioned (step 7 done before
      a regression surfaced), rollback is to **roll forward** — use
      `rollback.yml` with the last-known-good `prod-*` image tag, or
@@ -281,8 +319,8 @@ the runbook PR merges.
 - The full cutover requires a real new Hetzner box and a real Cloudflare
   zone; there is no dry-run mode for `terraform apply` against the
   prod state backend
-- `gh secret set` is silent on success; only read-back-verify with
-  `gh secret list` confirms the env-scope var update
+- `gh variable set` is silent on success; only read-back-verify with
+  `gh variable list` confirms the env-scope variable update
 - DNS propagation depends on Cloudflare's edge cache and the resolver
   the client is using; the runbook treats step 5 as the
   point-of-no-return for that reason
