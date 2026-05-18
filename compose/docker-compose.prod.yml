@@ -309,6 +309,56 @@ services:
 
   # --- User Service ---
 
+  # One-shot alembic migration runner (#141). Mirrors the kafka-init pattern:
+  # runs to completion, exits 0 on success, stays in "exited" state for the
+  # rest of the compose lifecycle. The user-service `depends_on` block waits
+  # for `service_completed_successfully` so the API never starts against an
+  # unmigrated database.
+  #
+  # Why this exists alongside the SSH-driven alembic gate (db-migrate.yml):
+  #   - db-migrate.yml is the CI/promotion-time gate. It SSHes into the
+  #     prod VPS, pulls the candidate image, and runs `alembic upgrade head`
+  #     against the LIVE user-postgres before promote.yml retags the image.
+  #     That covers the rolling-deploy path.
+  #   - This init container covers the `compose up` path on a fresh
+  #     `user_pg_data` volume (DR-restore, first stack-up, blue-green VPS
+  #     swap with an empty postgres). The SSH gate cannot run by definition
+  #     when the stack does not yet exist (chicken-and-egg per
+  #     docs/runbooks/break-glass.md § skip_alembic_gate).
+  #
+  # Failure mode + recovery: if alembic fails, this container exits non-zero,
+  # `user-service` stays in `Created` (never `Running`), and `compose up`
+  # itself returns non-zero. Operator sees the failure immediately rather
+  # than a healthy-looking API serving against unmigrated tables. Logs are
+  # captured by the json-file driver below; `docker compose logs
+  # user-service-migrate` retrieves them.
+  user-service-migrate:
+    image: ghcr.io/noorinalabs/noorinalabs-user-service:${USER_SERVICE_IMAGE_TAG:-latest}
+    # asyncpg driver — alembic/env.py is async (create_async_engine +
+    # asyncio.run). Same scheme as the runtime user-service DATABASE_URL
+    # and the SSH alembic gate in db-migrate.yml (post-#236).
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
+    # `alembic upgrade head` matches the SSH gate's invocation. The
+    # heads-count belt-and-suspenders check from db-migrate.yml is not
+    # repeated here — that check guards CI-time migrations-DAG correctness
+    # and would be redundant noise at every `compose up`.
+    command: /app/.venv/bin/alembic upgrade head
+    depends_on:
+      user-postgres:
+        condition: service_healthy
+    networks:
+      - user-backend
+    # Container is one-shot; restart on failure would re-run forever if the
+    # migration is fundamentally broken. `no` is the correct choice — the
+    # non-zero exit cascades to user-service's depends_on block.
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   user-service:
     image: ghcr.io/noorinalabs/noorinalabs-user-service:${USER_SERVICE_IMAGE_TAG:-latest}
     expose:
@@ -339,6 +389,13 @@ services:
         condition: service_healthy
       user-redis:
         condition: service_healthy
+      user-service-migrate:
+        # Migrations MUST complete cleanly before user-service starts. A
+        # non-zero migrate exit cascades up: user-service stays in
+        # `Created`, `compose up` returns non-zero, operator sees the
+        # failure immediately (vs a healthy-looking API on unmigrated
+        # tables). See user-service-migrate block above for design notes.
+        condition: service_completed_successfully
     deploy:
       resources:
         limits:
