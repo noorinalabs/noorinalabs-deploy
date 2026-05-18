@@ -163,10 +163,6 @@ runcmd:
   - mkdir -p /home/deploy/.docker
   - chown -R deploy:deploy /home/deploy/.docker
 
-  # Pre-create Docker volumes for user-service data persistence
-  - docker volume create user-postgres-data
-  - docker volume create user-redis-data
-
   # node-exporter textfile_collector input directory (deploy#161).
   # Owned by deploy:deploy because the alembic pre-deploy gate's SSH step
   # (.github/workflows/db-migrate.yml) writes .prom files here as the
