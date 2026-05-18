@@ -693,13 +693,13 @@ services:
       - /sys:/host/sys:ro
       - /:/rootfs:ro
       # Textfile collector input directory (deploy#161). The host path is
-      # owned by the `deploy` user (mode 0775) and populated by the alembic
+      # owned by `deploy:deploy` (mode 0755) and populated by the alembic
       # pre-deploy gate in db-migrate.yml on every run via `if: always()`.
       # Read-only mount so a compromised node-exporter cannot clobber the
-      # written .prom files. Provisioning of the host directory is a runbook
-      # step today (`mkdir -p /var/lib/node_exporter/textfile_collector &&
-      # chown deploy:deploy && chmod 0775`); cloud-init bake-in is tracked as
-      # a follow-up if Nurul prefers it move to TF.
+      # written .prom files. The host directory is provisioned automatically
+      # by Terraform cloud-init (terraform/hetzner/modules/hetzner-vps/
+      # cloud-init.yaml.tpl runcmd:) on every fresh VPS — no manual step
+      # needed. Mode 0755 set by cloud-init (PR #210, Bereket amendment).
       - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro
     command:
       - "--path.procfs=/host/proc"
