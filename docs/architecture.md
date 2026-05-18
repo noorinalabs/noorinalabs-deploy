@@ -56,7 +56,7 @@ noorinalabs-deploy/
 │       └── promtail-config.yml
 ├── scripts/
 │   ├── backup.sh                 # Automated database backup
-│   ├── bootstrap-vps.sh          # First-time VPS setup
+│   ├── bootstrap-vps.sh          # Residual bootstrap — cloud-init gaps only (#163)
 │   ├── restore.sh                # Database restore from backup
 │   └── verify_deployment.sh      # Live deployment verification
 ├── systemd/
@@ -162,15 +162,25 @@ Provisioned via Terraform in `terraform/hetzner/`. The Terraform configuration c
 
 ### Bootstrap
 
-First-time setup is performed by `scripts/bootstrap-vps.sh`, which runs as root on a fresh VPS and:
+First-time setup of a Terraform-provisioned VPS is performed end-to-end by `terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl`, which on first boot:
 
-1. Installs Docker, docker-compose-v2, docker-buildx, git, curl
-2. Creates a `deploy` user with Docker group access
-3. Merges SSH authorized keys from root into the deploy user (append-with-fingerprint-dedup — idempotent across re-runs, never wipes a key already present in `/home/deploy/.ssh/authorized_keys`; see deploy#112)
-4. Clones this repo to `/opt/noorinalabs-deploy`
-5. Creates a template `.env` file with placeholder values
-6. Installs rclone for backups
-7. Installs and enables the backup systemd timer
+1. Installs Docker, docker-compose-v2, docker-buildx, git, curl, fail2ban, ufw, unattended-upgrades, rclone, jq
+2. Creates a `deploy` user with `docker, sudo` groups (NOPASSWD sudo) and seeds its SSH authorized_keys with the per-env `ssh_public_key`
+3. Writes the same key into `/root/.ssh/authorized_keys` (canonical operator/CI key)
+4. Configures fail2ban (SSH brute-force jail), ufw (default-deny incoming, allow 22/80/443), and unattended-upgrades (security patches only)
+5. Disables root SSH password login (`PermitRootLogin prohibit-password`, `PasswordAuthentication no`)
+6. Writes `/home/deploy/.docker/config.json` with GHCR auth when `ghcr_auth_b64` is non-empty (per #28 conditional skip)
+7. Writes `/opt/noorinalabs-deploy/.env.user-service` from Terraform secrets
+8. Clones this repo to `/opt/noorinalabs-deploy` and chowns to `deploy`
+9. Creates `/var/lib/node_exporter/textfile_collector` (deploy:deploy 0755) for the alembic pre-deploy gate's failure markers
+
+`scripts/bootstrap-vps.sh` is the **residual** bootstrap, run only on VPSes that pre-date cloud-init or to cover gaps cloud-init does not yet fill (#163):
+
+- Append-with-dedup SSH key merge from `/root/.ssh/authorized_keys` → `/home/deploy/.ssh/authorized_keys` (idempotent across re-runs, never wipes the deploy CI key; see deploy#112)
+- `git config --global --add safe.directory` exceptions for `/opt/noorinalabs-deploy` and the auxiliary repo dirs
+- Idempotent `git fetch && git reset --hard` of `/opt/noorinalabs-deploy`
+- Pre-provisioning the auxiliary repo dirs under `/opt/` (e.g., `/opt/noorinalabs-isnad-graph`, `/opt/noorinalabs-design-system`) with deploy ownership
+- Installing the systemd backup units (`isnad-backup.{service,timer}`, failure-marker, tmpfiles.d) and enabling the timer
 
 ## Docker Compose Stack
 
