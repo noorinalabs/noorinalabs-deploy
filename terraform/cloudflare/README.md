@@ -31,9 +31,37 @@ terraform/cloudflare/
 | `isnad.stg` CNAME | `stg_isnad_cname` | **no** | → `stg.noorinalabs.com` |
 | `users.stg` CNAME | `stg_users_cname` | **no** | → `stg.noorinalabs.com` |
 
-### Why are stg records gray-cloud (proxied=false)?
+## Prod vs stg proxy posture
 
-Cloudflare Universal SSL only covers one level of wildcards (`*.noorinalabs.com`). Third-level subdomains like `isnad.stg.noorinalabs.com` get a TLS handshake failure at the CF edge. Until Cloudflare Advanced Certificate Manager (paid) is enabled, stg lives outside the proxy. Origin Caddy provides valid Let's Encrypt certs for the stg hostnames and serves directly. Tracked as a tech-debt followup if needed.
+The two environments have asymmetric Cloudflare proxy posture by necessity:
+
+| Env | Records | Proxied | TLS terminated at | Edge benefits |
+|-----|---------|---------|-------------------|---------------|
+| prod | apex, www, isnad, users | **true** (orange-cloud) | CF edge | DDoS mitigation, WAF, edge cache |
+| stg | stg, isnad.stg, users.stg | **false** (gray-cloud) | origin Caddy (Let's Encrypt) | none |
+
+### Why the asymmetry is forced
+
+Cloudflare Universal SSL covers `*.noorinalabs.com` (one wildcard level) and the apex. Third-level subdomains like `isnad.stg.noorinalabs.com` are **not covered**: TLS handshake at the CF edge fails with a certificate mismatch. Enabling `proxied = true` on stg records causes immediate TLS errors (#228 confirmed this — toggled all stg records back to `proxied = false` as the forced fix).
+
+Origin Caddy auto-provisions valid Let's Encrypt certificates for the stg hostnames directly, so stg HTTPS works without the CF proxy.
+
+### Trade-off
+
+Stg without the CF proxy means:
+- No Cloudflare DDoS / rate-limit / WAF rules apply at the edge for stg traffic
+- No CF edge caching for stg responses
+- Stg origin is directly reachable (IP exposed) — acceptable for non-prod
+
+Prod keeps the full orange-cloud posture (DDoS mitigation, WAF, edge cache).
+
+### Remediation option: Cloudflare Advanced Certificate Manager (ACM)
+
+Cloudflare ACM (~$10/month) adds wildcard cert coverage at any subdomain depth, including `*.stg.noorinalabs.com`. Enabling ACM would allow stg records to be proxied like prod (one dashboard toggle in the CF zone). Owner decision — paid feature, not a defect. Tracked in deploy#229.
+
+**If ACM is enabled:** flip all stg records to `proxied = true` in `main.tf` and re-apply. No DNS record renames needed — the `proxied` field is the only change.
+
+**If stg stays gray-cloud:** no action needed. Document the decision in deploy#229 and close as won't-fix.
 
 ### IP source — no manual var needed
 
