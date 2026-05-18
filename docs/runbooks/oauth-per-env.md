@@ -39,6 +39,8 @@ User-service's OAuth callback path is `/auth/oauth/{provider}/callback` (`POST`,
 
 **Only the env's own callback URL goes in that env's app.** Do not mix prod and stg URIs in one app — that re-creates the shared-app posture this runbook exists to prevent.
 
+> **Adding a new OAuth provider:** follow the same per-env pattern — provision one provider app per env, set `AUTH_<PROVIDER>_CLIENT_ID` + `AUTH_<PROVIDER>_CLIENT_SECRET` at the env-scope for each env, and add the callback URI to the redirect URI conventions table above.
+
 ## Provisioning a new env (4 steps)
 
 Follow when adding any new env (e.g., `dev` between stg and prod, or a `canary` post-prod). Each step is owner-only because OAuth provider consoles require interactive auth that is out-of-band of CI.
