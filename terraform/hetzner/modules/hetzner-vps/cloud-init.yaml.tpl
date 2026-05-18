@@ -1,7 +1,8 @@
 #cloud-config
 # =============================================================================
 # cloud-init template for Noorina Labs VPS provisioning
-# Installs Docker, Caddy, security hardening (fail2ban, ufw), and GHCR auth.
+# Installs Docker, security hardening (fail2ban, ufw), and GHCR auth.
+# (Caddy runs as a Docker container via compose, not via apt.)
 #
 # Services provisioned on this VPS:
 #   - isnad-graph (FastAPI + React + Neo4j)
@@ -190,26 +191,6 @@ runcmd:
   - mkdir -p /var/lib/node_exporter/textfile_collector
   - chown deploy:deploy /var/lib/node_exporter/textfile_collector
   - chmod 0755 /var/lib/node_exporter/textfile_collector
-
-  # Install Caddy via official apt repo.
-  # DEBIAN_FRONTEND=noninteractive + NEEDRESTART_MODE=a are inlined per-command
-  # because cloud-init's runcmd exec's each entry independently — `export`s in
-  # an earlier entry don't survive to the next. Without these, caddy's apt
-  # install triggers a whiptail "Pending kernel upgrade" dialog from
-  # needrestart, which prints
-  #   debconf: whiptail output the above errors, giving up!
-  # and "Use of uninitialized value $ret in scalar chomp" in cloud-init logs.
-  # The install does NOT block today (whiptail bails when it can't open a
-  # terminal) but is an apt-hang risk under stricter dialog policies and is
-  # noisy in cloud-init.log. Matches the pattern used in bootstrap-vps.sh
-  # since deploy#110. See #173 gap D.
-  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  - echo "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" > /etc/apt/sources.list.d/caddy-stable.list
-  - DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq
-  - DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" caddy
-  - systemctl stop caddy
-  # Caddy will be run via Docker Compose, not systemd — disable the system service
-  - systemctl disable caddy
 
   # Enable automatic security updates
   - systemctl enable unattended-upgrades
