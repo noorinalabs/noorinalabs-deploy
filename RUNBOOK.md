@@ -20,6 +20,7 @@ own what they build. This repo owns what runs on the server.").
 | User-service Alembic migration | [`docs/runbooks/user-service-alembic.md`](docs/runbooks/user-service-alembic.md) |
 | Per-env OAuth provisioning | [`docs/runbooks/oauth-per-env.md`](docs/runbooks/oauth-per-env.md) |
 | Blackbox probes / synthetic checks | [`docs/runbooks/blackbox-probes.md`](docs/runbooks/blackbox-probes.md) |
+| Observability stack index + Cloudflare Web Analytics | [`docs/runbooks/observability.md`](docs/runbooks/observability.md) |
 | Break-glass `workflow_dispatch` inputs | [`docs/runbooks/break-glass.md`](docs/runbooks/break-glass.md) |
 | Cold-rebuild dry-run gate | [`docs/runbooks/cold-rebuild-dry-run.md`](docs/runbooks/cold-rebuild-dry-run.md) |
 | First-time VPS bring-up | [`docs/runbooks/user-service-migration.md`](docs/runbooks/user-service-migration.md) + § Build below |
