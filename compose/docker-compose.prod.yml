@@ -275,7 +275,7 @@ services:
     tmpfs:
       - /tmp:size=64M
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2019/config/ >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 3
