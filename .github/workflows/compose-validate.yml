@@ -56,21 +56,54 @@ jobs:
         run: docker compose -f docker-compose.prod.yml --env-file .env config --quiet
 
   shellcheck:
-    name: shellcheck infra & scripts
+    # deploy#74: backup/restore are critical DR scripts only exercised in
+    # production via the systemd timer; this job is the only PR-time gate
+    # against bash regressions before they reach the VPS. shellcheck catches
+    # quoting / word-splitting bugs; `bash -n` catches parse-time syntax
+    # errors that shellcheck doesn't always reject (e.g. mismatched heredocs
+    # in some shellcheck modes). Both are <2s — cheap belt-and-braces.
+    name: shellcheck + bash -n (infra & scripts)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Lint shell scripts
+      - name: Discover shell scripts
+        id: discover
         run: |
           mapfile -t files < <(find infra scripts -type f -name '*.sh' 2>/dev/null)
           if [ ${#files[@]} -eq 0 ]; then
             echo "No shell scripts found — nothing to lint."
+            echo "found=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           printf '%s\n' "${files[@]}"
+          # Newline-joined list, GH-Actions multiline-output safe-delimiter form.
+          {
+            echo "files<<EOF"
+            printf '%s\n' "${files[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "found=1" >> "$GITHUB_OUTPUT"
+      - name: Lint shell scripts (shellcheck)
+        if: steps.discover.outputs.found == '1'
+        run: |
+          mapfile -t files <<< "${{ steps.discover.outputs.files }}"
           shellcheck "${files[@]}"
+      - name: Validate shell script syntax (bash -n)
+        if: steps.discover.outputs.found == '1'
+        run: |
+          mapfile -t files <<< "${{ steps.discover.outputs.files }}"
+          fail=0
+          for f in "${files[@]}"; do
+            if bash -n "$f"; then
+              echo "OK  $f"
+            else
+              echo "::error file=$f::bash -n syntax check failed"
+              fail=1
+            fi
+          done
+          exit "$fail"
 
   passlist-drift:
     # deploy#97: catch drift between compose's :?-required vars and the
