@@ -157,8 +157,8 @@ The `.env` file is ephemeral: recreated fresh on each deployment, written with `
 Provisioned via Terraform in `terraform/hetzner/`. The Terraform configuration creates:
 
 - `hcloud_server` — the VPS instance
-- `hcloud_ssh_key` — deploy SSH key
 - `hcloud_firewall` — allows SSH (22), HTTP (80), HTTPS (443)
+- SSH authorized keys are injected via cloud-init (`cloud-init.yaml.tpl` in `terraform/hetzner/modules/hetzner-vps/`); there is no `hcloud_ssh_key` Terraform resource
 
 ### Bootstrap
 
