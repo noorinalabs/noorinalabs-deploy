@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /infra/neo4j
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - tech-debt
+      - ci-cd
+      - "deps:docker"
+    commit-message:
+      prefix: "deps(docker)"
+
+  - package-ecosystem: docker
+    directory: /integration-tests/fake_oauth
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - tech-debt
+      - ci-cd
+      - "deps:docker"
+    commit-message:
+      prefix: "deps(docker)"
