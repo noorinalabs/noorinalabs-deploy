@@ -45,7 +45,30 @@ curl -s http://localhost:8080/oauth2/v3/userinfo -H 'Authorization: Bearer fake-
 
 ## Image size
 
-Target under 100 MB. `python:3.12-slim` + fastapi + uvicorn[standard] +
-python-multipart weighs in around ~160 MB uncompressed; that's acceptable
-for a test-only container. Don't add DBs, Redis clients, or crypto libs —
-id_token signature verification is not required for Google's flow.
+Reconciled per #147 (PR #146 body said "55 MB unpacked single-arch", earlier
+draft of this README said "~160 MB"). Authoritative breakdown for the current
+Dockerfile (`python:3.12-slim` + `fastapi==0.115.0` + `uvicorn[standard]==0.32.0`
++ `python-multipart==0.0.12`):
+
+- `python:3.12-slim` amd64 base: **~119 MB** on-disk (per
+  [docker-library/repo-info](https://github.com/docker-library/repo-info/blob/master/repos/python/local/3.12-slim.md)
+  Virtual Size for `3.12.13-slim-trixie`).
+- Pip deps installed into site-packages: **~39 MB** (measured by replaying
+  `pip install -r requirements.txt` into a venv; dominated by `uvloop`
+  ~15 MB, `pip`/`setuptools` are NOT included since `pip install -r` doesn't
+  add them).
+- App code (`main.py`): negligible (<1 KB).
+- No `__pycache__` overhead — `PYTHONDONTWRITEBYTECODE=1` is set in the
+  Dockerfile.
+
+**Total: ~158 MB unpacked** (estimated, not measured via `docker image
+inspect` — see #147 for the reconciliation context). The 55 MB figure in PR
+#146's body was the compressed/registry size, not the on-disk size; this
+matters for pull bandwidth but not for the docker host's disk footprint or
+the `<100 MB target` discussion. Don't add DBs, Redis clients, or crypto
+libs — id_token signature verification is not required for Google's flow.
+
+The 58 MB over the 100 MB target is dominated by `uvicorn[standard]` extras
+(`httptools` ~1.6 MB, `uvloop` ~15 MB, `watchfiles` ~1.2 MB, `websockets`
+~1.4 MB) and `python:3.12-slim` itself. Dropping `[standard]` would shave
+~18-20 MB but is a future option, not a current change.
