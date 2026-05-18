@@ -5,6 +5,13 @@ cloudflare_api_token = "CHANGE-ME"
 # Zone ID — found on the Cloudflare dashboard overview page for noorinalabs.com
 cloudflare_zone_id = "CHANGE-ME"
 
+# Zone IDs for the defensive TLDs (`.net` + `.org`). Same lookup as above:
+# Cloudflare dashboard → noorinalabs.net (or .org) → Overview → Zone ID.
+# Public DNS metadata, not secrets. Used by the canonical-domain redirect
+# ruleset in redirects.tf.
+noorinalabs_net_zone_id = "CHANGE-ME"
+noorinalabs_org_zone_id = "CHANGE-ME"
+
 # Per-env VPS IPs are NOT input variables — they're read from the hetzner
 # env-root tfstates via `data "terraform_remote_state"` in main.tf. To run
 # this module locally you need read access to the hetzner state in B2:

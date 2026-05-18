@@ -1,15 +1,16 @@
 # Terraform — Cloudflare DNS
 
-Manages DNS records and zone settings for `noorinalabs.com` via the Cloudflare provider. This is a **single module** (not per-env like `terraform/hetzner/`) because there is one Cloudflare zone; both prod and stg records live in the same state.
+Manages DNS records and zone settings for `noorinalabs.com` via the Cloudflare provider, plus canonical-domain 301 redirects for the defensive `.net` + `.org` TLDs (per #166). This is a **single module** (not per-env like `terraform/hetzner/`) because the .com zone is shared between prod and stg, and the redirect rulesets on the dark zones are single-resource each.
 
 ## Layout
 
 ```
 terraform/cloudflare/
 ├── README.md                   # this file
-├── main.tf                     # provider, zone settings, all DNS records
-├── variables.tf                # cloudflare_api_token, cloudflare_zone_id, domain
-├── outputs.tf                  # prod_hostnames, stg_hostnames, ssl_mode maps
+├── main.tf                     # provider, zone settings, all .com DNS records
+├── redirects.tf                # canonical-domain 301 redirects (.net/.org → .com)
+├── variables.tf                # API token + all three zone IDs + domain
+├── outputs.tf                  # prod_hostnames, stg_hostnames, ssl_mode, redirect ruleset IDs
 ├── moved.tf                    # state-migration history (pre-#83 renames)
 ├── versions.tf
 └── terraform.tfvars.example
@@ -30,6 +31,33 @@ terraform/cloudflare/
 | `stg` AAAA | `stg_apex_aaaa` | **no** | Stg VPS IPv6 (conditional) |
 | `isnad.stg` CNAME | `stg_isnad_cname` | **no** | → `stg.noorinalabs.com` |
 | `users.stg` CNAME | `stg_users_cname` | **no** | → `stg.noorinalabs.com` |
+
+## Canonical-domain redirects (.net + .org → .com)
+
+Per #166. The owner holds `noorinalabs.net` and `noorinalabs.org` as defensive registrations. They are dark zones today (no app DNS records). To consolidate canonical-domain traffic, SEO signals, and brand consistency, both zones serve a Cloudflare-edge 301 redirect to the matching path on `noorinalabs.com`.
+
+| Source | Behavior | Defined in |
+|---|---|---|
+| `https://noorinalabs.net/<path>?<query>` | 301 → `https://noorinalabs.com/<path>?<query>` | `redirects.tf` |
+| `https://noorinalabs.org/<path>?<query>` | 301 → `https://noorinalabs.com/<path>?<query>` | `redirects.tf` |
+
+Implementation: a `cloudflare_ruleset` resource per zone in phase `http_request_dynamic_redirect`. The rule matches every request (`expression = "true"`) and rewrites the URL via a dynamic `target_url.expression`. Path + query string are preserved by string-concatenation in the expression. Because the redirect fires at the Cloudflare edge before origin lookup, no DNS A/AAAA record on `.net` / `.org` is required — the zones stay dark.
+
+### Why dynamic-redirect Rulesets
+
+Issue #166 enumerates three options:
+
+- **Bulk Redirects** (dashboard UI): no TF tracking, no diff review, no DR recovery.
+- **Page Rules**: deprecated upstream by Cloudflare.
+- **Rulesets** (chosen): TF-managed, diff-reviewable, identical secret + provider as the rest of this module.
+
+### Adding a new TLD redirect
+
+If a fourth TLD is later registered:
+
+1. Add its zone ID to `noorinalabs_<tld>_zone_id` in `variables.tf` and to `terraform.tfvars.example`.
+2. Add a `<tld> = var.noorinalabs_<tld>_zone_id` entry to `local.redirect_zones` in `redirects.tf`. The ruleset is `for_each`-driven, so no other change is needed.
+3. Wire the zone ID into the CI repo variables (`vars.CLOUDFLARE_NOORINALABS_<TLD>_ZONE_ID`) and the corresponding `TF_VAR_*` env in `.github/workflows/terraform.yml` (plan-cloudflare + apply-cloudflare jobs).
 
 ## Prod vs stg proxy posture
 

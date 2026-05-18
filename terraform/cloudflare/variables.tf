@@ -9,6 +9,21 @@ variable "cloudflare_zone_id" {
   type        = string
 }
 
+# Defensive-TLD zone IDs — `.net` and `.org` are dark zones owned for
+# squatter prevention. They carry no productive DNS records; the only
+# Cloudflare-managed configuration is the canonical-domain 301 redirect
+# ruleset defined in redirects.tf. Zone IDs are public-DNS metadata, not
+# secrets — sourced from the Cloudflare dashboard (Overview → Zone ID).
+variable "noorinalabs_net_zone_id" {
+  description = "Cloudflare Zone ID for noorinalabs.net (canonical-domain redirect target zone)."
+  type        = string
+}
+
+variable "noorinalabs_org_zone_id" {
+  description = "Cloudflare Zone ID for noorinalabs.org (canonical-domain redirect target zone)."
+  type        = string
+}
+
 variable "domain" {
   description = "Root domain name."
   type        = string
