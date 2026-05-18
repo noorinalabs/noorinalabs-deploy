@@ -261,6 +261,97 @@ The module configures two lifecycle rules:
 downstream stages are rebuildable from `raw/` via `/ontology-librarian
 pipeline reset levels`.
 
+## Rotating the state-bucket key (CI + workstation)
+
+Follow this sequence when you need to rotate the `noorinalabs-terraform-state` B2
+application key (e.g., after a key disable/expire, or on scheduled cadence).
+
+### Step 1 — Mint a new state-bucket key
+
+From the [B2 console → App Keys](https://secure.backblaze.com/app_keys.htm), create a
+new key with the same settings as described in
+[Provisioning the state-bucket key](#provisioning-the-state-bucket-key) above.
+Record `keyID` and `applicationKey` in your password manager before navigating away.
+
+Capture into shell variables (not exported yet — reduces history exposure):
+
+```bash
+NEW_KEY_ID=<keyID>
+NEW_APP_KEY=<applicationKey>
+```
+
+### Step 2 — Rotate GH Actions secrets
+
+The CI workflow `.github/workflows/terraform.yml` reads these two repo secrets:
+
+| GH Secret | Role |
+|---|---|
+| `TF_STATE_B2_KEY_ID` | `AWS_ACCESS_KEY_ID` → S3 backend auth |
+| `TF_STATE_B2_APP_KEY` | `AWS_SECRET_ACCESS_KEY` → S3 backend auth |
+
+Push the new values using stdin (`--body -` keeps secrets out of shell history):
+
+```bash
+echo "$NEW_KEY_ID"  | gh secret set TF_STATE_B2_KEY_ID  --repo noorinalabs/noorinalabs-deploy --body -
+echo "$NEW_APP_KEY" | gh secret set TF_STATE_B2_APP_KEY --repo noorinalabs/noorinalabs-deploy --body -
+```
+
+> **Per-environment scoping (future):** once #158 lands and `TF_STATE_B2_*` moves into
+> GH Environments, add `--env staging` and `--env production` flags and rotate both
+> atomically before proceeding.
+
+### Step 3 — Update your workstation shell
+
+Export the new values for any local `terraform plan/apply` runs in this session:
+
+```bash
+export AWS_ACCESS_KEY_ID=$NEW_KEY_ID
+export AWS_SECRET_ACCESS_KEY=$NEW_APP_KEY
+```
+
+Verify locally:
+
+```bash
+terraform -chdir=terraform/hetzner/envs/stg plan -input=false
+```
+
+A clean plan (no 403 / `SignatureDoesNotMatch`) confirms the state-bucket key is valid.
+
+### Step 4 — Re-trigger in-flight Terraform PRs
+
+Any open PR that ran a failed plan with the old key must be re-triggered. Pick one:
+
+```bash
+# Option A — re-run the failed run directly
+gh run rerun <run-id> --repo noorinalabs/noorinalabs-deploy
+
+# Option B — empty commit on the PR branch
+git commit --allow-empty -m "ci: re-trigger after B2 cred rotation"
+git push
+
+# Option C — manual workflow dispatch
+gh workflow run terraform.yml --ref <branch> --repo noorinalabs/noorinalabs-deploy
+```
+
+### Step 5 — Verify CI green, then disable the old key
+
+**Do not disable the old B2 key until at least one full Terraform CI run (fmt →
+validate → plan stg → plan prod) completes green with the new key.** An in-flight
+workflow that started before the GH secret update may still hold a reference to the
+old key; disabling prematurely races that run and leaves the rotation half-applied.
+
+Once CI is green:
+
+1. Return to [B2 console → App Keys](https://secure.backblaze.com/app_keys.htm).
+2. Locate the old `noorinalabs-tfstate-{operator-handle}` key.
+3. Click **Delete**. (B2 has no "disable" state for application keys — delete is final.)
+
+### Cross-references
+
+- deploy#158 — future CI `validate-creds` self-check that catches rotation drift between envs
+- deploy#180 — ADR on state-bucket key model and rotation cadence
+- deploy#93 — workstation-side runbook (closed by PR #177)
+
 ## Local development
 
 See `../../compose/docker-compose.minio.yml` for a MinIO-backed alternative
