@@ -21,6 +21,16 @@ REPO_URL="https://github.com/noorinalabs/noorinalabs-deploy.git"
 INSTALL_DIR="/opt/noorinalabs-deploy"
 DEPLOY_USER="deploy"
 
+# Auxiliary repo directories pre-provisioned under /opt/ (see Step 4.5).
+# Hoisted from Step 4.5 to module scope so the safe.directory loop in Step 3.5
+# can reference the same list — keeping AUX_REPOS as the single source of truth
+# for "directories root should be allowed to git-operate on after deploy
+# takes ownership."
+AUX_REPOS=(
+  "noorinalabs-isnad-graph"
+  "noorinalabs-design-system"
+)
+
 echo "============================================="
 echo "  Noorina Labs VPS bootstrap"
 echo "============================================="
@@ -120,6 +130,20 @@ else
   echo "    You'll need to manually add your public key to $DEPLOY_AUTH_KEYS"
 fi
 
+# ── Step 3.5: git safe.directory exceptions ────────────────────────────────
+# Allow root to operate on repos owned by the deploy user (git 2.35+
+# CVE-2022-24765 mitigation). Step 4's `git fetch && git reset --hard` runs
+# as root inside $INSTALL_DIR, which gets chowned to $DEPLOY_USER at the end
+# of Step 4 on first-run; every subsequent re-run hits the ownership-mismatch
+# refusal without these exceptions. Aux-repo dirs are listed too because the
+# same hazard applies if/when bootstrap evolves to git-operate on them. See
+# deploy#113. Runs after Step 1 (git installed) and before Step 4 (first git
+# call) — the `${AUX_REPOS[@]/#//opt/}` form prefixes each entry with /opt/.
+echo "==> [3.5/7] Adding git safe.directory exceptions..."
+for dir in "$INSTALL_DIR" "${AUX_REPOS[@]/#//opt/}"; do
+  git config --global --add safe.directory "$dir"
+done
+
 # ── Step 4: Clone the repository ────────────────────────────────────────────
 echo "==> [4/7] Cloning repository to $INSTALL_DIR..."
 if [ -d "$INSTALL_DIR/.git" ]; then
@@ -134,13 +158,11 @@ chown -R $DEPLOY_USER:$DEPLOY_USER "$INSTALL_DIR"
 # /opt/ is root-owned by default, so the deploy user can't `git clone` into it
 # without these dirs existing first with the right ownership. The deploy
 # workflow (.github/workflows/deploy-isnad-graph.yml) clone-or-pulls into each
-# of these. To add a new repo to the deploy pipeline: append it to AUX_REPOS,
-# re-run this bootstrap script (idempotent), done. See deploy#108 for context.
+# of these. To add a new repo to the deploy pipeline: append it to AUX_REPOS
+# (declared at the top of this script alongside INSTALL_DIR — that placement
+# also feeds the safe.directory loop), re-run this bootstrap script
+# (idempotent), done. See deploy#108 for context.
 echo "==> [4.5/7] Pre-provisioning auxiliary repo directories under /opt/..."
-AUX_REPOS=(
-  "noorinalabs-isnad-graph"
-  "noorinalabs-design-system"
-)
 for repo in "${AUX_REPOS[@]}"; do
   dir="/opt/$repo"
   if [ ! -d "$dir" ]; then
