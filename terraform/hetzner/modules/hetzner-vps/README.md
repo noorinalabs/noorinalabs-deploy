@@ -1,6 +1,6 @@
 # `modules/hetzner-vps` — Shared Hetzner VPS module
 
-Provisions one Hetzner Cloud VPS plus its firewall and SSH key, bootstrapped with cloud-init. Consumed by per-env root modules under `terraform/hetzner/envs/{stg,prod}/`.
+Provisions one Hetzner Cloud VPS plus its firewall, bootstrapped with cloud-init. Consumed by per-env root modules under `terraform/hetzner/envs/{stg,prod}/`.
 
 This module is **intentionally backend-less**. Backend configuration lives in each env root module so state is isolated per env — see ADR `docs/adr/0001-tf-hetzner-per-env-state-strategy.md`.
 
@@ -10,7 +10,8 @@ This module is **intentionally backend-less**. Backend configuration lives in ea
 |---|---|
 | `hcloud_server.app` | `noorinalabs-${var.env}` |
 | `hcloud_firewall.web` | `noorinalabs-${var.env}-firewall` |
-| `hcloud_ssh_key.deploy` | `noorinalabs-${var.env}-deploy` |
+
+SSH authorized keys (`/root/.ssh/authorized_keys` and `/home/deploy/.ssh/authorized_keys`) are injected via `cloud-init.yaml.tpl`; there is no `hcloud_ssh_key` resource.
 
 All resources carry labels `{ project = "noorinalabs", environment = var.env }`.
 
