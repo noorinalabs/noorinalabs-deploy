@@ -93,6 +93,18 @@ write_files:
   # write_files module runs before users, hits OSError('Unknown user "deploy"'),
   # aborts the entire write_files stage, and silently drops the remaining
   # entries (this file, .env.user-service, .cloud-init-provisioned). See #173 gap B.
+  #
+  # Conditional skip (deploy#28): when ghcr_auth_b64 is empty, omit this
+  # write_files entry entirely rather than writing an empty `"auth": ""`
+  # blob. An empty auth blob silently breaks `docker pull ghcr.io/...` for
+  # private images on first boot (per ontology/repos/deploy.yaml line 159,
+  # all app services are GHCR-only with no local-build fallback). Skipping
+  # the file means docker pull fails LOUDLY with "no basic auth credentials"
+  # instead of half-succeeding with a broken config — the operator sees the
+  # missing-credential error and supplies the value, rather than chasing a
+  # silently-misconfigured deploy. Public-only deploys (rare, e.g. infra-only
+  # bring-up before app images publish) work fine without the file present.
+%{ if ghcr_auth_b64 != "" ~}
   - path: /home/deploy/.docker/config.json
     owner: deploy:deploy
     permissions: '0600'
@@ -105,6 +117,7 @@ write_files:
           }
         }
       }
+%{ endif ~}
 
   # ---------------------------------------------------------------------------
   # User-service environment file
