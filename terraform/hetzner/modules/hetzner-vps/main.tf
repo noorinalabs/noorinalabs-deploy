@@ -11,6 +11,7 @@ locals {
 # pubkey hit `uniqueness_error 409`. cloud-init's user_data is now the sole
 # path for injecting authorized_keys (writes both /home/deploy/.ssh/authorized_keys
 # and /root/.ssh/authorized_keys with var.ssh_public_key_path content).
+# See docs/adr/0003-ssh-key-authorization-via-cloud-init.md for rationale.
 
 resource "hcloud_firewall" "web" {
   name   = "${local.name_prefix}-firewall"
@@ -73,6 +74,8 @@ resource "hcloud_server" "app" {
   # servers. If a template change represents a baseline shift that must reach
   # live boxes (e.g., new SSH key, new auditd rule), use the taint/replace
   # procedure documented in docs/runbooks/cloud-init-template-changes.md.
+  # See docs/adr/0003-ssh-key-authorization-via-cloud-init.md for the
+  # ssh_keys/user_data ignore_changes rationale.
   lifecycle {
     ignore_changes = [ssh_keys, user_data]
   }
