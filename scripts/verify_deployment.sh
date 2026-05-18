@@ -350,6 +350,119 @@ if [ -n "$ROLLBACK_TAG" ]; then
   fi
 fi
 
+# ---------- 11. Routing Carve-outs (deploy#135) ----------
+
+# Caddy evaluates `handle` blocks in source order; first match wins. Any
+# path-prefix carve-out that should land on a different upstream than its
+# catch-all parent MUST appear as an earlier `handle` block. This section
+# exercises one representative path per known carve-out on $SITE_URL and
+# asserts the response shape (status code + body content-type) is
+# consistent with the intended upstream. It would have caught the deploy#133
+# regression where `/auth/callback/*` matched `/auth/*` and hit user-service
+# (JSON 404) instead of the frontend (React AuthCallbackPage HTML).
+#
+# Carve-out → expected-upstream map (mirrors caddy/Caddyfile `isnad.*` block):
+#   /auth/callback/*      → frontend       (HTML, 200/404)
+#   /auth/oauth/*/login   → user-service   (JSON, 302/401/404 — NOT HTML)
+#   /api/v1/health        → isnad-graph    (JSON, 200/401/404)
+#   /api/v1/narrators     → isnad-graph    (JSON, 200/401/403)
+#   /api/v1/users         → user-service   (JSON, 401/405 — carve-out from /api/*)
+#   /.well-known/jwks.json → user-service  (JSON, 200)
+
+section "Routing Carve-outs"
+
+# Fetch headers + body in one shot per probe; check status code AND
+# content-type. Body sniff is a defense-in-depth check for the case where
+# both upstreams return the "right" status code but for the wrong reason.
+probe() {
+  local path="$1"
+  local expected_codes="$2"   # space-separated, e.g. "200 404"
+  local expected_kind="$3"    # "html" or "json"
+  local label="$4"
+
+  local url="${SITE_URL}${path}"
+  local body_file headers_file
+  body_file=$(mktemp)
+  headers_file=$(mktemp)
+  local code
+  code=$(curl -s -o "$body_file" -D "$headers_file" -w "%{http_code}" --max-time "$TIMEOUT" "$url" 2>/dev/null || echo "000")
+  local ct
+  ct=$(grep -i '^content-type:' "$headers_file" 2>/dev/null | head -1 | cut -d: -f2- | xargs || echo "")
+
+  local code_ok=false
+  for ec in $expected_codes; do
+    if [ "$code" = "$ec" ]; then
+      code_ok=true
+      break
+    fi
+  done
+
+  if [ "$code_ok" = "false" ]; then
+    fail "$label: $path returned HTTP $code (expected one of: $expected_codes) — possible carve-out shadowing"
+    rm -f "$body_file" "$headers_file"
+    return
+  fi
+
+  # Body-shape assertion: HTML carve-out must NOT return JSON; JSON
+  # carve-out must NOT return HTML. The error mode this defends against
+  # is a misordered handle block routing to the wrong upstream that
+  # happens to return the expected status code.
+  case "$expected_kind" in
+    html)
+      if echo "$ct" | grep -qi 'application/json'; then
+        fail "$label: $path returned JSON content-type ($ct) but should hit frontend (HTML) — carve-out likely shadowed by an earlier catch-all"
+      elif head -c 200 "$body_file" | grep -qi '"detail"\|"message"\|"status_code"'; then
+        # FastAPI/Starlette/user-service JSON error shape leaking through
+        fail "$label: $path body looks like JSON error shape but expected HTML — likely hitting user-service instead of frontend"
+      else
+        pass "$label: $path → HTTP $code, content-type=${ct:-unset} (frontend-shaped)"
+      fi
+      ;;
+    json)
+      if echo "$ct" | grep -qi 'text/html'; then
+        fail "$label: $path returned HTML content-type ($ct) but should hit an API upstream (JSON) — carve-out likely shadowed by frontend default"
+      else
+        pass "$label: $path → HTTP $code, content-type=${ct:-unset} (API-shaped)"
+      fi
+      ;;
+  esac
+  rm -f "$body_file" "$headers_file"
+}
+
+# Frontend carve-out from /auth/* catch-all. The probe path is intentionally
+# non-existent on the React SPA so we don't depend on a real OAuth state;
+# the React app serves index.html for any unmatched path, so 200 with HTML
+# is the success shape (the SPA renders an error route client-side).
+probe "/auth/callback/verify-shape-probe" "200 404" "html" "frontend /auth/callback/*"
+
+# user-service /auth/* catch-all (no carve-out). Hitting the OAuth login
+# initiator without a configured provider should give a 302 (redirect to
+# provider), 401 (unauthenticated), 404 (provider not configured in this
+# env), or 400 (validation). All four are valid "user-service answered"
+# shapes; HTML response would indicate the request fell through to the
+# frontend default handler.
+probe "/auth/oauth/google/login" "200 302 400 401 404" "json" "user-service /auth/oauth/*/login"
+
+# isnad-graph /api/v1/health — carve-out from /api/* (api:8000 — same
+# upstream, but exercises the /api/* block, distinct from the top-level
+# /health block tested in §3).
+probe "/api/v1/health" "200 401 404" "json" "isnad-graph /api/v1/health"
+
+# isnad-graph /api/v1/narrators — covered by §5 but classified here too
+# under the carve-out lens.
+probe "/api/v1/narrators" "200 401 403" "json" "isnad-graph /api/v1/narrators"
+
+# user-service /api/v1/users — carve-out from the /api/* catch-all (which
+# would otherwise send it to isnad-graph). 401/405 are valid auth-required
+# shapes from user-service; HTML or 501 would indicate a routing
+# regression (501 is isnad-graph's "delegated to user-service via Caddy"
+# response per ontology/repos/isnad-graph.yaml:72).
+probe "/api/v1/users" "401 403 405" "json" "user-service /api/v1/users (carve-out)"
+
+# user-service JWKS endpoint — well-known IETF path, carve-out from any
+# parent prefix. Should always be 200 with JSON keys array.
+probe "/.well-known/jwks.json" "200" "json" "user-service /.well-known/jwks.json"
+
 # ---------- Summary ----------
 
 section "Summary"

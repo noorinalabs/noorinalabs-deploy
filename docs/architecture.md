@@ -240,6 +240,31 @@ All responses include:
 
 Caddy automatically obtains and renews certificates via ACME (Let's Encrypt).
 
+### Routing invariant: longer-prefix-first ordering
+
+Caddy evaluates `handle` blocks **in source order**; the first match wins. This means any path-prefix carve-out that should go to a different upstream than its catch-all parent MUST appear as an earlier `handle` block than the catch-all. **Adding a new top-level path on any upstream service requires reviewing this Caddyfile.**
+
+Concrete example from `caddy/Caddyfile` (the `isnad.{$BASE_DOMAIN}` block):
+
+```
+handle /auth/callback/* {        # carve-out — frontend (React AuthCallbackPage)
+    reverse_proxy frontend:80
+}
+handle /auth/* {                 # catch-all — user-service auth API
+    reverse_proxy user-service:8000
+}
+```
+
+If the two blocks are swapped, `/auth/callback/google` matches `/auth/*` first and hits user-service, which returns a JSON 404 — the user's browser receives JSON instead of the React callback page. This is the failure mode that broke prod Google login on 2026-04-19 (see deploy#133, #134). The same shape applies to every other carve-out in the Caddyfile (`/api/v1/users*`, `/api/v1/sessions*`, etc., must precede `/api/*`; `/health` and `/status` precede the default `handle`; etc.).
+
+**When adding a new route on an upstream service:**
+
+1. Check whether the new path overlaps any existing `handle` block prefix in `caddy/Caddyfile`.
+2. If it would be shadowed by an earlier catch-all, add it as an earlier `handle` block.
+3. Run `scripts/verify_deployment.sh` against the target environment after deploy — §11 ("Routing carve-outs") exercises the known boundaries.
+
+A per-PR Caddyfile order-lint that detects longer-prefix `handle` blocks placed AFTER their shorter-prefix parents is tracked as a follow-up (see deploy#135 part 3).
+
 ## Post-Deployment Verification
 
 The `verify-deploy.yml` workflow runs automatically after a successful deploy (via `workflow_run` trigger on `Deploy to staging` and `Deploy to production`) and can also be triggered manually with a `target` input (`stg` or `prod`).
