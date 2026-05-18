@@ -35,4 +35,5 @@ Thumbs.db
 .vscode/
 .idea/
 
+.claude/.consulted/
 .claude/.librarian-consulted/
