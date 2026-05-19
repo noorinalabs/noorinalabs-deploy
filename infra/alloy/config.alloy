@@ -1,0 +1,89 @@
+// Grafana Alloy log-shipper config — migrated from infra/promtail/promtail-config.yml (deploy#132).
+// Scope: Docker SD + JSON pipeline + Loki push. Trace/metric shipping is out of scope
+// for this migration (separate follow-up per #132).
+
+// Discover running containers on the local Docker daemon. Pairs with the
+// docker.sock volume mount in compose/docker-compose.prod.yml.
+discovery.docker "containers" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "5s"
+}
+
+// Promtail relabel_configs ported one-to-one. Order preserved so existing
+// queries keying off `container`, `service`, `project` labels keep working
+// without dashboard edits.
+discovery.relabel "containers" {
+	targets = discovery.docker.containers.targets
+
+	// Container name — strip the leading "/" Docker prefixes.
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+
+	// Compose service name.
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service"
+	}
+
+	// Compose project name.
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		target_label  = "project"
+	}
+}
+
+// Read container stdout/stderr via the Docker engine API and forward into
+// the processing pipeline. Replaces promtail's `docker` job_name + scrape loop.
+loki.source.docker "containers" {
+	host       = "unix:///var/run/docker.sock"
+	targets    = discovery.relabel.containers.output
+	forward_to = [loki.process.default.receiver]
+}
+
+// JSON pipeline + level/logger labels + drop-on-empty-level. Same effect as
+// promtail's pipeline_stages list; Alloy uses block-per-stage in River syntax
+// rather than promtail's YAML list.
+loki.process "default" {
+	// Try to parse our structured-logging JSON shape. Non-JSON log lines fall
+	// through untouched; extracted vars default to "" when keys are absent.
+	stage.json {
+		expressions = {
+			level      = "level",
+			logger     = "logger",
+			request_id = "request_id",
+		}
+	}
+
+	// Promote level + logger to Loki labels (request_id stays extracted-only —
+	// high-cardinality, queried as a JSON field via LogQL, not a label).
+	stage.labels {
+		values = {
+			level  = "",
+			logger = "",
+		}
+	}
+
+	// Non-JSON lines have level="" after the json stage; drop the empty label
+	// pair so they don't collide with the JSON-line label set.
+	stage.match {
+		selector = "{level=\"\"}"
+
+		stage.label_drop {
+			values = ["level", "logger"]
+		}
+	}
+
+	forward_to = [loki.write.default.receiver]
+}
+
+// Push to local Loki. Endpoint URL + service name match the existing promtail
+// `clients[].url` and Loki service-name in compose. Wire format is unchanged;
+// Loki 2.9.10 stays put per the migration plan.
+loki.write "default" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

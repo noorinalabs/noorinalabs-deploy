@@ -649,21 +649,28 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  promtail:
-    # 3.x bundles a Docker API client compatible with Docker 26+ daemons (API 1.44).
-    # 2.9.10 shipped a 1.42 client which can't enumerate containers on the prod
-    # VPS — see #128. Push API stays compatible with Loki 2.9.x; no Loki bump needed.
-    image: grafana/promtail:3.4.1
+  alloy:
+    # Successor to promtail (deploy#132). Alloy ships a base image with /bin/sh +
+    # wget, so the HTTP healthcheck disabled for promtail in #128 is re-enabled
+    # here. River config in infra/alloy/config.alloy ports the promtail Docker SD
+    # + JSON pipeline 1:1; loki.write is wire-compatible with Loki 2.9.10 (no
+    # Loki bump needed). Image is multi-arch pinned by digest — resolved against
+    # the OCI image-index at registry.docker.io on 2026-05-18.
+    image: grafana/alloy:v1.16.1@sha256:51aeb9d829239345070619dad3edd6873186f913c84f45b365b74574fcb38ec0
     volumes:
-      - ../infra/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - ../infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
     command:
-      - "-config.file=/etc/promtail/config.yml"
-    # Healthcheck removed — promtail's distroless image has no wget/curl/nc, so
-    # any HTTP-probe healthcheck fails permanently (888-deep failing streak observed
-    # pre-fix). Liveness signal is restart-policy + Prometheus alerting on log-rate
-    # drop. Long-term: migrate to grafana/alloy (richer base image). See #128.
+      - "run"
+      - "/etc/alloy/config.alloy"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:12345/-/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
       loki:
         condition: service_healthy

@@ -35,14 +35,16 @@ scrape_configs:
     static_configs:
       - targets: ["user-postgres-exporter:9187"]
 
-  # Promtail self-metrics scrape (deploy#131). The promtail container exposes
-  # its own metrics on :9080 (server.http_listen_port in promtail-config.yml).
-  # The companion `promtail_log_ingestion_drop` alert in alerts.yml fires when
-  # `rate(promtail_sent_entries_total[5m]) == 0` — the documented backstop
-  # for the healthcheck removed in deploy#130 (distroless image, no wget/curl/nc).
-  - job_name: "promtail"
+  # Alloy self-metrics scrape (originally added for promtail in deploy#131; migrated
+  # to alloy in deploy#132). The alloy container exposes /metrics on :12345
+  # (--server.http.listen-addr in compose). The companion `AlloyLogIngestionStopped`
+  # alert in alerts.yml fires when `rate(loki_write_sent_entries_total[5m]) == 0` —
+  # the documented backstop preserved across the promtail→alloy migration. Alloy's
+  # base image ships wget so a container HTTP healthcheck is also enabled in compose,
+  # but the metric-rate alert is kept as defense-in-depth.
+  - job_name: "alloy"
     static_configs:
-      - targets: ["promtail:9080"]
+      - targets: ["alloy:12345"]
 
   # blackbox-exporter — continuous external probe of the same 6 prod
   # routes covered by the post-deploy smoke battery

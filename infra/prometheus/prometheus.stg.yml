@@ -32,11 +32,11 @@ scrape_configs:
     static_configs:
       - targets: ["user-postgres-exporter:9187"]
 
-  # Promtail self-metrics scrape (deploy#131). See prometheus.prod.yml for
-  # the alert companion details.
-  - job_name: "promtail"
+  # Alloy self-metrics scrape (originally promtail per deploy#131; migrated to
+  # alloy in deploy#132). See prometheus.prod.yml for the alert companion details.
+  - job_name: "alloy"
     static_configs:
-      - targets: ["promtail:9080"]
+      - targets: ["alloy:12345"]
 
   # blackbox-exporter — STAGING-ONLY targets (deploy#263 per-env split).
   #

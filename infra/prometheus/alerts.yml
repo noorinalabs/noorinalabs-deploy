@@ -341,57 +341,57 @@ groups:
             See the audit-log issue for the historical record.
           runbook: "docs/runbooks/break-glass.md#metric-stale-cleanup"
 
-  # Log-ingestion backstop (deploy#131). #130 removed promtail's healthcheck
-  # because the distroless promtail image lacks wget/curl/nc; the stated
-  # backstop was "restart-policy + Prometheus alerting on log-rate drop."
-  # The restart-policy half landed with #130; this group lands the alert
-  # half. Without it a silent promtail failure (OOM inside its restart loop,
-  # Docker SD breakage on a future daemon bump) goes undetected until an
-  # operator notices Loki has stopped receiving logs.
+  # Log-ingestion backstop. Originally added in deploy#131 for promtail; ported
+  # to grafana/alloy in deploy#132 (promtail → alloy migration). Alloy's base
+  # image ships wget so the container HTTP healthcheck disabled for promtail in
+  # #128/#130 is re-enabled in compose; this metric-rate alert remains as
+  # defense-in-depth — a healthy /-/ready response doesn't prove logs are
+  # actually flowing (Docker SD could be broken, loki.write could be dropping,
+  # the pipeline could be matching nothing).
   #
-  # `promtail_sent_entries_total` is exposed on promtail's :9080 metrics
-  # endpoint (server.http_listen_port in promtail-config.yml) and is
-  # incremented on every entry shipped to Loki. A 10-minute zero-rate
-  # window across all promtail instances indicates ingestion has stopped.
+  # `loki_write_sent_entries_total` is exposed on alloy's :12345 /metrics
+  # endpoint by the loki.write component and is incremented on every entry
+  # shipped to Loki. A 10-minute zero-rate window indicates ingestion has
+  # stopped. Replaces the promtail-era `promtail_sent_entries_total`.
   - name: log_ingestion
     rules:
-      - alert: PromtailLogIngestionStopped
+      - alert: AlloyLogIngestionStopped
         # 10-minute hold-down before alerting. Short enough to catch a
         # real outage well before the 7-day Loki retention starts mattering;
-        # long enough to ride out a normal compose restart (promtail's
-        # 30-60s startup window) or a brief Loki distributor blip.
+        # long enough to ride out a normal compose restart (alloy's startup
+        # window) or a brief Loki distributor blip.
         expr: |
-          rate(promtail_sent_entries_total[5m]) == 0
+          rate(loki_write_sent_entries_total[5m]) == 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Promtail log ingestion has stopped"
+          summary: "Alloy log ingestion has stopped"
           description: >-
-            Promtail has not shipped any log entries to Loki in the last
-            10 minutes (rate(promtail_sent_entries_total[5m]) == 0). Either
-            promtail is unhealthy (check `docker compose -p noorinalabs ps
-            promtail` and `docker compose -p noorinalabs logs --tail=50
-            promtail`) or no containers on this VPS are producing log
-            output (rare — usually means the docker_sd discovery broke).
-            Without ingestion, Loki has no logs for the affected window.
-          runbook: "docs/runbooks/log-ingestion.md#promtail-ingestion-stopped"
+            Alloy has not shipped any log entries to Loki in the last
+            10 minutes (rate(loki_write_sent_entries_total[5m]) == 0). Either
+            alloy is unhealthy (check `docker compose -p noorinalabs ps
+            alloy` and `docker compose -p noorinalabs logs --tail=50 alloy`)
+            or no containers on this VPS are producing log output (rare —
+            usually means the docker SD discovery broke). Without ingestion,
+            Loki has no logs for the affected window.
+          runbook: "docs/runbooks/log-ingestion.md#alloy-ingestion-stopped"
 
-      - alert: PromtailDown
+      - alert: AlloyDown
         # Companion to the rate-zero alert: catches the case where the
-        # promtail container is fully down (so the metric series itself
+        # alloy container is fully down (so the metric series itself
         # disappears, and the rate expression evaluates against an empty
-        # set). `up{job="promtail"}` is set by Prometheus's scrape-success
+        # set). `up{job="alloy"}` is set by Prometheus's scrape-success
         # bookkeeping and is 0 when the target is unreachable.
-        expr: up{job="promtail"} == 0
+        expr: up{job="alloy"} == 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Promtail target is unreachable"
+          summary: "Alloy target is unreachable"
           description: >-
-            Prometheus has been unable to scrape promtail's /metrics
-            endpoint on :9080 for >5m. This usually means the promtail
-            container is crashed or stuck in a restart loop. Without
-            promtail, no logs reach Loki.
-          runbook: "docs/runbooks/log-ingestion.md#promtail-down"
+            Prometheus has been unable to scrape alloy's /metrics endpoint
+            on :12345 for >5m. This usually means the alloy container is
+            crashed or stuck in a restart loop. Without alloy, no logs
+            reach Loki.
+          runbook: "docs/runbooks/log-ingestion.md#alloy-down"

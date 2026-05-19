@@ -168,7 +168,7 @@ away on the next `terraform apply`.
       enum so operators can roll just your new service. *Manual.*
 - [ ] **Add observability** — Prometheus scrape config in
       `infra/prometheus/`, Grafana dashboard in `infra/grafana/dashboards/`,
-      Loki labels via Promtail's existing docker_socket scrape (automatic).
+      Loki labels via Alloy's existing Docker SD scrape (automatic).
       Add an Alertmanager rule for the new service's SLO if applicable.
 - [ ] **Document the per-service runbook** at
       `docs/runbooks/deploy-<service>.md` following the
