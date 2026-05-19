@@ -137,15 +137,87 @@ jobs:
       # failure surfaces via the junit artifact above and via run-tests.sh
       # stdout in the job's run-log.
 
-      # Artifact consumed by deploy#179 (promote.yml gate). Schema v1:
-      # { "schema_version": 1,
+      # ── Schema v2 prep: resolve each service's stg-latest digest ─────
+      # Schema v2 (deploy#199) gates prod-promote on per-service digest
+      # equality between what verify-stg observed and what promote.yml's
+      # plan resolves. We snapshot each service's `stg-latest` manifest
+      # digest at verify-time so the gate has a fixed reference point to
+      # compare against. Without this, the gate falls back to the v1
+      # freshness window (a different service moving its stg-latest
+      # post-verify but pre-promote ships unverified bits — the T1 window
+      # documented in deploy#199).
+      #
+      # docker/login-action is required because GHCR rate-limits anonymous
+      # manifest-inspect requests on private repos. We use the workflow's
+      # GITHUB_TOKEN scoped via the existing `packages: read` permission
+      # the workflow already has implicitly (verify-deploy.yml does not
+      # set workflow-level permissions, so it inherits the default
+      # GITHUB_TOKEN scope which includes packages:read for the org).
+      - name: Log in to GHCR (for digest resolution)
+        if: always() && job.status == 'success'
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx (for digest resolution)
+        if: always() && job.status == 'success'
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Resolve per-service stg-latest digests
+        id: digests
+        if: always() && job.status == 'success'
+        run: |
+          set -euo pipefail
+          # Image mapping MUST stay in sync with promote.yml plan job's
+          # `mapping` dict. If a service is added/renamed, update BOTH.
+          # The cold-rebuild static-shape guard (#199) asserts both files
+          # cover the same 4 keys.
+          : > /tmp/service_digests.jsonl
+          for entry in \
+              "api:noorinalabs/noorinalabs-isnad-graph" \
+              "frontend:noorinalabs/noorinalabs-isnad-graph-frontend" \
+              "user-service:noorinalabs/noorinalabs-user-service" \
+              "landing:noorinalabs/noorinalabs-landing-page"; do
+            key="${entry%%:*}"
+            image="${entry#*:}"
+            full="ghcr.io/${image}"
+            digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$full:stg-latest" 2>/dev/null || echo "")
+            if [ -z "$digest" ]; then
+              echo "::warning::Could not resolve stg-latest digest for $full — emitting empty digest. Gate may fall back to v1 semantics for this service."
+            fi
+            printf '{"key":"%s","digest":"%s"}\n' "$key" "$digest" >> /tmp/service_digests.jsonl
+          done
+          echo "Resolved digests:"
+          cat /tmp/service_digests.jsonl
+
+      # Artifact consumed by deploy#179 / #199 (promote.yml gate).
+      # Schema v2 shape (current):
+      # { "schema_version": 2,
       #   "result": "success"|"failure",
       #   "commit_sha": "...",
+      #   "service_digests": {
+      #     "api":          "sha256:...",
+      #     "frontend":     "sha256:...",
+      #     "user-service": "sha256:...",
+      #     "landing":      "sha256:..."
+      #   },
       #   "timestamp": "...",
       #   "run_id": "..." }
+      #
+      # v1 (legacy, consumed by gate via fallback path) had no
+      # `service_digests` field. promote.yml's gate accepts both
+      # schemas — v2 enables strict per-service equality, v1 falls
+      # back to the freshness-window heuristic.
+      #
+      # `service_digests` is omitted when result != "success" — the
+      # gate hard-blocks on failure result anyway, so emitting partial
+      # digests on a failed verify would be misleading (digests resolved
+      # post-failure don't represent what was actually verified).
+      #
       # Filename includes run_id so promote.yml can validate freshness.
-      # `schema_version` lets future #179 consumers do graceful evolution
-      # (deploy#181 review, Nurul).
+      # `schema_version` lets #199 consumers do graceful evolution.
       - name: Emit verify-stg-result artifact
         if: always()
         run: |
@@ -164,8 +236,37 @@ jobs:
           fi
           TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           OUT="stg-verify-result-${{ github.run_id }}.json"
-          printf '{"schema_version":1,"result":"%s","commit_sha":"%s","timestamp":"%s","run_id":"%s"}\n' \
-            "$RESULT" "$COMMIT_SHA" "$TS" "${{ github.run_id }}" > "$OUT"
+
+          # Build service_digests object from the jsonl (only if verify
+          # succeeded — digest-resolution step is gated on success too).
+          if [ "$RESULT" = "success" ] && [ -f /tmp/service_digests.jsonl ]; then
+            DIGESTS_JSON=$(python3 -c "
+          import json, sys
+          out = {}
+          for line in open('/tmp/service_digests.jsonl'):
+              line = line.strip()
+              if not line:
+                  continue
+              row = json.loads(line)
+              out[row['key']] = row['digest']
+          print(json.dumps(out))
+          ")
+          else
+            DIGESTS_JSON="{}"
+          fi
+
+          python3 - <<PY > "$OUT"
+          import json
+          payload = {
+              "schema_version": 2,
+              "result": "$RESULT",
+              "commit_sha": "$COMMIT_SHA",
+              "service_digests": json.loads('''$DIGESTS_JSON'''),
+              "timestamp": "$TS",
+              "run_id": "${{ github.run_id }}",
+          }
+          print(json.dumps(payload))
+          PY
           echo "Wrote $OUT:"
           cat "$OUT"
 

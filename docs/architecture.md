@@ -291,8 +291,46 @@ resolution). Validates auth flow, RBAC, subscriptions, sessions, 2FA,
 verification flow, network isolation, and performance baselines.
 
 Failure semantics: blocking gate. Emits a `stg-verify-result-{run_id}.json`
-artifact (schema: `{result, commit_sha, timestamp, run_id}`) consumed by
-`promote.yml`'s prod-promote gate (deploy#179, follow-up).
+artifact consumed by `promote.yml`'s prod-promote gate (deploy#179
+introduced the v1 gate; deploy#199 added v2 per-service-digest equality).
+
+**Schema v2 (current, deploy#199):**
+
+```json
+{
+  "schema_version": 2,
+  "result": "success" | "failure",
+  "commit_sha": "<deploy-repo HEAD at verify-time>",
+  "service_digests": {
+    "api":          "sha256:...",
+    "frontend":     "sha256:...",
+    "user-service": "sha256:...",
+    "landing":      "sha256:..."
+  },
+  "timestamp": "<ISO 8601 UTC>",
+  "run_id": "<gh actions run id>"
+}
+```
+
+`service_digests` is the snapshot of each service's GHCR `stg-latest`
+manifest digest at verify-time. `promote.yml`'s gate then compares
+each plan-resolved digest against `service_digests[<service>]`. Any
+divergence FAILS the gate with a per-service diff — that's a service
+whose `stg-latest` pointer moved between verify-stg capture and the
+promote run, which means promotion would ship unverified bits (the
+T1-window risk #199 closed).
+
+**Schema v1 (legacy, accepted via fallback path):** omits
+`service_digests`; gate falls back to the freshness-window heuristic
+("latest stg-verify succeeded within `stg_verify_max_age_hours`,
+default 24h") with a warning annotation pointing operators at #199.
+The fallback path is unreachable once every stg deploy has rolled
+through a #199-shipping commit.
+
+`service_digests` is omitted (rendered as `{}`) when `result != "success"` —
+the gate hard-blocks on failed verifies anyway, and emitting partial
+digests post-failure would be misleading (they don't represent what was
+actually verified).
 
 > Limitation: today's stg verify validates "the code on the wave branch
 > passes integration", not "the bits actually running on the stg VPS pass
