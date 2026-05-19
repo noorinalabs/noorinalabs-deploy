@@ -901,6 +901,65 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  kafka-exporter:
+    # Prometheus exporter for Kafka broker + consumer-group metrics (deploy#88).
+    # Scrapes the broker over the backend network on kafka:9092 (plaintext, internal
+    # listener); exposes a Prometheus /metrics endpoint on :9308. Not exposed to the
+    # host or frontend — Prometheus reaches it over the docker `backend` network.
+    #
+    # Image: danielqsj/kafka-exporter is the de-facto open-source kafka exporter
+    # (battle-tested, multi-arch, tracks broker 3.x). v1.9.0 is upstream-latest
+    # (2025-02-17). Multi-arch index digest pinned (matches the alloy precedent
+    # in this same file — resolved against registry.docker.io via the OCI image-
+    # index endpoint on 2026-05-19). Pinning the index digest lets docker pull
+    # the right per-arch child blob automatically.
+    #
+    # depends_on the broker's healthcheck so the exporter only starts once kafka
+    # is accepting connections — avoids a noisy 30s of "connection refused"
+    # restart-loops at compose-up time.
+    #
+    # Consumer-group metrics (`kafka_consumergroup_*`) populate only when real
+    # consumers are running. Until ingest-platform consumer workers are deployed,
+    # the broker/topic/partition gauges still populate (so the dashboard ISR
+    # and partition panels are immediately useful) and the consumer-lag panel
+    # renders empty-state — acceptable and tracked as a W12 follow-up.
+    image: danielqsj/kafka-exporter:v1.9.0@sha256:4150e46b2e9697ac30e4be8de03ec1704b4bdc7037577b83b8d35a32be298c16
+    command:
+      - "--kafka.server=kafka:9092"
+      - "--web.listen-address=:9308"
+    expose:
+      - "9308"
+    healthcheck:
+      # Base image is quay.io/prometheus/busybox — wget is available as a
+      # busybox applet (verified against v1.9.0 Dockerfile, 2026-05-19). The
+      # /metrics endpoint responds 200 even with zero consumer groups (empty
+      # body still parses), so this gate fires positive as soon as the
+      # exporter has dialed the broker and started serving.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9308/metrics || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+        reservations:
+          memory: 32M
+          cpus: "0.05"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   kafka-ui:
     # Admin console for Kafka. Bound to loopback on the VPS — operators reach it
     # via SSH tunnel (ssh -L 8085:127.0.0.1:8085 deploy@vps). Basic auth required.

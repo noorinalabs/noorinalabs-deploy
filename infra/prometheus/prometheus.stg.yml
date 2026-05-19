@@ -32,6 +32,16 @@ scrape_configs:
     static_configs:
       - targets: ["user-postgres-exporter:9187"]
 
+  # kafka-exporter — pipeline broker metrics (deploy#88). See prometheus.prod.yml
+  # for series rationale. Stg currently has no consumers running and the kafka
+  # broker itself runs in stg via the same compose stack — when the broker is up
+  # in stg the exporter scrapes normally; when stg is torn down the
+  # KafkaBrokerDown alert fires with the `env=stg` external label, routing to
+  # #stg-alerts (alertmanager.stg.yml).
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
   # Alloy self-metrics scrape (originally promtail per deploy#131; migrated to
   # alloy in deploy#132). See prometheus.prod.yml for the alert companion details.
   - job_name: "alloy"

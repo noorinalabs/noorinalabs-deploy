@@ -83,8 +83,23 @@ docker run --rm bitnamilegacy/kafka:3.8.0 kafka-storage.sh random-uuid
 
 Store the output in the production `.env` file alongside the other secrets.
 
+## Observability
+
+Prometheus scraping is wired via the `kafka-exporter` sidecar (`compose/docker-compose.prod.yml`) on the `backend` network. The exporter exposes `/metrics` on `:9308`; the `kafka` scrape job in both `infra/prometheus/prometheus.{prod,stg}.yml` collects:
+
+- Broker liveness (`up{job="kafka"}`, `kafka_brokers`) → drives `KafkaBrokerDown` (critical, 1m)
+- Per-topic partition/ISR gauges → `kafka_topic_partitions`, `kafka_topic_partition_in_sync_replica`
+- Per-topic producer rate (derived) → `rate(kafka_topic_partition_current_offset[5m])`
+- Per-consumer-group offset/lag → `kafka_consumergroup_current_offset`, `kafka_consumergroup_lag` → drives `KafkaConsumerGroupLagHigh` (warning, 10k for 10m)
+- DLQ growth → `KafkaDLQGrowing` (warning, growth-rate>0 for 15m)
+
+Grafana dashboard: `infra/grafana/dashboards/kafka-pipeline.json` (uid `kafka-pipeline`).
+
+Consumer-group metrics populate only when ingest-platform consumer workers are running — the dashboard panels for consumer rate/lag render empty-state until then, and that is intentional. Broker/topic/partition gauges are useful immediately.
+
 ## Follow-ups
 
-- **JMX / Prometheus scraping:** not wired in this PR. When consumers land (`#107`), add a `kafka-exporter` sidecar and a `kafka` scrape job to `infra/prometheus/prometheus.yml`. Tracked as part of the observability polish pass.
+- **JMX scraping:** not wired. The kafka-exporter sidecar covers the broker/topic/consumer-group surface for current pipeline needs; JMX-direct path is heavier and only worth the complexity if a future enrichment workload needs JVM-internal GC/heap visibility. Defer until kafka-exporter proves insufficient.
+- **Consumer-lag empty-state validation pass:** when ingest-platform consumer workers (`pipeline.<stage>.<variant>` groups) are deployed, run a one-time validation that the Consumer Lag / Consumer Rate panels populate end-to-end. Tracked separately — see the W12 tracker filed alongside deploy#88.
 - **Multi-broker / replication-factor > 1:** single-broker is acceptable for the ingest pipeline (stateless reprocessing from B2 is always possible). A move to 3-broker is a Phase 3 concern.
 - **Schema registry:** the pointer payload is stable and small enough that a registry is overkill today. Revisit if a new producer joins.
