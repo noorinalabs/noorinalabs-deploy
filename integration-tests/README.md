@@ -81,6 +81,22 @@ Remote mode:
   (so RBAC / sessions / 2FA / subscription flows can run remotely too)
   are downstream follow-up work — see deploy#178 body.
 
+### Two-layer prod-environment guard
+
+The `RUN_MODE=remote` + `ENVIRONMENT in {prod, production}` refusal is
+enforced at **two layers** to cover the case where pytest is invoked
+directly (interactive debugging inside the runner image, future workflows
+that skip `run-tests.sh`, `python -m pytest`, etc.):
+
+| Layer | Where | When it fires | How it aborts |
+|------|------|------|------|
+| Shell | `run-tests.sh` lines ~46-56 | Before pytest starts via the documented entrypoint | `exit 3` |
+| Python | `tests/conftest.py` module-load | At pytest collection time, regardless of invocation path | `RuntimeError` raised before any fixture or test runs |
+
+Both layers check the same predicate (`RUN_MODE=remote` AND
+`ENVIRONMENT in {prod, production}`). If you change one, change the
+other — they are intentionally coupled. See deploy#203.
+
 ## Architecture
 
 - All services run on isolated Docker networks: `backend`, `user-backend`, `testnet`
