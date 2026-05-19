@@ -102,9 +102,71 @@ jobs:
       - name: Validate
         run: terraform validate
 
+  tflint:
+    # Static analysis. Catches the class of bug that motivated this issue:
+    # an `endpoint` (singular, pre-TF 1.6) vs `endpoints` (plural, TF 1.6+)
+    # S3 backend-arg mismatch slipped through `terraform validate` because
+    # the parser treats unknown-but-syntactically-valid args as warnings.
+    # tflint's terraform-recommended preset fails on those. See deploy#23.
+    name: TFLint (${{ matrix.path }})
+    needs: fmt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        path:
+          - terraform/hetzner/modules/hetzner-vps
+          - terraform/hetzner/envs/stg
+          - terraform/hetzner/envs/prod
+          - terraform/cloudflare
+          - terraform/backblaze
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+    steps:
+      - uses: actions/checkout@v6
+      # Pinned to commit-sha (v6.2.2) per third-party-action integrity
+      # discipline — see ontology feedback_verify_third_party_integrity_claims.
+      - uses: terraform-linters/setup-tflint@b480b8fcdaa6f2c577f8e4fa799e89e756bb7c93  # v6.2.2
+        with:
+          tflint_version: latest
+      - name: Init tflint plugins
+        run: tflint --init --config="${GITHUB_WORKSPACE}/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run tflint
+        # tflint's --recursive is a bare bool flag (no =value form); default is
+        # non-recursive, which is what we want — each matrix entry runs from a
+        # working-directory scoped to one module. NOTE: actionlint does NOT
+        # validate tflint flag syntax, so when bumping setup-tflint, verify
+        # against `tflint --help` of the pinned version before merge.
+        run: tflint --config="${GITHUB_WORKSPACE}/.tflint.hcl" --format=compact
+
+  checkov:
+    # Policy / security scan. Runs against the whole terraform/ tree in
+    # a single job (checkov walks the tree itself). Soft-fail false so
+    # any NEW finding blocks the PR; pre-existing findings are skipped
+    # inline via `# checkov:skip=CKV_*` comments in the source files.
+    # See terraform/BACKEND.md § Pre-existing checkov skips.
+    name: Checkov
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Pinned to commit-sha (v12.3102.0) per third-party-action integrity
+      # discipline — see ontology feedback_verify_third_party_integrity_claims.
+      - uses: bridgecrewio/checkov-action@4048c972aae68d0b983a48bb3479aab2d877b898  # v12.3102.0
+        with:
+          directory: terraform/
+          framework: terraform
+          soft_fail: false
+          quiet: true
+          output_format: cli
+          skip_results_upload: true
+
   plan:
     name: Plan (hetzner/${{ matrix.env }})
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
@@ -152,7 +214,7 @@ jobs:
 
   plan-cloudflare:
     name: Plan (cloudflare)
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     environment: production
@@ -203,7 +265,7 @@ jobs:
 
   plan-backblaze:
     name: Plan (backblaze)
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     environment: production
@@ -247,7 +309,7 @@ jobs:
 
   apply:
     name: Apply (hetzner/${{ matrix.env }})
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
@@ -283,7 +345,7 @@ jobs:
   # cloudflare DNS pointing at the prior IP until the *next* push.
   apply-cloudflare:
     name: Apply (cloudflare)
-    needs: [validate, apply]
+    needs: [validate, tflint, checkov, apply]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: production
@@ -314,7 +376,7 @@ jobs:
 
   apply-backblaze:
     name: Apply (backblaze)
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: production
