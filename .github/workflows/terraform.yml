@@ -135,7 +135,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Run tflint
-        run: tflint --config="${GITHUB_WORKSPACE}/.tflint.hcl" --recursive=false --format=compact
+        # tflint's --recursive is a bare bool flag (no =value form); default is
+        # non-recursive, which is what we want — each matrix entry runs from a
+        # working-directory scoped to one module. NOTE: actionlint does NOT
+        # validate tflint flag syntax, so when bumping setup-tflint, verify
+        # against `tflint --help` of the pinned version before merge.
+        run: tflint --config="${GITHUB_WORKSPACE}/.tflint.hcl" --format=compact
 
   checkov:
     # Policy / security scan. Runs against the whole terraform/ tree in
