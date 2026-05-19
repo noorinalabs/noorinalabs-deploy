@@ -52,8 +52,8 @@ noorinalabs-deploy/
 │   ├── prometheus/
 │   │   ├── alerts.yml
 │   │   └── prometheus.yml
-│   └── promtail/
-│       └── promtail-config.yml
+│   └── alloy/
+│       └── config.alloy
 ├── scripts/
 │   ├── backup.sh                 # Automated database backup
 │   ├── bootstrap-vps.sh          # Residual bootstrap — cloud-init gaps only (#163)
@@ -200,7 +200,7 @@ Defined in `compose/docker-compose.prod.yml`. The stack runs 13 services under t
 | `alertmanager` | `prom/alertmanager:v0.28.1` | Alert routing | backend |
 | `grafana` | `grafana/grafana:11.6.0` | Dashboards at `/grafana` | backend |
 | `loki` | `grafana/loki:2.9.10` | Log aggregation | backend |
-| `promtail` | `grafana/promtail:2.9.10` | Log collection from Docker containers | backend |
+| `alloy` | `grafana/alloy:v1.16.1` | Log collection from Docker containers (River config, replaces promtail per deploy#132) | backend |
 | `node-exporter` | `prom/node-exporter:v1.9.1` | Host-level metrics | backend |
 | `postgres-exporter` | `prometheuscommunity/postgres-exporter:v0.16.0` | PostgreSQL metrics | backend |
 
@@ -398,9 +398,9 @@ Configured in `infra/prometheus/prometheus.yml`. Scrapes three targets at 15-sec
 
 Storage retention: 30 days. Alert rules defined in `infra/prometheus/alerts.yml`.
 
-### Logging (Loki + Promtail)
+### Logging (Loki + Alloy)
 
-- **Promtail** reads container logs from `/var/lib/docker/containers` via read-only Docker socket mount
+- **Alloy** (`grafana/alloy:v1.16.1`) reads container logs from `/var/lib/docker/containers` via read-only Docker socket mount, runs the JSON pipeline declared in `infra/alloy/config.alloy` (River syntax), and pushes to Loki via `loki.write`. Migrated from promtail in deploy#132.
 - **Loki** aggregates and indexes logs, configured via `infra/loki/loki-config.yml`
 
 ### Dashboards (Grafana)

@@ -5,7 +5,7 @@ that complement it. This file is intentionally an entrypoint: each named
 sub-system has its own runbook (linked below) for the deep procedure.
 
 The deploy-repo observability stack is documented per-component in
-`infra/{prometheus,grafana,loki,promtail,alertmanager,blackbox-exporter}/`.
+`infra/{prometheus,grafana,loki,alloy,alertmanager,blackbox-exporter}/`.
 The list of running containers is canonical in
 `compose/docker-compose.prod.yml` and mirrored in
 `ontology/repos/deploy.yaml` (services.observability).
@@ -16,7 +16,7 @@ The list of running containers is canonical in
 |---|---|---|---|
 | Prometheus | metrics scrape | prod VPS, port 9090 (internal) | per-alert links in `infra/prometheus/alerts.yml` |
 | Grafana | metrics + log visualisation | prod VPS, `/grafana` behind Caddy | n/a (browse + edit in-app) |
-| Loki + Promtail | log aggregation | prod VPS, container-side `docker-socket` scrape | [`log-ingestion.md`](log-ingestion.md) |
+| Loki + Alloy | log aggregation | prod VPS, container-side `docker-socket` scrape | [`log-ingestion.md`](log-ingestion.md) |
 | Alertmanager | alert routing | prod VPS, port 9093 (internal) | [`alertmanager-slack-routing.md`](alertmanager-slack-routing.md) |
 | blackbox-exporter | synthetic probes (HTTP) | prod VPS, container `blackbox-exporter` | [`blackbox-probes.md`](blackbox-probes.md) |
 | Cloudflare Web Analytics (CWA) | real-user RUM | CF dashboard (per zone) | § below |

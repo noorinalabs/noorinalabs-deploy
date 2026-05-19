@@ -18,7 +18,7 @@ This file provides guidance to Claude Code when working in the deployment orches
 | `terraform/hetzner/` | Hetzner VPS provisioning (Terraform) |
 | `compose/` | Production Docker Compose and .env template |
 | `caddy/` | Caddyfile for reverse proxy |
-| `infra/` | Prometheus, Grafana, Loki, Alertmanager, Promtail configs |
+| `infra/` | Prometheus, Grafana, Loki, Alertmanager, Alloy configs |
 | `systemd/` | Backup service and timer units |
 | `scripts/` | VPS bootstrap, deployment verification, backup/restore |
 
