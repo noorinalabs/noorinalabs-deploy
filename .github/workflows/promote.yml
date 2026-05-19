@@ -891,35 +891,15 @@ jobs:
           # match, but verifying catches registry bugs or accidental
           # buildx flag drift.
           #
-          # Comparison is shape-aware (#239 fix). When the source is a
-          # multi-arch index/list, `imagetools create` preserves it
-          # identically and we compare top-level manifest digests directly.
-          # When the source is a single-arch v2 manifest (landing-page is
-          # currently the only one), `imagetools create` wraps it in a
-          # NEW index whose digest is necessarily different from the
-          # unwrapped source manifest. In that case we compare the source
-          # digest to the destination index's `manifests[0].digest` —
-          # which IS the wrapped source manifest, so equality means the
-          # retag preserved content even though the surface representation
-          # changed.
+          # All services emit OCI index post-#242 (landing-page PR #75,
+          # isnad-graph + user-service + design-system from prior waves),
+          # so the shape-aware fallback for single-arch v2 manifests is no
+          # longer needed. Direct top-level digest comparison applies
+          # uniformly.
           src=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:$SOURCE_TAG")
-          src_media=$(docker buildx imagetools inspect --format '{{.Manifest.MediaType}}' "$IMAGE:$SOURCE_TAG")
+          ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-$SHORT")
+          pl=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-latest")
 
-          if echo "$src_media" | grep -qE 'index|manifest\.list'; then
-            # Multi-arch source — direct top-level comparison.
-            ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-$SHORT")
-            pl=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-latest")
-            shape="multi-arch (direct top-level digest comparison)"
-          else
-            # Single-arch source — compare against the wrapped manifest digest
-            # inside the destination index.
-            ps=$(docker buildx imagetools inspect --raw "$IMAGE:prod-$SHORT" | jq -r '.manifests[0].digest')
-            pl=$(docker buildx imagetools inspect --raw "$IMAGE:prod-latest" | jq -r '.manifests[0].digest')
-            shape="single-arch (compare source to destination's manifests[0].digest)"
-          fi
-
-          echo "Source MediaType:    $src_media"
-          echo "Comparison shape:    $shape"
           echo "source digest:       $src"
           echo "prod-<short> digest: $ps"
           echo "prod-latest digest:  $pl"
