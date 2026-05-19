@@ -48,6 +48,14 @@ if [[ "$RUN_MODE" == "remote" ]]; then
     # The suite seeds and mutates state via /auth endpoints; running against
     # prod could create test users in the live user-postgres or trip
     # rate-limiters that page oncall.
+    #
+    # DEFENSE IN DEPTH: this shell guard is the fast-fail layer for the
+    # documented entrypoint (this script). The matching Python module-load
+    # guard in `tests/conftest.py` catches direct-pytest invocations that
+    # would otherwise bypass this check (e.g. interactive debug inside the
+    # runner image, future workflow author who skips run-tests.sh). Keep the
+    # two coupled: if you change the predicate here, update conftest.py too.
+    # See deploy#203.
     : "${ENVIRONMENT:=stg}"
     if [[ "$ENVIRONMENT" == "prod" || "$ENVIRONMENT" == "production" ]]; then
         echo "ERROR: refusing to run integration suite against ENVIRONMENT=$ENVIRONMENT." >&2
