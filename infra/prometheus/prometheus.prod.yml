@@ -35,6 +35,18 @@ scrape_configs:
     static_configs:
       - targets: ["user-postgres-exporter:9187"]
 
+  # kafka-exporter — pipeline broker metrics (deploy#88). Scrapes the
+  # exporter's /metrics on :9308. Series exposed:
+  #   - kafka_brokers (count) + kafka_topic_partition_* (gauge, ISR/leader/replicas)
+  #   - kafka_topic_partition_current_offset / oldest_offset (producer rate via rate())
+  #   - kafka_consumergroup_current_offset / lag / lag_in_seconds (populates only
+  #     when consumer-group workers from ingest-platform are running; empty-state
+  #     pre-consumers is acceptable — broker/topic gauges are still useful).
+  # The `up{job="kafka"}` series fires the KafkaBrokerDown alert in alerts.yml.
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
   # Alloy self-metrics scrape (originally added for promtail in deploy#131; migrated
   # to alloy in deploy#132). The alloy container exposes /metrics on :12345
   # (--server.http.listen-addr in compose). The companion `AlloyLogIngestionStopped`
