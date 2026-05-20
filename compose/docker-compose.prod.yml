@@ -275,7 +275,7 @@ services:
     tmpfs:
       - /tmp:size=64M
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2019/config/ >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 3
@@ -309,6 +309,56 @@ services:
 
   # --- User Service ---
 
+  # One-shot alembic migration runner (#141). Mirrors the kafka-init pattern:
+  # runs to completion, exits 0 on success, stays in "exited" state for the
+  # rest of the compose lifecycle. The user-service `depends_on` block waits
+  # for `service_completed_successfully` so the API never starts against an
+  # unmigrated database.
+  #
+  # Why this exists alongside the SSH-driven alembic gate (db-migrate.yml):
+  #   - db-migrate.yml is the CI/promotion-time gate. It SSHes into the
+  #     prod VPS, pulls the candidate image, and runs `alembic upgrade head`
+  #     against the LIVE user-postgres before promote.yml retags the image.
+  #     That covers the rolling-deploy path.
+  #   - This init container covers the `compose up` path on a fresh
+  #     `user_pg_data` volume (DR-restore, first stack-up, blue-green VPS
+  #     swap with an empty postgres). The SSH gate cannot run by definition
+  #     when the stack does not yet exist (chicken-and-egg per
+  #     docs/runbooks/break-glass.md § skip_alembic_gate).
+  #
+  # Failure mode + recovery: if alembic fails, this container exits non-zero,
+  # `user-service` stays in `Created` (never `Running`), and `compose up`
+  # itself returns non-zero. Operator sees the failure immediately rather
+  # than a healthy-looking API serving against unmigrated tables. Logs are
+  # captured by the json-file driver below; `docker compose logs
+  # user-service-migrate` retrieves them.
+  user-service-migrate:
+    image: ghcr.io/noorinalabs/noorinalabs-user-service:${USER_SERVICE_IMAGE_TAG:-latest}
+    # asyncpg driver — alembic/env.py is async (create_async_engine +
+    # asyncio.run). Same scheme as the runtime user-service DATABASE_URL
+    # and the SSH alembic gate in db-migrate.yml (post-#236).
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
+    # `alembic upgrade head` matches the SSH gate's invocation. The
+    # heads-count belt-and-suspenders check from db-migrate.yml is not
+    # repeated here — that check guards CI-time migrations-DAG correctness
+    # and would be redundant noise at every `compose up`.
+    command: /app/.venv/bin/alembic upgrade head
+    depends_on:
+      user-postgres:
+        condition: service_healthy
+    networks:
+      - user-backend
+    # Container is one-shot; restart on failure would re-run forever if the
+    # migration is fundamentally broken. `no` is the correct choice — the
+    # non-zero exit cascades to user-service's depends_on block.
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   user-service:
     image: ghcr.io/noorinalabs/noorinalabs-user-service:${USER_SERVICE_IMAGE_TAG:-latest}
     expose:
@@ -339,6 +389,13 @@ services:
         condition: service_healthy
       user-redis:
         condition: service_healthy
+      user-service-migrate:
+        # Migrations MUST complete cleanly before user-service starts. A
+        # non-zero migrate exit cascades up: user-service stays in
+        # `Created`, `compose up` returns non-zero, operator sees the
+        # failure immediately (vs a healthy-looking API on unmigrated
+        # tables). See user-service-migrate block above for design notes.
+        condition: service_completed_successfully
     deploy:
       resources:
         limits:
@@ -453,8 +510,13 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.4.0
+    # Per-env config selection (deploy#263). `PROM_CONFIG_FILE` is set by the
+    # deploy workflow's .env write step — `prometheus.prod.yml` for prod,
+    # `prometheus.stg.yml` for stg. Default to prod for local `docker compose
+    # config` validation (compose-validate.yml uses the bare .env.example,
+    # which is fine: only one variant is mounted at a time).
     volumes:
-      - ../infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../infra/prometheus/${PROM_CONFIG_FILE:-prometheus.prod.yml}:/etc/prometheus/prometheus.yml:ro
       - ../infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     command:
@@ -479,8 +541,23 @@ services:
 
   alertmanager:
     image: prom/alertmanager:v0.28.1
+    # Per-env config selection (deploy#262 + #263). `ALERTMANAGER_CONFIG_FILE`
+    # picks `alertmanager.prod.yml` or `alertmanager.stg.yml` (set by deploy
+    # workflow .env write); default = prod for compose-validate. The Slack
+    # webhook URL is read at runtime from `/etc/alertmanager/slack_webhook_url`
+    # (api_url_file directive — supported since alertmanager v0.25). The file
+    # is bind-mounted from `../infra/alertmanager/slack_webhook_url.secret`
+    # which is written by the deploy workflow from `${{ secrets.SLACK_WEBHOOK_URL }}`.
+    # If the secret is unset, the file contains the placeholder string
+    # "<unset>" and alerts route to nowhere — alertmanager itself starts
+    # cleanly. See docs/runbooks/alertmanager-slack-routing.md.
     volumes:
-      - ../infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ../infra/alertmanager/${ALERTMANAGER_CONFIG_FILE:-alertmanager.prod.yml}:/etc/alertmanager/alertmanager.yml:ro
+      # `SLACK_WEBHOOK_FILE` defaults to the in-tree `.example` placeholder
+      # (literal "<unset>") so `docker compose config` works in CI and on
+      # fresh clones. The deploy workflow writes the real secret to
+      # `slack_webhook_url.secret` (gitignored) and overrides this var.
+      - ../infra/alertmanager/${SLACK_WEBHOOK_FILE:-slack_webhook_url.secret.example}:/etc/alertmanager/slack_webhook_url:ro
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
@@ -572,21 +649,28 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  promtail:
-    # 3.x bundles a Docker API client compatible with Docker 26+ daemons (API 1.44).
-    # 2.9.10 shipped a 1.42 client which can't enumerate containers on the prod
-    # VPS — see #128. Push API stays compatible with Loki 2.9.x; no Loki bump needed.
-    image: grafana/promtail:3.4.1
+  alloy:
+    # Successor to promtail (deploy#132). Alloy ships a base image with /bin/sh +
+    # wget, so the HTTP healthcheck disabled for promtail in #128 is re-enabled
+    # here. River config in infra/alloy/config.alloy ports the promtail Docker SD
+    # + JSON pipeline 1:1; loki.write is wire-compatible with Loki 2.9.10 (no
+    # Loki bump needed). Image is multi-arch pinned by digest — resolved against
+    # the OCI image-index at registry.docker.io on 2026-05-18.
+    image: grafana/alloy:v1.16.1@sha256:51aeb9d829239345070619dad3edd6873186f913c84f45b365b74574fcb38ec0
     volumes:
-      - ../infra/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - ../infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
     command:
-      - "-config.file=/etc/promtail/config.yml"
-    # Healthcheck removed — promtail's distroless image has no wget/curl/nc, so
-    # any HTTP-probe healthcheck fails permanently (888-deep failing streak observed
-    # pre-fix). Liveness signal is restart-policy + Prometheus alerting on log-rate
-    # drop. Long-term: migrate to grafana/alloy (richer base image). See #128.
+      - "run"
+      - "/etc/alloy/config.alloy"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:12345/-/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
       loki:
         condition: service_healthy
@@ -616,13 +700,13 @@ services:
       - /sys:/host/sys:ro
       - /:/rootfs:ro
       # Textfile collector input directory (deploy#161). The host path is
-      # owned by the `deploy` user (mode 0775) and populated by the alembic
+      # owned by `deploy:deploy` (mode 0755) and populated by the alembic
       # pre-deploy gate in db-migrate.yml on every run via `if: always()`.
       # Read-only mount so a compromised node-exporter cannot clobber the
-      # written .prom files. Provisioning of the host directory is a runbook
-      # step today (`mkdir -p /var/lib/node_exporter/textfile_collector &&
-      # chown deploy:deploy && chmod 0775`); cloud-init bake-in is tracked as
-      # a follow-up if Nurul prefers it move to TF.
+      # written .prom files. The host directory is provisioned automatically
+      # by Terraform cloud-init (terraform/hetzner/modules/hetzner-vps/
+      # cloud-init.yaml.tpl runcmd:) on every fresh VPS — no manual step
+      # needed. Mode 0755 set by cloud-init (PR #210, Bereket amendment).
       - /var/lib/node_exporter/textfile_collector:/var/lib/node_exporter/textfile_collector:ro
     command:
       - "--path.procfs=/host/proc"
@@ -811,6 +895,65 @@ services:
     networks:
       - backend
     restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kafka-exporter:
+    # Prometheus exporter for Kafka broker + consumer-group metrics (deploy#88).
+    # Scrapes the broker over the backend network on kafka:9092 (plaintext, internal
+    # listener); exposes a Prometheus /metrics endpoint on :9308. Not exposed to the
+    # host or frontend — Prometheus reaches it over the docker `backend` network.
+    #
+    # Image: danielqsj/kafka-exporter is the de-facto open-source kafka exporter
+    # (battle-tested, multi-arch, tracks broker 3.x). v1.9.0 is upstream-latest
+    # (2025-02-17). Multi-arch index digest pinned (matches the alloy precedent
+    # in this same file — resolved against registry.docker.io via the OCI image-
+    # index endpoint on 2026-05-19). Pinning the index digest lets docker pull
+    # the right per-arch child blob automatically.
+    #
+    # depends_on the broker's healthcheck so the exporter only starts once kafka
+    # is accepting connections — avoids a noisy 30s of "connection refused"
+    # restart-loops at compose-up time.
+    #
+    # Consumer-group metrics (`kafka_consumergroup_*`) populate only when real
+    # consumers are running. Until ingest-platform consumer workers are deployed,
+    # the broker/topic/partition gauges still populate (so the dashboard ISR
+    # and partition panels are immediately useful) and the consumer-lag panel
+    # renders empty-state — acceptable and tracked as a W12 follow-up.
+    image: danielqsj/kafka-exporter:v1.9.0@sha256:4150e46b2e9697ac30e4be8de03ec1704b4bdc7037577b83b8d35a32be298c16
+    command:
+      - "--kafka.server=kafka:9092"
+      - "--web.listen-address=:9308"
+    expose:
+      - "9308"
+    healthcheck:
+      # Base image is quay.io/prometheus/busybox — wget is available as a
+      # busybox applet (verified against v1.9.0 Dockerfile, 2026-05-19). The
+      # /metrics endpoint responds 200 even with zero consumer groups (empty
+      # body still parses), so this gate fires positive as soon as the
+      # exporter has dialed the broker and started serving.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9308/metrics || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+        reservations:
+          memory: 32M
+          cpus: "0.05"
     logging:
       driver: json-file
       options:

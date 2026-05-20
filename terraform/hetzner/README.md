@@ -47,8 +47,8 @@ Each env is a self-contained Terraform root module. **Working directory IS the e
 Terraform manages:                    Docker Compose manages:
 ├── VPS (hcloud_server)               ├── isnad-graph (FastAPI + React)
 ├── Firewall (hcloud_firewall)        ├── neo4j
-├── SSH Key (hcloud_ssh_key)          ├── user-service (FastAPI)
-└── cloud-init bootstrap              ├── user-postgres
+└── cloud-init bootstrap              ├── user-service (FastAPI)
+   (injects SSH authorized_keys)     ├── user-postgres
                                       ├── user-redis
                                       └── caddy (reverse proxy)
 ```

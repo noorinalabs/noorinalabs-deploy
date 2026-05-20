@@ -1,0 +1,87 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: stg
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: "api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: "postgres-exporter"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # user-service stack exporters (deploy#64). See prometheus.prod.yml for
+  # full rationale on the user-service:8000 carve-out (noorinalabs-user-service#124).
+  - job_name: "user-postgres-exporter"
+    static_configs:
+      - targets: ["user-postgres-exporter:9187"]
+
+  # kafka-exporter — pipeline broker metrics (deploy#88). See prometheus.prod.yml
+  # for series rationale. Stg currently has no consumers running and the kafka
+  # broker itself runs in stg via the same compose stack — when the broker is up
+  # in stg the exporter scrapes normally; when stg is torn down the
+  # KafkaBrokerDown alert fires with the `env=stg` external label, routing to
+  # #stg-alerts (alertmanager.stg.yml).
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  # Alloy self-metrics scrape (originally promtail per deploy#131; migrated to
+  # alloy in deploy#132). See prometheus.prod.yml for the alert companion details.
+  - job_name: "alloy"
+    static_configs:
+      - targets: ["alloy:12345"]
+
+  # blackbox-exporter — STAGING-ONLY targets (deploy#263 per-env split).
+  #
+  # Pre-split (single prometheus.yml) the stg VPS was probing PROD hostnames
+  # from inside stg, which produced three correlated bugs:
+  #   - prod hiccups generated alerts attributed to stg (misattribution)
+  #   - *.stg.noorinalabs.com had zero probe coverage (signal gap)
+  #   - cross-env stg→prod probes polluted prod's RUM-shape baseline (noise)
+  #
+  # Post-split: stg probes only *.stg.noorinalabs.com; prod probes only
+  # *.noorinalabs.com. Grafana dashboard filter `external_labels.env=stg`
+  # now shows only stg-hostname probes (and ditto for prod).
+  - job_name: "blackbox"
+    metrics_path: /probe
+    scrape_interval: 60s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["https://isnad.stg.noorinalabs.com/health"]
+        labels: { route: "isnad-health", module: "http_2xx_json" }
+      - targets: ["https://isnad.stg.noorinalabs.com/api/v1/user-service/health"]
+        labels: { route: "user-service-health", module: "http_2xx" }
+      - targets: ["https://stg.noorinalabs.com/"]
+        labels: { route: "landing-root", module: "http_2xx" }
+      - targets: ["https://isnad.stg.noorinalabs.com/api/v1/narrators?limit=1"]
+        labels: { route: "narrator-401", module: "http_401_json" }
+      - targets: ["https://isnad.stg.noorinalabs.com/.well-known/jwks.json"]
+        labels: { route: "jwks", module: "http_2xx_json" }
+      - targets: ["https://isnad.stg.noorinalabs.com/auth/oauth/google/login"]
+        labels: { route: "auth-login-redirect", module: "http_2xx_json" }
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [module]
+        target_label: __param_module
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

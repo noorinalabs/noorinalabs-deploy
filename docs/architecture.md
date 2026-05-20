@@ -52,11 +52,11 @@ noorinalabs-deploy/
 │   ├── prometheus/
 │   │   ├── alerts.yml
 │   │   └── prometheus.yml
-│   └── promtail/
-│       └── promtail-config.yml
+│   └── alloy/
+│       └── config.alloy
 ├── scripts/
 │   ├── backup.sh                 # Automated database backup
-│   ├── bootstrap-vps.sh          # First-time VPS setup
+│   ├── bootstrap-vps.sh          # Residual bootstrap — cloud-init gaps only (#163)
 │   ├── restore.sh                # Database restore from backup
 │   └── verify_deployment.sh      # Live deployment verification
 ├── systemd/
@@ -157,20 +157,30 @@ The `.env` file is ephemeral: recreated fresh on each deployment, written with `
 Provisioned via Terraform in `terraform/hetzner/`. The Terraform configuration creates:
 
 - `hcloud_server` — the VPS instance
-- `hcloud_ssh_key` — deploy SSH key
 - `hcloud_firewall` — allows SSH (22), HTTP (80), HTTPS (443)
+- SSH authorized keys are injected via cloud-init (`cloud-init.yaml.tpl` in `terraform/hetzner/modules/hetzner-vps/`); there is no `hcloud_ssh_key` Terraform resource
 
 ### Bootstrap
 
-First-time setup is performed by `scripts/bootstrap-vps.sh`, which runs as root on a fresh VPS and:
+First-time setup of a Terraform-provisioned VPS is performed end-to-end by `terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl`, which on first boot:
 
-1. Installs Docker, docker-compose-v2, docker-buildx, git, curl
-2. Creates a `deploy` user with Docker group access
-3. Copies SSH authorized keys from root to deploy user
-4. Clones this repo to `/opt/noorinalabs-deploy`
-5. Creates a template `.env` file with placeholder values
-6. Installs rclone for backups
-7. Installs and enables the backup systemd timer
+1. Installs Docker, docker-compose-v2, docker-buildx, git, curl, fail2ban, ufw, unattended-upgrades, rclone, jq
+2. Creates a `deploy` user with `docker, sudo` groups (NOPASSWD sudo) and seeds its SSH authorized_keys with the per-env `ssh_public_key`
+3. Writes the same key into `/root/.ssh/authorized_keys` (canonical operator/CI key)
+4. Configures fail2ban (SSH brute-force jail), ufw (default-deny incoming, allow 22/80/443), and unattended-upgrades (security patches only)
+5. Disables root SSH password login (`PermitRootLogin prohibit-password`, `PasswordAuthentication no`)
+6. Writes `/home/deploy/.docker/config.json` with GHCR auth when `ghcr_auth_b64` is non-empty (per #28 conditional skip)
+7. Writes `/opt/noorinalabs-deploy/.env.user-service` from Terraform secrets
+8. Clones this repo to `/opt/noorinalabs-deploy` and chowns to `deploy`
+9. Creates `/var/lib/node_exporter/textfile_collector` (deploy:deploy 0755) for the alembic pre-deploy gate's failure markers
+
+`scripts/bootstrap-vps.sh` is the **residual** bootstrap, run only on VPSes that pre-date cloud-init or to cover gaps cloud-init does not yet fill (#163):
+
+- Append-with-dedup SSH key merge from `/root/.ssh/authorized_keys` → `/home/deploy/.ssh/authorized_keys` (idempotent across re-runs, never wipes the deploy CI key; see deploy#112)
+- `git config --global --add safe.directory` exceptions for `/opt/noorinalabs-deploy` and the auxiliary repo dirs
+- Idempotent `git fetch && git reset --hard` of `/opt/noorinalabs-deploy`
+- Pre-provisioning the auxiliary repo dirs under `/opt/` (e.g., `/opt/noorinalabs-isnad-graph`, `/opt/noorinalabs-design-system`) with deploy ownership
+- Installing the systemd backup units (`isnad-backup.{service,timer}`, failure-marker, tmpfiles.d) and enabling the timer
 
 ## Docker Compose Stack
 
@@ -190,7 +200,7 @@ Defined in `compose/docker-compose.prod.yml`. The stack runs 13 services under t
 | `alertmanager` | `prom/alertmanager:v0.28.1` | Alert routing | backend |
 | `grafana` | `grafana/grafana:11.6.0` | Dashboards at `/grafana` | backend |
 | `loki` | `grafana/loki:2.9.10` | Log aggregation | backend |
-| `promtail` | `grafana/promtail:2.9.10` | Log collection from Docker containers | backend |
+| `alloy` | `grafana/alloy:v1.16.1` | Log collection from Docker containers (River config, replaces promtail per deploy#132) | backend |
 | `node-exporter` | `prom/node-exporter:v1.9.1` | Host-level metrics | backend |
 | `postgres-exporter` | `prometheuscommunity/postgres-exporter:v0.16.0` | PostgreSQL metrics | backend |
 
@@ -240,6 +250,31 @@ All responses include:
 
 Caddy automatically obtains and renews certificates via ACME (Let's Encrypt).
 
+### Routing invariant: longer-prefix-first ordering
+
+Caddy evaluates `handle` blocks **in source order**; the first match wins. This means any path-prefix carve-out that should go to a different upstream than its catch-all parent MUST appear as an earlier `handle` block than the catch-all. **Adding a new top-level path on any upstream service requires reviewing this Caddyfile.**
+
+Concrete example from `caddy/Caddyfile` (the `isnad.{$BASE_DOMAIN}` block):
+
+```
+handle /auth/callback/* {        # carve-out — frontend (React AuthCallbackPage)
+    reverse_proxy frontend:80
+}
+handle /auth/* {                 # catch-all — user-service auth API
+    reverse_proxy user-service:8000
+}
+```
+
+If the two blocks are swapped, `/auth/callback/google` matches `/auth/*` first and hits user-service, which returns a JSON 404 — the user's browser receives JSON instead of the React callback page. This is the failure mode that broke prod Google login on 2026-04-19 (see deploy#133, #134). The same shape applies to every other carve-out in the Caddyfile (`/api/v1/users*`, `/api/v1/sessions*`, etc., must precede `/api/*`; `/health` and `/status` precede the default `handle`; etc.).
+
+**When adding a new route on an upstream service:**
+
+1. Check whether the new path overlaps any existing `handle` block prefix in `caddy/Caddyfile`.
+2. If it would be shadowed by an earlier catch-all, add it as an earlier `handle` block.
+3. Run `scripts/verify_deployment.sh` against the target environment after deploy — §11 ("Routing carve-outs") exercises the known boundaries.
+
+A per-PR Caddyfile order-lint that detects longer-prefix `handle` blocks placed AFTER their shorter-prefix parents is tracked as a follow-up (see deploy#135 part 3).
+
 ## Post-Deployment Verification
 
 The `verify-deploy.yml` workflow runs automatically after a successful deploy (via `workflow_run` trigger on `Deploy to staging` and `Deploy to production`) and can also be triggered manually with a `target` input (`stg` or `prod`).
@@ -256,8 +291,46 @@ resolution). Validates auth flow, RBAC, subscriptions, sessions, 2FA,
 verification flow, network isolation, and performance baselines.
 
 Failure semantics: blocking gate. Emits a `stg-verify-result-{run_id}.json`
-artifact (schema: `{result, commit_sha, timestamp, run_id}`) consumed by
-`promote.yml`'s prod-promote gate (deploy#179, follow-up).
+artifact consumed by `promote.yml`'s prod-promote gate (deploy#179
+introduced the v1 gate; deploy#199 added v2 per-service-digest equality).
+
+**Schema v2 (current, deploy#199):**
+
+```json
+{
+  "schema_version": 2,
+  "result": "success" | "failure",
+  "commit_sha": "<deploy-repo HEAD at verify-time>",
+  "service_digests": {
+    "api":          "sha256:...",
+    "frontend":     "sha256:...",
+    "user-service": "sha256:...",
+    "landing":      "sha256:..."
+  },
+  "timestamp": "<ISO 8601 UTC>",
+  "run_id": "<gh actions run id>"
+}
+```
+
+`service_digests` is the snapshot of each service's GHCR `stg-latest`
+manifest digest at verify-time. `promote.yml`'s gate then compares
+each plan-resolved digest against `service_digests[<service>]`. Any
+divergence FAILS the gate with a per-service diff — that's a service
+whose `stg-latest` pointer moved between verify-stg capture and the
+promote run, which means promotion would ship unverified bits (the
+T1-window risk #199 closed).
+
+**Schema v1 (legacy, accepted via fallback path):** omits
+`service_digests`; gate falls back to the freshness-window heuristic
+("latest stg-verify succeeded within `stg_verify_max_age_hours`,
+default 24h") with a warning annotation pointing operators at #199.
+The fallback path is unreachable once every stg deploy has rolled
+through a #199-shipping commit.
+
+`service_digests` is omitted (rendered as `{}`) when `result != "success"` —
+the gate hard-blocks on failed verifies anyway, and emitting partial
+digests post-failure would be misleading (they don't represent what was
+actually verified).
 
 > Limitation: today's stg verify validates "the code on the wave branch
 > passes integration", not "the bits actually running on the stg VPS pass
@@ -325,9 +398,9 @@ Configured in `infra/prometheus/prometheus.yml`. Scrapes three targets at 15-sec
 
 Storage retention: 30 days. Alert rules defined in `infra/prometheus/alerts.yml`.
 
-### Logging (Loki + Promtail)
+### Logging (Loki + Alloy)
 
-- **Promtail** reads container logs from `/var/lib/docker/containers` via read-only Docker socket mount
+- **Alloy** (`grafana/alloy:v1.16.1`) reads container logs from `/var/lib/docker/containers` via read-only Docker socket mount, runs the JSON pipeline declared in `infra/alloy/config.alloy` (River syntax), and pushes to Loki via `loki.write`. Migrated from promtail in deploy#132.
 - **Loki** aggregates and indexes logs, configured via `infra/loki/loki-config.yml`
 
 ### Dashboards (Grafana)

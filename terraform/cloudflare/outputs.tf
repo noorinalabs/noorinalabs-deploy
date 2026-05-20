@@ -24,3 +24,8 @@ output "ssl_mode" {
   description = "Current SSL/TLS mode for the zone."
   value       = cloudflare_zone_settings_override.ssl.settings[0].ssl
 }
+
+output "canonical_redirect_ruleset_ids" {
+  description = "Map of dark-TLD key (net|org) → Cloudflare ruleset ID for the canonical-domain 301 redirect. Useful for `gh api`/CF API debugging of the rule that fires on a request."
+  value       = { for k, r in cloudflare_ruleset.canonical_redirect : k => r.id }
+}

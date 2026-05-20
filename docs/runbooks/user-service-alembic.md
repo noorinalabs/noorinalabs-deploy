@@ -158,7 +158,7 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 
 **Status: implemented — [`deploy#161`](https://github.com/noorinalabs/noorinalabs-deploy/issues/161) (P3W1) wired the textfile-collector plumbing and landed the Prometheus alert.**
 
-Gate runs emit two gauges to node-exporter's textfile collector via an `if: always()` SSH step in `db-migrate.yml`. The metric file lives at `/var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom` on the VPS (mode 0644, written by the `deploy` user via temp + atomic rename). The host directory is provisioned as a one-time runbook step on each VPS (`mkdir -p /var/lib/node_exporter/textfile_collector && chown deploy:deploy && chmod 0775`); the `node-exporter` service in `compose/docker-compose.prod.yml` mounts that directory read-only and reads the file on each scrape.
+Gate runs emit two gauges to node-exporter's textfile collector via an `if: always()` SSH step in `db-migrate.yml`. The metric file lives at `/var/lib/node_exporter/textfile_collector/user_service_alembic_gate.prom` on the VPS (mode 0644, written by the `deploy` user via temp + atomic rename). The host directory is provisioned automatically by Terraform cloud-init on every VPS — see `terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl` `runcmd:` (creates `/var/lib/node_exporter/textfile_collector`, owned `deploy:deploy`, mode `0755`). No manual runbook step is needed on fresh VPSes. The `node-exporter` service in `compose/docker-compose.prod.yml` mounts that directory read-only and reads the file on each scrape.
 
 Metric schema:
 

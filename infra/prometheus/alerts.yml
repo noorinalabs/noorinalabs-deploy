@@ -209,20 +209,29 @@ groups:
       # mismatch surfaces as probe_success=0 — but we still alert
       # explicitly on the status-code metric so the description tells
       # operators *what* code came back rather than just "probe failed".
+      #
+      # Guarded on `probe_success == 1` (deploy#209) — when a probe fails
+      # due to connectivity loss (TCP-reset, DNS, TLS-handshake), Blackbox
+      # reports probe_http_status_code=0 because no HTTP response was
+      # received. Status 0 fails every `!= <expected>` equality check
+      # below, so a single connectivity-loss incident would fire BOTH
+      # `BlackboxProbeFailing` (probe_success==0) AND this alert —
+      # two pages, one incident. The guard ensures this alert only
+      # fires when a response was received but its status is wrong.
       - alert: BlackboxUnexpectedStatus
         expr: |
+          probe_success == 1
+          and
           (
-            probe_http_status_code{route="isnad-health"}        != 200
-          ) or (
-            probe_http_status_code{route="user-service-health"} != 200
-          ) or (
-            probe_http_status_code{route="landing-root"}        != 200
-          ) or (
-            probe_http_status_code{route="jwks"}                != 200
-          ) or (
-            probe_http_status_code{route="narrator-401"}        != 401
-            and
-            probe_http_status_code{route="narrator-401"}        != 403
+            (probe_http_status_code{route="isnad-health"}        != 200) or
+            (probe_http_status_code{route="user-service-health"} != 200) or
+            (probe_http_status_code{route="landing-root"}        != 200) or
+            (probe_http_status_code{route="jwks"}                != 200) or
+            (
+              probe_http_status_code{route="narrator-401"}        != 401
+              and
+              probe_http_status_code{route="narrator-401"}        != 403
+            )
           )
         for: 5m
         labels:
@@ -331,3 +340,149 @@ groups:
             `rm /var/lib/node_exporter/textfile_collector/break_glass_invocation_{{ $labels.input }}.prom`.
             See the audit-log issue for the historical record.
           runbook: "docs/runbooks/break-glass.md#metric-stale-cleanup"
+
+  # Log-ingestion backstop. Originally added in deploy#131 for promtail; ported
+  # to grafana/alloy in deploy#132 (promtail → alloy migration). Alloy's base
+  # image ships wget so the container HTTP healthcheck disabled for promtail in
+  # #128/#130 is re-enabled in compose; this metric-rate alert remains as
+  # defense-in-depth — a healthy /-/ready response doesn't prove logs are
+  # actually flowing (Docker SD could be broken, loki.write could be dropping,
+  # the pipeline could be matching nothing).
+  #
+  # `loki_write_sent_entries_total` is exposed on alloy's :12345 /metrics
+  # endpoint by the loki.write component and is incremented on every entry
+  # shipped to Loki. A 10-minute zero-rate window indicates ingestion has
+  # stopped. Replaces the promtail-era `promtail_sent_entries_total`.
+  - name: log_ingestion
+    rules:
+      - alert: AlloyLogIngestionStopped
+        # 10-minute hold-down before alerting. Short enough to catch a
+        # real outage well before the 7-day Loki retention starts mattering;
+        # long enough to ride out a normal compose restart (alloy's startup
+        # window) or a brief Loki distributor blip.
+        expr: |
+          rate(loki_write_sent_entries_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alloy log ingestion has stopped"
+          description: >-
+            Alloy has not shipped any log entries to Loki in the last
+            10 minutes (rate(loki_write_sent_entries_total[5m]) == 0). Either
+            alloy is unhealthy (check `docker compose -p noorinalabs ps
+            alloy` and `docker compose -p noorinalabs logs --tail=50 alloy`)
+            or no containers on this VPS are producing log output (rare —
+            usually means the docker SD discovery broke). Without ingestion,
+            Loki has no logs for the affected window.
+          runbook: "docs/runbooks/log-ingestion.md#alloy-ingestion-stopped"
+
+      - alert: AlloyDown
+        # Companion to the rate-zero alert: catches the case where the
+        # alloy container is fully down (so the metric series itself
+        # disappears, and the rate expression evaluates against an empty
+        # set). `up{job="alloy"}` is set by Prometheus's scrape-success
+        # bookkeeping and is 0 when the target is unreachable.
+        expr: up{job="alloy"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alloy target is unreachable"
+          description: >-
+            Prometheus has been unable to scrape alloy's /metrics endpoint
+            on :12345 for >5m. This usually means the alloy container is
+            crashed or stuck in a restart loop. Without alloy, no logs
+            reach Loki.
+          runbook: "docs/runbooks/log-ingestion.md#alloy-down"
+
+  # Pipeline Kafka broker (deploy#88). The single-broker KRaft cluster is the
+  # hand-off bus between ingestion stages (raw → dedup → enrich → normalize →
+  # graph-load). Broker death halts the entire pipeline; consumer lag growth
+  # signals a stuck or back-pressured worker; DLQ growth signals systemic
+  # failure across whatever stage is producing into it. These three alerts are
+  # the minimum operator-actionable surface.
+  #
+  # Series source: kafka-exporter container (danielqsj/kafka-exporter) scrapes
+  # the broker over the internal `backend` docker network. See
+  # infra/prometheus/prometheus.prod.yml § `job_name: "kafka"` and the kafka-
+  # exporter service in compose/docker-compose.prod.yml.
+  #
+  # Note on overlap with ServiceDown: `ServiceDown` (service_health group above)
+  # already fires on `up == 0` for ANY job, so KafkaBrokerDown is partially
+  # redundant. We keep it because:
+  #   (a) operator-readable annotation specific to kafka (the generic
+  #       ServiceDown message names the job but doesn't explain pipeline impact)
+  #   (b) it lets routing rules / inhibit_rules later treat kafka-pipeline
+  #       outages distinctly from API outages without splitting ServiceDown
+  #       by-label.
+  - name: kafka_pipeline
+    rules:
+      - alert: KafkaBrokerDown
+        # `for: 1m` — same hold-down as ServiceDown. The broker has a 30s
+        # stop_grace_period and ~40s start_period, so a restart blip during a
+        # compose-up shouldn't fire this. Anything longer than 1m means the
+        # broker is genuinely unreachable.
+        expr: up{job="kafka"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka pipeline broker is down"
+          description: >-
+            Prometheus has been unable to scrape kafka-exporter on
+            kafka-exporter:9308 for >1m. Either the kafka broker itself is
+            down (verify with `docker compose -p noorinalabs ps kafka`) or
+            the exporter cannot reach it (verify with `docker compose -p
+            noorinalabs ps kafka-exporter` + `logs --tail=50`). The
+            ingestion pipeline halts until the broker returns — workers
+            replay from the last committed offset on recovery.
+          runbook: "docs/runbooks/kafka-pipeline.md#broker-down"
+
+      - alert: KafkaConsumerGroupLagHigh
+        # Fires only when there ARE consumer groups (`kafka_consumergroup_lag`
+        # is a per-(consumergroup, topic, partition) gauge — the series simply
+        # doesn't exist until a consumer joins). So this alert is harmless
+        # pre-consumers (matches nothing) and becomes active automatically the
+        # first time an ingest-platform worker connects.
+        #
+        # Threshold 10000 messages for 10m: large enough to ignore a brief
+        # back-pressure event during normal processing; small enough to catch
+        # a stuck worker before the broker's 3-day retention starts dropping
+        # un-acknowledged messages. Per-stage thresholds can be added later
+        # via topic-label routing if the pipeline grows to multi-batch sizes.
+        expr: |
+          max by (consumergroup, topic) (kafka_consumergroup_lag) > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer-group lag high on {{ $labels.consumergroup }}/{{ $labels.topic }}"
+          description: >-
+            Consumer group `{{ $labels.consumergroup }}` is more than 10000
+            messages behind on topic `{{ $labels.topic }}`. Investigate the
+            worker for that stage (see consumer-group naming convention in
+            docs/pipeline-kafka.md § Consumer-group naming).
+          runbook: "docs/runbooks/kafka-pipeline.md#consumer-lag-high"
+
+      - alert: KafkaDLQGrowing
+        # `pipeline.dlq` retention is 30d, so a growing DLQ is an indication
+        # of systemic failure rather than a one-off bad message. We alert on
+        # any positive growth rate sustained for 15m — short enough to catch
+        # a runaway producer flooding the DLQ, long enough to ignore a few
+        # poison messages from a normal day. The metric is the per-partition
+        # current_offset on the dlq topic; rate() captures growth velocity
+        # without false-firing on a non-zero static depth.
+        expr: |
+          sum(rate(kafka_topic_partition_current_offset{topic="pipeline.dlq"}[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline DLQ depth growing"
+          description: >-
+            The `pipeline.dlq` topic has been receiving messages for >15m.
+            Inspect the DLQ for the `error_stage` and `error_code` record
+            headers (see docs/pipeline-kafka.md § Message schema) to
+            identify the failing stage.
+          runbook: "docs/runbooks/kafka-pipeline.md#dlq-growing"

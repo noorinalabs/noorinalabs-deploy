@@ -179,19 +179,78 @@ ssh deploy@noorinalabs-prod \
 
 Replace `<input>` with the value from the alert's `input` label.
 
-## Receiver routing caveat
+## Receiver routing
 
-As of 2026-05-03, Alertmanager's `critical` receiver webhook is a
-localhost placeholder (`http://localhost:9095/webhook`) pending real
-Slack/email routing — tracked in deploy#262 (post-#251 sequel; the
-parse-error fix for `${VAR}` interpolation that landed the placeholder
-itself was deploy#127, closed 2026-04-19). The `BreakGlassUsed` rule
-fires correctly inside Prometheus + Alertmanager, but the human-facing
-notification path requires #262 to land first.
+As of 2026-05-17, Alertmanager routes `default` and `critical` receivers
+to Slack (`#prod-alerts` for prod, `#stg-alerts` for stg) via the
+`api_url_file:` directive (deploy#262). The webhook URL is read at
+container startup from `/etc/alertmanager/slack_webhook_url`, mounted from
+the host file `infra/alertmanager/slack_webhook_url.secret` (gitignored)
+that the deploy workflow writes from the `SLACK_WEBHOOK_URL` GitHub
+Environment secret.
 
-Until #262 is resolved, on-call should grep the audit-log issue + check
-the Alertmanager UI directly:
-`https://noorinalabs.com/alertmanager/` (behind admin auth).
+If the Slack webhook secret is not set in the relevant GitHub Environment,
+the deploy workflow writes a placeholder ("<unset>") and logs a WARNING.
+Alertmanager loads cleanly but webhook posts to "<unset>" fail; on-call
+should grep the audit-log issue + check the Alertmanager UI directly:
+`https://noorinalabs.com/alertmanager/` (behind admin auth) until the
+secret is rotated in.
+
+Full runbook for the Slack routing pattern: see
+`docs/runbooks/alertmanager-slack-routing.md`.
+
+## Scope review — 2026-05-17 (deploy#238)
+
+Post-#236 (psycopg → asyncpg URL fix) + #237 (CI dry-run gate) +
+deploy#141 (compose init-container migration runner) — three layers now
+catch the failure modes that originally drove break-glass use:
+
+| Failure mode that drove a break-glass use | Where it's now caught |
+|---|---|
+| psycopg URL scheme drift (#235, 2026-05-02) | `db-migrate-ci-gate.yml` (#237) — gate fails in CI before merge |
+| Fresh `user_pg_data` volume → unmigrated DB (#141) | `user-service-migrate` init container in `compose/docker-compose.prod.yml` — runs at `compose up` time |
+| `stg-latest` TOCTOU during retag (#234) | PR #236 — retag pins to `sha-<short>` always |
+
+### `skip_alembic_gate` — KEEP, narrow guidance
+
+The chicken-and-egg first-deploy / DR-restore justification is structural
+and does NOT go away with #237: the SSH gate still cannot run when the
+target stack doesn't yet exist. Keep the input.
+
+Narrowed guidance for **NOT appropriate** (now stricter):
+
+- The migration itself is failing. (Same as before — #237 catches this in
+  CI; if you're seeing it at promote-time, fix the migration upstream.)
+- The image-vs-URL scheme mismatch from #235. (#237's fixture asserts
+  this can't recur silently. If you see it at promote-time, the gate
+  itself is misconfigured — that's an emergency in its own right and
+  should be filed as a P0 issue, not bypassed.)
+
+### `allow_stg_tags` — KEEP for now, revisit P3W12+
+
+The 2026-05-02 driver (cross-repo GHCR write-403 blocking retag) was
+infrastructure-shaped, not workflow-shaped. With #251's audit-log issue
+and Alertmanager `BreakGlassUsed` rule live, misuse is observable. But
+the underlying GHCR cross-repo permission story has not changed; another
+GHCR outage could legitimately need this input.
+
+Pending the deploy#262 Alertmanager receiver wiring landing AND one
+clean promotion cycle showing the new infrastructure is stable, keep
+this input. If P3W12+ shows no new emergency-restore needs, file a
+removal PR.
+
+### Decision summary
+
+Both break-glass inputs stay. Scope is reaffirmed as DR/emergency only.
+The audit-log issue + Alertmanager rule + textfile metrics from
+deploy#251 provide the discipline; removal is premature.
+
+Removal trigger conditions (whichever fires first):
+
+- One full quarter (P3W12 → P3W15+) with zero invocations of either
+  input → file removal PRs for both.
+- A new emergency-restore happens that the input did NOT cover →
+  rescope rather than remove.
 
 ## What can NOT be tested in CI
 

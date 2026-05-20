@@ -1,6 +1,8 @@
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
+  external_labels:
+    env: prod
 
 rule_files:
   - /etc/prometheus/alerts.yml
@@ -24,6 +26,38 @@ scrape_configs:
     static_configs:
       - targets: ["postgres-exporter:9187"]
 
+  # user-service stack exporters (deploy#64). user-service:8000/metrics is NOT
+  # scraped here because user-service has no /metrics endpoint yet — tracked
+  # in noorinalabs-user-service#124. user-postgres-exporter IS scraped — it
+  # has been running in compose since the user-service stack extraction and
+  # was silently un-scraped until #64 surfaced the gap.
+  - job_name: "user-postgres-exporter"
+    static_configs:
+      - targets: ["user-postgres-exporter:9187"]
+
+  # kafka-exporter — pipeline broker metrics (deploy#88). Scrapes the
+  # exporter's /metrics on :9308. Series exposed:
+  #   - kafka_brokers (count) + kafka_topic_partition_* (gauge, ISR/leader/replicas)
+  #   - kafka_topic_partition_current_offset / oldest_offset (producer rate via rate())
+  #   - kafka_consumergroup_current_offset / lag / lag_in_seconds (populates only
+  #     when consumer-group workers from ingest-platform are running; empty-state
+  #     pre-consumers is acceptable — broker/topic gauges are still useful).
+  # The `up{job="kafka"}` series fires the KafkaBrokerDown alert in alerts.yml.
+  - job_name: "kafka"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  # Alloy self-metrics scrape (originally added for promtail in deploy#131; migrated
+  # to alloy in deploy#132). The alloy container exposes /metrics on :12345
+  # (--server.http.listen-addr in compose). The companion `AlloyLogIngestionStopped`
+  # alert in alerts.yml fires when `rate(loki_write_sent_entries_total[5m]) == 0` —
+  # the documented backstop preserved across the promtail→alloy migration. Alloy's
+  # base image ships wget so a container HTTP healthcheck is also enabled in compose,
+  # but the metric-rate alert is kept as defense-in-depth.
+  - job_name: "alloy"
+    static_configs:
+      - targets: ["alloy:12345"]
+
   # blackbox-exporter — continuous external probe of the same 6 prod
   # routes covered by the post-deploy smoke battery
   # (scripts/verify_prod_smoke.sh). Each target carries a `route` label
@@ -34,6 +68,10 @@ scrape_configs:
   #   1. instance label = the URL itself (visible in alerts)
   #   2. __param_target = URL passed to /probe?target=…
   #   3. __address__   = blackbox-exporter:9115 (the actual scrape target)
+  #
+  # PROD-ONLY targets: see prometheus.stg.yml for the stg counterpart (deploy#263
+  # per-env split — stg blackbox was probing prod hostnames pre-split, masking
+  # stg-side signal and polluting prod attribution).
   - job_name: "blackbox"
     metrics_path: /probe
     scrape_interval: 60s

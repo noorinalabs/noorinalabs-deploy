@@ -15,6 +15,7 @@ reads the workflow YAML files, the terraform sources, and the user-service
 pyproject and asserts shape. The dynamic complement (registry shape parity
 for bug #4) is the buildx-shape-dryrun job in cold-rebuild-dryrun.yml.
 """
+
 from __future__ import annotations
 
 import os
@@ -158,7 +159,7 @@ def check_promote_token_scope() -> list[Failure]:
 
     # Take everything from `retag:` to either the next top-level job or EOF.
     retag_start = retag_match.start()
-    next_job = re.search(r"^  [a-z][a-z0-9_-]*:\s*$", pm[retag_start + 1:], re.MULTILINE)
+    next_job = re.search(r"^  [a-z][a-z0-9_-]*:\s*$", pm[retag_start + 1 :], re.MULTILINE)
     retag_end = retag_start + 1 + next_job.start() if next_job else len(pm)
     retag_block = pm[retag_start:retag_end]
 
@@ -315,10 +316,10 @@ def check_db_migrate_driver_aligned() -> list[Failure]:
     # expect in pyproject.toml. The set covers what's been used in this
     # codebase plus the likely-next options (psycopg2 / psycopg / asyncpg).
     SCHEME_TO_PKG = {
-        "asyncpg":  "asyncpg",
-        "psycopg":  "psycopg",   # psycopg 3
+        "asyncpg": "asyncpg",
+        "psycopg": "psycopg",  # psycopg 3
         "psycopg2": "psycopg2",
-        "pg8000":   "pg8000",
+        "pg8000": "pg8000",
     }
 
     for scheme in sorted(schemes):
@@ -354,12 +355,145 @@ def check_db_migrate_driver_aligned() -> list[Failure]:
     return failures
 
 
+def check_stg_verify_artifact_v2_contract() -> list[Failure]:
+    """Contract guard for the stg-verify artifact schema v2 (deploy#199).
+
+    The v2 contract is split across two workflow files and must stay
+    consistent on both sides:
+
+    - verify-deploy.yml MUST emit `schema_version: 2` artifacts with a
+      `service_digests` object covering all four service keys.
+    - promote.yml gate MUST dispatch on schema_version, accept v2 strict
+      per-service equality, fall back to v1 freshness-window, and
+      compare the four service keys against plan-resolved digests.
+
+    A drift in either file (e.g., bumping the verify schema to v3 without
+    updating the gate, or adding a new service to the plan mapping
+    without updating verify-deploy's digest loop) silently degrades the
+    gate to v1 fallback for the new service — exactly the T1-window
+    risk #199 closed.
+
+    The four service keys mapping MUST match between verify-deploy.yml's
+    digest-resolution loop and promote.yml's plan job mapping dict.
+    """
+    failures: list[Failure] = []
+    vd = (WORKFLOWS / "verify-deploy.yml").read_text(encoding="utf-8")
+    pm = (WORKFLOWS / "promote.yml").read_text(encoding="utf-8")
+
+    expected_services = {"api", "frontend", "user-service", "landing"}
+
+    # ── verify-deploy.yml side ──────────────────────────────────────
+    if '"schema_version": 2' not in vd and '"schema_version":2' not in vd:
+        failures.append(
+            Failure(
+                "vd-v2-schema-version",
+                "#199",
+                "verify-deploy.yml does not emit `schema_version: 2` in the "
+                "stg-verify-result artifact. The promote.yml v2 gate (deploy#199) "
+                "depends on this field to dispatch between strict per-service "
+                "equality (v2) and freshness-window fallback (v1).",
+            )
+        )
+
+    if "service_digests" not in vd:
+        failures.append(
+            Failure(
+                "vd-v2-service-digests-field",
+                "#199",
+                "verify-deploy.yml does not include a `service_digests` field "
+                "in the emitted artifact. The v2 gate requires this field to "
+                "compare against plan-resolved digests.",
+            )
+        )
+
+    # Each of the four service keys must appear in verify-deploy.yml's
+    # digest resolution loop. Loose substring match — the entries are
+    # `"<key>:noorinalabs/..."` shell-string literals.
+    vd_missing = [s for s in sorted(expected_services) if f'"{s}:noorinalabs/' not in vd]
+    if vd_missing:
+        failures.append(
+            Failure(
+                "vd-v2-service-coverage",
+                "#199",
+                f"verify-deploy.yml's digest-resolution loop is missing the "
+                f"following service keys: {vd_missing}. The v2 contract requires "
+                f"all four services ({sorted(expected_services)}) to be covered "
+                "on both sides; a missing service silently degrades the gate to "
+                "v1 fallback for that service.",
+            )
+        )
+
+    # ── promote.yml side ────────────────────────────────────────────
+    # The plan job's mapping dict must cover the same four keys. We
+    # look for the literal mapping shape.
+    pm_missing = [
+        s
+        for s in sorted(expected_services)
+        if f'"{s}":' not in pm  # mapping = { "api": "noorinalabs/...", ... }
+    ]
+    if pm_missing:
+        failures.append(
+            Failure(
+                "pm-v2-plan-mapping-coverage",
+                "#199",
+                f"promote.yml's plan job mapping is missing the following "
+                f"service keys: {pm_missing}. Must match verify-deploy.yml's "
+                "digest-resolution loop on the same set.",
+            )
+        )
+
+    # The gate must dispatch on schema_version. We look for a case-style
+    # accept of both 1 and 2.
+    if not re.search(r'case\s+"\$schema_version"\s+in\s*\n\s*1\|2\)', pm):
+        failures.append(
+            Failure(
+                "pm-v2-schema-dispatch",
+                "#199",
+                "promote.yml gate does not have a `case` block accepting both "
+                "schema_version 1 and 2. The dispatch is required so a v1 "
+                "artifact (legacy) falls back to freshness-window while v2 "
+                "enforces strict per-service digest equality.",
+            )
+        )
+
+    # The gate must declare per-service digest outputs from plan AND
+    # consume them as env vars in the gate step.
+    for svc_env in ("API_DIGEST", "FRONTEND_DIGEST", "USER_SERVICE_DIGEST", "LANDING_DIGEST"):
+        if svc_env not in pm:
+            failures.append(
+                Failure(
+                    "pm-v2-digest-env-coverage",
+                    "#199",
+                    f"promote.yml gate step does not reference the `{svc_env}` "
+                    "env var. The v2 gate compares plan-resolved digests against "
+                    "the artifact's service_digests on a per-service basis; all "
+                    "four service digest env vars must be plumbed through.",
+                )
+            )
+
+    # The gate must have a v1-fallback warning annotation pointing at #199.
+    if "ship deploy#199" not in pm.lower() and "ship #199" not in pm:
+        failures.append(
+            Failure(
+                "pm-v2-fallback-warning",
+                "#199",
+                "promote.yml gate's v1 fallback path does not emit a warning "
+                "annotation directing operators to ship #199 to all stg deploys. "
+                "Without the warning, operators won't see the upgrade path while "
+                "the rollout is still in progress.",
+            )
+        )
+
+    return failures
+
+
 def main() -> int:
     sections = [
         ("Terraform: no ephemeral keypair (bug #1, #216)", check_terraform_no_ephemeral_keypair),
-        ("Promote: retag uses GH_PACKAGES_TOKEN (bug #2)",  check_promote_token_scope),
-        ("Promote: no floating-tag source (bug #3, #234)",  check_promote_no_floating_source),
+        ("Promote: retag uses GH_PACKAGES_TOKEN (bug #2)", check_promote_token_scope),
+        ("Promote: no floating-tag source (bug #3, #234)", check_promote_no_floating_source),
         ("DB-migrate: driver matches pyproject (bug #5, #235)", check_db_migrate_driver_aligned),
+        ("Stg-verify artifact v2 contract (#199)", check_stg_verify_artifact_v2_contract),
     ]
     all_failures: list[Failure] = []
     for label, fn in sections:

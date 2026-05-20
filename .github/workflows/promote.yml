@@ -159,13 +159,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       # Each matrix cell of `retag` picks its per-image short from here.
-      # Shape: [{"key": "api", "image": "...", "short": "a1b2c3d"}, ...]
+      # Shape: [{"key": "api", "image": "...", "short": "a1b2c3d", "digest": "sha256:..."}, ...]
       images_json: ${{ steps.resolve.outputs.images_json }}
       # Flat per-service shorts for trigger-prod-deploy's input mapping.
       api_short:          ${{ steps.resolve.outputs.api_short }}
       frontend_short:     ${{ steps.resolve.outputs.frontend_short }}
       user_service_short: ${{ steps.resolve.outputs.user_service_short }}
       landing_short:      ${{ steps.resolve.outputs.landing_short }}
+      # Per-service stg-latest manifest digests for the v2 gate
+      # (deploy#199). Empty string if the service is not in this
+      # promotion's image set or if digest resolution failed.
+      api_digest:          ${{ steps.resolve.outputs.api_digest }}
+      frontend_digest:     ${{ steps.resolve.outputs.frontend_digest }}
+      user_service_digest: ${{ steps.resolve.outputs.user_service_digest }}
+      landing_digest:      ${{ steps.resolve.outputs.landing_digest }}
     steps:
       - name: Log in to GHCR
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
@@ -223,10 +230,49 @@ jobs:
           explicit = os.environ.get("_EXPLICIT_SHORT", "")
           # Plan is deterministic: if an explicit short is given, every image
           # uses it. Otherwise each image resolves its own via stg-latest walk
-          # in the bash block that follows.
-          out = [{"key": k, "image": mapping[k], "short": explicit} for k in requested]
+          # in the bash block that follows. The `digest` field is filled by
+          # the bash block below (auto-resolve path) or by the explicit-short
+          # digest-resolve step (manual override path).
+          out = [{"key": k, "image": mapping[k], "short": explicit, "digest": ""} for k in requested]
           print(json.dumps(out))
           PY
+
+          # Explicit-short path: resolve each service's digest from its
+          # `sha-<short>` tag. The auto-resolve path below already records
+          # the digest as part of stg-latest walk; this branch covers the
+          # manual `inputs.source_sha` override so the v2 gate (deploy#199)
+          # still has a digest to compare against.
+          if [ -n "$explicit_short" ]; then
+            : > /tmp/explicit_digests.jsonl
+            while IFS= read -r entry; do
+              key=$(printf '%s' "$entry" | python3 -c "import sys,json;print(json.loads(sys.stdin.read())['key'])")
+              image=$(printf '%s' "$entry" | python3 -c "import sys,json;print(json.loads(sys.stdin.read())['image'])")
+              full="${REGISTRY}/${image}"
+              digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$full:sha-${explicit_short}" 2>/dev/null || echo "")
+              if [ -z "$digest" ]; then
+                echo "::warning::Could not resolve digest for explicit-short $full:sha-${explicit_short} — gate will fall back to v1 semantics for $key."
+              fi
+              KEY="$key" IMAGE_NAME="$image" SHORT="$explicit_short" DIGEST="$digest" python3 -c "
+          import json, os
+          print(json.dumps({
+              'key': os.environ['KEY'],
+              'image': os.environ['IMAGE_NAME'],
+              'short': os.environ['SHORT'],
+              'digest': os.environ['DIGEST'],
+          }))
+          " >> /tmp/explicit_digests.jsonl
+            done < <(python3 -c "
+          import json
+          for e in json.load(open('/tmp/plan.json')):
+              print(json.dumps(e))
+          ")
+            python3 -c "
+          import json
+          with open('/tmp/explicit_digests.jsonl') as fh:
+              rows = [json.loads(line) for line in fh if line.strip()]
+          json.dump(rows, open('/tmp/plan.json', 'w'))
+          "
+          fi
 
           # If explicit_short is empty, resolve per-image from stg-latest.
           # We do this in bash since we already have buildx + curl available.
@@ -267,9 +313,16 @@ jobs:
               fi
               echo "[plan] $key ($image): resolved short=$short (digest=$stg_digest)"
               # Write one JSON object per line for downstream aggregation.
-              KEY="$key" IMAGE_NAME="$image" SHORT="$short" python3 -c "
+              # Carrying `digest` through enables the v2 gate (deploy#199)
+              # to compare against verify-deploy's recorded service_digests.
+              KEY="$key" IMAGE_NAME="$image" SHORT="$short" DIGEST="$stg_digest" python3 -c "
           import json, os
-          print(json.dumps({'key': os.environ['KEY'], 'image': os.environ['IMAGE_NAME'], 'short': os.environ['SHORT']}))
+          print(json.dumps({
+              'key': os.environ['KEY'],
+              'image': os.environ['IMAGE_NAME'],
+              'short': os.environ['SHORT'],
+              'digest': os.environ['DIGEST'],
+          }))
           " >> /tmp/resolved_shorts.jsonl
             done < <(python3 -c "
           import json
@@ -285,7 +338,10 @@ jobs:
           "
           fi
 
-          # Emit aggregated matrix JSON + per-service short outputs.
+          # Emit aggregated matrix JSON + per-service short + per-service
+          # digest outputs. Digests are consumed by the v2 stg-verify gate
+          # (deploy#199) for per-service equality checks against the
+          # verify-deploy artifact's `service_digests` map.
           python3 - <<'PY3'
           import json, os
           data = json.load(open("/tmp/plan.json"))
@@ -293,37 +349,38 @@ jobs:
           with open(out_path, "a") as fh:
               fh.write("images_json=" + json.dumps(data) + "\n")
               # Per-service flat shorts (empty string if service not in set).
-              by_key = {e["key"]: e["short"] for e in data}
-              fh.write(f"api_short={by_key.get('api', '')}\n")
-              fh.write(f"frontend_short={by_key.get('frontend', '')}\n")
-              fh.write(f"user_service_short={by_key.get('user-service', '')}\n")
-              fh.write(f"landing_short={by_key.get('landing', '')}\n")
+              by_short = {e["key"]: e["short"] for e in data}
+              fh.write(f"api_short={by_short.get('api', '')}\n")
+              fh.write(f"frontend_short={by_short.get('frontend', '')}\n")
+              fh.write(f"user_service_short={by_short.get('user-service', '')}\n")
+              fh.write(f"landing_short={by_short.get('landing', '')}\n")
+              # Per-service digests (empty if not in set or resolve failed).
+              by_digest = {e["key"]: e.get("digest", "") for e in data}
+              fh.write(f"api_digest={by_digest.get('api', '')}\n")
+              fh.write(f"frontend_digest={by_digest.get('frontend', '')}\n")
+              fh.write(f"user_service_digest={by_digest.get('user-service', '')}\n")
+              fh.write(f"landing_digest={by_digest.get('landing', '')}\n")
           print("[plan] matrix:", json.dumps(data, indent=2))
           PY3
 
   # ─────────────────────────────────────────────────────────────────
-  # Stg-verify gate (deploy#179).
+  # Stg-verify gate (deploy#179 introduced v1 freshness; deploy#199 adds
+  # v2 per-service digest equality).
   #
   # Hard-blocks promotion unless the most recent `verify-deploy.yml`
-  # run triggered by "Deploy to staging" concluded success AND its
-  # emitted artifact is fresh (default: <24h old).
+  # run triggered by "Deploy to staging" concluded success AND the
+  # appropriate schema-version check passes:
   #
-  # Why "most recent" instead of "per image SHA":
-  #   verify-deploy.yml emits its artifact's `commit_sha` from the
-  #   triggering deploy-stg run's `head_sha`, which for a
-  #   repository_dispatch is the deploy-repo HEAD, NOT the service
-  #   image's SHA. The plan job resolves per-service image short SHAs
-  #   from each service's GHCR `stg-latest` digest — these two
-  #   identifiers do not share a namespace, so per-image SHA equality
-  #   isn't achievable without modifying verify-deploy.yml's schema
-  #   (out of scope for this issue per the issue body).
+  #   v2 (current): every service in this promotion's image set has
+  #       its plan-resolved stg-latest digest equal to the artifact's
+  #       `service_digests[<service>]`. Any divergence (a service moved
+  #       its stg-latest pointer between verify-stg capture and this
+  #       promote) FAILS the gate with a per-service diff.
   #
-  #   Operationally, the unit of stg verification IS the compose stack
-  #   as a whole at a moment in time. One successful verify-stg run
-  #   validates the cumulative state of every `stg-latest` pointer at
-  #   trigger time. If `stg-latest` hasn't moved since, that verify
-  #   covers what plan resolved. The freshness window enforces the
-  #   "hasn't moved" assumption probabilistically.
+  #   v1 (legacy fallback during rollout): fresh-enough artifact
+  #       (default: <24h old). Used until every stg deploy has rolled
+  #       through a deploy#199-shipping commit. A warning annotation
+  #       surfaces the fallback so operators see the upgrade path.
   #
   # Override: `inputs.skip_stg_verify: true` skips the gate. A warning
   # annotation + job-summary entry surface the break-glass use.
@@ -392,6 +449,14 @@ jobs:
           FRONTEND_SHORT:     ${{ needs.plan.outputs.frontend_short }}
           USER_SERVICE_SHORT: ${{ needs.plan.outputs.user_service_short }}
           LANDING_SHORT:      ${{ needs.plan.outputs.landing_short }}
+          # Per-service digests for the v2 gate (deploy#199). Empty if the
+          # service is not in this promotion's image set or if plan's
+          # digest resolution failed (the latter only happens on registry
+          # outage — plan fails hard in that case so we shouldn't reach here).
+          API_DIGEST:          ${{ needs.plan.outputs.api_digest }}
+          FRONTEND_DIGEST:     ${{ needs.plan.outputs.frontend_digest }}
+          USER_SERVICE_DIGEST: ${{ needs.plan.outputs.user_service_digest }}
+          LANDING_DIGEST:      ${{ needs.plan.outputs.landing_digest }}
         run: |
           set -euo pipefail
 
@@ -408,6 +473,7 @@ jobs:
           mkdir -p /tmp/verify_artifacts
           chosen_run_id=""
           chosen_artifact=""
+          chosen_schema=""
           while IFS=$'\t' read -r run_id event; do
             # Only workflow_run-triggered verify runs matter (those are
             # auto-fired post-deploy). workflow_dispatch runs may target
@@ -443,17 +509,23 @@ jobs:
             if [ -z "$json_file" ] || [ ! -f "$json_file" ]; then
               continue
             fi
-            # Sanity-check schema_version. Fail loud on unknown schema —
-            # do NOT silently treat unrecognized as success.
+            # Schema dispatch: v1 (legacy, deploy#179) and v2 (per-service
+            # digests, deploy#199) are both accepted. Unknown versions
+            # hard-fail per the original strict-evolution rule.
             schema_version=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('schema_version',''))" "$json_file" 2>/dev/null || echo "")
-            if [ "$schema_version" != "1" ]; then
-              echo "::error::stg-verify-result artifact for run ${run_id} has unknown schema_version=${schema_version}; refusing to gate."
-              echo "::error::This gate understands only schema_version=1. Update the gate before publishing schema v2."
-              exit 1
-            fi
-            chosen_run_id="$run_id"
-            chosen_artifact="$json_file"
-            break
+            case "$schema_version" in
+              1|2)
+                chosen_run_id="$run_id"
+                chosen_artifact="$json_file"
+                chosen_schema="$schema_version"
+                break
+                ;;
+              *)
+                echo "::error::stg-verify-result artifact for run ${run_id} has unknown schema_version=${schema_version}; refusing to gate."
+                echo "::error::This gate understands schema_version in {1,2}. Update the gate before publishing a newer schema."
+                exit 1
+                ;;
+            esac
           done < /tmp/verify_runs.tsv
 
           if [ -z "$chosen_run_id" ]; then
@@ -467,17 +539,34 @@ jobs:
             exit 1
           fi
 
-          echo "Using stg-verify-result from run ${chosen_run_id}"
+          echo "Using stg-verify-result from run ${chosen_run_id} (schema v${chosen_schema})"
           echo "Artifact: ${chosen_artifact}"
           cat "$chosen_artifact"
           echo ""
 
-          # Parse fields.
+          # Parse fields common to both schemas.
           result=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('result',''))" "$chosen_artifact")
           commit_sha=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('commit_sha',''))" "$chosen_artifact")
           timestamp=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('timestamp',''))" "$chosen_artifact")
 
-          # Freshness check.
+          # Result check applies to both schemas — a failed verify ALWAYS
+          # blocks regardless of digest match / freshness.
+          if [ "$result" != "success" ]; then
+            echo "::error::Latest stg-verify-result is \`${result}\` (not success). Blocking prod-promote."
+            echo "gate_result=blocked-failed-verify" >> "$GITHUB_OUTPUT"
+            {
+              echo "## stg-verify gate FAILED — verify result not success"
+              echo ""
+              echo "| Field | Value |"
+              echo "|-------|-------|"
+              echo "| Schema | v${chosen_schema} |"
+              echo "| Source verify-deploy run | [${chosen_run_id}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${chosen_run_id}) |"
+              echo "| Artifact result | \`${result}\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Freshness check (universal — both schemas care about age).
           age_seconds=$(python3 - "$timestamp" <<'PY'
           import sys, datetime
           ts = sys.argv[1]
@@ -497,12 +586,121 @@ jobs:
           max_age_seconds=$(( MAX_AGE_HOURS * 3600 ))
           age_hours=$(python3 -c "print(round(${age_seconds}/3600.0, 2))")
 
-          # Decision.
+          # ─────────────────────────────────────────────────────────────
+          # Schema dispatch: v2 does strict per-service digest equality;
+          # v1 falls back to the legacy freshness-window heuristic with
+          # a warning annotation pointing at the upgrade path.
+          # ─────────────────────────────────────────────────────────────
+          if [ "$chosen_schema" = "2" ]; then
+            # v2: per-service digest equality. For every service in the
+            # current promotion set (non-empty plan-resolved short), the
+            # plan-resolved digest MUST equal the artifact's recorded
+            # service_digests[<service>]. Any mismatch FAILS the gate
+            # with a per-service diff.
+            verify_digests=$(python3 -c "
+          import json, sys
+          d = json.load(open('$chosen_artifact')).get('service_digests', {})
+          print(json.dumps(d))
+          ")
+            diff_lines=""
+            mismatch=0
+            checked=0
+            # Pipe-delimited so digest's embedded `:` doesn't break parsing.
+            # Format: key|plan_digest|short.
+            for entry in "api|${API_DIGEST}|${API_SHORT}" \
+                         "frontend|${FRONTEND_DIGEST}|${FRONTEND_SHORT}" \
+                         "user-service|${USER_SERVICE_DIGEST}|${USER_SERVICE_SHORT}" \
+                         "landing|${LANDING_DIGEST}|${LANDING_SHORT}"; do
+              key="${entry%%|*}"
+              rest="${entry#*|}"
+              plan_digest="${rest%%|*}"
+              short="${rest##*|}"
+              # Skip services not in this promotion set.
+              if [ -z "$short" ]; then
+                continue
+              fi
+              checked=$((checked + 1))
+              verify_digest=$(printf '%s' "$verify_digests" | python3 -c "import json,sys,os;print(json.loads(sys.stdin.read()).get(os.environ['K'], ''))" K="$key" 2>/dev/null || echo "")
+              if [ -z "$plan_digest" ]; then
+                # Plan failed to resolve a digest for this service (e.g.,
+                # explicit-short path + registry outage). Treat as
+                # mismatch — operator must investigate before promoting.
+                diff_lines="${diff_lines}- **${key}**: plan-digest missing (resolution failed); verify-digest \`${verify_digest:-<empty>}\`. Cannot confirm equality.\n"
+                mismatch=$((mismatch + 1))
+                continue
+              fi
+              if [ -z "$verify_digest" ]; then
+                # Artifact has no digest for this service. Could happen
+                # if verify-deploy is mid-rollout (older verify ran but
+                # this service wasn't in the v2 schema's image mapping).
+                diff_lines="${diff_lines}- **${key}**: verify-digest missing in artifact; plan-digest \`${plan_digest}\`. Verify mapping coverage.\n"
+                mismatch=$((mismatch + 1))
+                continue
+              fi
+              if [ "$plan_digest" != "$verify_digest" ]; then
+                diff_lines="${diff_lines}- **${key}**: MISMATCH — plan \`${plan_digest}\` vs verify \`${verify_digest}\`. \`stg-latest\` moved after verify-stg captured it.\n"
+                mismatch=$((mismatch + 1))
+                continue
+              fi
+              diff_lines="${diff_lines}- **${key}**: OK — \`${plan_digest}\`\n"
+            done
+
+            {
+              echo "## stg-verify gate — v2 (per-service digest)"
+              echo ""
+              echo "| Field | Value |"
+              echo "|-------|-------|"
+              echo "| Schema | v2 |"
+              echo "| Source verify-deploy run | [${chosen_run_id}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${chosen_run_id}) |"
+              echo "| Artifact result | \`${result}\` |"
+              echo "| Artifact commit_sha | \`${commit_sha}\` |"
+              echo "| Artifact timestamp | \`${timestamp}\` (age ${age_hours}h) |"
+              echo "| Services checked | ${checked} |"
+              echo "| Mismatches | ${mismatch} |"
+              echo ""
+              echo "### Per-service digest comparison"
+              printf '%b' "$diff_lines"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$mismatch" -gt 0 ]; then
+              echo "::error::v2 gate FAILED: ${mismatch} of ${checked} services have plan/verify digest divergence. A service's stg-latest moved after stg-verify captured it — unverified bits would ship. Block promotion; re-run verify-deploy.yml against current stg state before retrying."
+              echo "gate_result=blocked-v2-digest-mismatch" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            echo "stg-verify gate PASSED (v2: all ${checked} services digest-equal)."
+            echo "gate_result=passed-v2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ─────────────────────────────────────────────────────────────
+          # v1 fallback: freshness-window heuristic (deploy#179 legacy).
+          # Emits a warning annotation directing operators at the upgrade
+          # path — once every stg deploy has rolled past this PR, every
+          # artifact will be v2 and this branch is dead.
+          # ─────────────────────────────────────────────────────────────
+          echo "::warning::v1 artifact found at run ${chosen_run_id}; falling back to freshness-window gating. Ship deploy#199 to all stg deploy paths to upgrade to per-service-digest equality (closes the T1-window risk documented in #199)."
+          if [ "$age_seconds" -gt "$max_age_seconds" ]; then
+            echo "::error::stg verify is stale: artifact age=${age_hours}h exceeds max ${MAX_AGE_HOURS}h. Re-run verify-deploy.yml against current stg state, or raise stg_verify_max_age_hours if accepting risk."
+            echo "gate_result=blocked-stale" >> "$GITHUB_OUTPUT"
+            {
+              echo "## stg-verify gate FAILED — v1 stale"
+              echo ""
+              echo "| Field | Value |"
+              echo "|-------|-------|"
+              echo "| Schema | v1 (fallback path — ship #199 stg-side to upgrade) |"
+              echo "| Source verify-deploy run | [${chosen_run_id}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${chosen_run_id}) |"
+              echo "| Artifact age | ${age_hours}h (max ${MAX_AGE_HOURS}h) |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
           {
-            echo "## stg-verify gate"
+            echo "## stg-verify gate — v1 fallback (freshness window)"
             echo ""
             echo "| Field | Value |"
             echo "|-------|-------|"
+            echo "| Schema | v1 (fallback path — ship #199 stg-side to upgrade) |"
             echo "| Source verify-deploy run | [${chosen_run_id}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${chosen_run_id}) |"
             echo "| Artifact result | \`${result}\` |"
             echo "| Artifact commit_sha | \`${commit_sha}\` |"
@@ -514,22 +712,11 @@ jobs:
             echo "- user-service: \`${USER_SERVICE_SHORT:-<not in promotion set>}\`"
             echo "- landing:      \`${LANDING_SHORT:-<not in promotion set>}\`"
             echo ""
-            echo "_Note: per-service shorts and \`commit_sha\` come from different namespaces (image SHA vs deploy-repo HEAD). Identity match is informational only — the gate semantics are 'latest stg verify succeeded within freshness window'._"
+            echo "_v1 semantics: 'latest stg verify succeeded within freshness window'. v2 (deploy#199) replaces this with per-service digest equality; once every stg deploy has rolled past #199, this fallback is unreachable._"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$result" != "success" ]; then
-            echo "::error::Latest stg-verify-result is \`${result}\` (not success). Blocking prod-promote."
-            echo "gate_result=blocked-failed-verify" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          if [ "$age_seconds" -gt "$max_age_seconds" ]; then
-            echo "::error::stg verify is stale: artifact age=${age_hours}h exceeds max ${MAX_AGE_HOURS}h. Re-run verify-deploy.yml against current stg state, or raise stg_verify_max_age_hours if accepting risk."
-            echo "gate_result=blocked-stale" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-          echo "stg-verify gate PASSED."
-          echo "gate_result=passed" >> "$GITHUB_OUTPUT"
+          echo "stg-verify gate PASSED (v1 fallback: freshness OK)."
+          echo "gate_result=passed-v1-fallback" >> "$GITHUB_OUTPUT"
 
   # ─────────────────────────────────────────────────────────────────
   # Pre-retag alembic gate (deploy#160).
@@ -704,35 +891,15 @@ jobs:
           # match, but verifying catches registry bugs or accidental
           # buildx flag drift.
           #
-          # Comparison is shape-aware (#239 fix). When the source is a
-          # multi-arch index/list, `imagetools create` preserves it
-          # identically and we compare top-level manifest digests directly.
-          # When the source is a single-arch v2 manifest (landing-page is
-          # currently the only one), `imagetools create` wraps it in a
-          # NEW index whose digest is necessarily different from the
-          # unwrapped source manifest. In that case we compare the source
-          # digest to the destination index's `manifests[0].digest` —
-          # which IS the wrapped source manifest, so equality means the
-          # retag preserved content even though the surface representation
-          # changed.
+          # All services emit OCI index post-#242 (landing-page PR #75,
+          # isnad-graph + user-service + design-system from prior waves),
+          # so the shape-aware fallback for single-arch v2 manifests is no
+          # longer needed. Direct top-level digest comparison applies
+          # uniformly.
           src=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:$SOURCE_TAG")
-          src_media=$(docker buildx imagetools inspect --format '{{.Manifest.MediaType}}' "$IMAGE:$SOURCE_TAG")
+          ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-$SHORT")
+          pl=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-latest")
 
-          if echo "$src_media" | grep -qE 'index|manifest\.list'; then
-            # Multi-arch source — direct top-level comparison.
-            ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-$SHORT")
-            pl=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE:prod-latest")
-            shape="multi-arch (direct top-level digest comparison)"
-          else
-            # Single-arch source — compare against the wrapped manifest digest
-            # inside the destination index.
-            ps=$(docker buildx imagetools inspect --raw "$IMAGE:prod-$SHORT" | jq -r '.manifests[0].digest')
-            pl=$(docker buildx imagetools inspect --raw "$IMAGE:prod-latest" | jq -r '.manifests[0].digest')
-            shape="single-arch (compare source to destination's manifests[0].digest)"
-          fi
-
-          echo "Source MediaType:    $src_media"
-          echo "Comparison shape:    $shape"
           echo "source digest:       $src"
           echo "prod-<short> digest: $ps"
           echo "prod-latest digest:  $pl"

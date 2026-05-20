@@ -22,10 +22,11 @@ the helper script `.github/workflows/scripts/cold_rebuild_static_checks.py`.
 | Bug | Issue | Fix PR | Detection |
 |-----|-------|--------|-----------|
 | terraform.yml ephemeral keypair | [#216](https://github.com/noorinalabs/noorinalabs-deploy/issues/216) | [#217](https://github.com/noorinalabs/noorinalabs-deploy/pull/217) | static — `cold_rebuild_static_checks.py` asserts (a) terraform.yml contains no `ssh-keygen`, (b) `modules/hetzner-vps/deploy.pub` exists, (c) env-root `ssh_public_key_path` defaults point at the canonical pubkey. |
-| promote.yml retag-token mismatch | (no issue — fixed inline via PAT regen + `GH_PACKAGES_TOKEN` swap) | (inline) | static — asserts the retag job's docker/login-action authenticates with `secrets.GH_PACKAGES_TOKEN`, never `secrets.GITHUB_TOKEN`. |
+| promote.yml retag-token mismatch | [#230](https://github.com/noorinalabs/noorinalabs-deploy/issues/230) | (inline) | static — asserts the retag job's docker/login-action authenticates with `secrets.GH_PACKAGES_TOKEN`, never `secrets.GITHUB_TOKEN`. |
 | promote.yml stg-latest TOCTOU | [#234](https://github.com/noorinalabs/noorinalabs-deploy/issues/234) | [#236](https://github.com/noorinalabs/noorinalabs-deploy/pull/236) | static — asserts `Resolve source tag` step assigns `source_tag="sha-${SHORT}"` and never to a `*-latest` floating tag. |
 | promote.yml multi-arch parity | [#239](https://github.com/noorinalabs/noorinalabs-deploy/issues/239) | [#240](https://github.com/noorinalabs/noorinalabs-deploy/pull/240) | dynamic — `buildx-shape-dryrun` job builds a multi-arch + single-arch fixture against a local registry, runs `imagetools create`, and asserts the shape-aware parity logic from promote.yml passes for both shapes. Includes a negative control that asserts the pre-#239 naive comparison still fails on single-arch. |
 | db-migrate.yml psycopg-vs-asyncpg | [#235](https://github.com/noorinalabs/noorinalabs-deploy/issues/235) | [#236](https://github.com/noorinalabs/noorinalabs-deploy/pull/236) | static — extracts the `postgresql+<driver>://` scheme from db-migrate.yml's `DATABASE_URL=` line and asserts the driver package is declared in user-service/pyproject.toml (read from the wave-aware sibling checkout, matching `integration-tests.yml`'s pattern). |
+| stg-verify artifact v2 contract drift | [#199](https://github.com/noorinalabs/noorinalabs-deploy/issues/199) | (this PR) | static — asserts (a) `verify-deploy.yml` emits `schema_version: 2` with a `service_digests` object covering all four service keys; (b) `promote.yml` plan mapping covers the same four keys; (c) the gate has a `case` block accepting both schema_version 1 and 2; (d) all four `*_DIGEST` env vars are plumbed into the gate step; (e) the v1 fallback path emits a warning annotation pointing operators at #199 for the upgrade path. Catches drift where a new service is added to plan but not to verify-deploy's digest loop (silently degrades the gate to v1 fallback for the new service — re-introducing the T1-window risk #199 closed). |
 
 ## When the gate runs
 
@@ -133,7 +134,11 @@ When a new first-deploy / cold-start bug surfaces:
 2. **Add a guard** to `cold_rebuild_static_checks.py` (for static-shape
    bugs) or to `cold-rebuild-dryrun.yml` (for dynamic-shape bugs that
    need a fixture). The guard should fail loudly if the bug shape
-   reappears AND prove the fix shape is still in place.
+   reappears AND prove the fix shape is still in place. If the guard
+   checks a `DATABASE_URL` driver scheme, add the new driver to the
+   `SCHEME_TO_PKG` dict at `cold_rebuild_static_checks.py:317` —
+   unrecognized schemes fire `db-migrate-driver-known` with an
+   "extend SCHEME_TO_PKG" diagnostic.
 3. **Update this runbook**: add a row to the "What the gate covers"
    table with the issue number, fix PR, and detection mechanism.
 4. **Update `cold-rebuild-dryrun.yml`'s top-of-file comment** with the

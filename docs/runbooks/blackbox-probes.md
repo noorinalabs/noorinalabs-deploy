@@ -5,9 +5,28 @@ The blackbox-exporter (`prom/blackbox-exporter:v0.25.0`, container
 that `scripts/verify_prod_smoke.sh` validates post-deploy. Smoke is the
 deploy-time gate; blackbox is the steady-state monitor between deploys.
 
-Source of truth for the route list: `infra/prometheus/prometheus.yml`
-(scrape_config `blackbox`). Modules and HTTP-status expectations live in
-`infra/blackbox-exporter/blackbox.yml`.
+Source of truth for the route list: `infra/prometheus/prometheus.prod.yml`
+(prod) and `infra/prometheus/prometheus.stg.yml` (stg) — `scrape_config:
+blackbox` in each. Modules and HTTP-status expectations live in
+`infra/blackbox-exporter/blackbox.yml` (shared across envs).
+
+## Per-env probe scope (deploy#263)
+
+Pre-split, the stg VPS mounted the single `prometheus.yml` and probed PROD
+hostnames from inside stg — three correlated bugs (prod-attribution noise,
+zero stg coverage, polluted prod baseline). Post-split:
+
+| Env  | Hostnames probed                                         | Slack channel    |
+|------|----------------------------------------------------------|------------------|
+| prod | `isnad.noorinalabs.com`, `noorinalabs.com`               | `#prod-alerts`   |
+| stg  | `isnad.stg.noorinalabs.com`, `stg.noorinalabs.com`       | `#stg-alerts`    |
+
+The route labels are identical across envs; the `external_labels.env`
+global label discriminates. Grafana dashboard filter `env=$__url_var`
+shows only the in-scope probes for the selected environment.
+
+The route table below documents the PROD hostnames. The stg variant has
+the same routes with hostnames swapped to `*.stg.noorinalabs.com`.
 
 | Route label             | URL                                                                  | Module          | Expected |
 |-------------------------|----------------------------------------------------------------------|-----------------|----------|

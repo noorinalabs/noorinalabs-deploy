@@ -29,7 +29,7 @@ resource "b2_bucket" "pipeline" {
       allowed_operations = ["s3_get", "s3_head", "s3_put"]
       max_age_seconds    = 3600
       allowed_headers    = ["*"]
-      expose_headers     = ["x-bz-content-sha1"]
+      expose_headers     = ["x-bz-content-sha1", "ETag"]
     }
   }
 }

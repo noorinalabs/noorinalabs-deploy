@@ -1,16 +1,68 @@
 name: Terraform
 on:
   pull_request:
-    paths: ['terraform/**']
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
   push:
     branches: [main]
-    paths: ['terraform/**']
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
+  schedule:
+    # Weekly Monday 14:00 UTC — catches rotation-drift that landed
+    # between TF-touching PRs. Detection latency: <=7 days regardless
+    # of TF-PR cadence. See deploy#158.
+    - cron: '0 14 * * 1'
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
+  validate-creds:
+    # Detects rotation-drift between the `staging` and `production` GH
+    # Environments for shared B2 state-bucket credentials + per-env
+    # HCLOUD tokens. Fails fast with which-env-is-stale, instead of a
+    # generic AWS-auth error buried in a later `terraform init`. See
+    # deploy#158 and ADR 0004 § Decision C (detection layer).
+    name: Validate creds (${{ matrix.env }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [stg, prod]
+    environment: ${{ matrix.env == 'prod' && 'production' || 'staging' }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
+      HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
+    steps:
+      - name: Probe B2 state-bucket auth
+        run: |
+          if ! aws s3api head-bucket \
+              --bucket noorinalabs-terraform-state \
+              --endpoint-url https://s3.us-east-005.backblazeb2.com \
+              2> /tmp/b2-err; then
+            echo "::error::B2 credentials for '${{ matrix.env }}' env FAILED to authenticate against noorinalabs-terraform-state."
+            echo "::error::Rotation drift suspected. Verify both 'gh secret set TF_STATE_B2_KEY_ID --env ${{ matrix.env == 'prod' && 'production' || 'staging' }}' and TF_STATE_B2_APP_KEY were set with the current B2 key."
+            echo "::error::aws error output:"
+            sed 's/^/::error::  /' /tmp/b2-err
+            exit 1
+          fi
+          echo "B2 state-bucket auth OK for '${{ matrix.env }}' env."
+      - name: Probe HCLOUD API auth
+        run: |
+          http_code=$(curl --silent --output /tmp/hcloud-resp --write-out '%{http_code}' \
+            --header "Authorization: Bearer ${HCLOUD_TOKEN}" \
+            https://api.hetzner.cloud/v1/servers)
+          if [ "${http_code}" != "200" ]; then
+            echo "::error::HCLOUD_TOKEN for '${{ matrix.env }}' env FAILED to authenticate against Hetzner API (HTTP ${http_code})."
+            echo "::error::Rotation drift suspected. Verify 'gh secret set HCLOUD_TOKEN --env ${{ matrix.env == 'prod' && 'production' || 'staging' }}' was run with the current token."
+            exit 1
+          fi
+          echo "HCLOUD API auth OK for '${{ matrix.env }}' env (HTTP 200)."
+
   fmt:
     name: Format check
     runs-on: ubuntu-latest
@@ -50,9 +102,71 @@ jobs:
       - name: Validate
         run: terraform validate
 
+  tflint:
+    # Static analysis. Catches the class of bug that motivated this issue:
+    # an `endpoint` (singular, pre-TF 1.6) vs `endpoints` (plural, TF 1.6+)
+    # S3 backend-arg mismatch slipped through `terraform validate` because
+    # the parser treats unknown-but-syntactically-valid args as warnings.
+    # tflint's terraform-recommended preset fails on those. See deploy#23.
+    name: TFLint (${{ matrix.path }})
+    needs: fmt
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        path:
+          - terraform/hetzner/modules/hetzner-vps
+          - terraform/hetzner/envs/stg
+          - terraform/hetzner/envs/prod
+          - terraform/cloudflare
+          - terraform/backblaze
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+    steps:
+      - uses: actions/checkout@v6
+      # Pinned to commit-sha (v6.2.2) per third-party-action integrity
+      # discipline — see ontology feedback_verify_third_party_integrity_claims.
+      - uses: terraform-linters/setup-tflint@b480b8fcdaa6f2c577f8e4fa799e89e756bb7c93  # v6.2.2
+        with:
+          tflint_version: latest
+      - name: Init tflint plugins
+        run: tflint --init --config="${GITHUB_WORKSPACE}/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run tflint
+        # tflint's --recursive is a bare bool flag (no =value form); default is
+        # non-recursive, which is what we want — each matrix entry runs from a
+        # working-directory scoped to one module. NOTE: actionlint does NOT
+        # validate tflint flag syntax, so when bumping setup-tflint, verify
+        # against `tflint --help` of the pinned version before merge.
+        run: tflint --config="${GITHUB_WORKSPACE}/.tflint.hcl" --format=compact
+
+  checkov:
+    # Policy / security scan. Runs against the whole terraform/ tree in
+    # a single job (checkov walks the tree itself). Soft-fail false so
+    # any NEW finding blocks the PR; pre-existing findings are skipped
+    # inline via `# checkov:skip=CKV_*` comments in the source files.
+    # See terraform/BACKEND.md § Pre-existing checkov skips.
+    name: Checkov
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Pinned to commit-sha (v12.3102.0) per third-party-action integrity
+      # discipline — see ontology feedback_verify_third_party_integrity_claims.
+      - uses: bridgecrewio/checkov-action@4048c972aae68d0b983a48bb3479aab2d877b898  # v12.3102.0
+        with:
+          directory: terraform/
+          framework: terraform
+          soft_fail: false
+          quiet: true
+          output_format: cli
+          skip_results_upload: true
+
   plan:
     name: Plan (hetzner/${{ matrix.env }})
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     strategy:
@@ -100,7 +214,7 @@ jobs:
 
   plan-cloudflare:
     name: Plan (cloudflare)
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     environment: production
@@ -110,6 +224,10 @@ jobs:
     env:
       TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+      # Defensive-TLD zone IDs for the canonical-domain 301 redirect rulesets
+      # (per #166). Public DNS metadata, not secrets — stored as repo vars.
+      TF_VAR_noorinalabs_net_zone_id: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+      TF_VAR_noorinalabs_org_zone_id: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
       # AWS_* env vars serve double duty: cloudflare's own B2 backend AND the
       # `terraform_remote_state` data sources that read the hetzner tfstates
       # (same bucket, same auth — see terraform/cloudflare/main.tf).
@@ -147,7 +265,7 @@ jobs:
 
   plan-backblaze:
     name: Plan (backblaze)
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     environment: production
@@ -191,7 +309,7 @@ jobs:
 
   apply:
     name: Apply (hetzner/${{ matrix.env }})
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
@@ -227,7 +345,7 @@ jobs:
   # cloudflare DNS pointing at the prior IP until the *next* push.
   apply-cloudflare:
     name: Apply (cloudflare)
-    needs: [validate, apply]
+    needs: [validate, tflint, checkov, apply]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: production
@@ -237,6 +355,10 @@ jobs:
     env:
       TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+      # Defensive-TLD zone IDs for the canonical-domain 301 redirect rulesets
+      # (per #166). Public DNS metadata, not secrets — stored as repo vars.
+      TF_VAR_noorinalabs_net_zone_id: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+      TF_VAR_noorinalabs_org_zone_id: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
       # AWS_* env vars serve double duty: cloudflare's own B2 backend AND the
       # `terraform_remote_state` data sources that read the hetzner tfstates
       # (same bucket, same auth — see terraform/cloudflare/main.tf).
@@ -254,7 +376,7 @@ jobs:
 
   apply-backblaze:
     name: Apply (backblaze)
-    needs: validate
+    needs: [validate, tflint, checkov]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: production

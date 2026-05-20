@@ -44,6 +44,28 @@ import redis.asyncio as aioredis
 # of pytest (e.g. `pytest tests/test_health.py`) inside the runner container
 # still works the same way it always has.
 RUN_MODE = os.environ.get("RUN_MODE", "hermetic")
+
+# Defense-in-depth prod-environment guard. The shell entrypoint
+# `integration-tests/run-tests.sh` already exits 3 on `RUN_MODE=remote
+# ENVIRONMENT={prod,production}` before pytest starts, but a direct
+# `pytest` invocation inside the runner image (interactive debug, future
+# workflow that skips run-tests.sh, `python -m pytest`, etc.) would
+# otherwise reach the auth-mutating fixtures and create real users or
+# trip rate-limiters against prod. Re-check here at module load so the
+# guard fires regardless of how pytest is invoked. See deploy#203 and
+# the matching shell block in run-tests.sh — keep the two coupled.
+_ENVIRONMENT = os.environ.get("ENVIRONMENT", "stg")
+if RUN_MODE == "remote" and _ENVIRONMENT in ("prod", "production"):
+    raise RuntimeError(
+        f"Refusing to run integration suite in remote mode against "
+        f"ENVIRONMENT={_ENVIRONMENT!r}. The suite mutates state via "
+        f"/auth endpoints; running against prod could create real "
+        f"users or trip rate-limiters that page oncall. Set "
+        f"ENVIRONMENT=stg or unset (defaults to 'stg'). This is "
+        f"enforced both by integration-tests/run-tests.sh AND here "
+        f"at module load."
+    )
+
 HERMETIC_ONLY_REASON = (
     "hermetic-only fixture: direct DB/Redis access is not available in "
     "remote mode (stg DBs are not reachable from outside the VPS). Run "
@@ -55,12 +77,8 @@ HERMETIC_ONLY_REASON = (
 # the legacy USER_SERVICE_URL / ISNAD_GRAPH_URL names are the hermetic
 # compose-internal hostnames. run-tests.sh exports both shapes in remote
 # mode so this lookup works either way.
-USER_SERVICE_URL = os.environ.get(
-    "USER_SERVICE_URL", os.environ.get("USER_SERVICE_BASE_URL", "")
-)
-ISNAD_GRAPH_URL = os.environ.get(
-    "ISNAD_GRAPH_URL", os.environ.get("ISNAD_BASE_URL", "")
-)
+USER_SERVICE_URL = os.environ.get("USER_SERVICE_URL", os.environ.get("USER_SERVICE_BASE_URL", ""))
+ISNAD_GRAPH_URL = os.environ.get("ISNAD_GRAPH_URL", os.environ.get("ISNAD_BASE_URL", ""))
 if not USER_SERVICE_URL or not ISNAD_GRAPH_URL:
     raise RuntimeError(
         "USER_SERVICE_URL/USER_SERVICE_BASE_URL and "
@@ -250,8 +268,6 @@ async def seeded_user_factory(
 async def issue_token_for(
     user_service: httpx.AsyncClient, authorization_code: str
 ) -> dict[str, str | int]:
-    r = await user_service.post(
-        "/auth/token", json={"authorization_code": authorization_code}
-    )
+    r = await user_service.post("/auth/token", json={"authorization_code": authorization_code})
     assert r.status_code == 200, f"token issuance failed: {r.status_code} {r.text}"
     return r.json()

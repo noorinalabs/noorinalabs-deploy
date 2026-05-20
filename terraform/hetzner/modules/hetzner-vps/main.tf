@@ -4,6 +4,13 @@ locals {
     project     = "noorinalabs"
     environment = var.env
   }
+  cloud_init_vars = {
+    ssh_public_key          = sensitive(chomp(file(var.ssh_public_key_path)))
+    ghcr_auth_b64           = var.ghcr_auth_b64
+    user_postgres_password  = var.user_postgres_password
+    user_redis_password     = var.user_redis_password
+    user_service_jwt_secret = var.user_service_jwt_secret
+  }
 }
 
 # hcloud_ssh_key.deploy was removed in #222 — Hetzner enforces SSH-key content
@@ -11,6 +18,7 @@ locals {
 # pubkey hit `uniqueness_error 409`. cloud-init's user_data is now the sole
 # path for injecting authorized_keys (writes both /home/deploy/.ssh/authorized_keys
 # and /root/.ssh/authorized_keys with var.ssh_public_key_path content).
+# See docs/adr/0003-ssh-key-authorization-via-cloud-init.md for rationale.
 
 resource "hcloud_firewall" "web" {
   name   = "${local.name_prefix}-firewall"
@@ -51,13 +59,7 @@ resource "hcloud_server" "app" {
 
   firewall_ids = [hcloud_firewall.web.id]
 
-  user_data = templatefile("${path.module}/cloud-init.yaml.tpl", {
-    ssh_public_key          = sensitive(chomp(file(var.ssh_public_key_path)))
-    ghcr_auth_b64           = var.ghcr_auth_b64
-    user_postgres_password  = var.user_postgres_password
-    user_redis_password     = var.user_redis_password
-    user_service_jwt_secret = var.user_service_jwt_secret
-  })
+  user_data = templatefile("${path.module}/cloud-init.yaml.tpl", local.cloud_init_vars)
 
   labels = local.labels
 
@@ -68,6 +70,13 @@ resource "hcloud_server" "app" {
   # deleted hcloud_ssh_key.deploy id from #217's apply) doesn't cause
   # spurious reconciliation. user_data is ignored so cloud-init template
   # edits don't trigger destructive server replace on already-provisioned VPSes.
+  #
+  # IMPORTANT: changes to cloud-init.yaml.tpl are silently skipped on existing
+  # servers. If a template change represents a baseline shift that must reach
+  # live boxes (e.g., new SSH key, new auditd rule), use the taint/replace
+  # procedure documented in docs/runbooks/cloud-init-template-changes.md.
+  # See docs/adr/0003-ssh-key-authorization-via-cloud-init.md for the
+  # ssh_keys/user_data ignore_changes rationale.
   lifecycle {
     ignore_changes = [ssh_keys, user_data]
   }

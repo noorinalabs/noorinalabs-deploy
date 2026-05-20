@@ -3,7 +3,7 @@
 # emit-backup-failure-marker.sh — OnFailure= hook for isnad-backup.service
 #
 # Emits two failure signals:
-#   1. A journal line under SyslogIdentifier=BACKUP_FAILURE that Loki/Promtail
+#   1. A journal line under SyslogIdentifier=BACKUP_FAILURE that Loki/Alloy
 #      can match for alerting.
 #   2. A node-exporter textfile-collector .prom file under /var/lib/node_exporter
 #      so Prometheus picks up the failure timestamp on its next scrape.

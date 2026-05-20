@@ -1,0 +1,194 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "tags": ["observability", "kafka", "pipeline"],
+  "title": "Kafka Pipeline",
+  "uid": "kafka-pipeline",
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "title": "Broker Up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "up{job=\"kafka\"}",
+          "legendFormat": "broker",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Brokers in Cluster",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "kafka_brokers",
+          "legendFormat": "brokers",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Topics",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "count(count by (topic) (kafka_topic_partitions))",
+          "legendFormat": "topics",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Total Partitions",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(kafka_topic_partitions)",
+          "legendFormat": "partitions",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "In-Sync Replicas per Topic",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "description": "kafka_topic_partition_in_sync_replica — per-partition ISR count. With replication-factor 1, expected value is 1 for every partition. A drop to 0 indicates a partition has lost its only replica.",
+      "targets": [
+        {
+          "expr": "kafka_topic_partition_in_sync_replica",
+          "legendFormat": "{{topic}} p{{partition}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Partitions per Topic",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "description": "kafka_topic_partitions — number of partitions per topic. Should match the inventory in docs/pipeline-kafka.md § Topic inventory (defaults: 3 per topic).",
+      "targets": [
+        {
+          "expr": "kafka_topic_partitions",
+          "legendFormat": "{{topic}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Producer Rate per Topic (msg/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "description": "Per-topic produce rate, derived from rate() over kafka_topic_partition_current_offset (the log-end offset). Sums partitions for a topic-level signal.",
+      "targets": [
+        {
+          "expr": "sum by (topic) (rate(kafka_topic_partition_current_offset[5m]))",
+          "legendFormat": "{{topic}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "mps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Consumer Rate per Group (msg/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "description": "Per-(consumergroup, topic) consume rate, derived from rate() over kafka_consumergroup_current_offset. EMPTY until ingest-platform consumer workers are deployed (consumer-group series only exist when consumers connect — see deploy#88 PR body).",
+      "targets": [
+        {
+          "expr": "sum by (consumergroup, topic) (rate(kafka_consumergroup_current_offset[5m]))",
+          "legendFormat": "{{consumergroup}} → {{topic}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "mps" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Consumer Lag per Group (messages)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "description": "kafka_consumergroup_lag — per-(consumergroup, topic, partition) lag in messages. EMPTY until consumers exist (see Consumer Rate panel description). KafkaConsumerGroupLagHigh alert fires at >10000 for 10m.",
+      "targets": [
+        {
+          "expr": "max by (consumergroup, topic) (kafka_consumergroup_lag)",
+          "legendFormat": "{{consumergroup}} → {{topic}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    },
+    {
+      "title": "DLQ Depth (pipeline.dlq)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "description": "Current end-offset of the pipeline.dlq topic per partition. Growth indicates worker failures depositing messages — KafkaDLQGrowing alert fires when rate>0 for 15m. Inspect via Kafka UI (SSH tunnel: ssh -L 8085:127.0.0.1:8085) for error_stage/error_code record headers.",
+      "targets": [
+        {
+          "expr": "kafka_topic_partition_current_offset{topic=\"pipeline.dlq\"}",
+          "legendFormat": "p{{partition}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      }
+    }
+  ]
+}

@@ -197,3 +197,18 @@ resource "cloudflare_record" "stg_users_cname" {
   ttl     = 1
   proxied = false
 }
+
+# www.stg.noorinalabs.com → stg apex. Caddy's first vhost block matches
+# `www.{$BASE_DOMAIN}` and on stg that resolves to `www.stg.noorinalabs.com`;
+# without this record Caddy retries the LE HTTP-01 challenge forever
+# (slow-burn LE rate-limit risk). Gray-cloud (proxied=false) matches the
+# other stg.* records — Cloudflare Universal SSL only covers one level
+# deep, so 3rd-level subdomains can't proxy through CF.
+resource "cloudflare_record" "stg_www_cname" {
+  zone_id = var.cloudflare_zone_id
+  name    = "www.stg"
+  content = "stg.${var.domain}"
+  type    = "CNAME"
+  ttl     = 1
+  proxied = false
+}
