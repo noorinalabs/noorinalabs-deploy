@@ -28,9 +28,19 @@
 #
 # Why C1 (extend this module) and not C2 (new root `terraform/cloudflare-
 # redirects/`): fewer moving parts. Same provider, same backend, same
-# `CLOUDFLARE_API_TOKEN` (token scope already covers all three zones per
-# owner setup in W10). New state in a separate root would add CI matrix
+# `CLOUDFLARE_API_TOKEN`. New state in a separate root would add CI matrix
 # entries and a second `terraform init` for one resource per zone.
+#
+# Token scope: the `CLOUDFLARE_API_TOKEN` was extended to cover the `.net` /
+# `.org` zones (plus Dynamic Redirect edit) in #347 — it did NOT already
+# cover all three zones (the earlier comment here claimed otherwise and was
+# wrong; corrected per #348).
+#
+# Import, not create: each `.net` / `.org` zone already has an
+# `http_request_dynamic_redirect` phase entrypoint ruleset, and Cloudflare
+# permits only one entrypoint per phase per zone. The `cloudflare_ruleset`
+# resources below are therefore IMPORTED (adopting the existing entrypoint)
+# rather than created — see imports.tf and #348.
 # ===========================================================================
 
 locals {
