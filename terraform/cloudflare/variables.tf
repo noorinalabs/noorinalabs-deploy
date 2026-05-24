@@ -30,6 +30,34 @@ variable "domain" {
   default     = "noorinalabs.com"
 }
 
+# Existing dynamic-redirect phase-entrypoint ruleset IDs for the defensive
+# TLDs. Cloudflare allows exactly one entrypoint ruleset per phase per zone,
+# and both `.net` and `.org` already have one — so the canonical-redirect
+# rulesets in redirects.tf must be IMPORTED (adopt the existing entrypoint),
+# not created (see #348). The `import {}` blocks in imports.tf reference these.
+#
+# These IDs are NOT stored anywhere — they are discovered at CI time from the
+# Cloudflare API (`GET /zones/<zone_id>/rulesets` → the entry whose
+# `phase == "http_request_dynamic_redirect"`) and threaded in as `TF_VAR_*`
+# by the discovery step in .github/workflows/terraform.yml.
+#
+# Default "" so that `terraform validate -backend=false` (the CI `validate`
+# job, which runs no discovery and passes no vars) still parses. An empty id
+# is only a problem at PLAN/APPLY time — those jobs (plan-cloudflare,
+# apply-cloudflare) run the discovery step first, so the value is non-empty
+# there. Do not rely on this default anywhere a plan/apply runs.
+variable "net_redirect_ruleset_id" {
+  description = "Existing http_request_dynamic_redirect entrypoint ruleset ID for noorinalabs.net (CI-discovered; see imports.tf)."
+  type        = string
+  default     = ""
+}
+
+variable "org_redirect_ruleset_id" {
+  description = "Existing http_request_dynamic_redirect entrypoint ruleset ID for noorinalabs.org (CI-discovered; see imports.tf)."
+  type        = string
+  default     = ""
+}
+
 # Per-env Hetzner VPS IPs are read from the hetzner env-root tfstates via
 # `data "terraform_remote_state"` in main.tf — no input vars. Eliminates
 # the manual var-passing footgun where cloudflare DNS could drift from a

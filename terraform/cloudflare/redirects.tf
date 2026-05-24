@@ -28,9 +28,19 @@
 #
 # Why C1 (extend this module) and not C2 (new root `terraform/cloudflare-
 # redirects/`): fewer moving parts. Same provider, same backend, same
-# `CLOUDFLARE_API_TOKEN` (token scope already covers all three zones per
-# owner setup in W10). New state in a separate root would add CI matrix
+# `CLOUDFLARE_API_TOKEN`. New state in a separate root would add CI matrix
 # entries and a second `terraform init` for one resource per zone.
+#
+# Token scope: the `CLOUDFLARE_API_TOKEN` was extended to cover the `.net` /
+# `.org` zones (plus Dynamic Redirect edit) in #347 — it did NOT already
+# cover all three zones (the earlier comment here claimed otherwise and was
+# wrong; corrected per #348).
+#
+# Import, not create: each `.net` / `.org` zone already has an
+# `http_request_dynamic_redirect` phase entrypoint ruleset, and Cloudflare
+# permits only one entrypoint per phase per zone. The `cloudflare_ruleset`
+# resources below are therefore IMPORTED (adopting the existing entrypoint)
+# rather than created — see imports.tf and #348.
 # ===========================================================================
 
 locals {
@@ -46,9 +56,19 @@ locals {
 resource "cloudflare_ruleset" "canonical_redirect" {
   for_each = local.redirect_zones
 
-  zone_id     = each.value
-  name        = "canonical-domain-redirect-${each.key}"
-  description = "301 redirect noorinalabs.${each.key} → noorinalabs.com (path + query preserved)"
+  zone_id = each.value
+  # MUST be "default". A phase ENTRYPOINT ruleset (kind="zone") is named
+  # "default" by Cloudflare convention, and `name` is ForceNew on
+  # cloudflare_ruleset. Since each zone already HAS a "default"
+  # http_request_dynamic_redirect entrypoint (the one we import via
+  # imports.tf), any other name forces a destroy+recreate of the prod
+  # entrypoint instead of an in-place adopt-and-update — which both defeats
+  # the import (#348) and breaks idempotency. With name="default" the import
+  # converges in place: only the rule's description + target_url expression
+  # change to our path/query-preserving redirect. Per-zone labeling lives in
+  # `description` (NOT ForceNew) and on the inner rule below, not in `name`.
+  name        = "default"
+  description = "Canonical-domain 301 redirect entrypoint for noorinalabs.${each.key} → noorinalabs.com (path + query preserved)"
   kind        = "zone"
   phase       = "http_request_dynamic_redirect"
 

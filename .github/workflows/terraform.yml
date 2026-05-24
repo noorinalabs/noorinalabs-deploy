@@ -238,6 +238,38 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
+      # Discover the existing http_request_dynamic_redirect entrypoint ruleset
+      # ID for each defensive-TLD zone and thread it into the import {} blocks
+      # (imports.tf) via TF_VAR_*. Required because Cloudflare allows only one
+      # entrypoint per phase per zone, so the canonical-redirect rulesets must
+      # adopt the existing entrypoints rather than create new ones (#348). The
+      # IDs are not stored anywhere; the CLOUDFLARE_API_TOKEN that can read
+      # them lives only in CI. Must run before plan (an empty import id errors
+      # at plan time, not just apply).
+      - name: Discover redirect ruleset IDs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+          ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
+        run: |
+          discover() {
+            zone_id="$1"; label="$2"
+            resp=$(curl --silent --show-error --fail-with-body \
+              --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets") || {
+                echo "::error::Failed to list rulesets for ${label} zone ${zone_id}"; echo "${resp}"; exit 1; }
+            id=$(printf '%s' "${resp}" | jq -r \
+              '.result[] | select(.phase=="http_request_dynamic_redirect") | .id' | head -n1)
+            if [ -z "${id}" ] || [ "${id}" = "null" ]; then
+              echo "::error::No http_request_dynamic_redirect entrypoint ruleset found for ${label} zone ${zone_id}."
+              echo "::error::imports.tf assumes one already exists (the reason this PR imports rather than creates — see #348)."
+              exit 1
+            fi
+            echo "Discovered ${label} dynamic-redirect ruleset: ${id}"
+            echo "TF_VAR_${label}_redirect_ruleset_id=${id}" >> "${GITHUB_ENV}"
+          }
+          discover "${NET_ZONE_ID}" net
+          discover "${ORG_ZONE_ID}" org
       - name: Init
         run: terraform init
       - name: Plan
@@ -369,6 +401,36 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "~> 1.6"
+      # See plan-cloudflare § "Discover redirect ruleset IDs". Same discovery
+      # is required on apply: the import {} blocks (imports.tf) reference
+      # TF_VAR_{net,org}_redirect_ruleset_id, and an empty import id errors at
+      # plan-during-apply. After the first apply imports the entrypoints into
+      # state, re-runs are idempotent (Terraform consults import {} only for
+      # resources not yet in state). See #348.
+      - name: Discover redirect ruleset IDs
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+          ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
+        run: |
+          discover() {
+            zone_id="$1"; label="$2"
+            resp=$(curl --silent --show-error --fail-with-body \
+              --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              "https://api.cloudflare.com/client/v4/zones/${zone_id}/rulesets") || {
+                echo "::error::Failed to list rulesets for ${label} zone ${zone_id}"; echo "${resp}"; exit 1; }
+            id=$(printf '%s' "${resp}" | jq -r \
+              '.result[] | select(.phase=="http_request_dynamic_redirect") | .id' | head -n1)
+            if [ -z "${id}" ] || [ "${id}" = "null" ]; then
+              echo "::error::No http_request_dynamic_redirect entrypoint ruleset found for ${label} zone ${zone_id}."
+              echo "::error::imports.tf assumes one already exists (the reason this PR imports rather than creates — see #348)."
+              exit 1
+            fi
+            echo "Discovered ${label} dynamic-redirect ruleset: ${id}"
+            echo "TF_VAR_${label}_redirect_ruleset_id=${id}" >> "${GITHUB_ENV}"
+          }
+          discover "${NET_ZONE_ID}" net
+          discover "${ORG_ZONE_ID}" org
       - name: Init
         run: terraform init
       - name: Apply
