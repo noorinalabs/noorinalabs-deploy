@@ -56,9 +56,19 @@ locals {
 resource "cloudflare_ruleset" "canonical_redirect" {
   for_each = local.redirect_zones
 
-  zone_id     = each.value
-  name        = "canonical-domain-redirect-${each.key}"
-  description = "301 redirect noorinalabs.${each.key} → noorinalabs.com (path + query preserved)"
+  zone_id = each.value
+  # MUST be "default". A phase ENTRYPOINT ruleset (kind="zone") is named
+  # "default" by Cloudflare convention, and `name` is ForceNew on
+  # cloudflare_ruleset. Since each zone already HAS a "default"
+  # http_request_dynamic_redirect entrypoint (the one we import via
+  # imports.tf), any other name forces a destroy+recreate of the prod
+  # entrypoint instead of an in-place adopt-and-update — which both defeats
+  # the import (#348) and breaks idempotency. With name="default" the import
+  # converges in place: only the rule's description + target_url expression
+  # change to our path/query-preserving redirect. Per-zone labeling lives in
+  # `description` (NOT ForceNew) and on the inner rule below, not in `name`.
+  name        = "default"
+  description = "Canonical-domain 301 redirect entrypoint for noorinalabs.${each.key} → noorinalabs.com (path + query preserved)"
   kind        = "zone"
   phase       = "http_request_dynamic_redirect"
 
