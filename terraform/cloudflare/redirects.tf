@@ -83,15 +83,24 @@ resource "cloudflare_ruleset" "canonical_redirect" {
     action_parameters {
       from_value {
         status_code = 301
-        # Dynamic target: concatenate canonical host with the incoming
-        # request's path, and append `?<query>` only when a query string
-        # is present. Cloudflare's `wirefilter` expression dialect supports
-        # `concat()`, `if()`, and the `http.request.uri.{path,query}` fields.
-        # Expression-based `target_url` already covers query preservation,
+        # Dynamic target: concatenate the canonical host with the incoming
+        # request's URI. Cloudflare's `http.request.uri` field is the path
+        # AND query string together (e.g. `/foo?x=1`), so a single concat()
+        # preserves both with no conditional — there is no need to glue path
+        # and query back together by hand.
+        #
+        # The earlier form used `if()`/`len()` and `http.request.uri.{path,
+        # query}`, but Cloudflare's redirect target_url expression language
+        # does NOT support `if()`/`len()` (they are not in the redirect
+        # expression function set). The CF API rejected it at apply time with
+        # "Filter parsing error … unknown identifier" — the plan can't catch
+        # this because CF validates the expression only at apply (#348).
+        #
+        # Expression-based `target_url` covers query preservation inherently,
         # so the separate `preserve_query_string` boolean is intentionally
         # omitted (it applies only to static `target_url.value` redirects).
         target_url {
-          expression = "concat(\"https://noorinalabs.com\", http.request.uri.path, if(len(http.request.uri.query) > 0, concat(\"?\", http.request.uri.query), \"\"))"
+          expression = "concat(\"https://noorinalabs.com\", http.request.uri)"
         }
       }
     }
