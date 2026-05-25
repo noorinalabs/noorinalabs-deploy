@@ -11,6 +11,11 @@ variable "env" {
 variable "server_type" {
   description = "Hetzner Cloud server type (e.g., cpx21, cpx41)."
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.server_type)) > 0
+    error_message = "server_type must not be empty — set it in the module call from the env root (terraform/hetzner/envs/<env>/main.tf, e.g. server_type = \"cpx41\")."
+  }
 }
 
 variable "location" {

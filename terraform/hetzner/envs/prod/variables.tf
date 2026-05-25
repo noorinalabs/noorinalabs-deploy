@@ -2,6 +2,11 @@ variable "hcloud_token" {
   description = "Hetzner Cloud API token."
   type        = string
   sensitive   = true
+
+  validation {
+    condition     = length(trimspace(var.hcloud_token)) > 0
+    error_message = "hcloud_token must not be empty — set the HCLOUD_TOKEN secret in the 'production' environment (wired as TF_VAR_hcloud_token in the Plan/Apply (hetzner/prod) jobs)."
+  }
 }
 
 variable "deploy_ssh_public_key_path" {
