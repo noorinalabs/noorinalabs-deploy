@@ -9,8 +9,9 @@ module "vps" {
   server_type = "cpx41"
   location    = "ash"
 
-  ssh_public_key_path = var.ssh_public_key_path
-  ssh_source_ips      = var.ssh_source_ips
+  deploy_ssh_public_key_path = var.deploy_ssh_public_key_path
+  root_ssh_public_key_path   = var.root_ssh_public_key_path
+  ssh_source_ips             = var.ssh_source_ips
 
   ghcr_auth_b64           = var.ghcr_auth_b64
   user_postgres_password  = var.user_postgres_password

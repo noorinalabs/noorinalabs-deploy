@@ -5,7 +5,8 @@ locals {
     environment = var.env
   }
   cloud_init_vars = {
-    ssh_public_key          = sensitive(chomp(file(var.ssh_public_key_path)))
+    deploy_ssh_public_key   = sensitive(chomp(file(var.deploy_ssh_public_key_path)))
+    root_ssh_public_key     = sensitive(chomp(file(var.root_ssh_public_key_path)))
     ghcr_auth_b64           = var.ghcr_auth_b64
     user_postgres_password  = var.user_postgres_password
     user_redis_password     = var.user_redis_password
@@ -16,9 +17,14 @@ locals {
 # hcloud_ssh_key.deploy was removed in #222 — Hetzner enforces SSH-key content
 # uniqueness across the project, so per-env resources sharing one canonical
 # pubkey hit `uniqueness_error 409`. cloud-init's user_data is now the sole
-# path for injecting authorized_keys (writes both /home/deploy/.ssh/authorized_keys
-# and /root/.ssh/authorized_keys with var.ssh_public_key_path content).
-# See docs/adr/0003-ssh-key-authorization-via-cloud-init.md for rationale.
+# path for injecting authorized_keys. Per ADR 0006 (#164, supersedes 0003) the
+# keys are split per-env AND per-role: the DEPLOY key goes to
+# /home/deploy/.ssh/authorized_keys (the only key in the CI DEPLOY_SSH_PRIVATE_KEY
+# secret) and the ROOT key — owner-workstation-only, never in a GH secret — goes
+# to /root/.ssh/authorized_keys. Because the hcloud_ssh_key resource is gone,
+# the Hetzner project-scoped uniqueness 409 that ADR 0003 cited as the blocker
+# for per-env keys no longer applies. See
+# docs/adr/0006-per-env-per-role-ssh-keys.md for rationale.
 
 resource "hcloud_firewall" "web" {
   name   = "${local.name_prefix}-firewall"
@@ -75,7 +81,10 @@ resource "hcloud_server" "app" {
   # servers. If a template change represents a baseline shift that must reach
   # live boxes (e.g., new SSH key, new auditd rule), use the taint/replace
   # procedure documented in docs/runbooks/cloud-init-template-changes.md.
-  # See docs/adr/0003-ssh-key-authorization-via-cloud-init.md for the
+  # Routine per-env per-role KEY ROTATION does NOT recreate the box — append the
+  # new pubkey to the live authorized_keys directly per
+  # docs/runbooks/ssh-key-rotation.md. See
+  # docs/adr/0006-per-env-per-role-ssh-keys.md (supersedes 0003) for the
   # ssh_keys/user_data ignore_changes rationale.
   lifecycle {
     ignore_changes = [ssh_keys, user_data]

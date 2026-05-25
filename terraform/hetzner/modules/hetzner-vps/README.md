@@ -11,7 +11,7 @@ This module is **intentionally backend-less**. Backend configuration lives in ea
 | `hcloud_server.app` | `noorinalabs-${var.env}` |
 | `hcloud_firewall.web` | `noorinalabs-${var.env}-firewall` |
 
-SSH authorized keys (`/root/.ssh/authorized_keys` and `/home/deploy/.ssh/authorized_keys`) are injected via `cloud-init.yaml.tpl`; there is no `hcloud_ssh_key` resource.
+SSH authorized keys are injected via `cloud-init.yaml.tpl`; there is no `hcloud_ssh_key` resource. Per [ADR 0006](../../../../docs/adr/0006-per-env-per-role-ssh-keys.md) (supersedes 0003) the keys are split **per-env and per-role**: `/home/deploy/.ssh/authorized_keys` gets the DEPLOY key (`deploy_ssh_public_key_path` — the CI `DEPLOY_SSH_PRIVATE_KEY` key), and `/root/.ssh/authorized_keys` gets a SEPARATE ROOT key (`root_ssh_public_key_path` — owner-workstation-only, never in a GH secret). Two pubkeys are checked in: `deploy.pub` (the real canonical CI deploy pubkey) and `root.pub` (a **placeholder** — its private half does not exist; operators override `root_ssh_public_key_path` per-env with their real root pubkey). The checked-in pubkeys exist so module-only `terraform validate` and CI/cold-rebuild provisioning work without an operator-local path.
 
 All resources carry labels `{ project = "noorinalabs", environment = var.env }`.
 
@@ -23,7 +23,8 @@ All resources carry labels `{ project = "noorinalabs", environment = var.env }`.
 | `server_type` | string | — | no | e.g., `cpx21` (stg), `cpx41` (prod). |
 | `location` | string | `ash` | no | Hetzner location code. |
 | `image` | string | `ubuntu-24.04` | no | |
-| `ssh_public_key_path` | string | `~/.ssh/id_ed25519.pub` | no | |
+| `deploy_ssh_public_key_path` | string | `./deploy.pub` | no | Per-env DEPLOY pubkey (→ `deploy` user). Private half = env CI `DEPLOY_SSH_PRIVATE_KEY`. |
+| `root_ssh_public_key_path` | string | `./root.pub` | no | Per-env ROOT pubkey (→ `root` user). Owner-workstation-only; never in a GH secret. Default is the checked-in placeholder. |
 | `ssh_source_ips` | list(string) | `["0.0.0.0/0", "::/0"]` | no | Restrict for prod. |
 | `ghcr_auth_b64` | string | `""` | **yes** | Base64 `username:token` for GHCR. |
 | `user_postgres_password` | string | `""` | **yes** | ≥16 chars when set. |

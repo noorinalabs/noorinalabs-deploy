@@ -87,15 +87,27 @@ fi
 # time an operator added a personal admin key to /root/.ssh/authorized_keys
 # and then re-ran bootstrap.
 #
-# Cloud-init seeds both /root/.ssh/authorized_keys AND
-# /home/deploy/.ssh/authorized_keys with the same ${ssh_public_key} on
-# first boot — so this merge is a no-op on a fresh cloud-init box. Its
-# residual value is for operators who add personal admin keys to
-# /root/.ssh/authorized_keys post-provision and want them propagated to
-# deploy without losing the existing deploy authorized keys.
+# Per ADR 0006 (#164) cloud-init now seeds the two files with DIFFERENT keys:
+# /home/deploy/.ssh/authorized_keys gets ${deploy_ssh_public_key} (the per-env
+# DEPLOY key), and /root/.ssh/authorized_keys gets ${root_ssh_public_key} (the
+# per-env ROOT key, owner-workstation-only). On a fresh cloud-init box the two
+# keys are distinct by design — the role split is the whole point of ADR 0006.
 #
-# Fix: append each root key to deploy's file only if its fingerprint isn't
-# already present. Idempotent across any number of re-runs.
+# Residual value of this merge: operators who add PERSONAL admin keys to
+# /root/.ssh/authorized_keys post-provision and want them reachable from the
+# deploy user too. Idempotent append-with-fingerprint-dedup (#287).
+#
+# CAUTION (ADR 0006): this merge copies EVERY root authorized_keys line into
+# deploy, including the canonical per-env ROOT key — which re-authorizes the
+# root key for the deploy user and partially erodes the per-role separation
+# the split exists to create. The behavior is retained for now because this
+# is the legacy/residual bootstrap path (fresh boxes are fully cloud-init'd
+# and should not need it), but whether to exclude the canonical root key from
+# the merge is tracked as an ADR-0006 follow-up. Do not rely on this merge as
+# part of the role-separation guarantee.
+#
+# Fix (#287): append each root key to deploy's file only if its fingerprint
+# isn't already present. Idempotent across any number of re-runs.
 echo "==> [1/5] Merging /root/.ssh/authorized_keys → deploy (idempotent)..."
 DEPLOY_AUTH_KEYS="/home/$DEPLOY_USER/.ssh/authorized_keys"
 mkdir -p "/home/$DEPLOY_USER/.ssh"
@@ -239,7 +251,7 @@ echo ""
 echo "What this script did NOT do (cloud-init already handles it on fresh boxes):"
 echo "  - Install Docker / docker-compose / docker-buildx / git / curl / rclone / jq"
 echo "  - Create the 'deploy' user, configure sudo, add to docker group"
-echo "  - Seed root + deploy authorized_keys with the per-env ssh_public_key"
+echo "  - Seed root + deploy authorized_keys with the per-env per-role keys (ADR 0006: root key, deploy key)"
 echo "  - Install fail2ban, ufw, unattended-upgrades"
 echo "  - Disable root SSH password login"
 echo "  - Write /opt/noorinalabs-deploy/.env.user-service from Terraform vars"
