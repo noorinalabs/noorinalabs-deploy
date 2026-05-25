@@ -67,11 +67,15 @@ user. The reusable workflows (`deploy-stg.yml`, `db-migrate.yml`,
       `staging` and `production` GH Environments. **Not the domain**, and
       **not the Cloudflare-proxied IP** — `appleboy/ssh-action` will time out
       on either. (Wave-B failure #1.)
-- [ ] **`secrets.DEPLOY_SSH_PRIVATE_KEY` set** at the org level (or per-env
-      override). Public half is in the VPS's `/home/deploy/.ssh/authorized_keys`.
+- [ ] **`secrets.DEPLOY_SSH_PRIVATE_KEY` set** per-env (GH Environment
+      `staging`/`production`). This is the per-env DEPLOY key only — its public
+      half is in the VPS's `/home/deploy/.ssh/authorized_keys`. Per ADR 0006
+      (`docs/adr/0006-per-env-per-role-ssh-keys.md`) the `root` key is a
+      SEPARATE, owner-workstation-only key and MUST NOT be in any GH secret.
       *Automated in:* [`cloud-init.yaml.tpl`](../../terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl)
-      seeds both root and deploy authorized_keys with the per-env
-      `ssh_public_key` on first boot (Terraform-provisioned VPSes only).
+      seeds the deploy and root authorized_keys with their respective per-env
+      `deploy_ssh_public_key` / `root_ssh_public_key` on first boot
+      (Terraform-provisioned VPSes only).
       Cloud-init gap surfaced 2026-04-24 (`cloud_init_ssh_key_gap` in
       `ontology/repos/deploy.yaml`) — for TF-provisioned boxes confirm the key
       actually landed before relying on it. For pre-cloud-init VPSes or

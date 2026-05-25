@@ -50,22 +50,26 @@ users:
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
-      - ${ssh_public_key}
+      - ${deploy_ssh_public_key}
 
 # ---------------------------------------------------------------------------
 # Write configuration files
 # ---------------------------------------------------------------------------
 write_files:
-  # Root authorized_keys — the canonical operator/CI deploy key. Replaces the
-  # role previously played by Hetzner's `ssh_keys` server argument (removed
-  # in #222 because per-env resources couldn't share one pubkey). Operators
-  # who want their personal id_ed25519 on root can append it post-provision.
-  # See docs/adr/0003-ssh-key-authorization-via-cloud-init.md for rationale.
+  # Root authorized_keys — the per-env ROOT key, distinct from the deploy key
+  # injected into the `users:` block above. Per ADR 0006 (#164) the root key is
+  # owner-workstation-only and MUST NOT appear in any GH secret; only the deploy
+  # key is the env-scoped DEPLOY_SSH_PRIVATE_KEY CI secret. Replaces the role
+  # previously played by Hetzner's `ssh_keys` server argument (removed in #222
+  # because per-env resources couldn't share one pubkey). Operators who want an
+  # additional personal id_ed25519 on root can append it post-provision.
+  # See docs/adr/0006-per-env-per-role-ssh-keys.md for the split rationale
+  # (supersedes 0003) and docs/runbooks/ssh-key-rotation.md for rotation.
   - path: /root/.ssh/authorized_keys
     owner: root:root
     permissions: '0600'
     content: |
-      ${ssh_public_key}
+      ${root_ssh_public_key}
 
   # fail2ban jail for SSH brute force
   - path: /etc/fail2ban/jail.local
