@@ -47,6 +47,44 @@ The classic failure mode (which directly motivated this doc — see deploy#23 an
 
 **Use the plural `endpoints = { s3 = ... }` form everywhere. tflint's terraform-recommended preset (wired in `.github/workflows/terraform.yml`'s `tflint` job as of deploy#23) catches mismatches at PR-time.**
 
+## Required variables must not be empty (plan-time guard)
+
+**Every required variable (no `default`) MUST carry a non-empty `validation` block so that emptiness fails at `terraform plan` in CI — never at `apply` against the live provider.**
+
+```hcl
+variable "noorinalabs_net_zone_id" {
+  description = "Cloudflare Zone ID for noorinalabs.net (canonical-domain redirect target zone)."
+  type        = string
+  validation {
+    condition     = length(trimspace(var.noorinalabs_net_zone_id)) > 0
+    error_message = "noorinalabs_net_zone_id must not be empty — set repo Actions variable CLOUDFLARE_NOORINALABS_NET_ZONE_ID."
+  }
+}
+```
+
+The `error_message` MUST name the **source** (the repo Actions secret/variable or env-protected secret that feeds the `TF_VAR_*`) so a CI failure tells the operator exactly what to set.
+
+The classic failure mode this guards against (deploy#346; originating PR #344 partial prod apply, 2026-05-20):
+
+1. A variable is declared *required* (no `default`), but is wired in CI from a repo Actions variable that was never created — so `TF_VAR_…` resolves to an **empty string**.
+2. An empty string still satisfies "required" — Terraform errors only on an *unset* required variable, not an empty-but-set one.
+3. `terraform plan` passes clean in CI; the gap bites only at `apply`, where the provider rejects the malformed call (an empty `noorinalabs_net_zone_id` produced `/zones//rulesets` → "Could not route … perhaps your object identifier is invalid?").
+4. Result: a partial prod apply on a class of error a plan-time guard would have caught in the PR.
+
+Note: `terraform validate -backend=false` (the CI `validate` job, which passes no vars) does **not** evaluate `validation` conditions — so adding these blocks does not break the no-vars validate job. They fire at `plan`/`apply`, exactly where the empty value would otherwise slip through.
+
+### Exemption — CI-wired vars that resolve to `default=""` in real plans
+
+A small set of credential/config variables carry `default = ""` and are intentionally empty in real CI plans/applies — a hard non-empty guard on them would break the existing green `plan` job (which does not thread them in as `TF_VAR_*`). These are exempt; document which and why in the variable's `description`. Current exemptions:
+
+| Variable(s) | Why exempt |
+|---|---|
+| `ghcr_auth_b64`, `user_postgres_password`, `user_redis_password`, `user_service_jwt_secret` (hetzner env roots + `hetzner-vps` module) | Never wired as `TF_VAR_*` in the hetzner `plan`/`apply` jobs (only `TF_VAR_hcloud_token` is); consumed as cloud-init template fields that tolerate empty. The module's `user_*` keep their `== "" \|\| length >= N` allow-empty validation. |
+| `deploy_ssh_public_key_path`, `root_ssh_public_key_path` (hetzner env roots + module) | Carry meaningful checked-in-pubkey defaults so cold-rebuild/CI provisions without an operator-local path (ADR 0006). |
+| `net_redirect_ruleset_id`, `org_redirect_ruleset_id` (cloudflare) | CI-discovered at plan/apply time; `default=""` so the no-var `validate` job parses. |
+
+Any new exemption requires an explicit rationale in the variable's `description`.
+
 ## Required CI credentials
 
 The four root modules all read auth from the same env-var pair:
@@ -67,7 +105,8 @@ One bucket, separate state keys keeps the `terraform_remote_state` data sources 
 1. Create `terraform/<module>/versions.tf` (or `backend.tf`) with the block above; pick a unique state key.
 2. Add the module path to `.github/workflows/terraform.yml`'s `validate`, `tflint`, and `plan-<module>` / `apply-<module>` jobs.
 3. Wire any per-module provider creds via `TF_VAR_*` in the workflow `env:` block.
-4. If the new module needs to read sibling state, use `data "terraform_remote_state"` pointing at the same bucket — no extra auth needed.
+4. Add a non-empty `validation` block to every required (no-`default`) variable, with a source-naming `error_message` (see "Required variables must not be empty" above). Document any `default=""` exemption in the variable's `description`.
+5. If the new module needs to read sibling state, use `data "terraform_remote_state"` pointing at the same bucket — no extra auth needed.
 
 ## Pre-existing checkov skips
 
