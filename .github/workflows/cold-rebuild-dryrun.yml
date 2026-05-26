@@ -43,9 +43,17 @@
 #     visible in the YAML; assert the fix shape stays in place".
 #
 #   * Dynamic registry-shape behavior (bug #4) against a scratch local
-#     registry plus a multi-arch + single-arch fixture pair, exercising
-#     `docker buildx imagetools create` and the parity logic copied from
-#     promote.yml's verify step.
+#     registry. Post-#242/#342 every promote-matrix service emits an OCI
+#     image index (multi-arch, or single-arch + provenance=true), so
+#     promote.yml's verify-parity does direct top-level digest comparison
+#     uniformly — the single-arch v2 shape-aware fallback is gone. This
+#     job is now an OCI-index CONTRACT TEST (deploy#343): it builds a
+#     fixture in each of the two index-producing shapes the four services
+#     use and asserts each emits an OCI image index, then exercises
+#     `docker buildx imagetools create` + the (uniform) parity logic
+#     against them. If a service ever reverts to a single-arch v2 manifest
+#     the contract assertion fails loudly here rather than silently
+#     breaking promote.yml's now-fallback-free parity step.
 #
 #   * Driver/pyproject parity (bug #5 dynamic complement) by parsing the
 #     scheme out of db-migrate.yml's DATABASE_URL line and asserting the
@@ -148,7 +156,7 @@ jobs:
           python3 .github/workflows/scripts/cold_rebuild_static_checks.py
 
   buildx-shape-dryrun:
-    name: Buildx multi-arch / single-arch parity dryrun (bug #4)
+    name: OCI-index contract test + retag parity dryrun (bug #4, #343)
     runs-on: ubuntu-latest
     services:
       # Local registry for the dryrun. Hermetic — no real GHCR contact.
@@ -195,28 +203,68 @@ jobs:
             --tag localhost:5000/fixture/multi:stg-latest \
             /tmp/fixture-multi
 
-      - name: Build single-arch fixture image (landing-page shape)
-        # `docker buildx build --platform linux/amd64` (single platform)
-        # produces a single-arch v2 manifest — exactly the shape landing-page
-        # ships and the shape that broke #239.
+      - name: Build single-platform + provenance fixture (landing-page shape)
+        # Landing-page builds `--platform linux/amd64` (single platform) but
+        # WITH `provenance: true`, which makes buildx wrap the single
+        # manifest in an OCI image index (see landing-page deploy.yml, PR
+        # #75 / deploy#242). So even the one single-platform service emits
+        # an index — that uniformity is what let promote.yml drop the
+        # shape-aware fallback. We model that exact shape here (NOT the
+        # obsolete `--provenance=false` v2 manifest that broke #239 and no
+        # longer ships) so the contract test asserts the CURRENT reality.
         run: |
           set -euo pipefail
-          mkdir -p /tmp/fixture-single
-          cat > /tmp/fixture-single/Dockerfile <<'EOF'
+          mkdir -p /tmp/fixture-landing
+          cat > /tmp/fixture-landing/Dockerfile <<'EOF'
           FROM scratch
           COPY README /README
           EOF
-          echo "fixture-single-arch" > /tmp/fixture-single/README
+          echo "fixture-landing-page" > /tmp/fixture-landing/README
           docker buildx build \
             --push \
             --platform linux/amd64 \
-            --provenance=false \
-            --tag localhost:5000/fixture/single:sha-bbbbbbb \
-            --tag localhost:5000/fixture/single:stg-bbbbbbb \
-            --tag localhost:5000/fixture/single:stg-latest \
-            /tmp/fixture-single
+            --provenance=true \
+            --tag localhost:5000/fixture/landing:sha-bbbbbbb \
+            --tag localhost:5000/fixture/landing:stg-bbbbbbb \
+            --tag localhost:5000/fixture/landing:stg-latest \
+            /tmp/fixture-landing
 
-      - name: Retag — multi-arch path
+      - name: OCI-index contract test — every promote-matrix shape emits an index
+        # #343 contract gate. promote.yml's verify-parity (post-#342) does
+        # direct top-level digest comparison with NO shape-aware fallback,
+        # premised on every service in the promote matrix
+        # (api,frontend,user-service,landing) emitting an OCI image index.
+        # This step makes that premise an ACTIVE gate instead of the old
+        # negative-control "warn when the single-arch fallback is obsolete":
+        # we assert each index-producing shape the four services use does in
+        # fact yield an OCI image index media type. If a service ever
+        # reverts to a single-arch v2 manifest, this fails loudly here
+        # rather than silently breaking promote.yml's fallback-free parity.
+        #
+        # Two shapes cover all four services:
+        #   * multi-arch (api, frontend, user-service): linux/amd64,arm64
+        #   * single-platform + provenance=true (landing): index-wrapped
+        run: |
+          set -euo pipefail
+          # OCI image index + Docker manifest list are both "index" shapes;
+          # this matches promote.yml's pre-#342 grep -qE 'index|manifest\.list'.
+          INDEX_RE='index|manifest\.list'
+          assert_index() {
+            local label="$1" image="$2"
+            local media
+            media=$(docker buildx imagetools inspect --format '{{.Manifest.MediaType}}' "$image")
+            echo "  $label: $media"
+            if ! echo "$media" | grep -qE "$INDEX_RE"; then
+              echo "::error::OCI-index contract VIOLATED for $label ($image): media type '$media' is not an image index."
+              echo "::error::promote.yml verify-parity (post-#342) assumes every promote-matrix service emits an OCI index and has NO single-arch fallback. Restore the index shape or re-add the fallback (see deploy#343, promote.yml#242/#342)."
+              return 1
+            fi
+          }
+          echo "== OCI-index contract: all promote-matrix shapes must emit an index =="
+          assert_index "multi-arch (api/frontend/user-service)" localhost:5000/fixture/multi:sha-aaaaaaa
+          assert_index "single-platform+provenance (landing)"   localhost:5000/fixture/landing:sha-bbbbbbb
+
+      - name: Retag — multi-arch shape
         # Mirrors promote.yml retag: `imagetools create` writes
         # prod-<short> + prod-latest from the sha-<short> source.
         run: |
@@ -226,47 +274,41 @@ jobs:
             --tag localhost:5000/fixture/multi:prod-latest \
             localhost:5000/fixture/multi:sha-aaaaaaa
 
-      - name: Retag — single-arch path
+      - name: Retag — single-platform+provenance shape
         run: |
           set -euo pipefail
           docker buildx imagetools create \
-            --tag localhost:5000/fixture/single:prod-bbbbbbb \
-            --tag localhost:5000/fixture/single:prod-latest \
-            localhost:5000/fixture/single:sha-bbbbbbb
+            --tag localhost:5000/fixture/landing:prod-bbbbbbb \
+            --tag localhost:5000/fixture/landing:prod-latest \
+            localhost:5000/fixture/landing:sha-bbbbbbb
 
-      - name: Verify parity check shape-aware logic catches both shapes
-        # This is the assertion that closes #239: the parity check copied
-        # from promote.yml MUST handle both shapes correctly. We reproduce
-        # the exact verify-step logic from promote.yml here against the
-        # fixtures and assert PASS.
+      - name: Verify parity — uniform direct digest comparison (mirrors promote.yml)
+        # Reproduces promote.yml's verify-parity step EXACTLY as it stands
+        # post-#342: direct top-level `{{.Manifest.Digest}}` comparison for
+        # source == prod-<short> == prod-latest, with NO shape-aware
+        # fallback. Because the OCI-index contract test above already
+        # guaranteed both fixtures are indexes, this uniform comparison is
+        # valid for both — which is the whole point of #343: the dryrun now
+        # models the SAME parity logic production runs, not a divergent copy
+        # that still carries the obsolete single-arch fallback.
         run: |
           set -euo pipefail
           parity_check() {
             local image="$1"
             local short="$2"
             local source_tag="sha-${short}"
-            local src src_media ps pl shape
+            local src ps pl
 
             src=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image:$source_tag")
-            src_media=$(docker buildx imagetools inspect --format '{{.Manifest.MediaType}}' "$image:$source_tag")
+            ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image:prod-$short")
+            pl=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image:prod-latest")
 
-            if echo "$src_media" | grep -qE 'index|manifest\.list'; then
-              ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image:prod-$short")
-              pl=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image:prod-latest")
-              shape="multi-arch (direct top-level digest comparison)"
-            else
-              ps=$(docker buildx imagetools inspect --raw "$image:prod-$short" | jq -r '.manifests[0].digest')
-              pl=$(docker buildx imagetools inspect --raw "$image:prod-latest" | jq -r '.manifests[0].digest')
-              shape="single-arch (compare source to destination's manifests[0].digest)"
-            fi
-
-            echo "  image:       $image"
-            echo "  shape:       $shape"
-            echo "  source:      $src"
-            echo "  prod-<short>:$ps"
-            echo "  prod-latest: $pl"
+            echo "  image:        $image"
+            echo "  source:       $src"
+            echo "  prod-<short>: $ps"
+            echo "  prod-latest:  $pl"
             if [ "$src" != "$ps" ] || [ "$src" != "$pl" ]; then
-              echo "::error::Parity check FAILED for $image — shape-aware logic regressed."
+              echo "::error::Parity check FAILED for $image — source/prod-<short>/prod-latest diverged."
               return 1
             fi
             echo "  parity OK"
@@ -276,38 +318,8 @@ jobs:
           parity_check localhost:5000/fixture/multi aaaaaaa
 
           echo ""
-          echo "== single-arch fixture (landing-page shape) =="
-          parity_check localhost:5000/fixture/single bbbbbbb
-
-      - name: Verify naive (pre-#239) parity check would FAIL on single-arch
-        # Negative control: assert that the OLD parity logic (top-level
-        # digest comparison only) fails on single-arch — i.e. the bug we
-        # fixed is REAL and reproducible. If this step PASSES, the registry
-        # behavior changed and the dryrun is no longer modeling the bug;
-        # the fix in #240 may have become redundant or a buildx version
-        # bump silently obviated it.
-        run: |
-          set -euo pipefail
-          src=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
-            localhost:5000/fixture/single:sha-bbbbbbb)
-          ps=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
-            localhost:5000/fixture/single:prod-bbbbbbb)
-          if [ "$src" = "$ps" ]; then
-            echo "::warning::Naive top-level digest comparison no longer fails on single-arch."
-            echo "::warning::Registry/buildx behavior may have changed; #240 fix may be obsolete."
-            echo "::warning::This is informational — the shape-aware check still passes either way."
-            {
-              echo "## Negative control: behavior change detected"
-              echo ""
-              echo "The pre-#239 naive comparison did NOT fail on the single-arch fixture."
-              echo "Registry behavior likely changed; review whether #240's shape-aware"
-              echo "logic is still load-bearing."
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Pre-#239 naive comparison correctly fails on single-arch (src != ps)."
-            echo "  src:          $src"
-            echo "  prod-<short>: $ps"
-          fi
+          echo "== single-platform+provenance fixture (landing-page shape) =="
+          parity_check localhost:5000/fixture/landing bbbbbbb
 
   summary:
     name: Cold-rebuild dryrun summary
@@ -327,7 +339,7 @@ jobs:
             echo "| Job | Result | Bugs guarded |"
             echo "|-----|--------|--------------|"
             echo "| workflow-cold-checks | ${STATIC} | #216 (TF ephemeral keypair), retag-token scope, #234 (TOCTOU floating tag), #235 (alembic driver) |"
-            echo "| buildx-shape-dryrun  | ${BUILDX} | #239 (single-arch parity) |"
+            echo "| buildx-shape-dryrun  | ${BUILDX} | #239 (parity) + #343 (OCI-index contract: every promote-matrix service emits an index) |"
             echo ""
             echo "See \`docs/runbooks/cold-rebuild-dry-run.md\` for failure triage."
           } >> "$GITHUB_STEP_SUMMARY"
