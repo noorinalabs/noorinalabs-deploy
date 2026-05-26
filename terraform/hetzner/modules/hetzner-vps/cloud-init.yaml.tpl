@@ -196,6 +196,49 @@ runcmd:
   - chown deploy:deploy /var/lib/node_exporter/textfile_collector
   - chmod 0755 /var/lib/node_exporter/textfile_collector
 
+  # Pre-provision aux-repo dirs under /opt/ (#163 followup gap 1/3, deploy#328).
+  # /opt/ is root-owned by default, so the deploy workflow
+  # (.github/workflows/deploy-isnad-graph.yml) `git clone` as the deploy user
+  # fails without these dirs existing first with deploy:deploy ownership.
+  # Mirrors scripts/bootstrap-vps.sh Step 4 (AUX_REPOS); a strictly-cloud-init'd
+  # box now matches a bootstrapped one. Same mkdir+chown shape as the
+  # node_exporter triplet above.
+  - mkdir -p /opt/noorinalabs-isnad-graph
+  - chown deploy:deploy /opt/noorinalabs-isnad-graph
+  - mkdir -p /opt/noorinalabs-design-system
+  - chown deploy:deploy /opt/noorinalabs-design-system
+
+  # Install the systemd backup unit set (#163 followup gap 2/3, deploy#329).
+  # Transcribed from scripts/bootstrap-vps.sh Step 5. The source files live
+  # under /opt/noorinalabs-deploy/systemd/, so this MUST run after the
+  # `git clone .../noorinalabs-deploy` step above (cloud-init runcmd is ordered)
+  # — otherwise the install targets don't exist yet. Without this, backups
+  # never run on a strictly-cloud-init'd box (silent failure; deploy#121 class).
+  # The tmpfiles.d staging dir is created before daemon-reload so the unit's
+  # ReadWritePaths=/var/lib/noorinalabs-backups namespace setup succeeds
+  # (deploy#121 Bug A: 226/NAMESPACE before ExecStart). The failure-marker
+  # unit's .prom output dir (/var/lib/node_exporter/textfile_collector) is
+  # already provisioned by the node_exporter triplet above.
+  - install -m 644 /opt/noorinalabs-deploy/systemd/isnad-backup.service /etc/systemd/system/
+  - install -m 644 /opt/noorinalabs-deploy/systemd/isnad-backup.timer /etc/systemd/system/
+  - install -m 644 /opt/noorinalabs-deploy/systemd/isnad-backup-failure-marker.service /etc/systemd/system/
+  - install -m 644 /opt/noorinalabs-deploy/systemd/tmpfiles.d/noorinalabs-backups.conf /etc/tmpfiles.d/
+  - systemd-tmpfiles --create /etc/tmpfiles.d/noorinalabs-backups.conf
+  - systemctl daemon-reload
+  - systemctl enable isnad-backup.timer
+
+  # Allow root to git-operate on the deploy-owned /opt/ repos (#163 followup
+  # gap 3/3, deploy#330). git 2.35+ (CVE-2022-24765) refuses to run as root
+  # against a deploy-owned working tree with "detected dubious ownership"; any
+  # root-run `git fetch`/`git reset` (e.g. a bootstrap-vps.sh re-run, recovery)
+  # then fails. MUST come after the aux-repo dirs are created above so the paths
+  # exist. `--system` (not `--global`, which is per-user $HOME) because root may
+  # not be the only user invoking git against these from a script. Mirrors
+  # scripts/bootstrap-vps.sh Step 2; git's --add dedups so re-runs are safe.
+  - git config --system --add safe.directory /opt/noorinalabs-deploy
+  - git config --system --add safe.directory /opt/noorinalabs-isnad-graph
+  - git config --system --add safe.directory /opt/noorinalabs-design-system
+
   # Enable automatic security updates
   - systemctl enable unattended-upgrades
   - systemctl start unattended-upgrades
