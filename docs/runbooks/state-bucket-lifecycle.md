@@ -1,28 +1,37 @@
 # Runbook — `noorinalabs-terraform-state` lifecycle policy
 
+> **SPEC-OF-RECORD ONLY (as of #331).** The implementation now lives in
+> [`terraform/backblaze-bootstrap/`](../../terraform/backblaze-bootstrap/README.md)
+> (ADR 0004 Part-2): the `b2_bucket.terraform_state` resource declares the
+> lifecycle rule below as a reviewable IaC artifact, and that module is the
+> apply-path. This document remains the **canonical spec** the module's
+> lifecycle block must match verbatim, and a **DR fallback** for applying the
+> lifecycle by hand if the bootstrap module is unavailable. Keep the two in
+> sync — if you change the rule here, change it in the module (and vice versa).
+
 Source: [deploy#194](https://github.com/noorinalabs/noorinalabs-deploy/issues/194).
 Composes with: [deploy#172](https://github.com/noorinalabs/noorinalabs-deploy/issues/172)
 (SSE-B2 at-rest), [ADR 0004](../adr/0004-b2-state-bucket-and-key-management.md)
-(IaC-management strategy).
+(IaC-management strategy), [`terraform/backblaze-bootstrap/`](../../terraform/backblaze-bootstrap/README.md)
+(the implementation, #331).
 
-## Why this is a console runbook (not Terraform-managed today)
+## Why this console procedure is the DR fallback (not the primary path)
 
 The `noorinalabs-terraform-state` bucket is the load-bearing root of every
 Terraform apply in this repo — it holds the `*.tfstate` for `terraform/hetzner/`,
-`terraform/cloudflare/`, and `terraform/backblaze/`. The bucket itself is
-**not currently IaC-managed**: it was created out-of-band in the B2 console
-during initial repo bootstrap, and no `b2_bucket` resource for it exists in
-any `terraform/` root.
+`terraform/cloudflare/`, and `terraform/backblaze/`. The bucket was created
+out-of-band in the B2 console during initial repo bootstrap.
 
 [ADR 0004 Decision A](../adr/0004-b2-state-bucket-and-key-management.md#decision-a--noorinalabs-terraform-state-bucket-iac-management)
 accepts the chicken-and-egg problem (the bucket holds the state for the modules
-that would otherwise manage it) and adopts **Option A2**: a new
+that would otherwise manage it) and adopts **Option A2**: a
 `terraform/backblaze-bootstrap/` root module with a `local` backend, executed
-once-per-DR-event. That module does not yet exist — its implementation is
-tracked as the Part-2 issue for #180 (to be filed). Until that module ships,
-bucket-config changes (lifecycle, versioning, object-lock, SSE-B2 toggle, etc.)
-are operator-applied via the B2 console, with the desired state documented
-here as the canonical spec.
+once-per-DR-event. **That module now exists (#331)** and is the primary
+apply-path. The B2-console / `b2`-CLI procedure documented below is retained as
+the **DR fallback** — use it to apply bucket-config (lifecycle, versioning,
+object-lock, SSE-B2 toggle, etc.) by hand when the bootstrap module is
+unavailable (e.g. mid-DR before the repo is cloned, or if the module's local
+state is lost and not yet re-imported).
 
 Adding a `b2_bucket` resource for the state bucket to the existing
 `terraform/backblaze/main.tf` would be wrong: that module manages the
@@ -124,24 +133,26 @@ Expected output:
   permanently removed. Re-running `b2 ls --versions` shows only the current
   head plus any not-yet-7-day-old hidden versions.
 
-## When the `backblaze-bootstrap/` module lands (Part-2 of #180)
+## The `backblaze-bootstrap/` module (landed — Part-2 of #180, #331)
 
-The `b2_bucket "terraform_state"` resource in the new bootstrap module
-**MUST** declare a `lifecycle_rules` block matching the spec above
-verbatim:
+The `b2_bucket "terraform_state"` resource in
+[`terraform/backblaze-bootstrap/`](../../terraform/backblaze-bootstrap/) declares
+a `lifecycle_rules` block matching the spec above verbatim:
 
 ```hcl
 lifecycle_rules {
-  file_name_prefix              = ""
-  days_from_hiding_to_deleting  = 7
+  file_name_prefix             = ""
+  days_from_hiding_to_deleting = 7
   # days_from_uploading_to_hiding intentionally omitted — keep current
   # versions accessible forever; only age out hidden (superseded) versions.
 }
 ```
 
-At that point this runbook becomes the spec-of-record + DR fallback; the
-bootstrap module becomes the apply-path. Update this section accordingly
-when the module ships.
+The bootstrap module is now the **apply-path** (operator-run, once-per-cycle —
+see its README); this runbook is the **spec-of-record** (the rule the module
+must match) and the **DR fallback** (the § "Apply procedure (B2 console)" and
+§ "Equivalent via `b2` CLI" steps above, for applying the lifecycle by hand if
+the module is unavailable). If you change the rule, change it in BOTH places.
 
 ## Parent-ontology coupling
 
