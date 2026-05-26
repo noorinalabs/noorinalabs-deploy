@@ -6,9 +6,17 @@
 # !! idempotent refresher for the items cloud-init does NOT cover yet:  !!
 # !!   - aux-repo dir pre-provisioning under /opt/                      !!
 # !!   - systemd backup timer (isnad-backup.{service,timer})            !!
-# !!   - safe.directory exceptions for root-run git in /opt/            !!
 # !!   - SSH key merge for operator-added admin keys on root            !!
 # !!   - first-time .env stub for manual (non-CI) bring-ups             !!
+#
+# Privilege model (deploy#311, option (b) followup to #113): every git
+# operation on a deploy-owned /opt/ repo runs as the deploy user via
+# `sudo -u "$DEPLOY_USER" git ...`, NOT as root. This removes the
+# CVE-2022-24765 ownership mismatch at its source — root never git-operates
+# on a deploy-owned tree — so the `git config --global --add safe.directory`
+# loop that #113/PR #309 added (option (a)) is no longer needed and has been
+# removed. Running git as the deploy user is also symmetric with how the
+# deploy user runs everything else at runtime.
 #
 # Fresh Terraform-provisioned VPSes are bootstrapped end-to-end by
 # terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl, which now
@@ -37,8 +45,8 @@ INSTALL_DIR="/opt/noorinalabs-deploy"
 DEPLOY_USER="deploy"
 
 # Auxiliary repo directories pre-provisioned under /opt/ (see Step 3).
-# Single source of truth — also drives the safe.directory loop in Step 2.
-# To add a new repo to the deploy pipeline: append it here, re-run this
+# Single source of truth. To add a new repo to the deploy pipeline: append
+# it here, re-run this
 # script (idempotent). cloud-init does NOT pre-create these dirs (gap to
 # close — see #163 PR body); until then, this script is the canonical
 # place that adds them.
@@ -108,7 +116,7 @@ fi
 #
 # Fix (#287): append each root key to deploy's file only if its fingerprint
 # isn't already present. Idempotent across any number of re-runs.
-echo "==> [1/5] Merging /root/.ssh/authorized_keys → deploy (idempotent)..."
+echo "==> [1/4] Merging /root/.ssh/authorized_keys → deploy (idempotent)..."
 DEPLOY_AUTH_KEYS="/home/$DEPLOY_USER/.ssh/authorized_keys"
 mkdir -p "/home/$DEPLOY_USER/.ssh"
 touch "$DEPLOY_AUTH_KEYS"
@@ -153,34 +161,37 @@ else
   echo "    /root/.ssh/authorized_keys not found — nothing to merge (expected on heavily-locked-down hosts)."
 fi
 
-# ── Step 2: git safe.directory exceptions ──────────────────────────────────
-# Allow root to operate on repos owned by the deploy user (git 2.35+
-# CVE-2022-24765 mitigation). Step 3's `git fetch && git reset --hard` runs
-# as root inside $INSTALL_DIR, which gets chowned to $DEPLOY_USER; every
-# subsequent re-run hits the ownership-mismatch refusal without these
-# exceptions. Aux-repo dirs are listed too because the same hazard applies
-# if/when this script evolves to git-operate on them. See deploy#113.
-# Runs before Step 3 (first git call) — the `${AUX_REPOS[@]/#//opt/}`
-# form prefixes each entry with /opt/.
-echo "==> [2/5] Adding git safe.directory exceptions..."
-for dir in "$INSTALL_DIR" "${AUX_REPOS[@]/#//opt/}"; do
-  git config --global --add safe.directory "$dir"
-done
-
-# ── Step 3: Refresh the deploy repo (idempotent) ───────────────────────────
+# ── Step 2: Refresh the deploy repo (idempotent, as the deploy user) ───────
 # Cloud-init's runcmd already clone-or-skips this on first boot. On
 # subsequent runs we fetch + reset to keep an existing checkout current.
 # Doubles as recovery if the working tree drifted from a manual edit.
-echo "==> [3/5] Refreshing $INSTALL_DIR (idempotent)..."
+#
+# deploy#311: every git op here runs as the deploy user via
+# `sudo -u "$DEPLOY_USER" git ...`. $INSTALL_DIR ends up deploy-owned, so the
+# deploy user is the natural owner of the working tree and git never hits the
+# CVE-2022-24765 "dubious ownership" refusal — which is why this script no
+# longer needs the `git config --global --add safe.directory` loop (the
+# option-(a) fix from #113/PR #309).
+#
+# /opt/ is root-owned by default, so the deploy user cannot create
+# $INSTALL_DIR itself on a first run. Pre-create + chown it first (same shape
+# as the Step 3 aux-repo dirs below), then clone into it as the deploy user.
+echo "==> [2/4] Refreshing $INSTALL_DIR as $DEPLOY_USER (idempotent)..."
+mkdir -p "$INSTALL_DIR"
+chown "$DEPLOY_USER:$DEPLOY_USER" "$INSTALL_DIR"
 if [ -d "$INSTALL_DIR/.git" ]; then
   echo "    Repository already exists, pulling latest..."
-  cd "$INSTALL_DIR" && git fetch origin main && git reset --hard origin/main
+  # Adopt any pre-existing root-owned checkout (e.g. from a legacy run) so the
+  # deploy user can git-operate on it; -R because the .git tree may be mixed.
+  chown -R "$DEPLOY_USER:$DEPLOY_USER" "$INSTALL_DIR"
+  sudo -u "$DEPLOY_USER" git -C "$INSTALL_DIR" fetch origin main
+  sudo -u "$DEPLOY_USER" git -C "$INSTALL_DIR" reset --hard origin/main
 else
-  git clone "$REPO_URL" "$INSTALL_DIR"
+  sudo -u "$DEPLOY_USER" git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 chown -R "$DEPLOY_USER:$DEPLOY_USER" "$INSTALL_DIR"
 
-# ── Step 4: Pre-provision auxiliary repo directories under /opt/ ───────────
+# ── Step 3: Pre-provision auxiliary repo directories under /opt/ ───────────
 # /opt/ is root-owned by default, so the deploy user can't `git clone` into
 # it without these dirs existing first with the right ownership. The deploy
 # workflow (.github/workflows/deploy-isnad-graph.yml) clone-or-pulls into
@@ -190,7 +201,7 @@ chown -R "$DEPLOY_USER:$DEPLOY_USER" "$INSTALL_DIR"
 # these dirs — until that gap is closed, this script is the canonical place
 # they live. To add a new repo to the deploy pipeline: append it to
 # AUX_REPOS at the top of this script, re-run (idempotent).
-echo "==> [4/5] Pre-provisioning auxiliary repo directories under /opt/..."
+echo "==> [3/4] Pre-provisioning auxiliary repo directories under /opt/..."
 for repo in "${AUX_REPOS[@]}"; do
   dir="/opt/$repo"
   if [ ! -d "$dir" ]; then
@@ -203,7 +214,7 @@ for repo in "${AUX_REPOS[@]}"; do
 done
 echo "    Auxiliary repo dirs ready."
 
-# ── Step 5: Install backup systemd timer + persistent staging dir ──────────
+# ── Step 4: Install backup systemd timer + persistent staging dir ──────────
 # CLOUD-INIT GAP (#163): cloud-init does NOT install the systemd backup
 # units. Until that gap is closed, the timer + tmpfiles.d staging dir +
 # failure-marker unit are installed here.
@@ -213,7 +224,7 @@ echo "    Auxiliary repo dirs ready."
 # so we no longer write a CHANGE-ME stub here. For first-time MANUAL
 # bring-ups (no CI yet), copy compose/env.example and edit by hand:
 #   cp $INSTALL_DIR/compose/env.example $INSTALL_DIR/.env && chmod 600 $INSTALL_DIR/.env
-echo "==> [5/5] Installing backup timer..."
+echo "==> [4/4] Installing backup timer..."
 if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
   install -m 644 "$INSTALL_DIR/systemd/isnad-backup.service"               /etc/systemd/system/
   install -m 644 "$INSTALL_DIR/systemd/isnad-backup.timer"                 /etc/systemd/system/
@@ -239,7 +250,7 @@ if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
   echo "    Persistent staging dir provisioned: /var/lib/noorinalabs-backups (mode 0700, root)."
   echo "    Start with: systemctl start isnad-backup.timer"
 else
-  echo "    Backup systemd files not found, skipping (did the repo refresh in Step 3 succeed?)."
+  echo "    Backup systemd files not found, skipping (did the repo refresh in Step 2 succeed?)."
 fi
 
 # ── Done ────────────────────────────────────────────────────────────────────
