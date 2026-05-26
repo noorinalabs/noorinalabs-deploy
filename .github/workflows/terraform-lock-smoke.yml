@@ -1,0 +1,64 @@
+# Lock-smoke — ADR 0005 (#334) proof that the apply concurrency-group serializes.
+#
+# This is NOT part of the normal terraform.yml lifecycle. It is dispatched
+# manually (twice in rapid succession) to demonstrate that two runs sharing a
+# concurrency group queue (same key → serialize) while two runs with distinct
+# keys run in parallel (different key → no false serialization).
+#
+# How to exercise (and link the run pair in the #334 PR body):
+#   # same key → the second run shows "pending" (queued) until the first ends
+#   gh workflow run terraform-lock-smoke.yml -f concurrency_key=hetzner-stg -f run_label=same-a
+#   gh workflow run terraform-lock-smoke.yml -f concurrency_key=hetzner-stg -f run_label=same-b
+#   # different key → both run immediately, in parallel
+#   gh workflow run terraform-lock-smoke.yml -f concurrency_key=cloudflare-prod -f run_label=diff
+#
+# The concurrency group below mirrors the SHAPE used by the real apply jobs in
+# terraform.yml: "terraform-apply-<key>". cancel-in-progress:false matches the
+# queue-and-wait (never cancel mid-apply) semantics ADR 0005 § Decision chose.
+
+name: Terraform lock-smoke (ADR 0005)
+
+on:
+  workflow_dispatch:
+    inputs:
+      concurrency_key:
+        description: "Concurrency key suffix (e.g. hetzner-stg, cloudflare-prod). Same value across two dispatches → they serialize."
+        required: true
+        type: string
+      run_label:
+        description: "Label echoed into the apply log to correlate a run with its dispatch."
+        required: false
+        type: string
+        default: "smoke"
+      hold_seconds:
+        description: "Seconds the apply holds so a same-key second run visibly queues."
+        required: false
+        type: string
+        default: "45"
+
+# The serialization mechanism under test. Keyed on the dispatch input so the
+# operator controls same-key vs different-key. Real apply jobs in terraform.yml
+# use the same "terraform-apply-<root>-<env>" shape.
+concurrency:
+  group: "terraform-apply-${{ github.event.inputs.concurrency_key }}"
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: lock-smoke (${{ github.event.inputs.concurrency_key }} / ${{ github.event.inputs.run_label }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/_lock-smoke
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.6"
+      - name: Init (local backend)
+        run: terraform init -backend=false
+      - name: Apply
+        run: |
+          terraform apply -auto-approve \
+            -var "run_label=${{ github.event.inputs.run_label }}" \
+            -var "hold_seconds=${{ github.event.inputs.hold_seconds }}"

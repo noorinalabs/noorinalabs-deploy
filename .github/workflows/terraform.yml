@@ -4,11 +4,13 @@ on:
     paths:
       - 'terraform/**'
       - '.github/workflows/terraform.yml'
+      - 'scripts/check_tf_apply_locking.py'
   push:
     branches: [main]
     paths:
       - 'terraform/**'
       - '.github/workflows/terraform.yml'
+      - 'scripts/check_tf_apply_locking.py'
   schedule:
     # Weekly Monday 14:00 UTC — catches rotation-drift that landed
     # between TF-touching PRs. Detection latency: <=7 days regardless
@@ -20,6 +22,24 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Regression guard for ADR 0005 (#334): every `apply*` job in this workflow
+  # must carry a `terraform-apply-*` concurrency group with
+  # cancel-in-progress:false. Catches a future TF root added without the
+  # state-locking stanza — the silent-regression failure ADR 0005's
+  # failure-mode table names. Cheap (no creds), runs on every TF-touching PR.
+  lock-guard:
+    name: State-locking guard (ADR 0005)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: Assert apply jobs carry concurrency group
+        run: python3 scripts/check_tf_apply_locking.py
+
   validate-creds:
     # Detects rotation-drift between the `staging` and `production` GH
     # Environments for shared B2 state-bucket credentials + per-env
@@ -344,6 +364,17 @@ jobs:
     needs: [validate, tflint, checkov]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # State-locking per ADR 0005 (#334): serialize concurrent applies to the
+    # same B2 state file. Keyed per-root, per-env so hetzner/stg and hetzner/prod
+    # (and cloudflare, backblaze) never serialize against each other. The
+    # matrix already runs stg-before-prod via max-parallel:1; this group
+    # additionally serializes across *separate workflow runs* (e.g. two pushes
+    # to main in rapid succession both touching hetzner/stg).
+    # cancel-in-progress:false → a second apply queues; it never cancels an
+    # in-flight apply (mid-apply cancellation risks partial state writes).
+    concurrency:
+      group: "terraform-apply-hetzner-${{ matrix.env }}"
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       # Apply stg first, then prod — never both in parallel. Matches the
@@ -380,6 +411,12 @@ jobs:
     needs: [validate, tflint, checkov, apply]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # State-locking per ADR 0005 (#334). cloudflare is a single prod-scoped
+    # root (no env matrix), so the key is fixed. cancel-in-progress:false →
+    # queue, never cancel mid-apply.
+    concurrency:
+      group: "terraform-apply-cloudflare-prod"
+      cancel-in-progress: false
     environment: production
     defaults:
       run:
@@ -441,6 +478,12 @@ jobs:
     needs: [validate, tflint, checkov]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # State-locking per ADR 0005 (#334). backblaze is a single prod-scoped
+    # root (no env matrix), so the key is fixed. cancel-in-progress:false →
+    # queue, never cancel mid-apply.
+    concurrency:
+      group: "terraform-apply-backblaze-prod"
+      cancel-in-progress: false
     environment: production
     defaults:
       run:
