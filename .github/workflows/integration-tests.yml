@@ -70,7 +70,7 @@ jobs:
           ref: ${{ steps.sibling-refs.outputs.isnad_graph_ref }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Run integration tests
         working-directory: noorinalabs-deploy/integration-tests

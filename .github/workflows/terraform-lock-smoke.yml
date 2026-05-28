@@ -52,7 +52,7 @@ jobs:
         working-directory: terraform/_lock-smoke
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       - name: Init (local backend)
