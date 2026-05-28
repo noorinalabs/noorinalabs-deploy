@@ -1,6 +1,6 @@
 # Design — per-env env-var restructure for the NoorinALabs platform
 
-- **Status:** Proposed (awaiting owner sign-off on 3 decision points)
+- **Status:** Accepted — owner sign-off 2026-05-28
 - **Date:** 2026-05-28
 - **Author:** Weronika Zielinska (Platform Architect)
 - **Context issue:** [deploy#332](https://github.com/noorinalabs/noorinalabs-deploy/issues/332) — per-env env-var restructure DESIGN (part-2 of [deploy#116](https://github.com/noorinalabs/noorinalabs-deploy/issues/116))
@@ -20,7 +20,7 @@ The deploy#116 inventory measured the env-var surface deterministically across a
 
 Today there is **no per-env file structure at all**. The shape is:
 
-- A single flat **`compose/.env.example`** (76 lines) is the only checked-in env artifact in the deploy repo. There is no `env/` directory.
+- A single flat **`compose/.env.example`** (75 lines) is the only checked-in env artifact in the deploy repo. There is no `env/` directory.
 - The live per-env `.env` is **assembled at deploy time** by the `.github/actions/write-deploy-env` composite, which SSHes the file onto the VPS from GitHub Actions **Environment-scoped secrets** (`environment: staging` / `production`), plus a `base_domain` input and an `extra_env` block of selector vars (`PROM_CONFIG_FILE`, `ALERTMANAGER_CONFIG_FILE`, `SLACK_WEBHOOK_FILE`).
 - Per-env *divergence* is already handled, but ad-hoc: `BASE_DOMAIN` (`stg.noorinalabs.com` vs `noorinalabs.com`), `*_CONFIG_FILE` selector vars that pick `prometheus.{prod,stg}.yml` etc., and `${VAR:?must be set}` guards in `compose/docker-compose.prod.yml` that fail-fast on a missing required var.
 - The same `compose/docker-compose.prod.yml` serves **both** stg and prod — there is no `docker-compose.stg.yml`. Env, not compose topology, is the per-env axis.
@@ -78,6 +78,8 @@ Resolution order (last wins), assembled by `write-deploy-env`:
 
 The structural rule: **`env/**` is non-secret and reviewable in PRs; secrets never appear there.** Secret *keys* are catalogued in `secrets/<env>.env.example` (placeholder values only) so the required set is reviewable and the CI gate can assert completeness; secret *values* come from the store chosen in decision #2 and are assembled into the live `.env` at deploy time exactly as `write-deploy-env` does today. This makes "is this line a secret?" answerable by directory, not by reading the value.
 
+The load-bearing enforcement of that boundary is a **per-directory `secrets/.gitignore` containing `*.env` plus `!*.env.example`** — it ignores every real secret file in `secrets/` while keeping the `.env.example` key-catalogues tracked. This is not optional and is not covered by the repo-root `.gitignore`: a top-level bare `.env` entry matches only a literal `./.env`, *not* `secrets/stg.env`. Without the per-dir `secrets/.gitignore`, a `secrets/prod.env` written by an operator for a local stack would be silently committable — exactly the leak this layout exists to prevent. The CI gate should additionally fail if any tracked file under `secrets/` does not end in `.env.example`.
+
 ### "Add a new env" workflow (end-to-end)
 
 With the recommended shape, onboarding `dev` or a customer env `acme` becomes:
@@ -103,9 +105,11 @@ This is the one piece worth building first after acceptance: it is the forcing f
 
 ## Owner-decision points
 
-Each of the following is a deliberate **owner (Steven) call**. Options + tradeoffs + my recommendation are laid out, but the design intentionally does **not** decide them unilaterally.
+Each of the following was a deliberate **owner (Steven) call**. The owner signed off on all three on 2026-05-28; the chosen option, options table, and rationale are retained below for the record.
 
-### ⏳ Owner decision required #1 — single-file-per-env vs file-per-service-per-env
+### ✅ Decided (owner sign-off 2026-05-28) #1 — single-file-per-env vs file-per-service-per-env
+
+> **Decision: Option A — single file per env** (`env/<env>.env`) on the base + `env/services/*.env` skeleton.
 
 `env/<env>.env` (e.g. `env/stg.env`) vs `env/<env>/<service>.env` (e.g. `env/stg/isnad-graph.env`).
 
@@ -116,7 +120,9 @@ Each of the following is a deliberate **owner (Steven) call**. Options + tradeof
 
 **My recommendation: Option A (single file per env) for the per-env leaf, plus `env/services/<svc>.env` for service-shaped non-secret defaults** (the hybrid above). Rationale: at our scale (2 envs, ~6 services) the file-count cost of B outweighs its ownership benefit, and B re-creates the multi-source risk it tries to solve (shared vars live in a base file *and* the cross-service vars still need a home). Single-file-per-env keeps the diff legible and the assembly identical to today's `write-deploy-env`; service-shaped *defaults* get their own files, but the per-env *leaf* stays one file. **What happens when this fails?** A bad `env/prod.env` line under A breaks all services at once — mitigated by the CI `Settings()`-load gate catching it pre-merge, and by `${VAR:?}` compose guards failing fast and visibly rather than silently. Revisit B if/when a service team wants independent ownership of its env surface (the natural upgrade trigger).
 
-### ⏳ Owner decision required #2 — stg/prod credentials home
+### ✅ Decided (owner sign-off 2026-05-28) #2 — stg/prod credentials home
+
+> **Decision: stay on GitHub Actions env-scoped secrets** (Option A), and add the CI completeness gate (`secrets/<env>.env.example` ⊆ provisioned keys) to kill the 27-key hand-sync drift. The vault (Option B) upgrade-trigger is recorded as written below.
 
 Where the **secret values** live.
 
@@ -128,7 +134,9 @@ Where the **secret values** live.
 
 **My recommendation: stay on Option A (GH Actions env-scoped secrets) and fix its one real weakness with the CI gate** — the gate asserting `secrets/<env>.env.example` ⊆ provisioned keys removes the 27-key hand-sync drift, which is the actual pain, not the storage backend. This mirrors ADR 0005's reasoning: the strongest option (a vault) is "a different conversation" than the problem in front of us (drift + no separation), and introducing a vendor-availability dependency on the deploy path is a real cost at our scale. **What happens when this fails?** A GH secret leak is contained to one Environment (stg or prod, not both) by the existing `environment:` scoping — smaller blast radius than Option C's single decrypt key. **Upgrade trigger** (record it now so the next conversation is a migration plan, not a debate): adopt Option B when (a) operator-local secret access becomes routine, (b) a compliance/audit requirement lands, or (c) secret rotation cadence becomes load-bearing enough that manual `gh secret set` is the bottleneck.
 
-### ⏳ Owner decision required #3 — allow `os.environ.get(...)` outside Pydantic `Settings`?
+### ✅ Decided (owner sign-off 2026-05-28) #3 — allow `os.environ.get(...)` outside Pydantic `Settings`?
+
+> **Decision: Pydantic `Settings` mandatory in service `src/`; raw `os.environ` allowed in tests, integration-tests, and scripts** (Option B), enforced by a `**/src/**`-scoped lint.
 
 The inventory found **51 `os.environ`/`os.getenv` call sites**. Disallow-and-refactor (all config flows through a `Settings` class) vs allow-where-pragmatic.
 
@@ -159,7 +167,7 @@ Critical grounding fact: **the 51 sites are overwhelmingly test/glue code, not p
 
 ## Success criteria / next steps
 
-1. **Owner sign-off on the 3 decision points** (#1 file granularity, #2 secrets home, #3 `os.environ` policy). The issue ([deploy#332](https://github.com/noorinalabs/noorinalabs-deploy/issues/332)) stays open until these are signed off — the PR carrying this doc uses `Refs #332`, not `Closes`.
+1. **Owner sign-off on the 3 decision points received 2026-05-28** (#1 single-file-per-env + service skeleton, #2 stay-on-GH-secrets + completeness gate, #3 `Settings`-mandatory-in-`src/` + scoped lint). With sign-off in hand, the **next action is filing the CI-validation implementation issue** (item 2 below); deploy#332 closes when this design PR merges.
 2. **File the CI-validation implementation issue** after acceptance: build the per-service `Settings()`-load gate + the secret-key-completeness check + the `os.environ` lint (scope per decision #3) + the `env-inventory` staleness check.
 3. **Migrate incrementally**, not big-bang: introduce `env/base.env` + `env/<env>.env` behind the existing `write-deploy-env` assembly, collapse multi-source vars tier-by-tier (97 → 0) with the gate enforcing single-source as each lands.
 
