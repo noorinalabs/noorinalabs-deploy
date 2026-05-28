@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       - name: terraform fmt -check -recursive
@@ -94,7 +94,7 @@ jobs:
         working-directory: ${{ matrix.path }}
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       - name: Init (no backend)
@@ -183,7 +183,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       - name: Init
@@ -235,7 +235,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       # Discover the existing http_request_dynamic_redirect entrypoint ruleset
@@ -311,7 +311,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       - name: Init
@@ -362,7 +362,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       - name: Init
@@ -398,7 +398,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       # See plan-cloudflare § "Discover redirect ruleset IDs". Same discovery
@@ -452,7 +452,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
       - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
       - name: Init
