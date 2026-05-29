@@ -130,9 +130,16 @@ jobs:
               echo "       The deploy workflow has never written env-file here, or it was removed."
               exit 1
             fi
+            # The VPS .env carries an IMAGE_TAG for docker-compose's runtime,
+            # but it can be stale (a prior deploy's tag, possibly GC'd). The
+            # tag this gate must pull is the workflow-resolved one (step `tag`,
+            # defaults to <env>-latest). Preserve it across the sourcing so the
+            # .env's IMAGE_TAG does not clobber the resolved pull tag (#367).
+            WANT_TAG="$IMAGE_TAG"
             set -a
             . ./.env
             set +a
+            IMAGE_TAG="$WANT_TAG"
 
             # Log into GHCR so we can pull the user-service image this gate
             # runs alembic from. The trap logs out at end-of-run so no
