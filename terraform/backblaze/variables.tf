@@ -2,12 +2,22 @@ variable "b2_application_key_id" {
   description = "Backblaze B2 master application key ID (for provider auth; create in B2 console)"
   type        = string
   sensitive   = true
+
+  validation {
+    condition     = length(trimspace(var.b2_application_key_id)) > 0
+    error_message = "b2_application_key_id must not be empty — set repo Actions secret B2_MASTER_KEY_ID (wired as TF_VAR_b2_application_key_id in the Plan/Apply (backblaze) jobs)."
+  }
 }
 
 variable "b2_application_key" {
   description = "Backblaze B2 master application key (for provider auth; create in B2 console)"
   type        = string
   sensitive   = true
+
+  validation {
+    condition     = length(trimspace(var.b2_application_key)) > 0
+    error_message = "b2_application_key must not be empty — set repo Actions secret B2_MASTER_APP_KEY (wired as TF_VAR_b2_application_key in the Plan/Apply (backblaze) jobs)."
+  }
 }
 
 variable "bucket_name" {

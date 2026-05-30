@@ -410,12 +410,15 @@ services:
         max-size: "10m"
         max-file: "5"
     networks:
-      # frontend is non-internal — gives user-service outbound egress for OAuth
-      # provider calls (Google, GitHub, etc.). backend + user-backend are internal
-      # for DB isolation. See deploy#138.
+      # egress is non-internal — gives user-service outbound reach for OAuth
+      # provider calls (Google, GitHub, etc.). Caddy reaches user-service for
+      # inbound over the shared `backend` network (caddy is on backend+frontend),
+      # so user-service does NOT need `frontend` for inbound — it was only ever
+      # on `frontend` for egress (deploy#138). backend + user-backend stay
+      # internal for DB isolation. Swapped frontend→egress per deploy#140.
       - backend
       - user-backend
-      - frontend
+      - egress
     command: /app/.venv/bin/uvicorn src.app.main:create_app --factory --host 0.0.0.0 --port 8000 --workers 2
     restart: unless-stopped
 
@@ -569,7 +572,14 @@ services:
       timeout: 5s
       retries: 5
     networks:
+      # backend for scrape/UI; egress for outbound to alert receivers. The Slack
+      # webhook is already wired (api_url_file → secrets.SLACK_WEBHOOK_URL), so the
+      # moment a real webhook URL is set, alertmanager must resolve hooks.slack.com.
+      # Adding egress proactively avoids the silent DNS-failure-on-alert mode that
+      # bit user-service. PagerDuty/SMTP receivers (per #127) get egress for free.
+      # See deploy#140.
       - backend
+      - egress
     restart: unless-stopped
     deploy:
       resources:
@@ -1009,6 +1019,13 @@ networks:
   user-backend:
     driver: bridge
     internal: true
+  # Outbound-only to the public internet (NOT internal). For services that need
+  # to reach external hosts (OAuth providers, Slack/PagerDuty webhooks, SMTP)
+  # but have NO public-facing inbound traffic. Keeps `frontend` semantically
+  # limited to "public-facing via Caddy" rather than overloading it as the
+  # catch-all egress path. See deploy#140 (Option A).
+  egress:
+    driver: bridge
 
 volumes:
   neo4j_data:

@@ -11,6 +11,11 @@ variable "env" {
 variable "server_type" {
   description = "Hetzner Cloud server type (e.g., cpx21, cpx41)."
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.server_type)) > 0
+    error_message = "server_type must not be empty — set it in the module call from the env root (terraform/hetzner/envs/<env>/main.tf, e.g. server_type = \"cpx41\")."
+  }
 }
 
 variable "location" {
@@ -25,10 +30,16 @@ variable "image" {
   default     = "ubuntu-24.04"
 }
 
-variable "ssh_public_key_path" {
-  description = "Path to SSH public key file uploaded to Hetzner and authorized for the deploy user. Resolved relative to the env root module's working directory (envs always pass `../../modules/hetzner-vps/deploy.pub`); the module-local default is for module-only `terraform validate` runs."
+variable "deploy_ssh_public_key_path" {
+  description = "Path to the per-env DEPLOY SSH public key, authorized for the `deploy` user via cloud-init. This is the key whose private half is the env-scoped CI `DEPLOY_SSH_PRIVATE_KEY` secret. Resolved relative to the env root module's working directory (envs pass their per-env path); the module-local default points at the checked-in canonical deploy pubkey for module-only `terraform validate` runs. See ADR 0006."
   type        = string
   default     = "./deploy.pub"
+}
+
+variable "root_ssh_public_key_path" {
+  description = "Path to the per-env ROOT SSH public key, authorized for the `root` user via cloud-init. Per ADR 0006 this key is owner-workstation-only and its private half MUST NOT appear in any GH secret. Resolved relative to the env root module's working directory; the module-local default points at the checked-in placeholder root pubkey for module-only `terraform validate` runs (operators override per-env with their real root pubkey path)."
+  type        = string
+  default     = "./root.pub"
 }
 
 variable "ssh_source_ips" {

@@ -1,13 +1,15 @@
 # ADR 0003 — SSH-key authorization via cloud-init
 
-- **Status:** Accepted
+- **Status:** Superseded by [0006](0006-per-env-per-role-ssh-keys.md)
 - **Date:** 2026-05-18
 - **Author:** Nurul Hakim (Observability Engineer)
 - **Context issue:** [deploy#224](https://github.com/noorinalabs/noorinalabs-deploy/issues/224)
 - **Implementing PR:** [deploy#223](https://github.com/noorinalabs/noorinalabs-deploy/pull/223) (closes [deploy#222](https://github.com/noorinalabs/noorinalabs-deploy/issues/222))
 - **Supersedes:** none
-- **Superseded by:** none
+- **Superseded by:** [0006 — Per-env, per-role SSH keys](0006-per-env-per-role-ssh-keys.md)
 - **Related ADRs:** [0001 — Terraform Hetzner per-env state strategy](0001-tf-hetzner-per-env-state-strategy.md)
+
+> **Superseded (2026-05-25, [deploy#164](https://github.com/noorinalabs/noorinalabs-deploy/issues/164)).** This ADR's *cloud-init-sole-path* and *lifecycle `ignore_changes`* mechanisms are retained, but its **single-shared-key** decision is replaced by [ADR 0006](0006-per-env-per-role-ssh-keys.md), which splits authorization into four per-env, per-role keypairs. The Hetzner project-scoped uniqueness 409 that this ADR cited as the blocker for per-env keys became moot once `hcloud_ssh_key` was removed (#222) — there is no Hetzner-side key registry left for per-env keys to collide in. See ADR 0006 § Context.
 
 ## Context
 

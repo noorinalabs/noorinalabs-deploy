@@ -41,9 +41,18 @@ class Failure:
 
 def check_terraform_no_ephemeral_keypair() -> list[Failure]:
     """Bug #1 (#216, fixed #217): terraform.yml must NOT generate runner
-    keypairs. The fix shape: a canonical pubkey is committed at
-    modules/hetzner-vps/deploy.pub and `ssh_public_key_path` defaults
-    point at it.
+    keypairs. The fix shape: canonical pubkeys are committed under
+    modules/hetzner-vps/ and the env-root `*_ssh_public_key_path` defaults
+    point at them.
+
+    Updated for ADR 0006 (#164): the single `ssh_public_key_path` /
+    `deploy.pub` pair is now a per-role split — a `deploy.pub` (CI deploy
+    key) AND a `root.pub` (placeholder for the owner-workstation-only root
+    key), with two env-root variables `deploy_ssh_public_key_path` and
+    `root_ssh_public_key_path`. Both pubkeys must exist + look valid, and
+    both env-root defaults must point at the checked-in canonical pubkeys
+    (never an operator-local `~/.ssh/...` path — that recreates the #216
+    lockout class).
     """
     failures: list[Failure] = []
     tf_yml = (WORKFLOWS / "terraform.yml").read_text(encoding="utf-8")
@@ -61,21 +70,27 @@ def check_terraform_no_ephemeral_keypair() -> list[Failure]:
             )
         )
 
-    # Positive invariant: the canonical pubkey must exist on disk.
-    pubkey = TF_MODULE / "deploy.pub"
-    if not pubkey.is_file():
-        failures.append(
-            Failure(
-                "tf-canonical-pubkey-present",
-                "#216",
-                f"{pubkey} is missing — the canonical deploy pubkey checked in by "
-                "#217 is gone. Restore it (matches DEPLOY_SSH_PRIVATE_KEY org-secret).",
+    # Positive invariant: both canonical pubkeys must exist on disk and
+    # look like SSH ed25519 lines. We do NOT validate the cryptographic
+    # content (rotation is operator scope), only that each file isn't a
+    # stub or a different format. Per ADR 0006 root.pub is a placeholder
+    # (the real root key is owner-workstation-only); it still must be a
+    # syntactically valid pubkey so cloud-init's templatefile renders and
+    # `terraform validate` on the module passes with the local defaults.
+    for role in ("deploy", "root"):
+        pubkey = TF_MODULE / f"{role}.pub"
+        if not pubkey.is_file():
+            failures.append(
+                Failure(
+                    "tf-canonical-pubkey-present",
+                    "#216",
+                    f"{pubkey} is missing — the canonical {role} pubkey is gone. "
+                    "Restore it. The deploy pubkey matches the env-scoped "
+                    "DEPLOY_SSH_PRIVATE_KEY secret (ADR 0006); root.pub is the "
+                    "checked-in placeholder for the owner-workstation-only root key.",
+                )
             )
-        )
-    else:
-        # Sanity-check the pubkey looks like an SSH ed25519 line. We do
-        # NOT validate the cryptographic content (rotation is operator
-        # scope), only that the file isn't a stub or a different format.
+            continue
         line = pubkey.read_text(encoding="utf-8").strip()
         if not re.match(r"^ssh-(ed25519|rsa)\s+[A-Za-z0-9+/=]+(\s+\S+)?$", line):
             failures.append(
@@ -87,9 +102,15 @@ def check_terraform_no_ephemeral_keypair() -> list[Failure]:
                 )
             )
 
-    # Positive invariant: the env-root variables.tf default must point at
-    # the canonical pubkey, not `~/.ssh/id_ed25519.pub` (the operator's
-    # local key — what was there before #217 fixed it).
+    # Positive invariant: each env-root variables.tf default for the two
+    # per-role pubkey-path variables must point at the canonical checked-in
+    # pubkeys, not `~/.ssh/id_ed25519.pub` (the operator's local key — what
+    # was there before #217 fixed it). The expected default is the
+    # corresponding `../../modules/hetzner-vps/{role}.pub`.
+    role_to_var = {
+        "deploy": "deploy_ssh_public_key_path",
+        "root": "root_ssh_public_key_path",
+    }
     for env in ("stg", "prod"):
         var_tf = Path(f"terraform/hetzner/envs/{env}/variables.tf")
         if not var_tf.is_file():
@@ -102,33 +123,36 @@ def check_terraform_no_ephemeral_keypair() -> list[Failure]:
             )
             continue
         contents = var_tf.read_text(encoding="utf-8")
-        # Find the default for ssh_public_key_path.
-        m = re.search(
-            r'variable\s+"ssh_public_key_path"\s*\{[^}]*?default\s*=\s*"([^"]+)"',
-            contents,
-            re.DOTALL,
-        )
-        if not m:
-            failures.append(
-                Failure(
-                    "tf-ssh-key-default-present",
-                    "#216",
-                    f"{var_tf}: ssh_public_key_path variable missing or has no default.",
-                )
+        for role, var_name in role_to_var.items():
+            m = re.search(
+                rf'variable\s+"{re.escape(var_name)}"\s*\{{[^}}]*?default\s*=\s*"([^"]+)"',
+                contents,
+                re.DOTALL,
             )
-            continue
-        default = m.group(1)
-        if "id_ed25519.pub" in default or default.startswith("~"):
-            failures.append(
-                Failure(
-                    "tf-ssh-key-default-canonical",
-                    "#216",
-                    f"{var_tf}: ssh_public_key_path default is `{default}` — must "
-                    "point at the canonical checked-in deploy.pub "
-                    "(`../../modules/hetzner-vps/deploy.pub`). Operator-local paths "
-                    "like `~/.ssh/id_ed25519.pub` recreate the #216 lockout class.",
+            if not m:
+                failures.append(
+                    Failure(
+                        "tf-ssh-key-default-present",
+                        "#216",
+                        f"{var_tf}: {var_name} variable missing or has no default. "
+                        "ADR 0006 requires both deploy_ssh_public_key_path and "
+                        "root_ssh_public_key_path with checked-in defaults.",
+                    )
                 )
-            )
+                continue
+            default = m.group(1)
+            if "id_ed25519.pub" in default or default.startswith("~"):
+                failures.append(
+                    Failure(
+                        "tf-ssh-key-default-canonical",
+                        "#216",
+                        f"{var_tf}: {var_name} default is `{default}` — must point "
+                        f"at the canonical checked-in pubkey "
+                        f"(`../../modules/hetzner-vps/{role}.pub`). Operator-local "
+                        "paths like `~/.ssh/id_ed25519.pub` recreate the #216 "
+                        "lockout class.",
+                    )
+                )
 
     return failures
 

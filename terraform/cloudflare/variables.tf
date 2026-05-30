@@ -2,11 +2,21 @@ variable "cloudflare_api_token" {
   description = "Cloudflare API token with Zone:DNS:Edit, Zone:Zone Settings:Edit, Zone:Zone:Read."
   type        = string
   sensitive   = true
+
+  validation {
+    condition     = length(trimspace(var.cloudflare_api_token)) > 0
+    error_message = "cloudflare_api_token must not be empty — set repo Actions secret CLOUDFLARE_API_TOKEN (wired as TF_VAR_cloudflare_api_token in the Plan/Apply (cloudflare) jobs)."
+  }
 }
 
 variable "cloudflare_zone_id" {
   description = "Cloudflare Zone ID for noorinalabs.com."
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.cloudflare_zone_id)) > 0
+    error_message = "cloudflare_zone_id must not be empty — set repo Actions variable CLOUDFLARE_ZONE_ID (wired as TF_VAR_cloudflare_zone_id in the Plan/Apply (cloudflare) jobs)."
+  }
 }
 
 # Defensive-TLD zone IDs — `.net` and `.org` are dark zones owned for
@@ -17,11 +27,21 @@ variable "cloudflare_zone_id" {
 variable "noorinalabs_net_zone_id" {
   description = "Cloudflare Zone ID for noorinalabs.net (canonical-domain redirect target zone)."
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.noorinalabs_net_zone_id)) > 0
+    error_message = "noorinalabs_net_zone_id must not be empty — set repo Actions variable CLOUDFLARE_NOORINALABS_NET_ZONE_ID (wired as TF_VAR_noorinalabs_net_zone_id in the Plan/Apply (cloudflare) jobs). An empty zone id produced the malformed /zones//rulesets call in the PR #344 partial prod apply."
+  }
 }
 
 variable "noorinalabs_org_zone_id" {
   description = "Cloudflare Zone ID for noorinalabs.org (canonical-domain redirect target zone)."
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.noorinalabs_org_zone_id)) > 0
+    error_message = "noorinalabs_org_zone_id must not be empty — set repo Actions variable CLOUDFLARE_NOORINALABS_ORG_ZONE_ID (wired as TF_VAR_noorinalabs_org_zone_id in the Plan/Apply (cloudflare) jobs). An empty zone id produced the malformed /zones//rulesets call in the PR #344 partial prod apply."
+  }
 }
 
 variable "domain" {

@@ -165,8 +165,8 @@ Provisioned via Terraform in `terraform/hetzner/`. The Terraform configuration c
 First-time setup of a Terraform-provisioned VPS is performed end-to-end by `terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl`, which on first boot:
 
 1. Installs Docker, docker-compose-v2, docker-buildx, git, curl, fail2ban, ufw, unattended-upgrades, rclone, jq
-2. Creates a `deploy` user with `docker, sudo` groups (NOPASSWD sudo) and seeds its SSH authorized_keys with the per-env `ssh_public_key`
-3. Writes the same key into `/root/.ssh/authorized_keys` (canonical operator/CI key)
+2. Creates a `deploy` user with `docker, sudo` groups (NOPASSWD sudo) and seeds its SSH authorized_keys with the per-env `deploy_ssh_public_key` (the CI deploy key)
+3. Writes the per-env `root_ssh_public_key` into `/root/.ssh/authorized_keys` — a SEPARATE, owner-workstation-only key per ADR 0006 (`docs/adr/0006-per-env-per-role-ssh-keys.md`), never placed in a GH secret
 4. Configures fail2ban (SSH brute-force jail), ufw (default-deny incoming, allow 22/80/443), and unattended-upgrades (security patches only)
 5. Disables root SSH password login (`PermitRootLogin prohibit-password`, `PasswordAuthentication no`)
 6. Writes `/home/deploy/.docker/config.json` with GHCR auth when `ghcr_auth_b64` is non-empty (per #28 conditional skip)
