@@ -221,7 +221,7 @@ Defined in `compose/docker-compose.prod.yml`. The stack runs 13 services under t
 
 ## Caddy Configuration
 
-Defined in `caddy/Caddyfile`. Caddy serves as the TLS-terminating reverse proxy for `isnad-graph.noorinalabs.com`.
+Defined in `caddy/Caddyfile`. Caddy serves as the TLS-terminating reverse proxy for `isnad.noorinalabs.com` (frontend + isnad-graph API) and `users.noorinalabs.com` (user-service auth plane). The legacy `isnad-graph.noorinalabs.com` hostname was retired in the deploy#156 cutover.
 
 ### Routing
 
@@ -339,16 +339,17 @@ actually verified).
 ### Prod verify — smoke battery (<60s)
 
 Job: `verify-prod`. Runs `scripts/verify_prod_smoke.sh` against the live
-prod URLs. Defaults reflect today's prod Caddy
-(`isnad-graph.noorinalabs.com` per `caddy/Caddyfile:18`); will be updated
-to `isnad.*` / `users.*` when the deploy#156 cutover lands. Checks:
+prod URLs. Defaults reflect prod Caddy post-cutover
+(`isnad.noorinalabs.com` per `caddy/Caddyfile:18`, with the auth plane on
+`users.noorinalabs.com`) — the deploy#156 hostname cutover has landed and the
+legacy `isnad-graph.noorinalabs.com` record is retired. Checks:
 
-1. `isnad-graph.noorinalabs.com/health` — HTTP 200, JSON `.status`
-2. `isnad-graph.noorinalabs.com/api/v1/user-service/health` — HTTP 200 (Caddy rewrite)
+1. `isnad.noorinalabs.com/health` — HTTP 200, JSON `.status`
+2. `isnad.noorinalabs.com/api/v1/user-service/health` — HTTP 200 (Caddy rewrite)
 3. `noorinalabs.com/` — HTTP 200 (landing)
-4. `isnad-graph.noorinalabs.com/api/v1/narrators?limit=1` — HTTP 401 + JSON-shaped body (proves user-service answers, not Caddy bypass)
-5. `isnad-graph.noorinalabs.com/.well-known/jwks.json` — HTTP 200 with `.keys[]` populated
-6. `isnad-graph.noorinalabs.com/auth/login` — HTTP 3xx redirect to OAuth provider (route reachability only — no creds in prod)
+4. `isnad.noorinalabs.com/api/v1/narrators?limit=1` — HTTP 401 + JSON-shaped body (proves user-service answers, not Caddy bypass)
+5. `isnad.noorinalabs.com/.well-known/jwks.json` — HTTP 200 with `.keys[]` populated
+6. `isnad.noorinalabs.com/auth/login` — HTTP 3xx redirect to OAuth provider (route reachability only — no creds in prod)
 
 Failure semantics: emits `::error::` annotation. There is no auto-rollback
 (no rollback policy currently defined; owner investigates).
@@ -405,7 +406,7 @@ Storage retention: 30 days. Alert rules defined in `infra/prometheus/alerts.yml`
 
 ### Dashboards (Grafana)
 
-- Served at `https://isnad-graph.noorinalabs.com/grafana`
+- Served at `https://isnad.noorinalabs.com/grafana`
 - Pre-provisioned dashboard: `infra/grafana/dashboards/api-overview.json`
 - Datasources provisioned automatically via `infra/grafana/provisioning/datasources/datasource.yml`
 

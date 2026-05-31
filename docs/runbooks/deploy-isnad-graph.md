@@ -71,7 +71,7 @@ script, not invoked by CI anymore — used by the user-service migration
 runbook):
 
 ```bash
-SITE_URL=https://isnad-graph.noorinalabs.com ./scripts/verify_deployment.sh --skip-workflow
+SITE_URL=https://isnad.noorinalabs.com ./scripts/verify_deployment.sh --skip-workflow
 ```
 
 This broader script checks: site reachability (HTTP 200), API health

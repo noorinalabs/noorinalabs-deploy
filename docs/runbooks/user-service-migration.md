@@ -47,10 +47,10 @@ docker compose -f compose/docker-compose.prod.yml exec user-postgres \
 docker compose -f compose/docker-compose.prod.yml ps --format "table {{.Service}}\t{{.Status}}"
 
 # isnad-graph API
-curl -sf https://isnad-graph.noorinalabs.com/health
+curl -sf https://isnad.noorinalabs.com/health
 
 # user-service
-curl -sf https://isnad-graph.noorinalabs.com/api/v1/user-service/health
+curl -sf https://isnad.noorinalabs.com/api/v1/user-service/health
 ```
 
 ---
@@ -93,17 +93,17 @@ docker compose -f compose/docker-compose.prod.yml exec user-service \
   python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/health').read().decode())"
 
 # Via Caddy (public)
-curl -sf https://isnad-graph.noorinalabs.com/api/v1/user-service/health
+curl -sf https://isnad.noorinalabs.com/api/v1/user-service/health
 ```
 
 ### Verify JWKS endpoint
 
 ```bash
 # JWKS keys are served at the IETF well-known path
-curl -sf https://isnad-graph.noorinalabs.com/.well-known/jwks.json | python3 -m json.tool
+curl -sf https://isnad.noorinalabs.com/.well-known/jwks.json | python3 -m json.tool
 
 # Confirm at least one RSA key is present
-curl -sf https://isnad-graph.noorinalabs.com/.well-known/jwks.json | python3 -c "
+curl -sf https://isnad.noorinalabs.com/.well-known/jwks.json | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 keys = data.get('keys', [])
@@ -122,25 +122,25 @@ Verify all user-service routes are active and proxying correctly:
 
 ```bash
 # Auth endpoints
-curl -sf -o /dev/null -w "%{http_code}" https://isnad-graph.noorinalabs.com/auth/login
+curl -sf -o /dev/null -w "%{http_code}" https://isnad.noorinalabs.com/auth/login
 
 # User management
-curl -sf -o /dev/null -w "%{http_code}" https://isnad-graph.noorinalabs.com/api/v1/users
+curl -sf -o /dev/null -w "%{http_code}" https://isnad.noorinalabs.com/api/v1/users
 
 # Sessions
-curl -sf -o /dev/null -w "%{http_code}" https://isnad-graph.noorinalabs.com/api/v1/sessions
+curl -sf -o /dev/null -w "%{http_code}" https://isnad.noorinalabs.com/api/v1/sessions
 
 # Subscriptions
-curl -sf -o /dev/null -w "%{http_code}" https://isnad-graph.noorinalabs.com/api/v1/subscriptions
+curl -sf -o /dev/null -w "%{http_code}" https://isnad.noorinalabs.com/api/v1/subscriptions
 
 # Verification
-curl -sf -o /dev/null -w "%{http_code}" https://isnad-graph.noorinalabs.com/api/v1/verification
+curl -sf -o /dev/null -w "%{http_code}" https://isnad.noorinalabs.com/api/v1/verification
 
 # Roles
-curl -sf -o /dev/null -w "%{http_code}" https://isnad-graph.noorinalabs.com/api/v1/roles
+curl -sf -o /dev/null -w "%{http_code}" https://isnad.noorinalabs.com/api/v1/roles
 
 # 2FA
-curl -sf -o /dev/null -w "%{http_code}" https://isnad-graph.noorinalabs.com/api/v1/2fa
+curl -sf -o /dev/null -w "%{http_code}" https://isnad.noorinalabs.com/api/v1/2fa
 ```
 
 Expect `401` or `405` (not `404`) — these indicate the request reached the
@@ -224,13 +224,13 @@ docker compose -f compose/docker-compose.prod.yml exec user-postgres \
 
 ```bash
 # Test login flow (replace with a test account)
-curl -X POST https://isnad-graph.noorinalabs.com/auth/login \
+curl -X POST https://isnad.noorinalabs.com/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email": "<test-user-email>", "password": "<test-password>"}'
 
 # Verify the returned JWT validates against JWKS
 # (use the token from the login response)
-curl -sf https://isnad-graph.noorinalabs.com/.well-known/jwks.json | python3 -c "
+curl -sf https://isnad.noorinalabs.com/.well-known/jwks.json | python3 -c "
 import json, sys
 jwks = json.load(sys.stdin)
 print(f'JWKS has {len(jwks[\"keys\"])} key(s) — JWT validation available')
@@ -283,7 +283,7 @@ docker compose -f compose/docker-compose.prod.yml logs user-service --since 5m 2
 
 ```bash
 # Access Grafana (authenticated)
-# https://isnad-graph.noorinalabs.com/grafana
+# https://isnad.noorinalabs.com/grafana
 
 # Check Prometheus targets are scraping correctly
 curl -sf http://localhost:9090/api/v1/targets | python3 -c "
@@ -351,7 +351,7 @@ docker compose -f compose/docker-compose.prod.yml up -d \
 
 ```bash
 # Confirm isnad-graph auth is working
-curl -X POST https://isnad-graph.noorinalabs.com/api/v1/auth/login \
+curl -X POST https://isnad.noorinalabs.com/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email": "<test-user-email>", "password": "<test-password>"}'
 
