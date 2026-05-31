@@ -28,12 +28,29 @@ one-time **defense-in-depth rotation** of the secrets that were sitting plaintex
 Two of the four pending secrets reach the live VPS through **cloud-init
 `user_data`**, which Terraform renders from `local.cloud_init_vars`
 (`terraform/hetzner/modules/hetzner-vps/main.tf`) — so their plaintext value is
-captured in the **hetzner tfstate** on every apply:
+captured in the **hetzner tfstate** whenever Terraform writes `user_data`:
 
-| Secret | TF variable | Reaches the box via |
-|---|---|---|
-| `user_service_jwt_secret` | `var.user_service_jwt_secret` | cloud-init `user_data` → hetzner tfstate |
-| `ghcr_auth_b64` | `var.ghcr_auth_b64` | cloud-init `user_data` → hetzner tfstate |
+| Secret | TF variable | On the live box | Captured in |
+|---|---|---|---|
+| `user_service_jwt_secret` | `var.user_service_jwt_secret` | cloud-init `write_files` (user-service env) — **set at first boot only** | hetzner tfstate |
+| `ghcr_auth_b64` | `var.ghcr_auth_b64` | cloud-init `write_files` → `/home/deploy/.docker/config.json` — **set at first boot only** | hetzner tfstate |
+
+> **CRITICAL — `user_data` is `ignore_changes`-masked, so a plain `terraform
+> apply` does NOT re-render these onto an existing box.** `hcloud_server.app`
+> carries `lifecycle { ignore_changes = [ssh_keys, user_data] }`
+> (`modules/hetzner-vps/main.tf`), and Hetzner runs cloud-init exactly **once**
+> at first boot — after that, `user_data` has no effect on the live box no
+> matter what Terraform sends (see
+> [`cloud-init-template-changes.md`](cloud-init-template-changes.md)). The two
+> secrets above therefore reach a *running* box **only** via a
+> **taint/replace** of the server (destroy + recreate). Sections 2 and 3 below
+> use that path. **Do not** rotate these with a bare `terraform apply` — it
+> updates only the tfstate value, leaving the live box serving the OLD secret
+> while you believe you rotated.
+>
+> *(`user_postgres_password` / `user_redis_password` are also cloud-init-seeded,
+> but they were rotated via #126 through the user-service's own path — out of
+> scope here; see the note below.)*
 
 The other two are **B2 application keys** minted by `terraform/backblaze/` (whose
 outputs are `sensitive` and stored in the **backblaze tfstate**), then fed to the
@@ -93,7 +110,7 @@ Pipeline workers can be restarted post-rotation; no user-facing impact.
    `terraform/backblaze/main.tf` are *immutable* on capability/scope change —
    the canonical way to "rotate" is to taint and re-apply so B2 issues new key
    secrets (apply is workstation-only per
-   [`backblaze/README.md` § Apply](../../terraform/backblaze/README.md#apply)):
+   [`backblaze/README.md` § Apply (workstation only)](../../terraform/backblaze/README.md#apply-workstation-only)):
 
    ```bash
    cd terraform/backblaze
@@ -125,9 +142,23 @@ Pipeline workers can be restarted post-rotation; no user-facing impact.
 
 ---
 
-### 2. `ghcr_auth_b64` (medium blast radius)
+### 2. `ghcr_auth_b64` (medium blast radius — server replace)
 
-Controls image pulls on the VPS (isnad-graph + user-service stacks).
+Controls image pulls on the VPS — cloud-init writes it to
+`/home/deploy/.docker/config.json` (`modules/hetzner-vps/cloud-init.yaml.tpl`).
+It is **not** in the deploy workflow `.env` (`deploy-prod.yml` `env_keys` has no
+`ghcr_auth_b64`), so a redeploy does **not** refresh it. Because it is only
+written at first boot and `user_data` is `ignore_changes`-masked, updating the
+state-resident value requires a **server taint/replace** — a bare
+`terraform apply` will update tfstate but leave the live box's
+`/home/deploy/.docker/config.json` on the OLD value.
+
+> **Cheaper alternative (preferred if you only need to rotate the running
+> cred):** edit `/home/deploy/.docker/config.json` on the box directly
+> (`docker login ghcr.io` as the `deploy` user with the new PAT, or rewrite the
+> `auth` blob), then still update the TF variable + tfstate so the next legitimate
+> server-replace doesn't reinstate the old value. A full server replace is only
+> required when you want state and box reconciled in one operation.
 
 1. **Generate a fresh GHCR PAT** scoped `read:packages` (+ `write:packages` only
    if the same token pushes — confirm against the publishing workflow before
@@ -137,34 +168,49 @@ Controls image pulls on the VPS (isnad-graph + user-service stacks).
    NEW_GHCR_B64=$(printf '%s:%s' "<gh-username>" "<new-ghcr-pat>" | base64 -w0)
    ```
 
-2. **Update the TF variable** (this is the state-resident copy). Set
-   `ghcr_auth_b64` in the **prod** and **stg** workstation tfvars (NOT committed;
-   `terraform.tfvars.example` shows the shape) or export
-   `TF_VAR_ghcr_auth_b64`, then apply each env so cloud-init `user_data` —
-   and the hetzner tfstate — captures the new value:
+2. **Update the TF variable** (the state-resident copy). Set `ghcr_auth_b64` in
+   the **prod** and **stg** workstation tfvars (NOT committed;
+   `terraform.tfvars.example` shows the shape) or export `TF_VAR_ghcr_auth_b64`.
 
-   ```bash
-   cd terraform/hetzner/envs/prod && terraform apply   # then envs/stg
-   ```
+3. **Reach the live box.** Either:
+   - **Direct edit (cheaper):** on the box, `sudo -u deploy docker login ghcr.io`
+     with the new PAT (rewrites `/home/deploy/.docker/config.json`), then a
+     plain `terraform apply` to reconcile tfstate to the new variable value
+     (the `user_data` diff is `ignore_changes`-masked, so apply only writes the
+     stored value — it will NOT touch the box); **or**
+   - **Server replace (state + box in one op):** follow the **taint/replace**
+     procedure in
+     [`cloud-init-template-changes.md`](cloud-init-template-changes.md)
+     (snapshot → stg-first → drain prod traffic → DNS-TTL check):
 
-3. **Also update any GH secret** the deploy workflow uses for the pull cred, and
-   **redeploy** so the running box re-authenticates to GHCR:
+     ```bash
+     cd terraform/hetzner/envs/stg   # ALWAYS stg first
+     terraform apply -replace='module.vps.hcloud_server.app' -var-file=terraform.tfvars
+     # verify stg healthy, then repeat for envs/prod
+     ```
 
-   ```bash
-   gh workflow run deploy-prod.yml --repo noorinalabs/noorinalabs-deploy
-   ```
-
-4. **Verify:** a redeploy completes a clean image pull (no `denied: ...` /
-   `unauthorized` from ghcr.io in the deploy log); old PAT revoked in GitHub
-   → Settings → Developer settings.
+4. **Verify:** an image pull on the box authenticates with the new cred
+   (`sudo -u deploy docker pull <a private ghcr image>` succeeds; no
+   `denied`/`unauthorized` from ghcr.io); old PAT revoked in GitHub → Settings →
+   Developer settings. If you replaced the server, also run the
+   `cloud-init-template-changes.md` § Post-replacement checklist.
 
 ---
 
-### 3. `user_service_jwt_secret` (highest blast radius — schedule a window)
+### 3. `user_service_jwt_secret` (highest blast radius — server replace, schedule a window)
 
 Rotating this **invalidates every live user-service session** — all logged-in
 users are kicked. Schedule for a **low-traffic window** and expect to re-auth on
 your next session.
+
+Like `ghcr_auth_b64`, this is a **cloud-init-seeded** secret (user-service env,
+written at first boot) and is **not** in the deploy workflow `.env` —
+`deploy-prod.yml` `env_keys` carries `JWT_PRIVATE_KEY` / `JWT_PUBLIC_KEY` (the
+isnad-graph asymmetric keypair, a *different* secret) but **not**
+`user_service_jwt_secret`. So a redeploy does NOT refresh it, and a bare
+`terraform apply` only rewrites tfstate (the `user_data` diff is
+`ignore_changes`-masked). Reaching the running box requires the **taint/replace**
+path, or a direct on-box rewrite of the user-service env value.
 
 1. **Generate a new 32-byte URL-safe value** (per the deploy#126 pattern):
 
@@ -174,24 +220,31 @@ your next session.
    ```
 
 2. **Update the TF variable** `user_service_jwt_secret` (prod + stg tfvars or
-   `TF_VAR_user_service_jwt_secret`) and **apply each env** so the new value
-   re-renders into cloud-init and overwrites the state-resident copy:
+   `TF_VAR_user_service_jwt_secret`) so the state-resident copy is the new value.
 
-   ```bash
-   cd terraform/hetzner/envs/prod && terraform apply   # then envs/stg
-   ```
+3. **Reach the live box.** Either:
+   - **Direct edit (cheaper, lower blast radius):** update the
+     `user_service_jwt_secret` value in the user-service's env file on the box
+     and restart the user-service container (coordinate with the user-service
+     repo if its own pipeline owns the env injection / restart), then a plain
+     `terraform apply` to reconcile tfstate to the new variable
+     (`ignore_changes` masks the `user_data` diff — apply only stores the
+     value, it will NOT replace the box); **or**
+   - **Server replace (state + box in one op):** follow the **taint/replace**
+     procedure in
+     [`cloud-init-template-changes.md`](cloud-init-template-changes.md)
+     (snapshot → stg-first → drain prod traffic → DNS-TTL check):
 
-3. **Redeploy user-service** so the running container picks up the new secret
-   (coordinate with the user-service repo deploy if its own pipeline owns the
-   restart):
-
-   ```bash
-   gh workflow run deploy-prod.yml --repo noorinalabs/noorinalabs-deploy
-   ```
+     ```bash
+     cd terraform/hetzner/envs/stg   # ALWAYS stg first
+     terraform apply -replace='module.vps.hcloud_server.app' -var-file=terraform.tfvars
+     # verify stg healthy, then repeat for envs/prod
+     ```
 
 4. **Verify:** existing tokens are rejected (401 on a pre-rotation token), a
    fresh login issues a token signed by the new secret, user-service health is
-   green.
+   green. If you replaced the server, also run the
+   `cloud-init-template-changes.md` § Post-replacement checklist.
 
 ---
 
@@ -206,9 +259,15 @@ old key until CI is green" gate). Note it in #11.
 
 - [ ] Each rotated secret has a **fresh value not present** in the pre-2026-04-30
       state.
-- [ ] Each downstream service **redeploys cleanly**.
+- [ ] **The new value reached the LIVE box, not just tfstate** — verified on the
+      box (e.g. pipeline workers authenticate; `/home/deploy/.docker/config.json`
+      holds the new `auth`; a pre-rotation user-service token now 401s). This is
+      the bullet the `ignore_changes`-masked `user_data` makes load-bearing: a
+      green `terraform apply` alone does **not** prove propagation for the
+      cloud-init-seeded secrets (§2, §3).
 - [ ] A post-rotation `terraform plan` against **each** affected backend reports
-      `No changes` (state consistent with the new secret values):
+      `No changes` (state consistent with the new secret values — note this is
+      *necessary but not sufficient*; it confirms tfstate, not the live box):
 
       ```bash
       terraform -chdir=terraform/hetzner/envs/prod plan -input=false   # No changes
