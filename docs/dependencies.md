@@ -100,7 +100,7 @@ GitHub Secrets (noorinalabs-deploy, production environment)
 
 | Domain | Record Type | Points To |
 |--------|-------------|-----------|
-| `isnad-graph.noorinalabs.com` | A | VPS public IPv4 (from `terraform output server_ip`) |
-| `isnad-graph.noorinalabs.com` | AAAA | VPS public IPv6 (from `terraform output server_ipv6`) |
+| `isnad.noorinalabs.com` | A | VPS public IPv4 (from `terraform output server_ip`) |
+| `isnad.noorinalabs.com` | AAAA | VPS public IPv6 (from `terraform output server_ipv6`) |
 
 Caddy auto-provisions TLS certificates via ACME (Let's Encrypt). DNS must resolve before the first deploy or TLS provisioning will fail.

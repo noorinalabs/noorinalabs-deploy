@@ -212,7 +212,7 @@ gh workflow run verify-deploy.yml -f target=stg
 gh workflow run verify-deploy.yml -f target=prod
 
 # Legacy operator script — use only if Actions is unreachable
-SITE_URL=https://isnad-graph.noorinalabs.com ./scripts/verify_deployment.sh --skip-workflow
+SITE_URL=https://isnad.noorinalabs.com ./scripts/verify_deployment.sh --skip-workflow
 ```
 
 ---
