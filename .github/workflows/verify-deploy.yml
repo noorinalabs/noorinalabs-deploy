@@ -113,6 +113,57 @@ jobs:
           path: noorinalabs-deploy
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
+      # ── Fast-fail smoke gate (deploy#379, P3 #8 stg arm) ──────────────
+      # The stg counterpart to verify-prod's smoke battery. Runs FIRST so
+      # a plainly-unreachable stg stack (Caddy down, a vhost not routing,
+      # the auth plane dead) fails the job in ~30s instead of paying the
+      # remote integration suite's ~10–30min wall-clock only to fail at the
+      # end. It is a pre-flight probe, NOT a replacement for the suite —
+      # set -e propagates the script's exit 1, so a smoke FAIL short-
+      # circuits the job (the suite step below never runs) and, exactly
+      # like a suite failure, results in stg-verify-result=failure, which
+      # promote.yml hard-blocks prod-promote on (deploy#179/#199). The
+      # report-upload + summary steps below are `if: always()` so the
+      # smoke table still surfaces even when this step fails.
+      #
+      # ISNAD_BASE_URL / USER_SERVICE_BASE_URL come from the job-level env
+      # (the stg public URLs). LANDING_BASE_URL is stg-specific: stg's
+      # landing is the apex stg.noorinalabs.com (vs prod's noorinalabs.com),
+      # so it's set here rather than at job level. The script defaults to
+      # the same values if the env is unset (see scripts/verify_stg_smoke.sh).
+      - name: Run stg smoke battery (fast-fail gate)
+        working-directory: noorinalabs-deploy
+        env:
+          LANDING_BASE_URL: https://stg.noorinalabs.com
+          SMOKE_REPORT: smoke-report.md
+        run: |
+          set -o pipefail
+          chmod +x scripts/verify_stg_smoke.sh
+          ./scripts/verify_stg_smoke.sh 2>&1 | tee smoke-output.txt
+
+      - name: Upload stg smoke output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verify-stg-smoke-output
+          path: |
+            noorinalabs-deploy/smoke-output.txt
+            noorinalabs-deploy/smoke-report.md
+          retention-days: 14
+
+      - name: Append stg smoke report to job summary
+        if: always()
+        run: |
+          if [ -f noorinalabs-deploy/smoke-report.md ]; then
+            cat noorinalabs-deploy/smoke-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "## Stg smoke — gate did not produce a report"
+              echo ""
+              echo "_smoke-report.md not produced; see verify-stg-smoke-output artifact._"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # run-tests.sh in RUN_MODE=remote (#178 / PR #202) skips compose
       # stack-up entirely, builds the runner image from Dockerfile.runner,
       # and `docker run`s it against the env-supplied stg URLs. The
