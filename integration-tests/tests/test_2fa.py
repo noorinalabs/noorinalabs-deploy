@@ -6,13 +6,21 @@ import httpx
 import pyotp
 import pytest
 
-from tests.conftest import issue_token_for
+from tests.conftest import (
+    REMOTE_SHAPING_UNSUPPORTED_REASON,
+    RUN_MODE,
+    issue_token_for,
+)
 
 
 @pytest.mark.asyncio
-async def test_totp_setup_and_verify(
-    seeded_user_factory, user_service: httpx.AsyncClient
-) -> None:
+async def test_totp_setup_and_verify(seeded_user_factory, user_service: httpx.AsyncClient) -> None:
+    # Hermetic-only: 2FA setup enrolls a TOTP secret as DURABLE state on the
+    # user. Running it against the shared long-lived stg test-user would
+    # leave that account in a 2FA-enrolled state, breaking other remote runs
+    # that assume a clean account. Each hermetic run gets a throwaway user.
+    if RUN_MODE != "hermetic":
+        pytest.skip(REMOTE_SHAPING_UNSUPPORTED_REASON)
     _, auth_code = await seeded_user_factory(email="totp-user@example.com")
     tokens = await issue_token_for(user_service, auth_code)
     auth_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
@@ -24,9 +32,7 @@ async def test_totp_setup_and_verify(
     assert secret, f"expected secret in 2FA setup response; got {body!r}"
 
     code = pyotp.TOTP(secret).now()
-    r = await user_service.post(
-        "/api/v1/2fa/verify", headers=auth_headers, json={"code": code}
-    )
+    r = await user_service.post("/api/v1/2fa/verify", headers=auth_headers, json={"code": code})
     assert r.status_code in (200, 201), r.text
 
 
@@ -34,6 +40,9 @@ async def test_totp_setup_and_verify(
 async def test_totp_rejects_invalid_code(
     seeded_user_factory, user_service: httpx.AsyncClient
 ) -> None:
+    # Hermetic-only for the same durable-state reason as the setup test above.
+    if RUN_MODE != "hermetic":
+        pytest.skip(REMOTE_SHAPING_UNSUPPORTED_REASON)
     _, auth_code = await seeded_user_factory(email="totp-bad@example.com")
     tokens = await issue_token_for(user_service, auth_code)
     auth_headers = {"Authorization": f"Bearer {tokens['access_token']}"}
@@ -41,9 +50,5 @@ async def test_totp_rejects_invalid_code(
     setup = await user_service.post("/api/v1/2fa/setup", headers=auth_headers)
     assert setup.status_code in (200, 201)
 
-    r = await user_service.post(
-        "/api/v1/2fa/verify", headers=auth_headers, json={"code": "000000"}
-    )
-    assert r.status_code in (400, 401, 403), (
-        f"invalid TOTP code should fail, got {r.status_code}"
-    )
+    r = await user_service.post("/api/v1/2fa/verify", headers=auth_headers, json={"code": "000000"})
+    assert r.status_code in (400, 401, 403), f"invalid TOTP code should fail, got {r.status_code}"

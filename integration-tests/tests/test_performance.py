@@ -12,7 +12,12 @@ import time
 import httpx
 import pytest
 
-from tests.conftest import issue_token_for
+from tests.conftest import (
+    REMOTE_SHAPING_UNSUPPORTED_REASON,
+    RUN_MODE,
+    AuthSession,
+    issue_token_for,
+)
 
 
 @pytest.mark.performance
@@ -20,6 +25,13 @@ from tests.conftest import issue_token_for
 async def test_token_issuance_latency_baseline(
     seeded_user_factory, user_service: httpx.AsyncClient
 ) -> None:
+    # Hermetic-only: issuance latency requires minting a fresh one-time auth
+    # code per sample, which is DB/Redis-direct seeding. Remote mode has no
+    # way to mint 20 distinct auth codes without DB access (no test-seed
+    # endpoint exists — deploy#204). The validate-latency baseline below is
+    # the remote-runnable performance signal.
+    if RUN_MODE != "hermetic":
+        pytest.skip(REMOTE_SHAPING_UNSUPPORTED_REASON)
     samples_ms = []
     for _ in range(20):
         _, auth_code = await seeded_user_factory()
@@ -39,11 +51,10 @@ async def test_token_issuance_latency_baseline(
 @pytest.mark.performance
 @pytest.mark.asyncio
 async def test_token_validate_latency_baseline(
-    seeded_user_factory, user_service: httpx.AsyncClient
+    auth_session: AuthSession, user_service: httpx.AsyncClient
 ) -> None:
-    _, auth_code = await seeded_user_factory()
-    tokens = await issue_token_for(user_service, auth_code)
-    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    # Validate-latency uses a single token, so it runs in both modes.
+    headers = {"Authorization": f"Bearer {auth_session.access_token}"}
 
     samples_ms = []
     for _ in range(20):
