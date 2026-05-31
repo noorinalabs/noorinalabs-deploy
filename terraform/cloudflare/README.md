@@ -98,7 +98,7 @@ Prod and stg VPS IPs are read automatically from the hetzner per-env Terraform r
 ## Prerequisites
 
 - [Terraform >= 1.6](https://developer.hashicorp.com/terraform/install)
-- `CLOUDFLARE_API_TOKEN` — Cloudflare API token with `Zone:DNS:Edit`, `Zone:Zone Settings:Edit`, `Zone:Zone:Read`
+- `CLOUDFLARE_API_TOKEN` — Cloudflare API token. **Permissions:** `Zone:DNS:Edit`, `Zone:Zone Settings:Edit`, `Zone:Zone:Read`, **and `Zone:Dynamic Redirect:Edit`** (the last is required for the `.net`/`.org` canonical-redirect rulesets — DNS edit alone is insufficient for ruleset management). **Zone Resources:** must cover all three zones — `noorinalabs.com`, `noorinalabs.net`, `noorinalabs.org` (or "All zones in account"). A token scoped to `.com` only authenticates for `.com` DNS but fails the redirect apply with `Authentication error (10000)` — see [token-scope runbook](../../docs/runbooks/cloudflare-token-scope.md) and #347.
 - `cloudflare_zone_id` — Zone ID for `noorinalabs.com` (Cloudflare dashboard → Overview → Zone ID)
 - Backblaze B2 credentials (to read hetzner remote state — same creds as the cloudflare module's own backend)
 
@@ -155,7 +155,8 @@ Root apex A/AAAA records point at `local.prod_vps_ipv4` / `local.prod_vps_ipv6` 
    - `Zone:DNS:Edit`
    - `Zone:Zone Settings:Edit`
    - `Zone:Zone:Read`
-   Scope it to `noorinalabs.com` zone only.
+   - `Zone:Dynamic Redirect:Edit` — required for the `.net`/`.org` canonical-redirect rulesets (#347)
+   Scope it (Zone Resources) to **all three zones** — `noorinalabs.com`, `noorinalabs.net`, `noorinalabs.org` (or "All zones in account"). A `.com`-only token fails the redirect apply with `Authentication error (10000)`; see the [token-scope runbook](../../docs/runbooks/cloudflare-token-scope.md).
 
 2. Update the secret in GitHub:
 
