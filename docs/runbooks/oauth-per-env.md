@@ -239,17 +239,82 @@ If the optional cleanup (§"Optional cleanup — move prod secrets org-scope →
 | 500 from user-service after OAuth callback | Aisha.Idrissi | Anya.Kowalczyk (user-service) | — |
 | `invalid_scope` from provider | Aisha.Idrissi | Anya.Kowalczyk (user-service — owns scope-request code) | — |
 | Fleet-wide `invalid_grant` post-rotation | Aisha.Idrissi | Lucas.Ferreira | Nino.Kavtaradze (Security) |
-| Google verification revoked / consent screen broken | parametrization (owner — sole Google Cloud Console admin) | Aisha.Idrissi (acts as owner liaison; cannot self-resolve until owner reachable — see SPOF note below) | Lucas.Ferreira / Bereket.Tadesse (deploy-team-on-call if Aisha unavailable) |
+| Google verification revoked / consent screen broken | Aisha.Idrissi (self-resolve **once** the `roles/oauthconfig.editor` binding is live — see Pre-staged IAM binding note below; until then owner liaison only) | Lucas.Ferreira / Bereket.Tadesse (deploy-team-on-call, same binding) | parametrization (owner — sole Google Cloud project admin; fallback while binding is pending or for project-IAM changes) |
 | OAuth `AUTH_*` cleanup ordering issue (org→env-scope) | parametrization (owner — only one who has the secret values) | Aisha.Idrissi (procedural support) | — |
 | Suspected leaked secret | Nino.Kavtaradze (deploy-team Senior Security Engineer — see `roster/security_engineer_nino.md`) | Bereket.Tadesse (IM) | — |
 
 **Roster disambiguation:** `Nino.Kavtaradze` is the deploy team's Senior Security Engineer (`noorinalabs-deploy/.claude/team/roster/security_engineer_nino.md`) — escalation-class for OAuth-incident scope. Reviewers from outside the deploy team may not recognize the name; the roster file is the source of truth.
 
-**SPOF note (Google verification revoked row):** until Google Cloud Console IAM is pre-staged with a `roles/oauthconfig.editor` binding for a deploy-team teammate (tracked outside this runbook's scope), an outage in this class is owner-blocked and may persist until owner is reachable. Aisha's secondary role is "owner liaison + procedural readiness," not "self-resolve." Tertiary escalation to Lucas/Bereket is for the case where Aisha is also unavailable; they can take over the liaison role but cannot bypass the owner-only console access either. Honest framing — this is the operational reality today.
+### Pre-staged IAM binding (Google verification revoked row) — deploy#269
+
+This row used to be a hard single point of failure: only the owner held Google
+Cloud admin, so a verification-revocation or consent-screen break was
+owner-blocked until the owner was reachable. deploy#269 removes that SPOF by
+pre-staging an IAM binding that lets a deploy-team teammate self-resolve
+OAuth-app emergencies (verification revoked, consent screen broken,
+`invalid_scope` allow-list edit) directly in the console.
+
+**Target posture (once the binding is live):** Aisha (primary), Lucas / Bereket
+(secondary) hold `roles/oauthconfig.editor` on the `noorinalabs` Google Cloud
+project and can edit the OAuth client + OAuth consent screen without
+owner-roundtrip. The owner remains the fallback for project-IAM changes and
+while the binding is pending.
+
+**Binding shape — per-teammate Google account (recommended, shape (a)):** bind
+the role to each teammate's Google identity rather than minting a shared
+service-account key. Shape (b) (service account + key via `gh secret`) is
+**deliberately rejected** here: piping a shared admin credential through a
+secret re-introduces the exact shared-key blast-radius that the per-env
+OAuth-app discipline (this whole runbook) exists to avoid. Per-account bindings
+add no new credential surface.
+
+**Owner grant recipe (the one owner-gated step).** Run once per teammate from a
+shell authenticated as a project admin (`gcloud auth login` as owner):
+
+```bash
+PROJECT=noorinalabs   # the Google Cloud project id holding the OAuth apps
+for acct in \
+  parametrization+Aisha.Idrissi@gmail.com \
+  parametrization+Lucas.Ferreira@gmail.com \
+  parametrization+Bereket.Tadesse@gmail.com ; do
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="user:${acct}" \
+    --role="roles/oauthconfig.editor"
+done
+# Confirm the bindings landed:
+gcloud projects get-iam-policy "$PROJECT" \
+  --flatten="bindings[].members" \
+  --filter="bindings.role=roles/oauthconfig.editor" \
+  --format="table(bindings.members)"
+```
+
+> `roles/oauthconfig.editor` grants edit on the OAuth client + brand/consent
+> screen only — it does NOT grant broader project IAM, billing, or compute
+> admin. It is the minimal role for this self-resolve scope.
+
+**Acceptance gate — do NOT mark this SPOF closed until live-verified.** IAM-list
+confirmation (the `get-iam-policy` table above) is necessary but NOT
+sufficient. The bound teammate must perform an end-to-end edit:
+
+1. Open the OAuth **client** settings in Google Cloud Console and make a
+   no-op-safe edit (e.g. re-save an authorized redirect URI) — confirm Save
+   succeeds, no permission error.
+2. Open the **OAuth consent screen** and confirm Scopes / branding fields are
+   editable and saveable.
+
+Record the verification date + teammate in this section when done.
+
+**Current status (as of deploy#269 landing):** binding **pending owner grant** —
+the recipe above is staged but not yet applied, and the live edit-capability
+test has not been run. Until both are complete, the row above is still
+owner-blocked in practice and Aisha/Lucas/Bereket act as owner liaison only.
+This is honest framing — flip the Escalation-row primary to true self-resolve
+only after the live verification lands.
 
 ## Refs
 
 - Issue: [deploy#244](https://github.com/noorinalabs/noorinalabs-deploy/issues/244) (this runbook closes the docs sub-task).
+- SPOF remediation: [deploy#269](https://github.com/noorinalabs/noorinalabs-deploy/issues/269) — pre-staged `roles/oauthconfig.editor` binding (§"Pre-staged IAM binding" above).
 - Surfacing PR: [deploy#241](https://github.com/noorinalabs/noorinalabs-deploy/pull/241) — `users.{base}` vhost carve-out, where the redirect URI convention was first established.
 - Charter codification: tracked in `noorinalabs-main` (see PR body for follow-up issue link).
 - Adjacent secret patterns: `user-service-alembic.md` § Environment protection (env-scope `USER_POSTGRES_*`, `JWT_*`).
