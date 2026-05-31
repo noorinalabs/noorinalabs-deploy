@@ -258,6 +258,18 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
+      # Token-scope preflight (#347). The redirect rulesets on .net/.org need
+      # the token scoped to those zones AND "Zone → Dynamic Redirect → Edit".
+      # Cloudflare validates ruleset writes only at APPLY, so a token missing
+      # that scope passes plan and fails apply with "Authentication error
+      # (10000)". This step turns that into an early, actionable failure by
+      # verifying the token and probing per-zone rulesets read access.
+      - name: Cloudflare token-scope preflight
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+          ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
+        run: ../../scripts/cf_token_preflight.sh
       # Discover the existing http_request_dynamic_redirect entrypoint ruleset
       # ID for each defensive-TLD zone and thread it into the import {} blocks
       # (imports.tf) via TF_VAR_*. Required because Cloudflare allows only one
@@ -438,6 +450,16 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
+      # Token-scope preflight (#347) — same as plan-cloudflare. On the apply
+      # path this is load-bearing: without it the token-scope miss surfaces as
+      # a half-applied prod run ("Authentication error (10000)" on the
+      # .net/.org rulesets after the .com DNS already applied). Fail fast here.
+      - name: Cloudflare token-scope preflight
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+          ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
+        run: ../../scripts/cf_token_preflight.sh
       # See plan-cloudflare § "Discover redirect ruleset IDs". Same discovery
       # is required on apply: the import {} blocks (imports.tf) reference
       # TF_VAR_{net,org}_redirect_ruleset_id, and an empty import id errors at
