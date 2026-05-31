@@ -73,6 +73,51 @@ HERMETIC_ONLY_REASON = (
     "user-service via stg test-user credentials (deploy#178 follow-up)."
 )
 
+# --- Remote-mode test-user credentials (deploy#204) ---
+#
+# In hermetic mode, `seeded_user_factory` shapes an arbitrary user (roles,
+# subscription, email_verified) directly in the local DB+Redis. Remote mode
+# can't do that — stg DB/Redis are not reachable from outside the VPS, and
+# user-service exposes NO password-login / test-seed / dev-bypass endpoint
+# (audited deploy#204: the only token-minting paths are the Redis-seeded
+# `/auth/token` one-time code and the real OAuth callback, neither of which
+# a CI runner can drive against stg).
+#
+# The CI-safe, HTTP-only path we DO have is `/auth/token/refresh`: a
+# long-lived refresh token for a pre-provisioned, stable stg test-user can
+# be exchanged for a fresh access+refresh pair without any DB access. The
+# refresh token is provisioned out-of-band (one real OAuth login by the
+# test-user, captured into a GH Actions secret) and rotated per the runbook
+# in README.md. See `remote_test_user` below.
+#
+# RUNTIME-GATED: the secret only exists in the integration-tests workflow's
+# stg environment. When it is absent (local dev, PR-CI hermetic runs,
+# secret not yet provisioned) the remote-capable tests skip cleanly rather
+# than fail — exactly as the DB-direct fixtures skip in remote mode today.
+STG_TEST_USER_REFRESH_TOKEN = os.environ.get("STG_TEST_USER_REFRESH_TOKEN", "")
+STG_TEST_USER_EMAIL = os.environ.get("STG_TEST_USER_EMAIL", "")
+
+REMOTE_CREDS_MISSING_REASON = (
+    "remote-mode test-user credentials not provisioned: "
+    "STG_TEST_USER_REFRESH_TOKEN is unset. This is expected outside the "
+    "integration-tests workflow's stg environment (local dev, hermetic "
+    "PR-CI). Provision the stg test-user refresh token per the runbook in "
+    "integration-tests/README.md to exercise this test against stg."
+)
+
+# Roles/subscription/email-verified shaping that a single fixed stg
+# test-user cannot satisfy stays hermetic-only. The test-user is created as
+# a plain free-tier, non-admin, email-verified account; tests asserting
+# admin RBAC, paid-subscription claims, fresh-2FA enrollment, or
+# unverified-email flows need DB-direct shaping and remain hermetic-only.
+REMOTE_SHAPING_UNSUPPORTED_REASON = (
+    "hermetic-only: this test requires DB-direct user shaping (specific "
+    "roles / subscription tier / email_verified / fresh-2FA state) that "
+    "the single fixed stg test-user cannot provide. The stg test-user is a "
+    "plain free-tier non-admin account. Run with RUN_MODE=hermetic."
+)
+
+
 # In remote mode, the *_BASE_URL env vars are the canonical stg targets;
 # the legacy USER_SERVICE_URL / ISNAD_GRAPH_URL names are the hermetic
 # compose-internal hostnames. run-tests.sh exports both shapes in remote
@@ -271,3 +316,164 @@ async def issue_token_for(
     r = await user_service.post("/auth/token", json={"authorization_code": authorization_code})
     assert r.status_code == 200, f"token issuance failed: {r.status_code} {r.text}"
     return r.json()
+
+
+@dataclass
+class AuthSession:
+    """An authenticated token pair, mode-agnostic.
+
+    Lets a test obtain a usable access+refresh token without caring whether
+    the underlying user was seeded DB-direct (hermetic) or is the
+    pre-provisioned stg test-user reached via `/auth/token/refresh` (remote).
+    `email` is the authenticated user's email when known (hermetic seeds it,
+    remote reads it from STG_TEST_USER_EMAIL); it may be empty in remote mode
+    if the secret was not supplied, in which case email-equality assertions
+    should be guarded.
+    """
+
+    access_token: str
+    refresh_token: str
+    email: str
+
+
+@pytest.fixture
+async def remote_test_user(user_service: httpx.AsyncClient) -> AuthSession:
+    """Mint a fresh token pair for the pre-provisioned stg test-user (remote mode).
+
+    Exchanges the long-lived `STG_TEST_USER_REFRESH_TOKEN` via the real
+    `/auth/token/refresh` endpoint — an HTTP-only path that needs no DB or
+    Redis access, so it works from outside the VPS. The exchange ROTATES the
+    refresh token (user-service revokes the old one on every refresh), so we
+    return the freshly-issued pair; the long-lived secret is only the
+    bootstrap seed for the first hop in this test process.
+
+    Skips when the credential is absent (see REMOTE_CREDS_MISSING_REASON).
+    In hermetic mode this fixture is a no-op sentinel: `auth_session`
+    declares it as a parameter but only consumes it in the remote branch, so
+    it must not skip (a skip would propagate and abort hermetic tests).
+    """
+    if RUN_MODE == "hermetic":
+        # Never consumed in hermetic mode; return an empty sentinel so the
+        # fixture resolves without contacting any service or skipping.
+        return AuthSession(access_token="", refresh_token="", email="")
+    if not STG_TEST_USER_REFRESH_TOKEN:
+        pytest.skip(REMOTE_CREDS_MISSING_REASON)
+
+    r = await user_service.post(
+        "/auth/token/refresh",
+        json={"refresh_token": STG_TEST_USER_REFRESH_TOKEN},
+    )
+    assert r.status_code == 200, (
+        "stg test-user refresh-token exchange failed: "
+        f"{r.status_code} {r.text}. The STG_TEST_USER_REFRESH_TOKEN secret "
+        "may have expired or been rotated out — re-provision per the runbook "
+        "in integration-tests/README.md."
+    )
+    body = r.json()
+    return AuthSession(
+        access_token=body["access_token"],
+        refresh_token=body["refresh_token"],
+        email=STG_TEST_USER_EMAIL,
+    )
+
+
+@pytest.fixture
+async def _hermetic_seed() -> AsyncIterator:
+    """Remote-SAFE hermetic-only seeding factory for `auth_session`.
+
+    This is a parallel of `seeded_user_factory` that does NOT depend on the
+    `user_pg` / `user_redis` fixtures. Those fixtures `pytest.skip()` in
+    remote mode, and a skip propagates to every dependent — which would make
+    `auth_session` (and thus every refactored test) skip in remote mode even
+    though the remote branch never touches the DB. To keep `auth_session`
+    usable via plain async-fixture parameter nesting (the only nesting
+    pytest-asyncio 0.24 supports cleanly — `getfixturevalue` on an async
+    fixture raises inside a running loop), this fixture opens its own
+    connections internally and ONLY in hermetic mode. In remote mode it
+    yields `None` and is never invoked, so no DB access happens.
+
+    The `make` callable it yields mirrors `seeded_user_factory.make` but is
+    intentionally minimal: it seeds a plain free-tier user (no role /
+    subscription / verification shaping), which is all `auth_session`
+    promises. Tests needing shaping use `seeded_user_factory` directly and
+    stay hermetic-only.
+    """
+    if RUN_MODE != "hermetic":
+        yield None
+        return
+
+    pg = await asyncpg.connect(USER_POSTGRES_DSN)
+    redis = aioredis.from_url(USER_REDIS_URL, decode_responses=True)
+    created_user_ids: list[uuid.UUID] = []
+    created_auth_codes: list[str] = []
+
+    async def make() -> tuple[SeededUser, str]:
+        email = f"test-{secrets.token_hex(4)}@example.com"
+        user_id = await _seed_user(pg, email=email, roles=[])
+        created_user_ids.append(user_id)
+
+        auth_code = secrets.token_urlsafe(48)
+        payload = json.dumps(
+            {
+                "user_id": str(user_id),
+                "email": email,
+                "roles": [],
+                "subscription_status": "free",
+            }
+        )
+        await redis.setex(f"auth_code:{auth_code}", 60, payload)
+        created_auth_codes.append(auth_code)
+        return (
+            SeededUser(user_id=user_id, email=email, roles=[], subscription_status="free"),
+            auth_code,
+        )
+
+    try:
+        yield make
+    finally:
+        for code in created_auth_codes:
+            await redis.delete(f"auth_code:{code}")
+        for uid in created_user_ids:
+            await pg.execute("DELETE FROM sessions WHERE user_id = $1", uid)
+            await pg.execute("DELETE FROM user_roles WHERE user_id = $1", uid)
+            await pg.execute("DELETE FROM subscriptions WHERE user_id = $1", uid)
+            await pg.execute("DELETE FROM oauth_accounts WHERE user_id = $1", uid)
+            await pg.execute("DELETE FROM verification_tokens WHERE user_id = $1", uid)
+            await pg.execute("DELETE FROM totp_secrets WHERE user_id = $1", uid)
+            await pg.execute("DELETE FROM users WHERE id = $1", uid)
+        await redis.aclose()
+        await pg.close()
+
+
+@pytest.fixture
+async def auth_session(_hermetic_seed, remote_test_user, user_service) -> AuthSession:
+    """Mode-aware authenticated session for the default (unshaped) test-user.
+
+    * hermetic — seeds a fresh free-tier user DB-direct (via `_hermetic_seed`)
+      and issues a token via the one-time-code path. Email is a unique
+      per-run address.
+    * remote — returns the pre-provisioned stg test-user's freshly-rotated
+      token pair (via `remote_test_user`).
+
+    Both underlying fixtures are declared as direct parameters (the nesting
+    pytest-asyncio supports). The non-active one is a cheap no-op in the
+    current mode: `_hermetic_seed` yields `None` in remote mode without
+    touching the DB, and `remote_test_user` skips only when its own
+    credential is needed — but `auth_session` reaches `remote_test_user`
+    solely in the remote branch, so in hermetic mode `remote_test_user`'s
+    skip is never triggered because the remote branch is not taken.
+
+    Use this in tests that need *an* authenticated user but do NOT need a
+    specific role / subscription tier / verification state. Tests that DO
+    need such shaping must stay on `seeded_user_factory` (hermetic-only) and
+    skip in remote mode with REMOTE_SHAPING_UNSUPPORTED_REASON.
+    """
+    if RUN_MODE == "hermetic":
+        seeded, auth_code = await _hermetic_seed()
+        tokens = await issue_token_for(user_service, auth_code)
+        return AuthSession(
+            access_token=str(tokens["access_token"]),
+            refresh_token=str(tokens["refresh_token"]),
+            email=seeded.email,
+        )
+    return remote_test_user

@@ -10,9 +10,12 @@
 #   remote    — Skip stack-up. Point HTTP fixtures at env-supplied stg URLs
 #               (ISNAD_BASE_URL, USER_SERVICE_BASE_URL). DB/Redis-direct
 #               fixtures auto-skip in remote (no direct stg DB access from
-#               outside the VPS), so the effective remote-runnable set today
-#               is health + JWKS. Per-test refactors to use stg test-user
-#               creds via secrets are downstream follow-up work — see #178.
+#               outside the VPS). With a provisioned stg test-user
+#               (STG_TEST_USER_REFRESH_TOKEN), the auth_session-based tests
+#               (auth / sessions / RBAC-negative / free-tier / validate
+#               latency) run remotely too; without it they skip cleanly so
+#               the baseline remote set is health + JWKS. See #204 and the
+#               provisioning runbook in README.md.
 #
 # Usage:
 #   ./run-tests.sh [pytest args]
@@ -23,6 +26,13 @@
 # Env (remote — required):
 #   ISNAD_BASE_URL          — e.g. https://isnad.stg.noorinalabs.com
 #   USER_SERVICE_BASE_URL   — e.g. https://auth.stg.noorinalabs.com
+#
+# Env (remote — optional, enables non-health coverage; see #204):
+#   STG_TEST_USER_REFRESH_TOKEN — long-lived refresh token for the
+#                             pre-provisioned stg test-user. When unset, the
+#                             auth_session-based tests skip cleanly.
+#   STG_TEST_USER_EMAIL     — that test-user's email (enables the
+#                             token/validate email-equality assertion).
 #
 # Env (remote — guardrail):
 #   ENVIRONMENT             — must NOT equal "prod"; refused at startup.
@@ -90,6 +100,10 @@ if [[ "$RUN_MODE" == "remote" ]]; then
     # RUN_MODE through env. Mount tests + reports just like compose does.
     # No --network arg — runner container reaches the public stg URLs over
     # the host's default bridge.
+    # Optional stg test-user creds (deploy#204). Pass them through with the
+    # value-from-environment `-e VAR` form so an unset secret is forwarded as
+    # absent (the conftest treats absent as "skip the remote auth tests")
+    # rather than as an empty string baked into the command line / logs.
     set +e
     docker run --rm \
         -e RUN_MODE=remote \
@@ -98,6 +112,8 @@ if [[ "$RUN_MODE" == "remote" ]]; then
         -e USER_SERVICE_BASE_URL="$USER_SERVICE_BASE_URL" \
         -e USER_SERVICE_URL="$USER_SERVICE_BASE_URL" \
         -e ISNAD_GRAPH_URL="$ISNAD_BASE_URL" \
+        -e STG_TEST_USER_REFRESH_TOKEN \
+        -e STG_TEST_USER_EMAIL \
         -v "$SCRIPT_DIR/tests:/app/tests:ro" \
         -v "$SCRIPT_DIR/reports:/app/reports" \
         noorinalabs-integration-test-runner:remote \

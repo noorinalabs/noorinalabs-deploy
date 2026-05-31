@@ -5,16 +5,16 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from tests.conftest import issue_token_for
+from tests.conftest import AuthSession
 
 
 @pytest.mark.asyncio
 async def test_session_lifecycle(
-    seeded_user_factory, user_service: httpx.AsyncClient
+    auth_session: AuthSession, user_service: httpx.AsyncClient
 ) -> None:
-    _, auth_code = await seeded_user_factory(email="dana@example.com")
-    tokens = await issue_token_for(user_service, auth_code)
-    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    # Session create/list/revoke works for any authenticated user — no role
+    # or subscription shaping needed — so this runs in both modes.
+    headers = {"Authorization": f"Bearer {auth_session.access_token}"}
 
     # The token-issuance flow already writes a session row; it must be listable.
     r = await user_service.get("/api/v1/sessions", headers=headers)
