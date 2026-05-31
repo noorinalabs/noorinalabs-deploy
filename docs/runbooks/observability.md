@@ -15,7 +15,7 @@ The list of running containers is canonical in
 | Surface | Signal type | Where it lives | Runbook |
 |---|---|---|---|
 | Prometheus | metrics scrape | prod VPS, port 9090 (internal) | per-alert links in `infra/prometheus/alerts.yml` |
-| Grafana | metrics + log visualisation | prod VPS, `/grafana` behind Caddy | n/a (browse + edit in-app) |
+| Grafana | metrics + log visualisation | prod VPS, `/grafana` behind Caddy | [§ Grafana access](#grafana-access) |
 | Loki + Alloy | log aggregation | prod VPS, container-side `docker-socket` scrape | [`log-ingestion.md`](log-ingestion.md) |
 | Alertmanager | alert routing | prod VPS, port 9093 (internal) | [`alertmanager-slack-routing.md`](alertmanager-slack-routing.md) |
 | blackbox-exporter | synthetic probes (HTTP) | prod VPS, container `blackbox-exporter` | [`blackbox-probes.md`](blackbox-probes.md) |
@@ -26,6 +26,86 @@ The synthetic-vs-real-user distinction matters for triage:
 **CWA** answers "what does a real visitor's browser see for p75 LCP?"
 The two are complements, not duplicates — a regression in either signal
 is independently actionable.
+
+---
+
+## Grafana access
+
+### Access URL
+
+Grafana is mounted as a **sub-path** behind Caddy on the isnad vhost:
+
+| Env | URL |
+|---|---|
+| prod | `https://isnad.noorinalabs.com/grafana` |
+| stg | `https://isnad.stg.noorinalabs.com/grafana` |
+
+The host is `isnad.{$BASE_DOMAIN}` — the same vhost that serves the
+isnad-graph frontend/API (`caddy/Caddyfile` → `handle /grafana/*` →
+`reverse_proxy grafana:3000`). It is **not** a dedicated subdomain. The
+legacy `isnad-graph.noorinalabs.com` record that Grafana's
+`GF_SERVER_ROOT_URL` formerly pointed at was destroyed in the
+2026-05-02 reconciliation (#192/#226); `GF_SERVER_ROOT_URL` is now
+templated to `https://isnad.${BASE_DOMAIN}/grafana` so login-redirect
+and sub-path asset URLs resolve to the live host (deploy#45).
+
+Two compose env vars make the sub-path mount work and must stay in
+lockstep with the Caddy route — change one, change all three:
+
+- `GF_SERVER_ROOT_URL: https://isnad.${BASE_DOMAIN}/grafana`
+- `GF_SERVER_SERVE_FROM_SUB_PATH: "true"`
+- `caddy/Caddyfile` → `handle /grafana/*` on the `isnad.{$BASE_DOMAIN}` vhost
+
+### Login
+
+Admin login is provisioned from compose env (`compose/.env`):
+
+- user: `GRAFANA_ADMIN_USER` (defaults to `admin` if unset)
+- password: `GRAFANA_ADMIN_PASSWORD` (required — compose fails fast if unset)
+
+The password is **not** in the repo. On the VPS it lives in
+`compose/.env`, written from the GitHub Actions encrypted secret
+`GRAFANA_ADMIN_PASSWORD` by the deploy workflow. To retrieve it for the
+project owner, read `compose/.env` on the VPS (`grep GRAFANA_ADMIN
+compose/.env`) or rotate it via the GitHub secret + redeploy. There is
+no OAuth integration for Grafana today — admin basic-auth only.
+
+### Dashboards
+
+Provisioned at boot from `infra/grafana/dashboards/` via
+`infra/grafana/provisioning/dashboards/dashboards.yml`. Datasources
+(Prometheus default, Loki) are provisioned from
+`infra/grafana/provisioning/datasources/datasource.yml`. Bundled
+dashboards:
+
+- `api-overview.json` — API latency, request counts, error rates
+- `kafka-pipeline.json` — pipeline worker throughput / lag
+- `blackbox-probes.json` — synthetic HTTP probe results
+
+### Post-merge verification (Test Plan — requires the live stack)
+
+Grafana reachability + working login cannot be verified at PR time — it
+needs the deployed stack with real DNS, TLS, and the admin secret. After
+this change deploys, an operator confirms on the live host:
+
+1. `curl -fsS https://isnad.noorinalabs.com/grafana/api/health` → returns
+   `{"database":"ok",...}` (200). Confirms reachability + sub-path routing.
+2. Open `https://isnad.noorinalabs.com/grafana/login` in a browser →
+   Grafana login page renders with correct CSS/JS (no asset 404s — this
+   is what the `GF_SERVER_ROOT_URL` fix is for; a wrong root URL serves
+   the page but breaks sub-path assets + the post-login redirect).
+3. Log in with `admin` / `GRAFANA_ADMIN_PASSWORD` (from VPS
+   `compose/.env`) → lands on the Grafana home, no redirect loop to a
+   dead host.
+4. Open **Dashboards** → confirm `api-overview`, `kafka-pipeline`, and
+   `blackbox-probes` are present, and that `api-overview` panels render
+   data (datasource wiring is live).
+5. Record the URL + credential-location in the owner hand-off so the
+   project owner can reach metrics.
+
+If step 1 or 2 fails after deploy, check that `BASE_DOMAIN` is set in the
+VPS `compose/.env` and that the `isnad` Caddy vhost is serving (the
+Grafana route is nested under it, not a standalone subdomain).
 
 ---
 

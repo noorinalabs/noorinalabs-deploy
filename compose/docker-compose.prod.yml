@@ -604,7 +604,15 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
-      GF_SERVER_ROOT_URL: https://isnad-graph.noorinalabs.com/grafana
+      # Sub-path mount behind Caddy on the isnad vhost (caddy/Caddyfile
+      # `handle /grafana/*`). Host MUST match the live Caddy binding —
+      # the legacy `isnad-graph.noorinalabs.com` record was destroyed in
+      # the 2026-05-02 reconciliation (#192/#226) and every other ref
+      # migrated to `isnad.{$BASE_DOMAIN}`; this line was the last hold-out
+      # (dates from initial commit c7642bf) and made Grafana emit
+      # login-redirect / sub-path asset URLs at a dead NXDOMAIN host,
+      # breaking reachability + login (deploy#45).
+      GF_SERVER_ROOT_URL: https://isnad.${BASE_DOMAIN:?BASE_DOMAIN required}/grafana
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
     expose:
       - "3000"
