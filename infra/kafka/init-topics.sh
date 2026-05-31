@@ -15,6 +15,14 @@
 
 set -euo pipefail
 
+# apache/kafka (migrated off Bitnami in #100) ships the CLI scripts under
+# /opt/kafka/bin but does NOT put them on PATH by default. Prepend it so the
+# bare `kafka-topics.sh` / `kafka-configs.sh` / `kafka-broker-api-versions.sh`
+# invocations below resolve. Harmless on any image that already has them on
+# PATH (the dir is simply searched first). The scripts themselves are the
+# Apache-canonical ones, so the command-line flags used below are unchanged.
+export PATH="/opt/kafka/bin:${PATH}"
+
 BOOTSTRAP="${KAFKA_BOOTSTRAP:-kafka:9092}"
 PARTITIONS="${KAFKA_DEFAULT_PARTITIONS:-3}"
 REPLICATION="${KAFKA_REPLICATION_FACTOR:-1}"

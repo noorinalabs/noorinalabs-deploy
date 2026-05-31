@@ -66,7 +66,7 @@ Direct broker access (for `kafka-*.sh` CLI debugging) is possible from the VPS h
 
 ```
 docker compose -f compose/docker-compose.prod.yml exec kafka \
-    kafka-topics.sh --bootstrap-server kafka:9092 --list
+    /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
 ```
 
 The broker listener is on the `backend` Docker network (internal). It is not reachable from the host or the public internet.
@@ -76,10 +76,10 @@ The broker listener is on the `backend` Docker network (internal). It is not rea
 `KAFKA_CLUSTER_ID` is required and must remain stable — changing it after the first boot will cause the broker to refuse to start against existing log directories. Generate once at VPS bootstrap time:
 
 ```
-docker run --rm bitnamilegacy/kafka:3.8.0 kafka-storage.sh random-uuid
+docker run --rm apache/kafka:3.9.2 /opt/kafka/bin/kafka-storage.sh random-uuid
 ```
 
-(The `bitnami/*` namespace was sunset Aug 2025; `bitnamilegacy/*` is the same image rebadged. Long-term migration off Bitnami tracked in #100.)
+(The broker runs on the official `apache/kafka` image — migrated off Bitnami in #100. The previous `bitnami/*` namespace was sunset Aug 2025 and the `bitnamilegacy/*` stopgap was itself on a sunset trajectory. The compose service supplies this value to the image as `CLUSTER_ID`, which the entrypoint uses to format the log dir on first boot.)
 
 Store the output in the production `.env` file alongside the other secrets.
 
