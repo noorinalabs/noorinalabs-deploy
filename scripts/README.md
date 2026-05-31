@@ -55,3 +55,36 @@ residual case of personal admin keys added to root post-provision).
 
 See also: `bootstrap-vps.sh` Step 1 inline comments, #112 (parent foot-gun),
 PR #287 (the dedup fix).
+
+## Canonical root key is excluded from the merge (ADR 0006, #352)
+
+ADR 0006 splits SSH access into per-env **and** per-role keys: the root key
+authorizes `root` only, the deploy key authorizes `deploy` only. The Step 1
+merge above must therefore **never** copy the canonical per-env root key into
+the deploy user — doing so would re-authorize the root key for `deploy` and
+erode the role separation the split exists to create.
+
+To make the merge honour that, supply the canonical root pubkey so the script
+can fingerprint-match and skip it. Set **one** of these before running
+`bootstrap-vps.sh`:
+
+| Variable | Value |
+|---|---|
+| `CANONICAL_ROOT_PUBKEY` | the root pubkey line itself (e.g. `ssh-ed25519 AAAA… root@prod`) — the same `${root_ssh_public_key}` cloud-init seeded for this env |
+| `CANONICAL_ROOT_PUBKEY_FILE` | path to a file whose first non-comment line is that pubkey |
+
+```bash
+CANONICAL_ROOT_PUBKEY="$(cat ~/.ssh/noorinalabs_prod_root.pub)" \
+  ./bootstrap-vps.sh
+```
+
+With it set, Step 1's summary line reports `… N canonical-root excluded
+(ADR 0006)`, and only **operator-personal** admin keys added to root
+post-provision flow into deploy. **If neither variable is set**, the script
+preserves the legacy merge-everything behaviour but prints a loud `WARNING
+(ADR 0006)` — on a role-separated box, always pass the canonical root key.
+
+This is the residual/legacy bootstrap path only — fresh Terraform-provisioned
+boxes are fully cloud-init'd and never need this merge. Nothing automated calls
+`bootstrap-vps.sh` (whole-tree grep at HEAD); this exclusion hardens the manual
+path so it cannot quietly undo the ADR 0006 split.
