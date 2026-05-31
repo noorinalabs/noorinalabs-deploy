@@ -257,6 +257,11 @@ Do **not** automate this step. The owner's eyes on the dependency
 graph (DNS, monitoring, any forgotten cron jobs reaching this box) is
 the safety check.
 
+The full teardown sequence, pre-teardown gates, operator-side stale-entry
+cleanup, and the in-repo reference-removal manifest live in
+[`decommission-old-prod-vps.md`](decommission-old-prod-vps.md)
+(`deploy#86`). Hand off to that runbook here.
+
 ## Rollback
 
 If any step fails and prod is degraded, roll back in reverse order:
