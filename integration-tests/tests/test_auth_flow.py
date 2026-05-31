@@ -12,26 +12,24 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
-from tests.conftest import issue_token_for
+from tests.conftest import AuthSession
 
 USER_SERVICE_URL = os.environ["USER_SERVICE_URL"]
 
 
 @pytest.mark.asyncio
 async def test_auth_code_grants_jwt_that_isnad_graph_accepts(
-    seeded_user_factory,
-    user_service: httpx.AsyncClient,
+    auth_session: AuthSession,
     isnad_graph: httpx.AsyncClient,
 ) -> None:
-    _, auth_code = await seeded_user_factory(email="alice@example.com")
-
-    tokens = await issue_token_for(user_service, auth_code)
-    assert tokens["access_token"]
-    assert tokens["refresh_token"]
-    assert int(tokens["expires_in"]) > 0
+    # Mode-aware: hermetic seeds a fresh user + one-time code; remote uses
+    # the pre-provisioned stg test-user's freshly-rotated token pair. Either
+    # way we end up with an access token to assert isnad-graph accepts.
+    assert auth_session.access_token
+    assert auth_session.refresh_token
 
     # Cross-service: access a protected isnad-graph endpoint with that JWT.
-    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    headers = {"Authorization": f"Bearer {auth_session.access_token}"}
     r = await isnad_graph.get("/api/v1/narrators", headers=headers, params={"limit": 1})
     # Accept 200 (data present) or 404/empty (no data seeded). Anything in the
     # 2xx / 4xx data-shape range is fine; 401 means JWT validation failed.
@@ -40,14 +38,14 @@ async def test_auth_code_grants_jwt_that_isnad_graph_accepts(
 
 @pytest.mark.asyncio
 async def test_refresh_token_rotation(
-    seeded_user_factory, user_service: httpx.AsyncClient
+    auth_session: AuthSession, user_service: httpx.AsyncClient
 ) -> None:
-    _, auth_code = await seeded_user_factory(email="bob@example.com")
-    t1 = await issue_token_for(user_service, auth_code)
+    # The token pair already carries a valid refresh token (hermetic: issued
+    # from a fresh seed; remote: the rotated pair from the stg test-user
+    # bootstrap). Exercise rotation starting from it.
+    t1 = {"access_token": auth_session.access_token, "refresh_token": auth_session.refresh_token}
 
-    r = await user_service.post(
-        "/auth/token/refresh", json={"refresh_token": t1["refresh_token"]}
-    )
+    r = await user_service.post("/auth/token/refresh", json={"refresh_token": t1["refresh_token"]})
     assert r.status_code == 200, r.text
     t2 = r.json()
 
@@ -61,31 +59,28 @@ async def test_refresh_token_rotation(
     assert t2["refresh_token"], "new refresh token must be present"
 
     # Old refresh must now be invalid (rotation revokes it).
-    r2 = await user_service.post(
-        "/auth/token/refresh", json={"refresh_token": t1["refresh_token"]}
-    )
-    assert r2.status_code == 401, (
-        f"old refresh token still valid after rotation: {r2.status_code} {r2.text}"
-    )
+    r2 = await user_service.post("/auth/token/refresh", json={"refresh_token": t1["refresh_token"]})
+    assert (
+        r2.status_code == 401
+    ), f"old refresh token still valid after rotation: {r2.status_code} {r2.text}"
 
 
 @pytest.mark.asyncio
 async def test_token_validation_endpoint(
-    seeded_user_factory, user_service: httpx.AsyncClient
+    auth_session: AuthSession, user_service: httpx.AsyncClient
 ) -> None:
-    seeded, auth_code = await seeded_user_factory(
-        email="carol@example.com", roles=["user"]
-    )
-    tokens = await issue_token_for(user_service, auth_code)
-
     r = await user_service.get(
         "/auth/token/validate",
-        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        headers={"Authorization": f"Bearer {auth_session.access_token}"},
     )
     assert r.status_code == 200
     body = r.json()
     assert body["valid"] is True
-    assert body["email"] == seeded.email
+    # Email equality only when we know the seeded/provisioned identity.
+    # Hermetic always knows it; remote knows it iff STG_TEST_USER_EMAIL was
+    # provided alongside the refresh-token secret.
+    if auth_session.email:
+        assert body["email"] == auth_session.email
 
 
 @pytest.mark.asyncio
@@ -150,9 +145,9 @@ async def test_oauth_callback_to_token_issue(
         # AUTH_OAUTH_POST_LOGIN_URL default is /auth/callback; the handler
         # appends /{provider}. Error redirects take the same base but carry
         # ?error=... — fail loudly if we got an error redirect.
-        assert parsed.path == "/auth/callback/google", (
-            f"unexpected redirect path {parsed.path!r} — full Location={location}"
-        )
+        assert (
+            parsed.path == "/auth/callback/google"
+        ), f"unexpected redirect path {parsed.path!r} — full Location={location}"
         qs = parse_qs(parsed.query)
         assert "error" not in qs, (
             f"callback redirected with error={qs.get('error')} — check user-service "
@@ -169,21 +164,17 @@ async def test_oauth_callback_to_token_issue(
         # token minted by the real OAuth callback. 401 means JWT validation
         # failed (issuer/audience/JWKS mismatch); anything else is fine here.
         headers = {"Authorization": f"Bearer {access_token}"}
-        ig = await isnad_graph.get(
-            "/api/v1/narrators", headers=headers, params={"limit": 1}
-        )
-        assert ig.status_code != 401, (
-            f"isnad-graph rejected JWT minted via fake_oauth flow: {ig.text}"
-        )
+        ig = await isnad_graph.get("/api/v1/narrators", headers=headers, params={"limit": 1})
+        assert (
+            ig.status_code != 401
+        ), f"isnad-graph rejected JWT minted via fake_oauth flow: {ig.text}"
 
     # 4. Cleanup — find_or_create_oauth_user persisted a row. Its email is
     # derived from the fake access_token suffix, so we can't predict it; look
     # it up by OAuth provider + the account id we issued (sub=fake-user-<suffix>).
     # Simplest path: delete any fake-*@example.com users created during this
     # test window. These are only produced by this test path.
-    rows = await user_pg.fetch(
-        "SELECT id FROM users WHERE email LIKE 'fake-%@example.com'"
-    )
+    rows = await user_pg.fetch("SELECT id FROM users WHERE email LIKE 'fake-%@example.com'")
     for row in rows:
         uid = row["id"]
         await user_pg.execute("DELETE FROM sessions WHERE user_id = $1", uid)

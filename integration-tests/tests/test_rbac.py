@@ -22,21 +22,23 @@ import asyncio
 import httpx
 import pytest
 
-from tests.conftest import issue_token_for
+from tests.conftest import (
+    REMOTE_SHAPING_UNSUPPORTED_REASON,
+    RUN_MODE,
+    AuthSession,
+    issue_token_for,
+)
 
 
 @pytest.mark.asyncio
 async def test_non_admin_jwt_lacks_admin_role(
-    seeded_user_factory, user_service: httpx.AsyncClient
+    auth_session: AuthSession, user_service: httpx.AsyncClient
 ) -> None:
-    _, auth_code = await seeded_user_factory(
-        email="not-admin@example.com", roles=["user"]
-    )
-    tokens = await issue_token_for(user_service, auth_code)
-
+    # The default test-user is a plain non-admin in both modes, so this
+    # negative-control assertion (admin role absent) runs remotely too.
     r = await user_service.get(
         "/auth/token/validate",
-        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        headers={"Authorization": f"Bearer {auth_session.access_token}"},
     )
     assert r.status_code == 200
     body = r.json()
@@ -49,9 +51,13 @@ async def test_admin_jwt_carries_admin_role_across_boundary(
     user_service: httpx.AsyncClient,
     isnad_graph: httpx.AsyncClient,
 ) -> None:
-    _, auth_code = await seeded_user_factory(
-        email="the-admin@example.com", roles=["admin"]
-    )
+    # Hermetic-only: requires an admin-role user, which the fixed free-tier
+    # stg test-user cannot provide. seeded_user_factory already skips in
+    # remote mode (DB-direct), so this is belt-and-braces with a clearer
+    # reason for anyone reading the remote skip report.
+    if RUN_MODE != "hermetic":
+        pytest.skip(REMOTE_SHAPING_UNSUPPORTED_REASON)
+    _, auth_code = await seeded_user_factory(email="the-admin@example.com", roles=["admin"])
     tokens = await issue_token_for(user_service, auth_code)
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
 
@@ -69,6 +75,7 @@ async def test_admin_jwt_carries_admin_role_across_boundary(
             break
         await asyncio.sleep(delay_s)
 
-    assert r.status_code not in (401, 403), (
-        f"admin JWT rejected by isnad-graph for auth: {r.status_code} {r.text}"
-    )
+    assert r.status_code not in (
+        401,
+        403,
+    ), f"admin JWT rejected by isnad-graph for auth: {r.status_code} {r.text}"

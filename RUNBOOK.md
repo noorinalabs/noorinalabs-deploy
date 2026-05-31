@@ -24,6 +24,8 @@ own what they build. This repo owns what runs on the server.").
 | Observability stack index + Cloudflare Web Analytics | [`docs/runbooks/observability.md`](docs/runbooks/observability.md) |
 | Break-glass `workflow_dispatch` inputs | [`docs/runbooks/break-glass.md`](docs/runbooks/break-glass.md) |
 | Cold-rebuild dry-run gate | [`docs/runbooks/cold-rebuild-dry-run.md`](docs/runbooks/cold-rebuild-dry-run.md) |
+| Phase C cutover (hand-made → TF-managed prod) | [`docs/runbooks/phase-c-cutover.md`](docs/runbooks/phase-c-cutover.md) |
+| Decommission the old hand-made prod VPS (post-cutover) | [`docs/runbooks/decommission-old-prod-vps.md`](docs/runbooks/decommission-old-prod-vps.md) |
 | First-time VPS bring-up | [`docs/runbooks/user-service-migration.md`](docs/runbooks/user-service-migration.md) + § Build below |
 | Architecture / topology | [`docs/architecture.md`](docs/architecture.md) |
 | Dependencies / required secrets | [`docs/dependencies.md`](docs/dependencies.md) |
@@ -210,7 +212,7 @@ gh workflow run verify-deploy.yml -f target=stg
 gh workflow run verify-deploy.yml -f target=prod
 
 # Legacy operator script — use only if Actions is unreachable
-SITE_URL=https://isnad-graph.noorinalabs.com ./scripts/verify_deployment.sh --skip-workflow
+SITE_URL=https://isnad.noorinalabs.com ./scripts/verify_deployment.sh --skip-workflow
 ```
 
 ---

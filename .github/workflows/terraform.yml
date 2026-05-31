@@ -258,6 +258,18 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
+      # Token-scope preflight (#347). The redirect rulesets on .net/.org need
+      # the token scoped to those zones AND "Zone → Dynamic Redirect → Edit".
+      # Cloudflare validates ruleset writes only at APPLY, so a token missing
+      # that scope passes plan and fails apply with "Authentication error
+      # (10000)". This step turns that into an early, actionable failure by
+      # verifying the token and probing per-zone rulesets read access.
+      - name: Cloudflare token-scope preflight
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+          ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
+        run: ../../scripts/cf_token_preflight.sh
       # Discover the existing http_request_dynamic_redirect entrypoint ruleset
       # ID for each defensive-TLD zone and thread it into the import {} blocks
       # (imports.tf) via TF_VAR_*. Required because Cloudflare allows only one
@@ -325,8 +337,16 @@ jobs:
       run:
         working-directory: terraform/backblaze
     env:
-      TF_VAR_b2_application_key_id: ${{ secrets.B2_MASTER_KEY_ID }}
-      TF_VAR_b2_application_key: ${{ secrets.B2_MASTER_APP_KEY }}
+      # Read-only, account-scoped plan key (ADR 0004 Decision D: the master key
+      # MUST NOT exist in CI — #361). This key carries only the capabilities a
+      # `terraform plan`/refresh needs to read the existing bucket + key topology:
+      # listBuckets, listKeys, listFiles, readFiles. It CANNOT mint or revoke keys
+      # or create/delete buckets, so a CI compromise cannot escalate to the
+      # account-takeover blast radius the master key holds. Apply (which needs
+      # writeBuckets+writeKeys) is workstation-only — see the removed apply-backblaze
+      # job and terraform/backblaze/README.md § "Apply (workstation only)".
+      TF_VAR_b2_application_key_id: ${{ secrets.B2_BACKBLAZE_PLAN_KEY_ID }}
+      TF_VAR_b2_application_key: ${{ secrets.B2_BACKBLAZE_PLAN_APP_KEY }}
       AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
     steps:
@@ -438,6 +458,16 @@ jobs:
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "~> 1.6"
+      # Token-scope preflight (#347) — same as plan-cloudflare. On the apply
+      # path this is load-bearing: without it the token-scope miss surfaces as
+      # a half-applied prod run ("Authentication error (10000)" on the
+      # .net/.org rulesets after the .com DNS already applied). Fail fast here.
+      - name: Cloudflare token-scope preflight
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
+          ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
+        run: ../../scripts/cf_token_preflight.sh
       # See plan-cloudflare § "Discover redirect ruleset IDs". Same discovery
       # is required on apply: the import {} blocks (imports.tf) reference
       # TF_VAR_{net,org}_redirect_ruleset_id, and an empty import id errors at
@@ -473,32 +503,21 @@ jobs:
       - name: Apply
         run: terraform apply -auto-approve
 
-  apply-backblaze:
-    name: Apply (backblaze)
-    needs: [validate, tflint, checkov]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    # State-locking per ADR 0005 (#334). backblaze is a single prod-scoped
-    # root (no env matrix), so the key is fixed. cancel-in-progress:false →
-    # queue, never cancel mid-apply.
-    concurrency:
-      group: "terraform-apply-backblaze-prod"
-      cancel-in-progress: false
-    environment: production
-    defaults:
-      run:
-        working-directory: terraform/backblaze
-    env:
-      TF_VAR_b2_application_key_id: ${{ secrets.B2_MASTER_KEY_ID }}
-      TF_VAR_b2_application_key: ${{ secrets.B2_MASTER_APP_KEY }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.TF_STATE_B2_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_STATE_B2_APP_KEY }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: hashicorp/setup-terraform@v4
-        with:
-          terraform_version: "~> 1.6"
-      - name: Init
-        run: terraform init
-      - name: Apply
-        run: terraform apply -auto-approve
+  # NOTE: there is intentionally NO `apply-backblaze` job.
+  #
+  # ADR 0004 Decision D: the account-grade master b2 key (writeBuckets +
+  # writeKeys) MUST NOT exist in CI. A CI apply of terraform/backblaze/ would
+  # require that master key, putting an account-takeover credential in a CI
+  # environment — exactly the blast-radius Decision D keeps off CI. The
+  # bucket/key topology this module manages changes ~twice a year, so the
+  # exposure/use ratio of standing master-key-in-CI is indefensible (#361).
+  #
+  # terraform/backblaze/ is applied MANUALLY from an operator workstation:
+  #   - capability story:  terraform/backblaze/README.md § "Apply (workstation only)"
+  #   - concurrency story: docs/runbooks/terraform-workstation-apply.md
+  #     (the procedural state-lock substitute for non-CI applies — the same
+  #     workstation discipline already covers terraform/backblaze/).
+  #
+  # If a future decision wants CI to apply terraform/backblaze/, it must first
+  # supersede ADR 0004 Decision D and justify the blast-radius change
+  # (ADR 0004 § "What happens if a future ADR wants to put the master key in CI").

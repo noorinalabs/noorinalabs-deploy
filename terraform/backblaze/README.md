@@ -129,13 +129,27 @@ These can also live in `~/.aws/credentials` under a named profile if you prefer
    [Pre-flight](#pre-flight-provisioning-credentials)).
 3. Terraform 1.5+.
 
-## Apply
+## Apply (workstation only)
 
-**NOTE:** This module is **not applied in CI** — run it once, manually, from an
-operator workstation. The resulting keys are fed into GitHub Actions secrets.
+**This module is NOT applied in CI.** `terraform apply` here mints the pipeline
+bucket and the scoped `pipeline_rw` / `pipeline_ro` keys, which requires the
+account-grade **master b2 key** (`writeBuckets` + `writeKeys`). Per
+[ADR 0004 Decision D](../../docs/adr/0004-b2-state-bucket-and-key-management.md#decision-d--master-b2-key-tf_var_b2_),
+that master key **MUST NOT exist in CI** — its compromise is full-B2-account
+takeover, and this module's topology changes only ~twice a year, so a
+standing master key in CI would be an indefensible exposure/use ratio (#361).
+There is deliberately no `apply-backblaze` job in `.github/workflows/terraform.yml`.
+
+Apply is run **manually, from an authorized operator workstation**, and is
+subject to the same workstation-apply state-lock discipline as every other TF
+root — announce-and-acknowledge in `#deploy`, check for an in-flight CI apply,
+post a completion note. See
+[`docs/runbooks/terraform-workstation-apply.md`](../../docs/runbooks/terraform-workstation-apply.md)
+for the full 4-step procedure and the authorized-operator list.
 
 Confirm both credential pairs from the [Pre-flight](#pre-flight-provisioning-credentials)
-section are exported in your shell, then:
+section are exported in your shell (the master key in the `TF_VAR_b2_*` slot,
+the state-bucket key in the `AWS_*` slot), then:
 
 ```bash
 cd terraform/backblaze
@@ -147,6 +161,62 @@ terraform apply
 
 If `init` fails with a 403 on the state backend, you have the wrong key in the `AWS_*`
 slot — see the rotate-direction guard above.
+
+## CI plan: the read-only scoped plan key (ADR 0004 Decision D)
+
+The `plan-backblaze` job in `.github/workflows/terraform.yml` runs
+`terraform plan` on every PR that touches `terraform/backblaze/`. It does **not**
+use the master key. Instead it authenticates the `b2` provider with a
+**read-only, account-scoped plan key** held in GH Environment secrets:
+
+| GH Secret | Maps to | Role |
+|---|---|---|
+| `B2_BACKBLAZE_PLAN_KEY_ID` | `TF_VAR_b2_application_key_id` | b2 provider auth (plan/refresh only) |
+| `B2_BACKBLAZE_PLAN_APP_KEY` | `TF_VAR_b2_application_key` | b2 provider auth (plan/refresh only) |
+
+### Minimal plan-key capability set
+
+`terraform plan` for this module reads, but never writes, the B2 account:
+
+- `b2_bucket.pipeline` refresh ⇒ list/read the existing bucket → `listBuckets`, `listFiles`, `readFiles`.
+- `b2_application_key.pipeline_rw` / `pipeline_ro` refresh ⇒ list keys → `listKeys`.
+
+The application-key *secrets* are stored in Terraform state at create time, and
+**B2 never re-returns an application-key secret after creation** — so refresh of
+the `b2_application_key` resources does not (and cannot) re-read the secret; it
+only reconciles metadata via `listKeys`. This is what makes a read-only key
+sufficient for plan. Verified against the pinned provider `Backblaze/b2 ~> 0.10`
+(`versions.tf`): the `b2_bucket` / `b2_application_key` data refresh paths issue
+`b2_list_buckets` / `b2_list_keys` (read) calls, not write calls.
+
+The minimal capability set is therefore:
+
+```
+listBuckets, listKeys, listFiles, readFiles
+```
+
+Provision it once, from an operator workstation that already holds the master
+key (the master key is needed to *mint* this scoped key, but the scoped key
+itself never holds write capability):
+
+```bash
+b2 key create \
+  noorinalabs-backblaze-plan \
+  listBuckets,listKeys,listFiles,readFiles
+```
+
+`b2 key create` prints `keyID applicationKey` on one line — capture both into a
+password manager, then load them into the `production` GH Environment without
+round-tripping through shell history:
+
+```bash
+echo "<keyID>"         | gh secret set B2_BACKBLAZE_PLAN_KEY_ID  --env production --repo noorinalabs/noorinalabs-deploy --body -
+echo "<applicationKey>"| gh secret set B2_BACKBLAZE_PLAN_APP_KEY --env production --repo noorinalabs/noorinalabs-deploy --body -
+```
+
+> If a future provider bump makes refresh require additional read capabilities,
+> widen this set by the *minimal* increment and document the reason here — never
+> reach back to the master key for CI plan.
 
 ## Retrieving sensitive outputs
 

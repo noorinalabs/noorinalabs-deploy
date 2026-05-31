@@ -17,7 +17,7 @@ Common production issues and how to resolve them.
 2. Compare the `AUTH_GOOGLE_CLIENT_ID` / `AUTH_GITHUB_CLIENT_ID` values with what is configured in:
    - [Google Cloud Console](https://console.cloud.google.com/apis/credentials) — OAuth 2.0 Client IDs
    - [GitHub Developer Settings](https://github.com/settings/developers) — OAuth Apps
-3. Verify the OAuth redirect URI matches `https://isnad-graph.noorinalabs.com` in both providers
+3. Verify the OAuth redirect URI matches `https://users.noorinalabs.com/auth/oauth/{provider}/callback` in both providers (see `docs/runbooks/oauth-per-env.md` § Redirect URI conventions — the callback lives on the `users.` user-service host, not the frontend host)
 4. After updating secrets, re-run the deploy workflow to inject the new values into the VPS `.env` file
 
 > Secrets are NOT hot-reloaded. A new deploy is required after any secret change.
@@ -69,7 +69,7 @@ ss -tlnp | grep -E ':(80|443)\b'
 
 **Common causes:**
 
-- **DNS not pointing to VPS:** Caddy needs DNS to resolve to the VPS IP for ACME challenge. Verify: `dig isnad-graph.noorinalabs.com +short`
+- **DNS not pointing to VPS:** Caddy needs DNS to resolve to the VPS IP for ACME challenge. Verify: `dig isnad.noorinalabs.com +short`
 - **Port 80 blocked:** ACME HTTP-01 challenge requires port 80. Check the Hetzner firewall rules.
 - **Rate limiting:** Let's Encrypt has rate limits (50 certs/week per domain). If hit, wait or use the staging ACME server.
 - **Stale Caddy config:** After updating the Caddyfile, restart Caddy: `docker compose -p noorinalabs -f compose/docker-compose.prod.yml restart caddy`

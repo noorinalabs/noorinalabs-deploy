@@ -105,17 +105,29 @@ fi
 # /root/.ssh/authorized_keys post-provision and want them reachable from the
 # deploy user too. Idempotent append-with-fingerprint-dedup (#287).
 #
-# CAUTION (ADR 0006): this merge copies EVERY root authorized_keys line into
-# deploy, including the canonical per-env ROOT key — which re-authorizes the
-# root key for the deploy user and partially erodes the per-role separation
-# the split exists to create. The behavior is retained for now because this
-# is the legacy/residual bootstrap path (fresh boxes are fully cloud-init'd
-# and should not need it), but whether to exclude the canonical root key from
-# the merge is tracked as an ADR-0006 follow-up. Do not rely on this merge as
-# part of the role-separation guarantee.
+# ADR 0006 role separation (#352): this merge must NOT copy the canonical
+# per-env ROOT key into the deploy user. The whole point of the split is that
+# the root key authorizes root ONLY and the deploy key authorizes deploy ONLY.
+# Previously this loop copied EVERY /root/.ssh/authorized_keys line into deploy,
+# including the cloud-init-seeded canonical root key — re-authorizing root for
+# deploy and partially eroding the separation. We now exclude the canonical root
+# key by fingerprint so ONLY operator-personal admin keys (added to root post-
+# provision) flow into deploy.
 #
-# Fix (#287): append each root key to deploy's file only if its fingerprint
-# isn't already present. Idempotent across any number of re-runs.
+# Identifying the canonical root key: the operator supplies it out-of-band so
+# this on-box script can fingerprint-match and skip it. Set ONE of:
+#   CANONICAL_ROOT_PUBKEY       — the pubkey line itself (e.g. "ssh-ed25519 AAA... root@prod")
+#   CANONICAL_ROOT_PUBKEY_FILE  — path to a file containing that pubkey line
+# This is the same ${root_ssh_public_key} cloud-init seeded for this env (see
+# terraform/hetzner/modules/hetzner-vps/cloud-init.yaml.tpl write_files). When
+# neither is set, the script PRESERVES the legacy behavior (merge everything)
+# but prints a loud warning — on a role-separated box the operator should always
+# pass it. Do not rely on this merge as part of the role-separation guarantee
+# unless the canonical root key is supplied.
+#
+# Residual value of the merge (post-exclusion): operators who add PERSONAL admin
+# keys to /root/.ssh/authorized_keys post-provision and want them reachable from
+# the deploy user too. Idempotent append-with-fingerprint-dedup (#287).
 echo "==> [1/4] Merging /root/.ssh/authorized_keys → deploy (idempotent)..."
 DEPLOY_AUTH_KEYS="/home/$DEPLOY_USER/.ssh/authorized_keys"
 mkdir -p "/home/$DEPLOY_USER/.ssh"
@@ -131,6 +143,29 @@ ssh_key_fp() {
   echo "$1" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true
 }
 
+# Resolve the canonical root key's fingerprint (the line to EXCLUDE from the
+# merge per ADR 0006). Empty when the operator did not supply it.
+CANONICAL_ROOT_FP=""
+canonical_root_line=""
+if [ -n "${CANONICAL_ROOT_PUBKEY:-}" ]; then
+  canonical_root_line="$CANONICAL_ROOT_PUBKEY"
+elif [ -n "${CANONICAL_ROOT_PUBKEY_FILE:-}" ]; then
+  if [ -f "$CANONICAL_ROOT_PUBKEY_FILE" ]; then
+    # First non-empty, non-comment line of the supplied pubkey file.
+    canonical_root_line=$(grep -vE '^[[:space:]]*($|#)' "$CANONICAL_ROOT_PUBKEY_FILE" | head -n1)
+  else
+    echo "ERROR: CANONICAL_ROOT_PUBKEY_FILE='$CANONICAL_ROOT_PUBKEY_FILE' not found." >&2
+    exit 1
+  fi
+fi
+if [ -n "$canonical_root_line" ]; then
+  CANONICAL_ROOT_FP=$(ssh_key_fp "$canonical_root_line")
+  if [ -z "$CANONICAL_ROOT_FP" ]; then
+    echo "ERROR: supplied canonical root pubkey is not a valid SSH public key line." >&2
+    exit 1
+  fi
+fi
+
 if [ -f /root/.ssh/authorized_keys ]; then
   declare -A DEPLOY_FPS=()
   while IFS= read -r existing_line; do
@@ -139,12 +174,25 @@ if [ -f /root/.ssh/authorized_keys ]; then
     [ -n "$fp" ] && DEPLOY_FPS["$fp"]=1
   done < "$DEPLOY_AUTH_KEYS"
 
+  if [ -z "$CANONICAL_ROOT_FP" ]; then
+    echo "    WARNING (ADR 0006): canonical root pubkey not supplied"
+    echo "    (set CANONICAL_ROOT_PUBKEY or CANONICAL_ROOT_PUBKEY_FILE). Merging"
+    echo "    ALL root keys including the canonical root key — this re-authorizes"
+    echo "    the root key for the deploy user and erodes per-role separation."
+  fi
+
   added=0
   skipped=0
+  excluded=0
   while IFS= read -r root_line; do
     case "$root_line" in ''|\#*) continue ;; esac
     fp=$(ssh_key_fp "$root_line")
     [ -z "$fp" ] && continue
+    # ADR 0006: never propagate the canonical per-env root key into deploy.
+    if [ -n "$CANONICAL_ROOT_FP" ] && [ "$fp" = "$CANONICAL_ROOT_FP" ]; then
+      excluded=$((excluded + 1))
+      continue
+    fi
     if [ -n "${DEPLOY_FPS[$fp]:-}" ]; then
       skipped=$((skipped + 1))
     else
@@ -156,7 +204,7 @@ if [ -f /root/.ssh/authorized_keys ]; then
 
   chown "$DEPLOY_USER:$DEPLOY_USER" "$DEPLOY_AUTH_KEYS"
   chmod 600 "$DEPLOY_AUTH_KEYS"
-  echo "    Merged root authorized_keys → deploy: $added added, $skipped already present."
+  echo "    Merged root authorized_keys → deploy: $added added, $skipped already present, $excluded canonical-root excluded (ADR 0006)."
 else
   echo "    /root/.ssh/authorized_keys not found — nothing to merge (expected on heavily-locked-down hosts)."
 fi

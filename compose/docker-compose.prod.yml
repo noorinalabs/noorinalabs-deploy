@@ -188,6 +188,19 @@ services:
     # no Node/npm toolchain, so the previous `npm pack`-based build path was
     # never viable and the CACHEBUST arg (local-build cache buster) went with it.
     image: ghcr.io/noorinalabs/noorinalabs-isnad-graph-frontend:${IMAGE_TAG:-latest}
+    environment:
+      # Runtime origin for the user-service API, consumed by the frontend
+      # container entrypoint (isnad-graph#932 / ig#934): entrypoint.sh runs
+      # `envsubst '${USER_SERVICE_ORIGIN}'` over runtime-config.js.template,
+      # so window.RUNTIME_CONFIG.USER_SERVICE_ORIGIN is this value at runtime.
+      # useAuth.ts / LoginPage.tsx then build absolute AUTH_BASE / USER_BASE /
+      # SESSIONS_BASE against it. This completes deploy#245 phase 2: the
+      # frontend targets users.{$BASE_DOMAIN} directly instead of the empty-
+      # string same-origin fallback the transitional isnad.* dual-bind relied
+      # on (now dropped — see caddy/Caddyfile isnad.{$BASE_DOMAIN} block).
+      # Per-env via ${BASE_DOMAIN} (prod: users.noorinalabs.com,
+      # stg: users.stg.noorinalabs.com).
+      USER_SERVICE_ORIGIN: "https://users.${BASE_DOMAIN}"
     expose:
       - "80"
     read_only: true
@@ -604,7 +617,15 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
-      GF_SERVER_ROOT_URL: https://isnad-graph.noorinalabs.com/grafana
+      # Sub-path mount behind Caddy on the isnad vhost (caddy/Caddyfile
+      # `handle /grafana/*`). Host MUST match the live Caddy binding —
+      # the legacy `isnad-graph.noorinalabs.com` record was destroyed in
+      # the 2026-05-02 reconciliation (#192/#226) and every other ref
+      # migrated to `isnad.{$BASE_DOMAIN}`; this line was the last hold-out
+      # (dates from initial commit c7642bf) and made Grafana emit
+      # login-redirect / sub-path asset URLs at a dead NXDOMAIN host,
+      # breaking reachability + login (deploy#45).
+      GF_SERVER_ROOT_URL: https://isnad.${BASE_DOMAIN:?BASE_DOMAIN required}/grafana
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
     expose:
       - "3000"
@@ -818,46 +839,65 @@ services:
   # remote access is only via SSH tunnel. Topic creation is handled by the
   # one-shot kafka-init service below.
   kafka:
-    # bitnami/* namespace was sunset Aug 2025; images now live at bitnamilegacy/*.
-    # Same image, same internal paths (/bitnami/kafka, /opt/bitnami/kafka/...) — only
-    # the registry namespace changes. Long-term migration off Bitnami tracked in #100.
-    image: bitnamilegacy/kafka:3.8.0
-    # Must run with GID 0 (root group) — matches the image's default USER directive.
-    # /opt/bitnami/kafka/config is root:root 775; the entrypoint cp's default configs
-    # there on first run and requires group-write via gid=0. Explicit user: 1001:1001
-    # loses that group membership and fails with "Permission denied" on server.properties
-    # — see #124. Long-term migration off Bitnami tracked in #100.
-    user: "1001:0"
+    # Official Apache Kafka image (KRaft-native, no ZooKeeper). Migrated off
+    # Bitnami in #100 — the bitnami/* namespace was sunset Aug 2025 and the
+    # bitnamilegacy/* stopgap is itself on a sunset trajectory. apache/kafka
+    # is the upstream-canonical, Apache-2.0-throughout, smallest standard
+    # image; owner-selected 2026-05-31. Differences from the Bitnami image
+    # that this block reconciles:
+    #   - Env-var convention: KAFKA_CFG_<X> → KAFKA_<X> (no CFG infix; the
+    #     apache/kafka entrypoint translates KAFKA_* directly to server
+    #     properties via KafkaDockerWrapper).
+    #   - Cluster ID: KAFKA_KRAFT_CLUSTER_ID → CLUSTER_ID (consumed by the
+    #     entrypoint's first-boot `kafka-storage format`; the image
+    #     auto-formats the log dir on first start).
+    #   - Data dir: /bitnami/kafka → /var/lib/kafka/data (apache/kafka's
+    #     default log.dirs from /etc/kafka/docker; volume remount below).
+    #   - User: the bitnami gid=0 workaround (#124, /opt/bitnami config
+    #     group-write) no longer applies — apache/kafka runs as its own
+    #     appuser (uid 1000) and owns its config/data dirs, so no explicit
+    #     `user:` override is needed.
+    #   - CLI scripts: /opt/bitnami/kafka/... → /opt/kafka/bin/... (see the
+    #     kafka-init mount + healthcheck below, and infra/kafka/init-topics.sh).
+    image: apache/kafka:3.9.2
     environment:
       # Core KRaft identity
-      KAFKA_CFG_NODE_ID: "1"
-      KAFKA_CFG_PROCESS_ROLES: "controller,broker"
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-      # Cluster ID must be stable across restarts — supplied via env (see .env.example).
-      KAFKA_KRAFT_CLUSTER_ID: "${KAFKA_CLUSTER_ID:?KAFKA_CLUSTER_ID must be set (generate once: docker run --rm bitnamilegacy/kafka:3.8.0 kafka-storage.sh random-uuid)}"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      # Cluster ID must be stable across restarts — supplied via env (see
+      # .env.example). apache/kafka reads CLUSTER_ID (not the Bitnami
+      # KAFKA_KRAFT_CLUSTER_ID) and formats the log dir with it on first boot.
+      CLUSTER_ID: "${KAFKA_CLUSTER_ID:?KAFKA_CLUSTER_ID must be set (generate once: docker run --rm apache/kafka:3.9.2 /opt/kafka/bin/kafka-storage.sh random-uuid)}"
+      # Persistent log dir — apache/kafka's bundled docker config defaults
+      # log.dirs to /var/lib/kafka/data; set it explicitly so the volume
+      # mount target below is unambiguous and survives any default change.
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
       # Listeners (plaintext, internal-only — backend network is docker-internal)
-      KAFKA_CFG_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093"
-      KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092"
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       # Durability / retention defaults (per-topic retention set by kafka-init)
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-      KAFKA_CFG_MIN_INSYNC_REPLICAS: "1"
-      KAFKA_CFG_NUM_PARTITIONS: "3"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_NUM_PARTITIONS: "3"
       # JVM heap — small single-node broker
       KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
     volumes:
-      - kafka_data:/bitnami/kafka
+      - kafka_data:/var/lib/kafka/data
     expose:
       - "9092"
     healthcheck:
       # kafka-broker-api-versions.sh returns non-zero if the broker isn't accepting connections.
-      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1 || exit 1"]
+      # apache/kafka ships the CLI scripts under /opt/kafka/bin and does NOT
+      # guarantee them on PATH (unlike Bitnami), so call by absolute path.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -886,17 +926,18 @@ services:
     # One-shot topic creation. Idempotent: uses --if-not-exists. Exits 0 on success.
     # The service stays in "exited" state after the first successful run and is
     # re-executed whenever compose is brought up — cheap and safe.
-    # bitnamilegacy/* — see broker service comment + #100 for the long-term plan.
-    image: bitnamilegacy/kafka:3.8.0
-    # Must run with GID 0 (root group) — matches the image's default USER directive.
-    # /opt/bitnami/kafka/config is root:root 775; the entrypoint cp's default configs
-    # there on first run and requires group-write via gid=0. Explicit user: 1001:1001
-    # loses that group membership and fails with "Permission denied" on server.properties
-    # — see #124. Long-term migration off Bitnami tracked in #100.
-    user: "1001:0"
+    # apache/kafka — migrated off Bitnami in #100 (see broker service comment).
+    # No gid=0 / config-dir workaround needed here: this service only runs the
+    # init script against the already-running broker; it doesn't write into the
+    # image's config dir. The CLI scripts the init script calls live under
+    # /opt/kafka/bin (handled inside init-topics.sh).
+    image: apache/kafka:3.9.2
+    # Mount under a neutral path (not /opt/bitnami/...) — apache/kafka has no
+    # /opt/bitnami tree. /opt/kafka exists in the image; placing the script
+    # alongside (not inside bin/) keeps it clearly ours.
     volumes:
-      - ../infra/kafka/init-topics.sh:/opt/bitnami/kafka/init-topics.sh:ro
-    entrypoint: ["/bin/bash", "/opt/bitnami/kafka/init-topics.sh"]
+      - ../infra/kafka/init-topics.sh:/opt/kafka/init-topics.sh:ro
+    entrypoint: ["/bin/bash", "/opt/kafka/init-topics.sh"]
     environment:
       KAFKA_BOOTSTRAP: "kafka:9092"
     depends_on:
