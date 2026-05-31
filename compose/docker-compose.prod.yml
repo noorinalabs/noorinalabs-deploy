@@ -188,6 +188,19 @@ services:
     # no Node/npm toolchain, so the previous `npm pack`-based build path was
     # never viable and the CACHEBUST arg (local-build cache buster) went with it.
     image: ghcr.io/noorinalabs/noorinalabs-isnad-graph-frontend:${IMAGE_TAG:-latest}
+    environment:
+      # Runtime origin for the user-service API, consumed by the frontend
+      # container entrypoint (isnad-graph#932 / ig#934): entrypoint.sh runs
+      # `envsubst '${USER_SERVICE_ORIGIN}'` over runtime-config.js.template,
+      # so window.RUNTIME_CONFIG.USER_SERVICE_ORIGIN is this value at runtime.
+      # useAuth.ts / LoginPage.tsx then build absolute AUTH_BASE / USER_BASE /
+      # SESSIONS_BASE against it. This completes deploy#245 phase 2: the
+      # frontend targets users.{$BASE_DOMAIN} directly instead of the empty-
+      # string same-origin fallback the transitional isnad.* dual-bind relied
+      # on (now dropped — see caddy/Caddyfile isnad.{$BASE_DOMAIN} block).
+      # Per-env via ${BASE_DOMAIN} (prod: users.noorinalabs.com,
+      # stg: users.stg.noorinalabs.com).
+      USER_SERVICE_ORIGIN: "https://users.${BASE_DOMAIN}"
     expose:
       - "80"
     read_only: true
