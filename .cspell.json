@@ -1,0 +1,30 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "//": "Spellcheck for noorinalabs-deploy authored docs (#326). Scoped to canonical authored prose (docs/, RUNBOOK, CLAUDE.md, the team charter) — append-only machine-ish records (feedback_log, trust_matrix) and roster cards are excluded because they are dense with names, SHAs, and quoted shell that would balloon the dictionary without catching real typos. Infra/domain vocabulary and team names live in project-words.txt.",
+  "dictionaryDefinitions": [
+    {
+      "name": "project-words",
+      "path": "./.cspell/project-words.txt",
+      "addWords": true
+    }
+  ],
+  "dictionaries": ["project-words", "en_US", "softwareTerms", "bash", "python", "node", "filetypes"],
+  "ignoreRegExpList": [
+    "/[0-9a-f]{7,40}/",
+    "/https?:\\/\\/[^\\s)]+/",
+    "/`[^`]+`/",
+    "/<!--[\\s\\S]*?-->/",
+    "/\\b[A-Z_]{3,}\\b/"
+  ],
+  "files": [
+    "docs/**/*.md",
+    "RUNBOOK.md",
+    "CLAUDE.md",
+    ".claude/team/charter.md"
+  ],
+  "ignorePaths": [
+    "node_modules/**",
+    ".venv/**"
+  ]
+}

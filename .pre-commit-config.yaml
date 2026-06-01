@@ -1,17 +1,35 @@
 # Pre-commit hooks for noorinalabs-deploy
-# Install: pre-commit install
-# Docs: https://pre-commit.com/
+# Install:  pre-commit install && pre-commit install --hook-type pre-push
+# Docs:     https://pre-commit.com/
 #
-# Hook execution order (fail-fast, cheapest first):
-#   1. Terraform format check
-#   2. Terraform validate
-#   3. gitleaks (secret detection)
+# This MIRRORS the repo's CI quality gates so a local commit/push fails fast
+# instead of surfacing a lint/format/type error only after a PR is opened
+# (Phase-3 end-state criterion #6 / noorinalabs-main#327). The pre-commit <-> CI
+# sync-drift gate (.claude/lib/pre_commit_ci_sync.py, wired as a CI job) verifies
+# this mirror stays in lockstep — if a future edit drops a kind CI enforces, that
+# gate fails the build.
 #
-# Prerequisites:
-#   - Terraform ~> 1.5
+# CI gates this mirrors (deploy is IaC/shell/YAML-heavy, so the load-bearing ones
+# are terraform-fmt, actionlint, and gitleaks):
+#   * terraform fmt + validate ........ terraform.yml
+#   * actionlint (workflow lint) ...... lint-workflows.yml + docs.yml
+#   * ruff lint + format, mypy ........ hooks-lint.yml (over .claude/hooks/)
+#   * gitleaks (secret detection) ..... stricter-local (no CI gate yet; kept)
+#
+# Stage split (fail-fast, cheapest first):
+#   pre-commit (every commit) — terraform fmt/validate, gitleaks, actionlint,
+#     ruff-format, ruff-lint, env-example completeness.
+#   pre-push   (every push)   — mypy over .claude/hooks/ (heavier; matches the
+#     hooks-lint.yml typecheck job, which skips when no hooks are present).
+#
+# Note on ruff/mypy: this repo is a dispatcher-style child with NO .claude/hooks/
+# *.py today, so hooks-lint.yml's ruff/mypy jobs SKIP (nullglob guard) and the
+# matching hooks here are scoped to that dir and no-op until hooks land. They are
+# present for CI parity (the sync gate classifies hooks-lint.yml as enforcing
+# those kinds) so the floor is already in place. Tools are pinned to match CI.
 
 repos:
-  # --- Terraform format ---
+  # --- Terraform format + validate (mirrors terraform.yml) ---
   - repo: https://github.com/antonbabenko/pre-commit-terraform
     rev: v1.96.3
     hooks:
@@ -21,19 +39,69 @@ repos:
       - id: terraform_validate
         name: terraform-validate
 
-  # --- Secret detection ---
+  # --- Secret detection (stricter-local: kept from the prior config) ---
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.24.3
     hooks:
       - id: gitleaks
         name: gitleaks
 
-  # --- Env file completeness check ---
+  # --- Workflow lint (mirrors lint-workflows.yml + docs.yml actionlint job) ---
+  # Pinned to v1.7.12 — the same version lint-workflows.yml downloads + SHA-
+  # verifies, kept in lockstep with the org rollout.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        name: actionlint
+
+  # --- Python lint/format for .claude/hooks (mirrors hooks-lint.yml) ---
+  # Pinned to ruff 0.11.6 (the org rollout pin). Scoped to .claude/hooks/ and
+  # no-op today (no hooks present); present for CI parity + future-proofing.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.6
+    hooks:
+      - id: ruff-format
+        name: ruff-format
+        files: ^\.claude/hooks/.*\.py$
+      - id: ruff
+        name: ruff-lint
+        args: [--fix]
+        files: ^\.claude/hooks/.*\.py$
+
+  # --- Local hooks ---
   - repo: local
     hooks:
+      # mypy over .claude/hooks (mirrors hooks-lint.yml typecheck job). Heavier,
+      # so pre-push. always_run with the wrapper no-op'ing when the directory is
+      # empty, matching the CI job's skip-when-no-hooks guard.
+      - id: mypy-hooks
+        name: mypy (pre-push)
+        entry: |-
+          bash -c 'shopt -s nullglob; files=(.claude/hooks/*.py); if [ ${#files[@]} -eq 0 ]; then echo "No hooks present, skipping mypy."; exit 0; fi; mypy .claude/hooks/ --ignore-missing-imports --no-error-summary'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # pytest over the sync-gate unit tests (mirrors precommit-ci-sync.yml's
+      # sync-gate-tests job). Heavier, so pre-push.
+      - id: pytest-sync-gate
+        name: pytest (pre-push)
+        entry: python3 -m pytest .claude/lib/tests/ -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # Env file completeness check (carried over from the prior config).
+      # NOTE: entry is a YAML literal block scalar (`|-`) because the inline
+      # `echo "WARNING: ..."` contains a colon-space that a plain scalar would
+      # mis-parse as a mapping (the docs.yml config-lint YAML gate catches this).
       - id: env-example-check
         name: env-example-check
-        entry: bash -c 'docker compose --env-file compose/.env.example -f compose/docker-compose.prod.yml config > /dev/null 2>&1 || echo "WARNING: .env.example may be incomplete (docker compose config failed)"'
+        entry: |-
+          bash -c 'docker compose --env-file compose/.env.example -f compose/docker-compose.prod.yml config >/dev/null 2>&1 || echo "WARNING: .env.example may be incomplete (docker compose config failed)"'
         language: system
         pass_filenames: false
         files: (\.env|docker-compose)

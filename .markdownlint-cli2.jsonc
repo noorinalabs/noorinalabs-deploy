@@ -1,0 +1,57 @@
+// markdownlint-cli2 config for noorinalabs-deploy committed docs (#326).
+//
+// Adapted from the parent (noorinalabs-main) canonical config. deploy's markdown
+// corpus is sizeable (RUNBOOK, docs/ design notes, 6 ADRs, 18 runbooks, the
+// .claude/team charter) and shares the org house style: long lines in tables,
+// inline HTML, repeated section headings. The goal of the docs-lint job is to
+// catch genuinely broken markdown (unclosed fences, malformed links, hard tabs,
+// trailing-space line breaks that silently drop content) — NOT to reflow the
+// corpus to a style guide.
+//
+// The stylistic rules the corpus deliberately uses are disabled (kept in
+// lockstep with the parent's list so the rollout is uniform); the structural
+// rules that catch real rendering breakage stay on. The current corpus passes
+// clean under this config (verified at PR time).
+{
+  "config": {
+    "default": true,
+
+    // --- intentionally-violated stylistic rules (disabled) ---
+    "MD013": false, // line-length — dense tables + prose run long by design
+    "MD033": false, // inline HTML — <br> in tables, note blockquotes
+    "MD024": false, // duplicate headings — same section name recurs across docs
+    "MD041": false, // first-line-heading — some docs open with a note blockquote
+    "MD036": false, // emphasis-as-heading — bold lead-ins are a house idiom
+    "MD034": false, // bare URLs — issue/PR refs are pasted bare
+    "MD029": false, // ordered-list prefix — manual numbering restarts
+    "MD040": false, // fenced-code language — some illustrative blocks are bare
+    "MD046": false, // code-block style — mixed fenced/indented across docs
+    "MD007": false, // unordered-list indentation — varied nested indent
+    "MD028": false, // blank line inside blockquote — multi-para notes use them
+    "MD025": false, // multiple top-level headings — some docs concatenate sections
+    "MD060": false, // table-column-style — compact table pipes are house style
+    "MD032": false, // blanks-around-lists — tight list/heading packing
+    "MD022": false, // blanks-around-headings — same tight packing
+    "MD031": false, // blanks-around-fences — tight fence packing
+    "MD004": false, // ul-style — mixed -/* bullets across docs
+    "MD058": false, // blanks-around-tables — tight table packing
+    "MD012": false, // no-multiple-blanks — deliberate spacing in records
+    "MD049": false, // emphasis-style — mixed _/* emphasis
+    "MD038": false, // spaces-in-code — intentional prose spans inside code spans
+    "MD051": false, // link-fragments — relative-file link breakage is covered by lychee instead
+    "MD018": false, // no-space-after-hash — prose lines wrap onto a leading `#11`/`#146` issue ref (house idiom), not an ATX heading
+
+    // --- structural rules kept ON (catch real breakage) ---
+    // MD009 trailing-spaces, MD047 single-trailing-newline, MD010 hard-tabs,
+    // MD042 empty-link, MD039 spaces-in-link-text, MD011 reversed-link-syntax,
+    // MD037 spaces-in-emphasis, and the rest of `default: true` remain enforced.
+    "MD010": { "code_blocks": false } // allow hard tabs inside code blocks only
+  },
+  "globs": [
+    "**/*.md"
+  ],
+  "ignores": [
+    "node_modules/**",
+    ".venv/**"
+  ]
+}
