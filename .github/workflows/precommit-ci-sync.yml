@@ -1,0 +1,62 @@
+name: CI — Pre-commit ⇄ CI sync-drift gate
+
+# Phase-3 end-state criterion #6 (noorinalabs-main#327): local pre-commit hooks
+# MIRROR the CI-enforced checks so a developer's local commit/push fails fast
+# instead of surfacing a lint/type error only after a PR is opened. This job is
+# the machine-enforcement that keeps the mirror from rotting: it fails the build
+# if a check CI enforces (terraform-fmt / actionlint / ruff / mypy / …) is NOT
+# mirrored in .pre-commit-config.yaml.
+#
+# The gate scans ALL .github/workflows/*.yml UNSCOPED (no --ci filter) against
+# .pre-commit-config.yaml. It is the deploy adoption of the parent-canonical
+# sync-drift gate (noorinalabs-main .claude/lib/pre_commit_ci_sync.py); the
+# deploy copy narrows only the `build` kind so this repo's heavy runtime
+# `docker buildx` usage is not misread as an un-mirrorable CI build gate (see
+# the module docstring).
+#
+# Triggered when EITHER side changes (a workflow edit or a pre-commit edit can
+# introduce drift) plus the gate's own files.
+
+on:
+  push:
+    branches: [main, "deployments/**"]
+    paths:
+      - ".pre-commit-config.yaml"
+      - ".github/workflows/**"
+      - ".claude/lib/pre_commit_ci_sync.py"
+  pull_request:
+    branches: [main, "deployments/**"]
+    paths:
+      - ".pre-commit-config.yaml"
+      - ".github/workflows/**"
+      - ".claude/lib/pre_commit_ci_sync.py"
+
+permissions:
+  contents: read
+
+jobs:
+  precommit-ci-sync:
+    name: Pre-commit ⇄ CI sync-drift gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Verify pre-commit config mirrors CI-enforced checks (#327)
+        # Fails if a check CI enforces (terraform-fmt/actionlint/ruff/mypy/…) is
+        # missing from .pre-commit-config.yaml, so local hooks can't silently
+        # drift behind CI.
+        run: python3 .claude/lib/pre_commit_ci_sync.py .
+
+  sync-gate-tests:
+    name: Sync-gate unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pyyaml
+      - name: Run pre_commit_ci_sync tests
+        run: python3 -m pytest .claude/lib/tests/test_pre_commit_ci_sync.py -q
