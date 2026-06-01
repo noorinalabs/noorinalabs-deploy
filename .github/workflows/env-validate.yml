@@ -1,0 +1,138 @@
+name: Env Restructure Validate
+# deploy#363 — per-env env-restructure validation gate (design deploy#332).
+# Implements the four checks in docs/env-restructure-design.md priority order:
+#   1. settings-load  — each service's Settings() loads from the assembled tiers
+#   2. secret-keys    — secret catalogue ⊆ deploy passlist + compose :? coverage
+#   3. os-environ     — no raw os.environ under **/src/** (Settings-mandatory)
+#   4. inventory      — docs/env-inventory.{csv,md} not stale (org-tree job)
+on:
+  pull_request:
+    paths:
+      - 'env/**'
+      - 'secrets/**'
+      - 'compose/docker-compose.prod.yml'
+      - '.github/workflows/deploy-stg.yml'
+      - '.github/workflows/deploy-prod.yml'
+      - '.github/workflows/env-validate.yml'
+      - 'scripts/env_validate.py'
+      - 'scripts/env_validate_schemas.py'
+      - 'scripts/env-inventory.py'
+      - 'docs/env-inventory.csv'
+      - 'docs/env-inventory.md'
+  push:
+    branches: [main]
+    paths:
+      - 'env/**'
+      - 'secrets/**'
+      - 'compose/docker-compose.prod.yml'
+      - '.github/workflows/deploy-stg.yml'
+      - '.github/workflows/deploy-prod.yml'
+      - '.github/workflows/env-validate.yml'
+      - 'scripts/env_validate.py'
+      - 'scripts/env_validate_schemas.py'
+      - 'scripts/env-inventory.py'
+      - 'docs/env-inventory.csv'
+      - 'docs/env-inventory.md'
+
+permissions:
+  contents: read
+
+jobs:
+  env-validate:
+    # Hermetic checks — deploy repo alone. settings-load + secret-keys are the
+    # forcing-function gates that prevent the 97-multi-source / 27-key-drift
+    # problems from re-growing. os-environ is a no-op here (no src/ in this
+    # repo) but is included so the gate is one entry point.
+    name: settings-load + secret-keys + os-environ
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run env-validate (hermetic checks)
+        run: |
+          python3 scripts/env_validate.py settings-load
+          python3 scripts/env_validate.py secret-keys
+          python3 scripts/env_validate.py os-environ
+
+  inventory-staleness:
+    # The env-inventory staleness check only makes sense with the full 7-repo
+    # org tree checked out — env-inventory.py scans every sibling. We assemble a
+    # minimal sibling tree (the two settings-bearing services + the surfaces the
+    # inventory weights heaviest) at the matching wave/main ref, then run
+    # `env-inventory.py --check`. Mirrors integration-tests.yml's sibling-ref
+    # resolution so a wave-branch PR validates against the matching wave branch.
+    name: env-inventory staleness (org tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: noorinalabs-deploy
+      - name: Resolve sibling-repo refs (wave-aware)
+        id: sibling-refs
+        working-directory: noorinalabs-deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base_ref="${{ github.base_ref || github.ref_name }}"
+          resolve_ref() {
+            repo="$1"
+            # Prefer the matching wave branch; fall back to main.
+            if [ -n "${base_ref}" ] && \
+               git ls-remote --exit-code --heads \
+                 "https://github.com/noorinalabs/${repo}.git" "${base_ref}" >/dev/null 2>&1; then
+              echo "${base_ref}"
+            else
+              echo "main"
+            fi
+          }
+          {
+            echo "isnad_graph_ref=$(resolve_ref noorinalabs-isnad-graph)"
+            echo "user_service_ref=$(resolve_ref noorinalabs-user-service)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Checkout noorinalabs-isnad-graph
+        uses: actions/checkout@v6
+        with:
+          repository: noorinalabs/noorinalabs-isnad-graph
+          path: noorinalabs-isnad-graph
+          ref: ${{ steps.sibling-refs.outputs.isnad_graph_ref }}
+      - name: Checkout noorinalabs-user-service
+        uses: actions/checkout@v6
+        with:
+          repository: noorinalabs/noorinalabs-user-service
+          path: noorinalabs-user-service
+          ref: ${{ steps.sibling-refs.outputs.user_service_ref }}
+      - name: Checkout noorinalabs-data-acquisition
+        uses: actions/checkout@v6
+        with:
+          repository: noorinalabs/noorinalabs-data-acquisition
+          path: noorinalabs-data-acquisition
+          ref: main
+      - name: Checkout noorinalabs-isnad-ingest-platform
+        uses: actions/checkout@v6
+        with:
+          repository: noorinalabs/noorinalabs-isnad-ingest-platform
+          path: noorinalabs-isnad-ingest-platform
+          ref: main
+      - name: Checkout noorinalabs-landing-page
+        uses: actions/checkout@v6
+        with:
+          repository: noorinalabs/noorinalabs-landing-page
+          path: noorinalabs-landing-page
+          ref: main
+      - name: Checkout noorinalabs-design-system
+        uses: actions/checkout@v6
+        with:
+          repository: noorinalabs/noorinalabs-design-system
+          path: noorinalabs-design-system
+          ref: main
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run env-inventory staleness check
+        working-directory: noorinalabs-deploy
+        run: python3 scripts/env_validate.py inventory
