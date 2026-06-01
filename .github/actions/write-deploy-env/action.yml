@@ -218,6 +218,46 @@ runs:
           fi
           chmod 600 "$slack_file"
 
+          # Pre-flight: Kafka KRaft cluster-id drift detector (deploy#393).
+          # apache/kafka formats the log dir with CLUSTER_ID only when the dir
+          # is empty. If the persisted kafka_data volume was formatted with a
+          # DIFFERENT cluster id (e.g. the pre-#385 Bitnami id, or a rotated
+          # KAFKA_CLUSTER_ID), the broker throws InconsistentClusterIdException,
+          # never reaches healthy, and compose aborts the WHOLE stack on
+          # kafka-init's `depends_on: service_healthy` — surfacing only as the
+          # opaque "container noorinalabs-kafka-1 is unhealthy". Detect the
+          # mismatch here and fail loud with a runbook pointer instead, so the
+          # operator gets the diagnosis (and the re-bootstrap procedure) up front
+          # rather than reverse-engineering it from an unhealthy container.
+          echo "==> Pre-flight: checking Kafka cluster-id consistency..."
+          desired_cid="$(grep -E "^KAFKA_CLUSTER_ID=" .env | head -n1 | cut -d= -f2- | sed "s/^'//; s/'$//")"
+          if [ -z "$desired_cid" ]; then
+            echo "ERROR: KAFKA_CLUSTER_ID is empty in .env — the broker cannot format a stable log dir." >&2
+            echo "       Set KAFKA_CLUSTER_ID in this env's GitHub Environment (generate once:" >&2
+            echo "       docker run --rm apache/kafka:3.9.2 /opt/kafka/bin/kafka-storage.sh random-uuid)." >&2
+            exit 1
+          fi
+          # Read the persisted volume's recorded cluster id, if any. A fresh
+          # volume (no meta.properties) is fine — the broker formats on boot.
+          # Reuse the apache/kafka image (already pulled for the broker) as the
+          # throwaway reader so we don't add a Docker Hub dependency on the
+          # GHCR-authenticated deploy path; override its entrypoint to a shell.
+          persisted_cid="$(docker run --rm --entrypoint /bin/sh \
+            -v noorinalabs_kafka_data:/data apache/kafka:3.9.2 \
+            -c 'grep -E "^cluster.id=" /data/meta.properties 2>/dev/null | head -n1 | cut -d= -f2-' \
+            2>/dev/null || true)"
+          if [ -n "$persisted_cid" ] && [ "$persisted_cid" != "$desired_cid" ]; then
+            echo "ERROR: Kafka cluster-id mismatch — the persisted kafka_data volume was formatted" >&2
+            echo "       with a DIFFERENT cluster id than KAFKA_CLUSTER_ID. Bringing the stack up now" >&2
+            echo "       would leave the broker unhealthy (InconsistentClusterIdException) and abort the deploy." >&2
+            echo "         persisted (volume meta.properties): $persisted_cid" >&2
+            echo "         desired   (.env KAFKA_CLUSTER_ID)  : $desired_cid" >&2
+            echo "       Re-bootstrap the volume per docs/runbooks/kafka-cluster-id-rebootstrap.md" >&2
+            echo "       (stg first), then re-run this deploy. Aborting before compose up." >&2
+            exit 1
+          fi
+          echo "==> Kafka cluster-id consistent (or fresh volume) — proceeding."
+
           echo "==> Authenticating to GHCR..."
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
