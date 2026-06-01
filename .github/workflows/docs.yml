@@ -1,0 +1,167 @@
+name: CI — Docs & Config
+
+# Phase-3 end-state criterion #5 (noorinalabs-main#326): all committed artifacts
+# pass checks — including documentation and config, not just the Python/IaC that
+# the other workflows gate. This workflow closes the NON-code gap for
+# noorinalabs-deploy: markdown lint + spellcheck + internal link-check over the
+# committed docs (RUNBOOK, docs/, ADRs, runbooks, CLAUDE.md, the .claude/team
+# charter), committed-config syntax (YAML/JSON parse), and workflow actionlint.
+# Adapted from the parent-canonical docs.yml; scoped to this repo's surface.
+#
+# deploy is YAML/HCL/shell-heavy (Terraform + Docker Compose + many workflows),
+# so the actionlint + config-syntax jobs are the load-bearing ones here: a
+# malformed workflow or an un-parseable compose/observability YAML is a real
+# operational defect. (Terraform fmt/validate + workflow actionlint also run in
+# terraform.yml / lint-workflows.yml on their own paths; this workflow is the
+# docs/config floor that catches the non-python config ci surface those skip.)
+
+on:
+  push:
+    branches: [main, "deployments/**"]
+    paths:
+      - "**/*.md"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - ".claude/team/**"
+      - ".markdownlint-cli2.jsonc"
+      - ".cspell.json"
+      - ".cspell/**"
+      - ".lychee.toml"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: [main, "deployments/**"]
+    paths:
+      - "**/*.md"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - ".claude/team/**"
+      - ".markdownlint-cli2.jsonc"
+      - ".cspell.json"
+      - ".cspell/**"
+      - ".lychee.toml"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  markdownlint:
+    name: Markdown lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: markdownlint-cli2
+        # Config (.markdownlint-cli2.jsonc) carries the glob + ignores and
+        # disables the stylistic rules the dense runbook/ADR corpus intentionally
+        # uses, keeping the structural rules that catch real breakage.
+        uses: DavidAnson/markdownlint-cli2-action@ded1f9488f68a970bc66ea5619e13e9b52e601cd # v23.2.0
+
+  spellcheck:
+    name: Spellcheck (cspell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: cspell
+        uses: streetsidesoftware/cspell-action@de2a73e963e7443969755b648a1008f77033c5b2 # v8.4.0
+        with:
+          # Dictionary + ignore rules come from .cspell.json. The `files` glob
+          # here is authoritative for the action (it overrides config-side
+          # discovery), so it is scoped to the AUTHORED-prose set — the runbooks,
+          # ADRs, design docs, CLAUDE.md and the team charter. A real typo in
+          # authored prose blocks; new infra/domain terms go in
+          # .cspell/project-words.txt.
+          config: ".cspell.json"
+          files: |
+            docs/**/*.md
+            RUNBOOK.md
+            CLAUDE.md
+            .claude/team/charter.md
+          incremental_files_only: false
+          strict: true
+
+  linkcheck:
+    name: Internal link-check (lychee)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: lychee
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
+        with:
+          # .lychee.toml runs offline (internal/relative links only; external
+          # URL liveness is intentionally not gated — third-party uptime must
+          # not flake the docs gate). A broken relative cross-reference between
+          # the many runbooks/ADRs that cross-link each other fails.
+          args: "--config .lychee.toml --no-progress './**/*.md'"
+          fail: true
+
+  config-lint:
+    name: Config — YAML/JSON syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Validate committed YAML + JSON parse
+        # A committed config file that does not parse is a real defect — this is
+        # the syntax floor for the non-python config artifacts the IaC workflows
+        # ignore (compose, observability configs, dependabot, workflow YAML).
+        # `.jsonc` (the markdownlint config) carries comments and is NOT strict
+        # JSON, so it is excluded from the json.loads pass. Generated/vendored
+        # trees are skipped.
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+          import pathlib
+
+          try:
+              import yaml  # PyYAML is preinstalled on ubuntu-latest runners
+          except ImportError:
+              import subprocess
+
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "pyyaml"])
+              import yaml
+
+          skip_prefixes = (
+              ".venv/",
+              "node_modules/",
+              ".git/",
+          )
+          root = pathlib.Path(".")
+          failures = []
+          for path in root.rglob("*"):
+              rel = path.as_posix()
+              if path.is_dir() or rel.startswith(skip_prefixes):
+                  continue
+              if path.suffix in (".yaml", ".yml"):
+                  try:
+                      list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+                  except Exception as exc:  # noqa: BLE001
+                      failures.append(f"{rel}: YAML parse error: {exc}")
+              elif path.suffix == ".json":
+                  try:
+                      json.loads(path.read_text(encoding="utf-8"))
+                  except Exception as exc:  # noqa: BLE001
+                      failures.append(f"{rel}: JSON parse error: {exc}")
+          if failures:
+              print("\n".join(failures))
+              sys.exit(1)
+          print("All committed YAML/JSON parse cleanly.")
+          PY
+
+  actionlint:
+    name: Config — Workflow actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run actionlint on workflows
+        # shellcheck is preinstalled on ubuntu-latest, so actionlint's embedded
+        # shellcheck integration runs (per the actionlint-needs-shellcheck
+        # discipline) rather than silently skipping — load-bearing for this
+        # shell-heavy repo. lint-workflows.yml pins+SHA-verifies actionlint for
+        # the workflow-paths trigger; this job is the docs-workflow companion
+        # using the upstream installer so the docs gate is self-contained.
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
