@@ -17,9 +17,11 @@ Implements the four checks the accepted env-restructure design
                       Eliminates the env:/env_keys hand-sync drift independent
                       of storage backend. Also fails if any tracked file under
                       secrets/ is not a *.env.example catalogue.
-  3. os-environ     — grep gate over **/src/** flagging os.environ/os.getenv,
-                      with an allowlist for tests/integration-tests/scripts
-                      (decision #3: Settings mandatory in service src/).
+  3. os-environ     — gate over **/src/** flagging both `os.environ`/`os.getenv`
+                      (dotted) AND `from os import environ/getenv` (direct
+                      import), with an allowlist for tests/integration-tests/
+                      scripts (decision #3: Settings mandatory in service src/).
+                      Module aliasing (`import os as o`) is a documented limit.
   4. inventory      — re-run scripts/env-inventory.py and fail if
                       docs/env-inventory.{csv,md} is stale. SKIPS when the
                       sibling org tree is not checked out (deploy CI checks out
@@ -259,7 +261,27 @@ def _git_tracked_under(subdir: str) -> list[str]:
 
 # ---------- check 3: os.environ lint over **/src/** ----------
 
+# Two detection forms so the bare-import path can't evade the gate:
+#   (1) dotted attribute access — `os.environ` / `os.getenv`
+#   (2) `from os import environ|getenv` — the name imported directly, so later
+#       use is bare `environ[...]` / `getenv(...)`. _OS_FROM_IMPORT_RE matches
+#       the import line; _OS_IMPORTED_NAME_RE finds environ/getenv as a whole
+#       name in the import list (comma lists, parenthesized, `as` aliases).
+# Aliasing the MODULE (`import os as o` → `o.environ`) is an accepted, documented
+# limitation: it is rare, conspicuous in review, and chasing it would need real
+# import-graph analysis rather than a line scan.
 _OS_ENVIRON_RE = re.compile(r"\bos\.(?:environ\b|getenv\b)")
+_OS_FROM_IMPORT_RE = re.compile(r"^\s*from\s+os\s+import\s+(?P<names>.+)$")
+_OS_IMPORTED_NAME_RE = re.compile(r"\b(?:environ|getenv)\b")
+
+
+def _os_environ_hit(line: str) -> bool:
+    """True if a line reaches os env config via dotted OR bare-import form."""
+    if _OS_ENVIRON_RE.search(line):
+        return True
+    m = _OS_FROM_IMPORT_RE.match(line)
+    return bool(m and _OS_IMPORTED_NAME_RE.search(m.group("names")))
+
 
 # Path fragments where raw os.environ is allowed (decision #3): tests, the
 # integration-tests harness, and one-off scripts. Scoped to **/src/** only.
@@ -272,7 +294,14 @@ _OS_ENVIRON_ALLOW_FRAGMENTS = (
 
 
 def cmd_os_environ() -> int:
-    """Flag raw os.environ/os.getenv under any **/src/** tree.
+    """Flag raw os env-config access under any **/src/** tree.
+
+    Detects BOTH forms (so the bare-import path can't evade the gate):
+      - dotted attribute: `os.environ` / `os.getenv`
+      - direct import:     `from os import environ` / `from os import getenv`
+        (incl. comma lists, parenthesized, `as`-aliased names)
+    Module aliasing (`import os as o` → `o.environ`) is an accepted, documented
+    limitation — see _os_environ_hit.
 
     Decision #3: Pydantic Settings mandatory in service src/; raw os.environ
     allowed in tests/integration-tests/scripts. The deploy repo has no src/ of
@@ -310,17 +339,18 @@ def cmd_os_environ() -> int:
             for lineno, line in enumerate(
                 py.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1
             ):
-                if _OS_ENVIRON_RE.search(line):
+                if _os_environ_hit(line):
                     failed = True
                     try:
                         shown = py.relative_to(org_root)
                     except ValueError:
                         shown = py
                     print(
-                        f"::error file={shown}::raw os.environ/os.getenv in src/ "
-                        f"(line {lineno}) — config must flow through Pydantic "
-                        f"Settings (deploy#332 decision #3). Move to a Settings "
-                        f"field, or relocate to tests/scripts if it is test glue."
+                        f"::error file={shown}::raw os.environ/os.getenv (dotted or "
+                        f"`from os import environ/getenv`) in src/ (line {lineno}) — "
+                        f"config must flow through Pydantic Settings (deploy#332 "
+                        f"decision #3). Move to a Settings field, or relocate to "
+                        f"tests/scripts if it is test glue."
                     )
     if not seen_any_src:
         print("os-environ: no src/ trees checked out — gate is a no-op here.")

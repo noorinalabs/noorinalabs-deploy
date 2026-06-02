@@ -56,7 +56,7 @@ design's priority order:
 |---|---|---|
 | `settings-load` | Each service's Settings loads from the assembled non-secret tiers + secret placeholders, with no ValidationError. The forcing function. | deploy repo alone (hermetic) |
 | `secret-keys` | `secrets/<env>.env.example` ⊆ `deploy-<env>.yml` `env_keys` passlist; every `${VAR:?}` compose guard satisfied by some tier; no real secret committed under `secrets/`. | deploy repo alone |
-| `os-environ` | No raw `os.environ`/`os.getenv` under `**/src/**` (Settings mandatory in service src/; tests/scripts allowed — decision #3). | over any `src/` checked out |
+| `os-environ` | No raw os env-config under `**/src/**` — flags both `os.environ`/`os.getenv` (dotted) and `from os import environ/getenv` (direct import); module aliasing (`import os as o`) is a documented limitation (Settings mandatory in service src/; tests/scripts allowed — decision #3). | over any `src/` checked out |
 | `inventory` | `docs/env-inventory.{csv,md}` not stale vs a fresh `env-inventory.py` scan. | org-tree job (siblings checked out) |
 
 Run locally:
