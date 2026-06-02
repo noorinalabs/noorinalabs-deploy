@@ -22,14 +22,18 @@
 #     principal IS the PR author, so a formal self-approval 422s). Reviewer-count
 #     enforcement stays with Hook 4 (validate_pr_review). A "require 1 approval"
 #     rule would deadlock every merge.
-#   * Required status checks: EMPTY for deploy. Every deploy CI workflow is
-#     paths-filtered, so a `strict` ruleset naming any context would deadlock
+#   * Required status checks: rule OMITTED for deploy. Every deploy CI workflow
+#     is paths-filtered, so a `strict` ruleset naming any context would deadlock
 #     PRs that don't touch that path (the check never runs → its context never
-#     reports). The PR-required + no-force-push + no-delete protections are still
-#     fully active; the CI-blocks-merge guarantee is carried operator-side by
-#     Hook 4 + the ADMIN_MERGE_EXCEPTION gate until deploy gains an unconditional
-#     PR CI gate. When it does, add `{ "context": "<job-name>" }` to
-#     ruleset-main.json's required set (confirm against live check-runs first).
+#     reports). The GitHub REST API also 422s on an empty required_status_checks
+#     array ("Expected at least 1 elements, got 0" — deploy#395), so the rule is
+#     dropped entirely rather than included-with-[]. The PR-required +
+#     no-force-push + no-delete protections are still fully active; the
+#     CI-blocks-merge guarantee is carried operator-side by Hook 4 + the
+#     ADMIN_MERGE_EXCEPTION gate until deploy gains an unconditional PR CI gate.
+#     When it does, ADD a required_status_checks rule with
+#     `{ "context": "<job-name>" }` to ruleset-main.json (confirm against live
+#     check-runs first) — re-introducing the rule, not un-emptying an array.
 #   * Repository-admin always-bypass (actor_id 5) keeps the orchestrator's
 #     --admin wave→main wrapup merges + the charter single-reviewer/doc-sweep/
 #     emergency exceptions working. The hook-side ADMIN_MERGE_EXCEPTION gate
