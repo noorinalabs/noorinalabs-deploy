@@ -798,11 +798,11 @@ After every wave completes and the deployments branch is PR'd to main:
 
 ## Automated Skills (Claude Code)
 
-The following Claude Code skills automate recurring team processes. Each skill is a markdown file in `.claude/skills/` and is invoked via `/skill-name` in Claude Code.
+The following Claude Code skills automate recurring team processes. These skills are **org-canonical** — their definitions live in the parent `noorinalabs-main/.claude/skills/` and are invoked via `/skill-name` from the parent-rooted session that orchestrates this repo. (This repo previously carried drifted flat-`.md` copies under its own `.claude/skills/`; those shadows were removed in deploy#560.)
 
 ### `/wave-kickoff` — Automated Wave Planning
 
-**Skill file:** `.claude/skills/wave-kickoff.md`
+**Skill:** org-canonical `/wave-kickoff` (defined in parent `noorinalabs-main/.claude/skills/wave-kickoff/`).
 
 **Replaces manual steps in:** § Branching Rules (deployments branch creation), § Wave Planning & Priority (priority ordering), § GitHub Label Hygiene (label creation/validation), § Implementation Kickoff & Issue Assignment (labeling and kickoff comments).
 
@@ -822,7 +822,7 @@ The following Claude Code skills automate recurring team processes. Each skill i
 
 ### `/wave-retro` — Automated Wave Retrospective
 
-**Skill file:** `.claude/skills/wave-retro.md`
+**Skill:** org-canonical `/wave-retro` (defined in parent `noorinalabs-main/.claude/skills/wave-retro/`).
 
 **Replaces manual steps in:** § Wave Retrospectives (retro conversations, consolidation, process change proposals), § Feedback System (trust matrix updates, feedback logging), § Trust Identity Matrix (directional score adjustments).
 
@@ -842,7 +842,7 @@ The following Claude Code skills automate recurring team processes. Each skill i
 
 ### `/team-reset` — Transparent Team Lifecycle Management
 
-**Skill file:** `.claude/skills/team-reset.md`
+**Skill:** org-canonical `/team-reset` (defined in parent `noorinalabs-main/.claude/skills/team-reset/`).
 
 **Replaces manual steps in:** § Team Lifecycle (TeamCreate / TeamDelete) (teardown transparency, force teardown, roster change reporting).
 
@@ -862,7 +862,7 @@ The following Claude Code skills automate recurring team processes. Each skill i
 
 ### `/wave-audit` — Close Orphaned Issues After Wave
 
-**Skill file:** `.claude/skills/wave-audit.md`
+**Skill:** org-canonical `/wave-audit` (defined in parent `noorinalabs-main/.claude/skills/wave-audit/`).
 
 **Replaces manual steps in:** § Issue Hygiene (close condition enforcement), § Bug Closure (closing issues when fix PRs merge).
 
