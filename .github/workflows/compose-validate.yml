@@ -105,6 +105,56 @@ jobs:
           done
           exit "$fail"
 
+  python-lint:
+    # noorinalabs-main#326: deploy's own Python tooling — the standalone
+    # scripts under scripts/ and .github/workflows/scripts/ — had NO ruff/mypy
+    # gate. hooks-lint.yml only lints .claude/hooks/*.py (none in this
+    # dispatcher-style child, so it skips), and the shellcheck job above is
+    # *.sh-only. So check_tf_apply_locking.py / env-inventory.py /
+    # cold_rebuild_static_checks.py were ungated despite being CI-critical
+    # (the TF-apply-lock regression guard and the cold-rebuild shape guards
+    # run from these). This job is the missing Python floor, mirroring
+    # hooks-lint.yml's ruff/mypy pattern. Pinned to ruff 0.11.6 — the same
+    # version the .pre-commit-config.yaml mirror + org rollout ship — so local
+    # `pre-commit` and CI run the identical tool (#327 fail-fast parity).
+    # integration-tests/ is out of scope here: it is pytest-gated by
+    # integration-tests.yml and carries its own dev-deps/config.
+    name: ruff + mypy (scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Discover Python scripts
+        id: discover
+        shell: bash
+        run: |
+          mapfile -t files < <(find scripts .github/workflows/scripts -type f -name '*.py' 2>/dev/null)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No Python scripts found — nothing to lint."
+            echo "found=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "${files[@]}"
+          echo "found=1" >> "$GITHUB_OUTPUT"
+      - name: Install ruff + mypy (pinned)
+        if: steps.discover.outputs.found == '1'
+        # ruff 0.11.6 matches .pre-commit-config.yaml's ruff-pre-commit rev and
+        # the org rollout pin. types-PyYAML supplies the stubs for
+        # check_tf_apply_locking.py's `import yaml` so mypy doesn't trip on
+        # import-untyped (which --ignore-missing-imports does NOT suppress).
+        run: pip install ruff==0.11.6 mypy types-PyYAML
+      - name: Ruff lint (scripts)
+        if: steps.discover.outputs.found == '1'
+        run: ruff check scripts .github/workflows/scripts
+      - name: Ruff format --check (scripts)
+        if: steps.discover.outputs.found == '1'
+        run: ruff format --check scripts .github/workflows/scripts
+      - name: Mypy type check (scripts)
+        if: steps.discover.outputs.found == '1'
+        run: mypy scripts .github/workflows/scripts --ignore-missing-imports --no-error-summary
+
   passlist-drift:
     # deploy#97: catch drift between compose's :?-required vars and the
     # deploy-stg/deploy-prod env_keys passlists at PR-review time, before
