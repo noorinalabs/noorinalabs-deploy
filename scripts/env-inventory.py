@@ -614,13 +614,21 @@ def collect_all(org_dir: Path) -> list[Row]:
     return deduped
 
 
-def write_csv(rows: list[Row], out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+_CSV_HEADER = [
+    "var_name",
+    "consumer_repo",
+    "consumer_service",
+    "source_path",
+    "source_line",
+    "var_type",
+]
+
+
+def render_csv(rows: list[Row]) -> str:
+    """Render rows to CSV text (shared by write_csv and the --check renderer)."""
     buf = StringIO()
     writer = csv.writer(buf, lineterminator="\n")
-    writer.writerow(
-        ["var_name", "consumer_repo", "consumer_service", "source_path", "source_line", "var_type"]
-    )
+    writer.writerow(_CSV_HEADER)
     for r in rows:
         writer.writerow(
             [
@@ -632,12 +640,22 @@ def write_csv(rows: list[Row], out_path: Path) -> None:
                 r.var_type,
             ]
         )
-    out_path.write_text(buf.getvalue(), encoding="utf-8")
+    return buf.getvalue()
+
+
+def write_csv(rows: list[Row], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(render_csv(rows), encoding="utf-8")
 
 
 def write_markdown(rows: list[Row], out_path: Path) -> None:
     """Render the inventory as a markdown table grouped by var_name."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(render_markdown(rows), encoding="utf-8")
+
+
+def render_markdown(rows: list[Row]) -> str:
+    """Render the inventory markdown to a string (shared by write + --check)."""
     # Group by var_name
     by_var: dict[str, list[Row]] = {}
     for r in rows:
@@ -679,7 +697,7 @@ def write_markdown(rows: list[Row], out_path: Path) -> None:
                 f"{r.source_line} | {r.var_type} |"
             )
         lines.append("")
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines) + "\n"
 
 
 def summary(rows: list[Row]) -> str:
@@ -736,6 +754,20 @@ def _find_org_dir(deploy_root: Path) -> Path:
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Don't write; regenerate in memory and exit non-zero if "
+            "docs/env-inventory.{csv,md} on disk is stale. Used by the "
+            "env-validate staleness gate (deploy#363)."
+        ),
+    )
+    args = parser.parse_args()
+
     script_path = Path(__file__).resolve()
     # `output_root` is the working tree the script was invoked from — usually a
     # git worktree off the deploy repo. We write outputs here so the diff lands
@@ -754,6 +786,30 @@ def main() -> int:
     rows = collect_all(org_dir)
     csv_out = output_root / "docs" / "env-inventory.csv"
     md_out = output_root / "docs" / "env-inventory.md"
+
+    if args.check:
+        # Render to strings and compare against on-disk; never write.
+        expected_csv = render_csv(rows)
+        expected_md = render_markdown(rows)
+
+        stale: list[str] = []
+        on_disk_csv = csv_out.read_text(encoding="utf-8") if csv_out.exists() else ""
+        if on_disk_csv != expected_csv:
+            stale.append(str(csv_out.relative_to(output_root)))
+        on_disk_md = md_out.read_text(encoding="utf-8") if md_out.exists() else ""
+        if on_disk_md != expected_md:
+            stale.append(str(md_out.relative_to(output_root)))
+
+        if stale:
+            print(
+                "STALE: " + ", ".join(stale) + " — re-run "
+                "`python3 scripts/env-inventory.py` and commit the result.",
+                file=sys.stderr,
+            )
+            return 1
+        print("env-inventory: docs/env-inventory.{csv,md} are current.")
+        return 0
+
     write_csv(rows, csv_out)
     write_markdown(rows, md_out)
 
