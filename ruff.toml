@@ -1,0 +1,21 @@
+# Ruff config for noorinalabs-deploy's Python tooling.
+#
+# Added with the python-lint CI gate (noorinalabs-main#326). Deploy previously
+# had NO ruff config, so a bare CI `ruff` run fell back to defaults (88-col)
+# while the scripts were authored to the org-standard 100-col (the parent
+# noorinalabs-main/pyproject.toml + every sibling repo). Pinning line-length
+# here makes CI and local pre-commit agree AND keeps deploy's Python formatted
+# the same as the rest of the org — without reformatting working scripts to a
+# narrower width that diverges from every sibling.
+#
+# Kept deliberately minimal: line-length + target + the lint rule-set the org
+# baseline uses (E/F/W/I). Mirror the parent if that baseline widens.
+target-version = "py312"
+line-length = 100
+
+# Worktree dirs are scratch checkouts of other branches — never lint/format
+# these (matches isnad-graph's ruff config).
+extend-exclude = [".claude/worktrees"]
+
+[lint]
+select = ["E", "F", "W", "I"]
