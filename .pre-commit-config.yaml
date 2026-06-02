@@ -55,30 +55,37 @@ repos:
       - id: actionlint
         name: actionlint
 
-  # --- Python lint/format for .claude/hooks (mirrors hooks-lint.yml) ---
-  # Pinned to ruff 0.11.6 (the org rollout pin). Scoped to .claude/hooks/ and
-  # no-op today (no hooks present); present for CI parity + future-proofing.
+  # --- Python lint/format (mirrors hooks-lint.yml + compose-validate.yml) ---
+  # Pinned to ruff 0.11.6 (the org rollout pin). Scoped to the repo's Python:
+  #   * .claude/hooks/ ............ mirrors hooks-lint.yml (no-op today; no hooks)
+  #   * scripts/ + .github/workflows/scripts/ .. mirrors compose-validate.yml's
+  #     python-lint job (noorinalabs-main#326) so local pre-commit catches the
+  #     same ruff drift CI does (#327 fail-fast parity).
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.11.6
     hooks:
       - id: ruff-format
         name: ruff-format
-        files: ^\.claude/hooks/.*\.py$
+        files: ^(\.claude/hooks/|scripts/|\.github/workflows/scripts/).*\.py$
       - id: ruff
         name: ruff-lint
         args: [--fix]
-        files: ^\.claude/hooks/.*\.py$
+        files: ^(\.claude/hooks/|scripts/|\.github/workflows/scripts/).*\.py$
 
   # --- Local hooks ---
   - repo: local
     hooks:
-      # mypy over .claude/hooks (mirrors hooks-lint.yml typecheck job). Heavier,
-      # so pre-push. always_run with the wrapper no-op'ing when the directory is
-      # empty, matching the CI job's skip-when-no-hooks guard.
-      - id: mypy-hooks
+      # mypy over .claude/hooks (mirrors hooks-lint.yml) + scripts/ and
+      # .github/workflows/scripts/ (mirrors compose-validate.yml's python-lint
+      # job, noorinalabs-main#326). Heavier, so pre-push. The .claude/hooks/
+      # arm no-ops when empty (matches the CI skip-when-no-hooks guard); the
+      # scripts arm always runs since those dirs are always present. types-PyYAML
+      # is needed for check_tf_apply_locking.py's `import yaml` — install it in
+      # your pre-commit env (`pip install types-PyYAML`) so mypy matches CI.
+      - id: mypy-python
         name: mypy (pre-push)
         entry: |-
-          bash -c 'shopt -s nullglob; files=(.claude/hooks/*.py); if [ ${#files[@]} -eq 0 ]; then echo "No hooks present, skipping mypy."; exit 0; fi; mypy .claude/hooks/ --ignore-missing-imports --no-error-summary'
+          bash -c 'shopt -s nullglob; targets=(scripts .github/workflows/scripts); hooks=(.claude/hooks/*.py); if [ ${#hooks[@]} -gt 0 ]; then targets+=(.claude/hooks); fi; mypy "${targets[@]}" --ignore-missing-imports --no-error-summary'
         language: system
         pass_filenames: false
         always_run: true
