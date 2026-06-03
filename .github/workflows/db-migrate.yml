@@ -7,10 +7,13 @@ name: DB Migrate (user-service alembic)
 #
 # Belt-and-suspenders (deploy#85, per Anya.Kowalczyk 2026-04-23): before
 # `alembic upgrade head`, assert that `alembic heads` reports exactly ONE
-# line containing `0040` — the merge-migration revision introduced by
-# user-service#80. This catches a future migration landing without bumping
-# `down_revision` properly (a silent divergence `alembic upgrade head` alone
-# would mask).
+# line containing the expected head — currently `0041`
+# (`0041_add_subscriptions_user_id_index`, down_revision `0040`; the `0040`
+# merge-migration was introduced by user-service#80). This catches a future
+# migration landing without bumping `down_revision` properly (a silent
+# divergence `alembic upgrade head` alone would mask). Bump EXPECTED_MERGE_HEAD
+# (below) in lockstep whenever user-service adds a migration — deploy#407 was a
+# wedged stg deploy caused by `0041` landing (us#54/#520) without this bump.
 
 on:
   workflow_call:
@@ -67,7 +70,7 @@ jobs:
       # Expected merge-migration revision. Bump this line in the same PR that
       # lands a future alembic merge migration in user-service. A mismatch
       # here means "the migration DAG moved under us" and is a hard stop.
-      EXPECTED_MERGE_HEAD: "0040"
+      EXPECTED_MERGE_HEAD: "0041"
     steps:
       - uses: actions/checkout@v6
 
