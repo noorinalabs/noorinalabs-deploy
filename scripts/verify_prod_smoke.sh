@@ -8,12 +8,14 @@
 #
 # Checks:
 #   1. isnad-graph /health    → HTTP 200, JSON .status in {healthy,degraded,ok}
-#   2. user-service /health   → HTTP 200 (via Caddy /api/v1/user-service/health)
+#   2. user-service /health   → HTTP 200 (USER_SERVICE_BASE_URL/health,
+#                                  direct on the carved-out users.* vhost — #245/#414)
 #   3. landing /              → HTTP 200
 #   4. /api/v1/narrators?limit=1 → HTTP 401 + JSON-shaped body (proves
 #                                  user-service auth is in the path, not
 #                                  Caddy bypass returning plaintext)
-#   5. /.well-known/jwks.json → HTTP 200 + valid JWKS shape (.keys[])
+#   5. /.well-known/jwks.json → HTTP 200 + valid JWKS shape (.keys[]),
+#                                  on USER_SERVICE_BASE_URL (users.* vhost — #245/#414)
 #   6. /auth/oauth/google/login → HTTP 200 + JSON .authorization_url
 #                                  pointing at accounts.google.com
 #                                  (proves user-service OAuth wiring
@@ -22,12 +24,12 @@
 #                                  Hit on USER_SERVICE_BASE_URL directly
 #                                  for honest attribution — see #256.
 #
-# Env (post-cutover topology, #226 + emergency 2026-05-02): frontend +
-# isnad-graph API live on `isnad.noorinalabs.com`; the pure user-service
-# API surface lives on `users.noorinalabs.com`. The auth-plane routes
-# (/auth/*, /.well-known/jwks.json) are dual-bound on both vhosts during
-# the absolute-URL frontend cutover (#245 phase 2), so the script's
-# auth-plane checks currently route via ISNAD_BASE_URL — see check 6:
+# Env (post-#245-carve-out topology): frontend + isnad-graph API live on
+# `isnad.noorinalabs.com`; the pure user-service API surface (health, JWKS,
+# /auth/*, /api/v1/users…) lives on `users.noorinalabs.com`. The #245
+# carve-out (merged e321e9a7) retired the user-service bindings on the
+# isnad vhost, so the user-service checks (2 + 5, and 6) all target
+# USER_SERVICE_BASE_URL directly — see deploy#414:
 #   ISNAD_BASE_URL          (default: https://isnad.noorinalabs.com)
 #   USER_SERVICE_BASE_URL   (default: https://users.noorinalabs.com —
 #                            canonical pure user-service API surface)
@@ -105,12 +107,16 @@ ms_from_secs() {
   fi
 }
 
-# --- 2. user-service /health (via Caddy rewrite) --------------------
+# --- 2. user-service /health ----------------------------------------
+# Post-#245 carve-out: user-service is its own vhost (users.*); the old
+# isnad-vhost rewrite (ISNAD_BASE_URL/api/v1/user-service/health → /health)
+# was retired when the carve-out merged (e321e9a7), so probe the canonical
+# user-service surface directly. See deploy#414.
 {
-  read -r code secs <<<"$(http_check "${ISNAD_BASE_URL}/api/v1/user-service/health")"
+  read -r code secs <<<"$(http_check "${USER_SERVICE_BASE_URL}/health")"
   ms="$(ms_from_secs "$secs")"
   if [ "$code" = "200" ]; then
-    record "user-service /health" pass "$ms" "HTTP 200 via Caddy rewrite"
+    record "user-service /health" pass "$ms" "HTTP 200"
   else
     record "user-service /health" fail "$ms" "HTTP $code (expected 200)"
   fi
@@ -147,8 +153,12 @@ ms_from_secs() {
 }
 
 # --- 5. JWKS endpoint -----------------------------------------------
+# Post-#245 carve-out: JWKS lives on the user-service vhost (users.*); the
+# isnad-vhost binding was retired with the carve-out (it returned an empty
+# .keys array after the move). Probe USER_SERVICE_BASE_URL directly. See
+# deploy#414.
 {
-  read -r code secs <<<"$(http_check "${ISNAD_BASE_URL}/.well-known/jwks.json")"
+  read -r code secs <<<"$(http_check "${USER_SERVICE_BASE_URL}/.well-known/jwks.json")"
   body="$(read_body)"
   ms="$(ms_from_secs "$secs")"
   if [ "$code" = "200" ] && echo "$body" | jq -e '.keys | length > 0' >/dev/null 2>&1; then
