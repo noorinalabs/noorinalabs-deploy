@@ -15,6 +15,10 @@ Outputs (relative to this repo root):
   - docs/env-inventory.md  (rendered from the CSV, grouped by var_name)
 
 Re-running on the same repo tree must produce byte-identical output.
+
+The inventory is org-wide and drifts as siblings evolve; refresh it against
+the CI's clean ref set (NOT the live local tree) per
+docs/runbooks/env-inventory-regen.md.
 """
 
 from __future__ import annotations
