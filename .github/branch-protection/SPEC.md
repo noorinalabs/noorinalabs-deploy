@@ -52,7 +52,7 @@ A **repository ruleset** targeting `~DEFAULT_BRANCH`, `enforcement: active`:
   (`validate_pr_review`), not formal reviews. A naive "require 1 approval" rule
   would **deadlock every merge**. Reviewer-count enforcement stays with Hook 4.
 
-- **`required_status_checks` is intentionally EMPTY for this repo** — the
+- **`required_status_checks` rule — OMITTED for this repo** — the
   deploy-specific divergence from the user-service pilot. **Every one of
   noorinalabs-deploy's CI workflows is `paths:`-filtered** (terraform.yml,
   compose-validate.yml, hooks-lint.yml, lint-workflows.yml, integration-tests.yml,
@@ -64,13 +64,18 @@ A **repository ruleset** targeting `~DEFAULT_BRANCH`, `enforcement: active`:
   *unconditional*; deploy has no such always-on gate, so requiring any specific
   context here would block unrelated PRs.
 
-  We therefore ship the ruleset with the `required_status_checks` rule present
-  but its list **empty**, which still enforces the `strict` (up-to-date) policy
-  shape without naming a context that can deadlock. The PR-required +
-  no-force-push + no-delete protections — the bulk of #322's intent — are fully
-  active. **The server-side CI-failure-blocks-merge guarantee on deploy is
-  instead carried by the operator-side Hook 4 + `validate_pr_ci_status`
-  ADMIN_MERGE_EXCEPTION gate** until/unless an unconditional CI gate is added.
+  The intent is therefore **no required status check at the ruleset layer**. Note
+  the GitHub REST API **rejects** a `required_status_checks` rule carrying an
+  empty `required_status_checks` array (HTTP 422: "Invalid parameter
+  required_status_checks: Expected at least 1 elements, got 0"), so the rule is
+  **omitted entirely** rather than included-with-`[]`. (An earlier revision
+  shipped the rule present-with-`[]`, which never applied — deploy#395; mirrors
+  the parent-repo correction noorinalabs-main#322 / commit 29cfc88.) The
+  PR-required + no-force-push + no-delete protections — the bulk of #322's
+  intent — are fully active. **The server-side CI-failure-blocks-merge guarantee
+  on deploy is instead carried by the operator-side Hook 4 +
+  `validate_pr_ci_status` ADMIN_MERGE_EXCEPTION gate** until/unless an
+  unconditional CI gate is added.
 
   **If deploy later gains an unconditional (un-path-filtered) PR CI gate**, add
   its job-name context here and to `apply-ruleset.sh`'s read-back, e.g.:
