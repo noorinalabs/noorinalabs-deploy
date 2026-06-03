@@ -177,6 +177,17 @@ users.{$BASE_DOMAIN} {
         reverse_proxy user-service:8000
     }
 
+    # Metrics — not publicly proxied; Prometheus scrapes user-service:8000
+    # directly via the Docker backend network (see infra/prometheus.yml,
+    # scrape config added in deploy#384). Without this block the catch-all
+    # below would proxy /metrics to user-service, exposing request volumes,
+    # latency histograms, the full route inventory, and error rates to the
+    # open internet (recon-useful). Mirrors the isnad.{$BASE_DOMAIN} block.
+    # MUST precede the catch-all `handle`. (deploy#386, us#124/#137 hard-dep)
+    handle /metrics {
+        respond 403
+    }
+
     # Default — catch-all to user-service for any unmapped path on this
     # vhost. The vhost is purely an API surface post-#247 (OAuth callback
     # redirects cross-origin to isnad.{$BASE_DOMAIN}/auth/callback rather

@@ -70,6 +70,7 @@ promtail
 promtool
 pubkeys
 Rashidi
+regen
 Renaud
 retag
 retagging

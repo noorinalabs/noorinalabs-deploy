@@ -26,8 +26,20 @@ scrape_configs:
     static_configs:
       - targets: ["postgres-exporter:9187"]
 
+  # user-service application metrics (deploy#384, follow-up to
+  # noorinalabs-user-service#124 / PR #137). user-service now exposes
+  # /metrics via prometheus_fastapi_instrumentator (low-cardinality:
+  # handler+method+status, excluded from the OpenAPI schema). Scraped
+  # service-to-service over the backend Docker network on :8000 — the
+  # endpoint is NOT publicly exposed (the Caddyfile `respond 403`s
+  # /metrics), so Prometheus reaches it directly by container name.
+  - job_name: "user-service"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["user-service:8000"]
+
   # user-service stack exporters (deploy#64). See prometheus.prod.yml for
-  # full rationale on the user-service:8000 carve-out (noorinalabs-user-service#124).
+  # full rationale on the user-service stack carve-out (noorinalabs-user-service#124).
   - job_name: "user-postgres-exporter"
     static_configs:
       - targets: ["user-postgres-exporter:9187"]
