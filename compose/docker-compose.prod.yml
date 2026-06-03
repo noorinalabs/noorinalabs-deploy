@@ -362,6 +362,13 @@ services:
     # deploy#403). DATABASE_HOST set ⇒ the app builds the URL via
     # sqlalchemy.URL.create (password URL-encoded); DATABASE_DRIVER preserves the
     # asyncpg scheme matching the SSH alembic gate in db-migrate.yml (post-#236).
+    #
+    # DATABASE_URL is ALSO retained (rollback safety — Aisha, deploy#403 review):
+    # rollback.yml only rewrites the image tag against the CURRENT compose, so a
+    # rollback to a pre-us#151 image (which reads only DATABASE_URL) must still
+    # find it here, or it falls back to the in-image localhost default and bricks.
+    # The new image ignores DATABASE_URL whenever DATABASE_HOST is set, so keeping
+    # both is strictly safe in both the forward and rollback directions.
     environment:
       - DATABASE_HOST=user-postgres
       - DATABASE_PORT=5432
@@ -369,6 +376,7 @@ services:
       - DATABASE_USER=${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}
       - DATABASE_PASSWORD=${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}
       - DATABASE_NAME=${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
+      - DATABASE_URL=postgresql+asyncpg://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
     # `alembic upgrade head` matches the SSH gate's invocation. The
     # heads-count belt-and-suspenders check from db-migrate.yml is not
     # repeated here — that check guards CI-time migrations-DAG correctness
@@ -396,15 +404,23 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=256M
-    # DB + Redis passed as discrete component vars, not interpolated URLs
-    # (deploy#403, completes us#65). The app builds the connection URLs in-process
-    # via Settings.effective_{database,redis}_url (us#151), URL-encoding the
-    # password — so a USER_*_PASSWORD secret containing `/ + = @ : #` can no longer
-    # corrupt the URL authority and crash urlparse at startup. The component path
-    # engages only when DATABASE_HOST / REDIS_HOST are set (else the app falls back
-    # to the verbatim DATABASE_URL / REDIS_URL local-dev defaults), so setting the
-    # HOST vars here is what activates the fix. Internal compose-network ports:
-    # user-postgres listens on 5432, user-redis on 6379 (host-published 5433/6380).
+    # DB + Redis passed as discrete component vars (deploy#403, completes us#65).
+    # The app builds the connection URLs in-process via
+    # Settings.effective_{database,redis}_url (us#151), URL-encoding the password —
+    # so a USER_*_PASSWORD secret containing `/ + = @ : #` can no longer corrupt the
+    # URL authority and crash urlparse at startup. The component path engages only
+    # when DATABASE_HOST / REDIS_HOST are set, so setting the HOST vars here is what
+    # activates the fix. Internal compose-network ports: user-postgres listens on
+    # 5432, user-redis on 6379 (host-published 5433/6380).
+    #
+    # DATABASE_URL / REDIS_URL are ALSO retained (rollback safety — Aisha,
+    # deploy#403 review): rollback.yml only rewrites the image tag against the
+    # CURRENT compose, so a rollback to a pre-us#151 image (which reads only the
+    # URLs) must still find them here, or it falls back to the in-image localhost
+    # defaults and bricks the container exactly when rollback is needed. The new
+    # image ignores the URLs whenever HOST is set, so keeping both is strictly safe
+    # in both the forward and rollback directions; the only cost is a few extra env
+    # keys (the passlist-drift gate tolerates extras).
     environment:
       - DATABASE_HOST=user-postgres
       - DATABASE_PORT=5432
@@ -412,10 +428,12 @@ services:
       - DATABASE_USER=${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}
       - DATABASE_PASSWORD=${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}
       - DATABASE_NAME=${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
+      - DATABASE_URL=postgresql+asyncpg://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
       - REDIS_HOST=user-redis
       - REDIS_PORT=6379
       - REDIS_DB=0
       - REDIS_PASSWORD=${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}
+      - REDIS_URL=redis://:${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}@user-redis:6379/0
       - JWT_PRIVATE_KEY=${JWT_PRIVATE_KEY:?JWT_PRIVATE_KEY must be set}
       - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY must be set}
       - CORS_ORIGINS=["https://isnad.${BASE_DOMAIN}","https://${BASE_DOMAIN}"]
