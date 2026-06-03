@@ -152,7 +152,7 @@ The `.env` file is ephemeral: recreated fresh on each deployment, written with `
 | Server type | CPX41 (8 vCPU, 16 GB RAM) |
 | OS | Ubuntu 24.04 |
 | Location | Ashburn (`ash`) |
-| Server name | `noorinalabs-isnad-graph-prod` |
+| Server name | `noorinalabs-prod` |
 
 Provisioned via Terraform in `terraform/hetzner/`. The Terraform configuration creates:
 
