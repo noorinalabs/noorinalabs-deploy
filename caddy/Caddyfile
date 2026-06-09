@@ -1,3 +1,16 @@
+# Container healthcheck target (deploy#402). Dedicated in-container HTTP
+# endpoint so `docker inspect` health reflects Caddy-is-serving, decoupled
+# from the admin API and from backend reachability. Port 2021 is NOT in
+# compose's `ports:` (only 80/443 are published), so this listener is reachable
+# only from inside the container — it is not a public surface. `respond` needs
+# no external tooling on Caddy's side; the busybox `wget` in caddy:2-alpine
+# probes it. Replaces the prior admin-API probe (wget localhost:2019/config/)
+# which reported the container unhealthy while all three vhosts served 200.
+:2021 {
+    respond /healthz "OK" 200
+    # Any other path on this internal listener is a 404 — keeps the surface tiny.
+}
+
 www.{$BASE_DOMAIN} {
     redir https://{$BASE_DOMAIN}{uri} permanent
 }
@@ -162,6 +175,17 @@ users.{$BASE_DOMAIN} {
     handle /api/v1/user-service/health {
         rewrite * /health
         reverse_proxy user-service:8000
+    }
+
+    # Metrics — not publicly proxied; Prometheus scrapes user-service:8000
+    # directly via the Docker backend network (see infra/prometheus.yml,
+    # scrape config added in deploy#384). Without this block the catch-all
+    # below would proxy /metrics to user-service, exposing request volumes,
+    # latency histograms, the full route inventory, and error rates to the
+    # open internet (recon-useful). Mirrors the isnad.{$BASE_DOMAIN} block.
+    # MUST precede the catch-all `handle`. (deploy#386, us#124/#137 hard-dep)
+    handle /metrics {
+        respond 403
     }
 
     # Default — catch-all to user-service for any unmapped path on this

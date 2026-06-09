@@ -134,6 +134,13 @@ services:
       # NEO4J_USER must be "neo4j" — Neo4j requires the admin account to use this name
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      # DEFERRED (deploy#403): PG_DSN / REDIS_URL stay as interpolated URLs here
+      # because isnad-graph-api has no app-side connection-component support yet —
+      # tracked in ig#956 (sibling of us#65). Switching to DATABASE_* / REDIS_*
+      # components requires that app change to land first; doing it here now would
+      # feed the api env vars it does not read. Convert in lockstep when ig#956
+      # ships. (Same URL-unsafe-password latent risk as us#65, lower urgency:
+      # POSTGRES_PASSWORD / REDIS_PASSWORD are not currently URL-special.)
       - PG_DSN=postgresql://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}
       - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379/0
       - AUTH_GOOGLE_CLIENT_ID=${AUTH_GOOGLE_CLIENT_ID:-}
@@ -288,7 +295,13 @@ services:
     tmpfs:
       - /tmp:size=64M
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:2019/config/ >/dev/null 2>&1 || exit 1"]
+      # Probe the dedicated :2021 /healthz site block in caddy/Caddyfile
+      # (deploy#402), NOT the admin API. The prior probe of
+      # localhost:2019/config/ reported the container unhealthy while every
+      # vhost served HTTP 200 — a false negative. busybox wget (present in
+      # caddy:2-alpine) fetches the tiny "OK" body; grep -q makes the check
+      # exit-code-driven.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2021/healthz 2>/dev/null | grep -q OK || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 3
@@ -348,9 +361,27 @@ services:
   user-service-migrate:
     image: ghcr.io/noorinalabs/noorinalabs-user-service:${USER_SERVICE_IMAGE_TAG:-latest}
     # asyncpg driver — alembic/env.py is async (create_async_engine +
-    # asyncio.run). Same scheme as the runtime user-service DATABASE_URL
-    # and the SSH alembic gate in db-migrate.yml (post-#236).
+    # asyncio.run). alembic/env.py resolves the URL via
+    # Settings.effective_database_url (us#151), so the migrate container needs
+    # the SAME component vars as the runtime user-service — otherwise it hits
+    # the identical urlparse crash on a URL-unsafe USER_POSTGRES_PASSWORD (us#65,
+    # deploy#403). DATABASE_HOST set ⇒ the app builds the URL via
+    # sqlalchemy.URL.create (password URL-encoded); DATABASE_DRIVER preserves the
+    # asyncpg scheme matching the SSH alembic gate in db-migrate.yml (post-#236).
+    #
+    # DATABASE_URL is ALSO retained (rollback safety — Aisha, deploy#403 review):
+    # rollback.yml only rewrites the image tag against the CURRENT compose, so a
+    # rollback to a pre-us#151 image (which reads only DATABASE_URL) must still
+    # find it here, or it falls back to the in-image localhost default and bricks.
+    # The new image ignores DATABASE_URL whenever DATABASE_HOST is set, so keeping
+    # both is strictly safe in both the forward and rollback directions.
     environment:
+      - DATABASE_HOST=user-postgres
+      - DATABASE_PORT=5432
+      - DATABASE_DRIVER=postgresql+asyncpg
+      - DATABASE_USER=${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}
+      - DATABASE_PASSWORD=${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}
+      - DATABASE_NAME=${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
       - DATABASE_URL=postgresql+asyncpg://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
     # `alembic upgrade head` matches the SSH gate's invocation. The
     # heads-count belt-and-suspenders check from db-migrate.yml is not
@@ -379,8 +410,35 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=256M
+    # DB + Redis passed as discrete component vars (deploy#403, completes us#65).
+    # The app builds the connection URLs in-process via
+    # Settings.effective_{database,redis}_url (us#151), URL-encoding the password —
+    # so a USER_*_PASSWORD secret containing `/ + = @ : #` can no longer corrupt the
+    # URL authority and crash urlparse at startup. The component path engages only
+    # when DATABASE_HOST / REDIS_HOST are set, so setting the HOST vars here is what
+    # activates the fix. Internal compose-network ports: user-postgres listens on
+    # 5432, user-redis on 6379 (host-published 5433/6380).
+    #
+    # DATABASE_URL / REDIS_URL are ALSO retained (rollback safety — Aisha,
+    # deploy#403 review): rollback.yml only rewrites the image tag against the
+    # CURRENT compose, so a rollback to a pre-us#151 image (which reads only the
+    # URLs) must still find them here, or it falls back to the in-image localhost
+    # defaults and bricks the container exactly when rollback is needed. The new
+    # image ignores the URLs whenever HOST is set, so keeping both is strictly safe
+    # in both the forward and rollback directions; the only cost is a few extra env
+    # keys (the passlist-drift gate tolerates extras).
     environment:
+      - DATABASE_HOST=user-postgres
+      - DATABASE_PORT=5432
+      - DATABASE_DRIVER=postgresql+asyncpg
+      - DATABASE_USER=${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}
+      - DATABASE_PASSWORD=${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}
+      - DATABASE_NAME=${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
       - DATABASE_URL=postgresql+asyncpg://${USER_POSTGRES_USER:?USER_POSTGRES_USER must be set}:${USER_POSTGRES_PASSWORD:?USER_POSTGRES_PASSWORD must be set}@user-postgres:5432/${USER_POSTGRES_DB:?USER_POSTGRES_DB must be set}
+      - REDIS_HOST=user-redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}
       - REDIS_URL=redis://:${USER_REDIS_PASSWORD:?USER_REDIS_PASSWORD must be set}@user-redis:6379/0
       - JWT_PRIVATE_KEY=${JWT_PRIVATE_KEY:?JWT_PRIVATE_KEY must be set}
       - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY:?JWT_PUBLIC_KEY must be set}
@@ -681,12 +739,11 @@ services:
         max-file: "3"
 
   alloy:
-    # Successor to promtail (deploy#132). Alloy ships a base image with /bin/sh +
-    # wget, so the HTTP healthcheck disabled for promtail in #128 is re-enabled
-    # here. River config in infra/alloy/config.alloy ports the promtail Docker SD
-    # + JSON pipeline 1:1; loki.write is wire-compatible with Loki 2.9.10 (no
-    # Loki bump needed). Image is multi-arch pinned by digest — resolved against
-    # the OCI image-index at registry.docker.io on 2026-05-18.
+    # Successor to promtail (deploy#132). River config in infra/alloy/config.alloy
+    # ports the promtail Docker SD + JSON pipeline 1:1; loki.write is
+    # wire-compatible with Loki 2.9.10 (no Loki bump needed). Image is multi-arch
+    # pinned by digest — resolved against the OCI image-index at
+    # registry.docker.io on 2026-05-18.
     image: grafana/alloy:v1.16.1@sha256:51aeb9d829239345070619dad3edd6873186f913c84f45b365b74574fcb38ec0
     volumes:
       - ../infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
@@ -697,11 +754,24 @@ services:
       - "/etc/alloy/config.alloy"
       - "--server.http.listen-addr=0.0.0.0:12345"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:12345/-/ready || exit 1"]
+      # The grafana/alloy image (ubuntu:noble base, entrypoint /bin/alloy) ships
+      # only ca-certificates/libsystemd0/tzdata on top of the base — there is NO
+      # wget or curl in it. The prior `wget .../-/ready` was therefore a
+      # command-not-found that pinned the container to `unhealthy` regardless of
+      # actual readiness (deploy#402). Ubuntu noble does carry /bin/bash, so probe
+      # via bash's /dev/tcp with no external binary: open a TCP conn to the alloy
+      # HTTP server, send a GET /-/ready, and require the "Alloy is ready" 200.
+      # /-/ready returns 503 until the initial config has loaded (grafana/alloy
+      # #4252), so start_period is widened to absorb that window.
+      test:
+        - "CMD"
+        - "/bin/bash"
+        - "-c"
+        - 'exec 3<>/dev/tcp/localhost/12345 && printf "GET /-/ready HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 && grep -q "Alloy is ready" <&3'
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 15s
+      start_period: 30s
     depends_on:
       loki:
         condition: service_healthy

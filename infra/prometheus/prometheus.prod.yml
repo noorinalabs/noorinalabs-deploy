@@ -26,11 +26,23 @@ scrape_configs:
     static_configs:
       - targets: ["postgres-exporter:9187"]
 
-  # user-service stack exporters (deploy#64). user-service:8000/metrics is NOT
-  # scraped here because user-service has no /metrics endpoint yet — tracked
-  # in noorinalabs-user-service#124. user-postgres-exporter IS scraped — it
-  # has been running in compose since the user-service stack extraction and
-  # was silently un-scraped until #64 surfaced the gap.
+  # user-service application metrics (deploy#384, follow-up to
+  # noorinalabs-user-service#124 / PR #137). user-service now exposes
+  # /metrics via prometheus_fastapi_instrumentator (low-cardinality:
+  # handler+method+status, excluded from the OpenAPI schema). This closes
+  # the carve-out documented in #64 — at that time user-service had no
+  # /metrics endpoint, so only user-postgres-exporter was scraped. Scraped
+  # service-to-service over the backend Docker network on :8000; the
+  # endpoint is NOT publicly exposed (the Caddyfile `respond 403`s
+  # /metrics), so Prometheus reaches it directly by container name.
+  - job_name: "user-service"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["user-service:8000"]
+
+  # user-postgres-exporter (deploy#64) — has been running in compose since
+  # the user-service stack extraction and was silently un-scraped until #64
+  # surfaced the gap.
   - job_name: "user-postgres-exporter"
     static_configs:
       - targets: ["user-postgres-exporter:9187"]
