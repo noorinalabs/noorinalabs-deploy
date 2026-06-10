@@ -22,9 +22,18 @@
 #     prefixed subdomains; hostname = `noorinalabs-stg` from deploy#150's
 #     TF output `server_name`).
 #
-# Image tag consumed: `stg-<short>` (immutable, per-push), resolved from the
-# `sha` field of the dispatching payload. If no payload is present (manual
-# dispatch), defaults to `stg-latest`.
+# Image tags consumed (per service — deploy#418):
+#   - api + frontend share `IMAGE_TAG` in compose (both are isnad-graph
+#     images). user-service has its own `USER_SERVICE_IMAGE_TAG`.
+#   - Each service's commit stream is independent, so the dispatching service's
+#     `sha` tags ONLY that service's image; every other service falls back to
+#     `stg-latest` (its last-good stg pointer). This mirrors deploy-prod.yml's
+#     per-service `prod-latest` fallback. Applying one dispatch sha to ALL
+#     services was the deploy#418 bug: a user-service sha (`stg-<us-sha>`) was
+#     used to pull the isnad-graph frontend, which never published that tag →
+#     `frontend: not found`, failing every user-service-only merge's deploy.
+#   - Manual `workflow_dispatch` with `image_tag` pins api+frontend only;
+#     user-service stays on `stg-latest`.
 
 name: Deploy to staging
 
@@ -86,25 +95,76 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Resolve image tag
+      - name: Resolve image tags (per service)
         id: tag
         env:
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
           DISPATCH_SHA: ${{ github.event.client_payload.sha }}
           MANUAL_TAG: ${{ inputs.image_tag }}
         run: |
           set -euo pipefail
+          # af_tag drives compose IMAGE_TAG (api + frontend, both isnad-graph);
+          # us_tag drives USER_SERVICE_IMAGE_TAG. Route the dispatch sha ONLY to
+          # the service that sent it (deploy#418); all others stay stg-latest.
+          af_tag="stg-latest"   # api + frontend (isnad-graph)
+          us_tag="stg-latest"   # user-service
+          ld_tag="stg-latest"   # landing-page (no fan-in; always last-good stg)
           if [ "$EVENT_NAME" = "repository_dispatch" ] && [ -n "${DISPATCH_SHA:-}" ]; then
             # 7-char short SHA per Contract v6 `<short>` definition.
             short="${DISPATCH_SHA:0:7}"
-            tag="stg-$short"
+            case "${EVENT_ACTION:-}" in
+              deploy-noorinalabs-isnad-graph)  af_tag="stg-$short" ;;
+              deploy-noorinalabs-user-service) us_tag="stg-$short" ;;
+              *) echo "::warning::Unrecognised dispatch action '${EVENT_ACTION:-}' — deploying stg-latest for all services" ;;
+            esac
           elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${MANUAL_TAG:-}" ]; then
-            tag="$MANUAL_TAG"
-          else
-            tag="stg-latest"
+            # Manual operator tag pins api+frontend; user-service stays stg-latest.
+            af_tag="$MANUAL_TAG"
           fi
-          echo "Resolved tag: $tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved tags: api/frontend=$af_tag user-service=$us_tag landing=$ld_tag"
+          {
+            echo "af_tag=$af_tag"
+            echo "us_tag=$us_tag"
+            echo "ld_tag=$ld_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      # Pre-flight: every resolved per-service tag must exist in GHCR before we
+      # touch the VPS. Without this, a missing manifest surfaces only as a raw
+      # `docker compose pull` daemon error mid-deploy (deploy#418). Checking on
+      # the runner (which holds packages:read) fails fast with a service+tag
+      # named message and leaves the running stack untouched. `imagetools
+      # inspect` uses the default buildx builder (pre-installed on the runner)
+      # and the same registry auth the VPS pull uses.
+      - name: Pre-flight — verify image manifests exist in GHCR
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AF_TAG: ${{ steps.tag.outputs.af_tag }}
+          US_TAG: ${{ steps.tag.outputs.us_tag }}
+          LD_TAG: ${{ steps.tag.outputs.ld_tag }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          miss=0
+          check() {
+            if docker buildx imagetools inspect "$1" >/dev/null 2>&1; then
+              echo "OK   $1"
+            else
+              echo "MISS $1"; miss=1
+            fi
+          }
+          # Cover every service compose pulls on stg (PULL_SERVICES =
+          # api frontend landing user-service).
+          check "ghcr.io/noorinalabs/noorinalabs-isnad-graph:$AF_TAG"
+          check "ghcr.io/noorinalabs/noorinalabs-isnad-graph-frontend:$AF_TAG"
+          check "ghcr.io/noorinalabs/noorinalabs-user-service:$US_TAG"
+          check "ghcr.io/noorinalabs/noorinalabs-landing-page:$LD_TAG"
+          if [ "$miss" -ne 0 ]; then
+            echo "::error::One or more resolved image tags are missing in GHCR (see MISS above). Refusing to deploy a partial/incorrect image set (deploy#418)."
+            exit 1
+          fi
 
       # .env-write + compose roll via the shared composite action
       # (deploy#190 + #66). Stg and prod call the same composite, so
@@ -146,7 +206,14 @@ jobs:
         with:
           ssh_host: ${{ vars.VPS_HOST }}
           ssh_key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          image_tag: ${{ steps.tag.outputs.tag }}
+          # IMAGE_TAG drives compose's api + frontend (isnad-graph) images.
+          image_tag: ${{ steps.tag.outputs.af_tag }}
+          # Per-service tag for user-service (compose USER_SERVICE_IMAGE_TAG).
+          # Without this the stg path left it on compose's `:-latest` default,
+          # losing the per-sha pin on user-service deploys (deploy#418).
+          extra_image_tags: |
+            USER_SERVICE_IMAGE_TAG=${{ steps.tag.outputs.us_tag }}
+            LANDING_IMAGE_TAG=${{ steps.tag.outputs.ld_tag }}
           # Per-env observability config selection (deploy#263 + #262).
           # Stg variants for prometheus + alertmanager (different blackbox
           # targets, different Slack channel routing). SLACK_WEBHOOK_FILE
@@ -205,6 +272,8 @@ jobs:
               echo "- **Source SHA:** ${{ github.event.client_payload.sha }}"
               echo "- **Event type:** ${{ github.event.action }}"
             fi
-            echo "- **Image tag:** ${{ steps.tag.outputs.tag }}"
+            echo "- **api/frontend tag:** ${{ steps.tag.outputs.af_tag }}"
+            echo "- **user-service tag:** ${{ steps.tag.outputs.us_tag }}"
+            echo "- **landing tag:** ${{ steps.tag.outputs.ld_tag }}"
             echo "- **Actor:** ${{ github.actor }}"
           } >> "$GITHUB_STEP_SUMMARY"
