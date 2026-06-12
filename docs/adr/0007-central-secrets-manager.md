@@ -1,6 +1,6 @@
 # ADR 0007 — Central secrets-manager tool + rotation policy
 
-- **Status:** Proposed — awaiting owner decision
+- **Status:** Accepted — owner decision 2026-06-12 (Steven French)
 - **Date:** 2026-06-12
 - **Author:** Weronika Zielinska (Platform Architect)
 - **Context issue:** [deploy#388](https://github.com/noorinalabs/noorinalabs-deploy/issues/388)
@@ -35,10 +35,11 @@ Two coupled things:
 - The heaviest secret classes are already addressed by their own ADRs: state-bucket key (0004), SSH keys (0006). What remains centrally unmanaged is the app-runtime set: DB/cache passwords, JWT signing key, GHCR pull token, pipeline creds, OAuth/PAT/webhook secrets.
 - No compliance regime today mandates dynamic secrets, short leases, or a consolidated audit pane. That can change; the ADR notes where each option's headroom sits.
 
-## Decision (open — owner to select)
+## Decision — Accepted 2026-06-12 (owner)
 
-> **Decision row, to be filled by the owner:** `_______________________`
-> (one of A / B / C / D below, or a documented hybrid — e.g. "A for CI-native secrets + B for git-resident config")
+> **Decision (owner, 2026-06-12):** **A + B hybrid** — **Option A** (GitHub Environment secrets, per-environment separated) as the baseline secret store, **plus Option B** (SOPS + age) adopted specifically for **git-resident config files**.
+> **Rotation policy:** **P2 (periodic + on-demand)** for all secret classes now; **#387 — automated DB-password rotation (P3)** is the next implementation step, built as a bespoke scheduled workflow on top of the A baseline (no tool change). **Scope:** per-secret rotation events (not bulk). On-demand triggers from `secret-rotation-policy.md` remain a floor on top of the P2 cadence.
+> Rationale: lowest-friction defensible posture at current ~2-operator / 2-environment scale (matches the architect's § Recommendation); Vault (D) over-scaled, SaaS (C) retained as the documented fallback if A+B manual-rotation burden proves too high.
 
 ### Option framing — the four postures
 
