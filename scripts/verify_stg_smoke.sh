@@ -40,6 +40,12 @@
 #                                  Redis state-store all reachable).
 #                                  Hit on USER_SERVICE_BASE_URL directly
 #                                  for honest attribution — see #256.
+#   7. /runtime-config.js     → HTTP 200 + a JS content-type (NOT the
+#                                  text/html SPA fallback) + body wires
+#                                  window.RUNTIME_CONFIG to the expected
+#                                  user-service origin. Anti-drift guard
+#                                  for the prod-lagging-stg login bug —
+#                                  see deploy#420.
 #
 # Env (stg topology — BASE_DOMAIN=stg.noorinalabs.com, deploy-stg.yml:158):
 # the Caddyfile is env-templated by {$BASE_DOMAIN}, so stg's vhosts are
@@ -227,6 +233,51 @@ ms_from_secs() {
     fi
   else
     record "/auth/oauth/google/login wiring" fail "$ms" "HTTP $code (expected 200)"
+  fi
+}
+
+# --- 7. runtime-config.js (anti-drift guard — deploy#420) -----------
+# Mirror of verify_prod_smoke.sh check 7 (keep in sync — prod is canonical).
+# The login page resolves the user-service origin at RUNTIME from
+# window.RUNTIME_CONFIG, injected by GET /runtime-config.js — served by
+# the frontend container, which `envsubst`s USER_SERVICE_ORIGIN over
+# runtime-config.js.template at start-up (compose sets USER_SERVICE_ORIGIN
+# =https://users.${BASE_DOMAIN}). If the frontend image predates this
+# feature (or the file is otherwise absent), Caddy's SPA catch-all serves
+# index.html instead — HTTP 200 but text/html — and the login fetch parses
+# HTML as JSON, throwing "JSON.parse: unexpected character" (deploy#420:
+# prod ran an older image than stg). This check fails loudly the moment an
+# env drifts back to a frontend image without runtime-config, BEFORE a
+# user hits a broken login. The content-type discriminator is load-bearing:
+# the SPA fallback also returns 200, so an HTTP-code-only check would pass
+# on the bug.
+{
+  rc_url="${ISNAD_BASE_URL}/runtime-config.js"
+  # Capture code + time + content-type in one request. content_type is
+  # taken as the trailing field because it may itself contain a space
+  # (e.g. "text/html; charset=utf-8").
+  rc_out="$(curl -sS -o "$SMOKE_BODY" \
+                 -w '%{http_code} %{time_total} %{content_type}' \
+                 --max-time "$TIMEOUT" "$rc_url" 2>/dev/null || echo '000 0 none')"
+  code="$(echo "$rc_out" | awk '{print $1}')"
+  secs="$(echo "$rc_out" | awk '{print $2}')"
+  ctype="$(echo "$rc_out" | cut -d' ' -f3-)"
+  body="$(read_body)"
+  ms="$(ms_from_secs "$secs")"
+  # Expected user-service host for this env = host part of the base URL.
+  us_host="$(echo "$USER_SERVICE_BASE_URL" | sed -E 's|^https?://([^/]+).*|\1|')"
+  if [ "$code" != "200" ]; then
+    record "runtime-config.js" fail "$ms" "HTTP $code (expected 200 — file absent / not provisioned)"
+  elif echo "$ctype" | grep -qiE 'text/html'; then
+    record "runtime-config.js" fail "$ms" "content-type=$ctype — SPA index.html fallback (frontend image lacks runtime-config; see deploy#420)"
+  elif ! echo "$ctype" | grep -qiE 'javascript'; then
+    record "runtime-config.js" fail "$ms" "content-type=$ctype (expected a JS script)"
+  elif ! echo "$body" | grep -q 'RUNTIME_CONFIG'; then
+    record "runtime-config.js" fail "$ms" "HTTP 200 + JS but body has no window.RUNTIME_CONFIG"
+  elif ! echo "$body" | grep -qF "$us_host"; then
+    record "runtime-config.js" fail "$ms" "RUNTIME_CONFIG present but does not reference expected user-service host $us_host"
+  else
+    record "runtime-config.js" pass "$ms" "HTTP 200 + JS, RUNTIME_CONFIG → $us_host"
   fi
 }
 
