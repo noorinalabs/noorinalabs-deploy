@@ -247,6 +247,17 @@ jobs:
             ALERTMANAGER_CONFIG_FILE=alertmanager.prod.yml
             SLACK_WEBHOOK_FILE=slack_webhook_url.secret
           base_domain: noorinalabs.com
+          # Tiered prod rollout (deploy#429). Only the app+edge tier is health-
+          # gated (`up -d --wait`); the Kafka pipeline tier comes up NON-gating so
+          # a crash-looping broker can never abort the rollout and leave
+          # caddy/frontend in `Created` → total edge outage. gated_services lists
+          # the app+edge leaf services (their deps — neo4j/postgres/redis/
+          # user-postgres/user-redis/user-service-migrate — are pulled in
+          # transitively by the --wait closure). deferred_services is the Kafka
+          # subgraph (broker + its only dependents). See write-deploy-env +
+          # scripts/compose_tiered_up.sh. stg omits both → legacy single-`up`.
+          gated_services: caddy frontend landing api user-service
+          deferred_services: kafka kafka-init kafka-ui kafka-exporter
           env_keys: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,JWT_PRIVATE_KEY,JWT_PUBLIC_KEY,KAFKA_CLUSTER_ID,KAFKA_UI_PASSWORD,KAFKA_UI_USER,PIPELINE_B2_BUCKET,PIPELINE_B2_ENDPOINT,PIPELINE_B2_KEY,PIPELINE_B2_KEY_ID,PIPELINE_B2_REGION,BACKUP_B2_KEY_ID,BACKUP_B2_APP_KEY,BACKUP_B2_BUCKET,USER_POSTGRES_DB,USER_POSTGRES_PASSWORD,USER_POSTGRES_USER,USER_REDIS_PASSWORD
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_actor: ${{ github.repository_owner }}
