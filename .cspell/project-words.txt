@@ -18,12 +18,14 @@ bitnami
 bitnamilegacy
 Blackbox
 buildx
+ciphertext
 consumergroup
 cookieless
 creds
 cutover
 dedup
 Diallo
+diffable
 dryrun
 emptively
 exfiltrates
