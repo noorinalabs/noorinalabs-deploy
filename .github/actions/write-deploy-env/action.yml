@@ -258,6 +258,46 @@ runs:
           fi
           echo "==> Kafka cluster-id consistent (or fresh volume) — proceeding."
 
+          # Pre-flight: Kafka KRaft stray non-topic directory detector (deploy#428).
+          # The cluster-id check above only compares ids — it passes clean while a
+          # stray dir is still present. apache/kafka's LogManager ALSO fatally
+          # rejects any DIRECTORY at the log-dir root that is not a topic-partition
+          # dir (a Bitnami-era `config/`, a nested `data/`, an ext4 `lost+found/`).
+          # prod's volume kept the old Bitnami layout (stg migrated onto a fresh
+          # volume in #385/#100), so its leftover `config/` crash-looped the broker
+          # with "Found directory .../config, 'config' is not in the form of
+          # topic-partition", aborting the whole stack on kafka-init. Scan the
+          # persisted volume's log-dir root with scripts/kafka_logdir_preflight.sh
+          # (piped into the apache/kafka image over the mounted volume — no bash in
+          # the image, so the scanner is POSIX sh) and fail loud with the runbook
+          # pointer BEFORE compose up. Only a genuine detection (the scanner's
+          # exit 2) aborts; any other non-zero (fresh volume, image not yet pulled,
+          # transient docker error) only WARNs and proceeds — mirroring the
+          # best-effort tolerance of the cluster-id reader above.
+          echo "==> Pre-flight: scanning Kafka log-dir for stray non-topic directories..."
+          stray_rc=0
+          stray_report="$(docker run --rm -i --entrypoint /bin/sh \
+            -v noorinalabs_kafka_data:/data apache/kafka:3.9.2 \
+            -s /data < scripts/kafka_logdir_preflight.sh 2>&1)" || stray_rc=$?
+          if [ "$stray_rc" -eq 2 ]; then
+            echo "ERROR: Kafka log-dir contains stray non-topic directories — apache/kafka's" >&2
+            echo "       LogManager will reject these on start and crash-loop the broker, aborting" >&2
+            echo "       the whole stack at kafka-init's depends_on. Bringing the stack up now would" >&2
+            echo "       repeat the deploy#428 prod outage." >&2
+            echo "$stray_report" | sed 's/^/         /' >&2
+            echo "       Re-bootstrap (wipe + reformat) the volume per" >&2
+            echo "       docs/runbooks/kafka-cluster-id-rebootstrap.md" >&2
+            echo "       § Variant: stray non-topic directories (stg first), then re-run this deploy." >&2
+            echo "       Aborting before compose up." >&2
+            exit 1
+          elif [ "$stray_rc" -ne 0 ]; then
+            echo "==> WARNING: stray-dir pre-flight could not run (rc=$stray_rc) — the volume is" >&2
+            echo "    likely fresh or the apache/kafka image is not pulled yet. Proceeding." >&2
+            [ -n "$stray_report" ] && echo "$stray_report" | sed 's/^/    /' >&2
+          else
+            echo "==> Kafka log-dir clean (no stray non-topic directories) — proceeding."
+          fi
+
           echo "==> Authenticating to GHCR..."
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
