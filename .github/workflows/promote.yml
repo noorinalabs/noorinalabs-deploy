@@ -620,7 +620,25 @@ jobs:
                 continue
               fi
               checked=$((checked + 1))
-              verify_digest=$(printf '%s' "$verify_digests" | python3 -c "import json,sys,os;print(json.loads(sys.stdin.read()).get(os.environ['K'], ''))" K="$key" 2>/dev/null || echo "")
+              # NB: `K` MUST be an environment PREFIX here. Written as a
+              # trailing `… python3 -c "…" K="$key"` it is python's argv[1],
+              # not an env var, so `os.environ['K']` raised KeyError → swallowed
+              # by `2>/dev/null || echo ""` → verify_digest empty for EVERY
+              # service → every service hit the "verify-digest missing" branch
+              # → the gate could NEVER pass a v2 artifact (deploy#423).
+              verify_digest=$(printf '%s' "$verify_digests" | K="$key" python3 -c "import json,sys,os;print(json.loads(sys.stdin.read()).get(os.environ['K'], ''))" 2>/dev/null || echo "")
+              # Normalize BOTH sides before any equality/emptiness check
+              # (deploy#423). The plan job resolves digests via
+              # `$(docker buildx imagetools inspect …)` threaded through
+              # env → JSONL → step-output; a stray trailing CR (`\r`) there
+              # rendered invisibly in logs but broke the byte-equality below
+              # against the JSON-clean verify digests, failing this gate on
+              # digests that were in fact hex-identical — blocking every v2
+              # promotion. A digest is `sha256:` + 64 hex with no legitimate
+              # whitespace, so stripping all whitespace is safe and makes the
+              # comparison robust regardless of which side carries the byte.
+              plan_digest="$(printf '%s' "$plan_digest" | tr -d '[:space:]')"
+              verify_digest="$(printf '%s' "$verify_digest" | tr -d '[:space:]')"
               if [ -z "$plan_digest" ]; then
                 # Plan failed to resolve a digest for this service (e.g.,
                 # explicit-short path + registry outage). Treat as
