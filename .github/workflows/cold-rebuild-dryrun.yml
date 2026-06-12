@@ -110,7 +110,7 @@ permissions:
 
 jobs:
   workflow-cold-checks:
-    name: Static workflow-shape guards (bugs #1, #2, #3, #5)
+    name: Static workflow-shape guards (bugs #1, #2, #3, #5, #427)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

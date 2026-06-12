@@ -289,6 +289,97 @@ def check_promote_no_floating_source() -> list[Failure]:
     return failures
 
 
+def check_promote_trigger_deploy_direct_needs_guard() -> list[Failure]:
+    """Bug #427: promote.yml's `trigger-prod-deploy` (auto-rollout) job must
+    carry an EXPLICIT `if:` that keys on its DIRECT needs' results — not the
+    implicit `if: success()`.
+
+    The bug shape: a `trigger-prod-deploy` with no job-level `if:` inherits
+    `if: success()`, which GitHub evaluates over the TRANSITIVE needs closure.
+    `retag` deliberately survives a skipped `migrate-prod` (user-service not in
+    the promotion set) via its own `always() && …` guard, but the implicit
+    success() on `trigger-prod-deploy` re-sees that skipped `migrate-prod`
+    ancestor through `retag` and returns false → the VPS rollout silently
+    skips on every api/frontend-only promotion (observed 2026-06-12, promote
+    run 27423040222). The fix shape: an `always() &&
+    needs.<direct>.result == 'success'` guard that ignores the skipped
+    ancestor, mirroring the pattern `retag` already uses.
+    """
+    failures: list[Failure] = []
+    pm = (WORKFLOWS / "promote.yml").read_text(encoding="utf-8")
+
+    job_match = re.search(r"^  trigger-prod-deploy:\s*$", pm, re.MULTILINE)
+    if not job_match:
+        failures.append(
+            Failure(
+                "promote-trigger-deploy-job-present",
+                "trigger-deploy-guard",
+                "promote.yml has no `trigger-prod-deploy:` job — workflow shape "
+                "changed. The deploy#427 auto-rollout guard check can no longer "
+                "locate its target; confirm the rollout dispatch still exists "
+                "and update this check.",
+            )
+        )
+        return failures
+
+    # Slice from `trigger-prod-deploy:` to the next top-level job or EOF.
+    job_start = job_match.start()
+    next_job = re.search(r"^  [a-z][a-z0-9_-]*:\s*$", pm[job_start + 1 :], re.MULTILINE)
+    job_end = job_start + 1 + next_job.start() if next_job else len(pm)
+    job_block = pm[job_start:job_end]
+
+    # Job-level `if:` sits at 4-space indent; step-level `if:` is at 8. Match
+    # only the job-level guard so a step's `if: always()` (e.g. a Summary step)
+    # can't satisfy this check.
+    job_if = re.search(r"^    if:.*$", job_block, re.MULTILINE)
+    if not job_if:
+        failures.append(
+            Failure(
+                "promote-trigger-deploy-has-explicit-if",
+                "trigger-deploy-guard",
+                "promote.yml `trigger-prod-deploy` has NO job-level `if:`. It "
+                "therefore inherits the implicit `if: success()`, which is "
+                "evaluated over the TRANSITIVE needs closure and returns false "
+                "whenever an ancestor (e.g. `migrate-prod`) is skipped — the "
+                "deploy#427 silent-rollout-skip bug. Add an explicit guard: "
+                "`if: ${{ always() && needs.plan.result == 'success' && "
+                "needs.retag.result == 'success' }}`.",
+            )
+        )
+        return failures
+
+    if_line = job_if.group(0)
+    # The guard must (a) use always() so a skipped ancestor doesn't short the
+    # job, and (b) key on the DIRECT needs' results explicitly.
+    if "always()" not in if_line:
+        failures.append(
+            Failure(
+                "promote-trigger-deploy-if-uses-always",
+                "trigger-deploy-guard",
+                "promote.yml `trigger-prod-deploy` job-level `if:` does not call "
+                "`always()`. Without it, a skipped `migrate-prod` ancestor "
+                "(reached transitively via `retag`) makes the implicit-success "
+                "short-circuit re-appear (deploy#427). The guard must be "
+                "`always() && needs.<direct>.result == 'success'`.",
+            )
+        )
+    if not re.search(r"needs\.retag\.result\s*==\s*'success'", if_line):
+        failures.append(
+            Failure(
+                "promote-trigger-deploy-if-keys-on-retag",
+                "trigger-deploy-guard",
+                "promote.yml `trigger-prod-deploy` job-level `if:` does not key "
+                "on `needs.retag.result == 'success'`. The auto-rollout must "
+                "fire on its DIRECT need succeeding (`retag` already encodes the "
+                "gate-stg-verify + migrate-prod acceptability), NOT on the "
+                "transitive closure that the implicit success() walks "
+                "(deploy#427).",
+            )
+        )
+
+    return failures
+
+
 def check_db_migrate_driver_aligned() -> list[Failure]:
     """Bug #5 (#235, fixed #236): db-migrate.yml's DATABASE_URL driver
     scheme must match a driver actually shipped in the user-service
@@ -516,6 +607,10 @@ def main() -> int:
         ("Terraform: no ephemeral keypair (bug #1, #216)", check_terraform_no_ephemeral_keypair),
         ("Promote: retag uses GH_PACKAGES_TOKEN (bug #2)", check_promote_token_scope),
         ("Promote: no floating-tag source (bug #3, #234)", check_promote_no_floating_source),
+        (
+            "Promote: trigger-prod-deploy direct-needs guard (bug #427)",
+            check_promote_trigger_deploy_direct_needs_guard,
+        ),
         ("DB-migrate: driver matches pyproject (bug #5, #235)", check_db_migrate_driver_aligned),
         ("Stg-verify artifact v2 contract (#199)", check_stg_verify_artifact_v2_contract),
     ]
