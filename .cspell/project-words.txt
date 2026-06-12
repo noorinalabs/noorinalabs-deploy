@@ -1,10 +1,10 @@
-# Project words for noorinalabs-deploy cspell (#326).
-# Infra/domain vocabulary, tool names, team-member names, and British
-# spellings that appear in the authored docs corpus (docs/, RUNBOOK,
-# CLAUDE.md, the team charter). These are NOT spelling defects — they are
-# the allowlist so a REAL typo in authored prose still blocks. Add new
-# domain terms here (keep sorted, case-insensitive).
 
+# CLAUDE.md, the team charter). These are NOT spelling defects — they are
+# domain terms here (keep sorted, case-insensitive).
+# Infra/domain vocabulary, tool names, team-member names, and British
+# Project words for noorinalabs-deploy cspell (#326).
+# spellings that appear in the authored docs corpus (docs/, RUNBOOK,
+# the allowlist so a REAL typo in authored prose still blocks. Add new
 Alertmanager
 Amara
 amtool
@@ -18,12 +18,14 @@ bitnami
 bitnamilegacy
 Blackbox
 buildx
+ciphertext
 consumergroup
 cookieless
 creds
 cutover
 dedup
 Diallo
+diffable
 dryrun
 emptively
 exfiltrates
