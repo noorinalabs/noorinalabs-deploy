@@ -101,6 +101,17 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      # pytest over the scripts/ unit tests (mirrors compose-validate.yml's
+      # scripts-pytest job, deploy#428). Covers the KRaft stray-dir detector
+      # scripts/kafka_logdir_preflight.sh. Heavier, so pre-push.
+      - id: pytest-scripts
+        name: pytest-scripts (pre-push)
+        entry: python3 -m pytest scripts/tests -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       # Env file completeness check (carried over from the prior config).
       # NOTE: entry is a YAML literal block scalar (`|-`) because the inline
       # `echo "WARNING: ..."` contains a colon-space that a plain scalar would

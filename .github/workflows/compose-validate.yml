@@ -291,3 +291,26 @@ jobs:
             -v "$PWD/infra/alertmanager:/etc/alertmanager:ro" \
             prom/alertmanager:v0.28.1 \
             check-config /etc/alertmanager/alertmanager.stg.yml
+
+  scripts-pytest:
+    # deploy#428 — unit tests for the standalone helpers under scripts/ that
+    # have no other runtime gate. Today the only such test is
+    # scripts/tests/test_kafka_logdir_preflight.py, which exercises the
+    # KRaft stray-non-topic-directory detector (scripts/kafka_logdir_preflight.sh)
+    # used by the write-deploy-env pre-flight. A real kafka_data volume is not
+    # available in CI, so the detector's directory-classification logic is
+    # tested against fixture dir layouts (clean vs stray-config/data). The .sh
+    # itself is already shellcheck + bash -n gated by the shellcheck job above;
+    # this job is the behavioral floor. Mirrored in .pre-commit-config.yaml
+    # (pytest-scripts pre-push hook) so the sync-drift gate stays green.
+    name: pytest (scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run scripts unit tests
+        run: python3 -m pytest scripts/tests -q
