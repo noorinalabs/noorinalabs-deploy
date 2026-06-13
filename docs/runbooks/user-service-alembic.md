@@ -144,6 +144,68 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 3. Promote via the normal promotion workflow (`promote.yml`, deploy#155). Do NOT bypass the gate — even for hotfixes.
 4. If the gate flags an unexpected head and the migration is genuinely additive and safe, the correct action is still to update `EXPECTED_MERGE_HEAD` in `db-migrate.yml` — not to skip the assertion. This is a 1-line PR and reviewable in minutes.
 
+## Admin bootstrap
+
+The same `db-migrate.yml` SSH step runs a **post-migrate admin-grant reassertion**
+immediately after `alembic upgrade head` succeeds (deploy#426). It invokes
+user-service's `scripts/bootstrap_admin.py` (us#159 / PR
+[noorinalabs-user-service#160](https://github.com/noorinalabs/noorinalabs-user-service/pull/160))
+inside the same one-shot user-service image, against the just-migrated
+`user-postgres`, to grant the `admin` role to the bootstrap account.
+
+```
+alembic upgrade head  →  bootstrap_admin.py --database-url <user-postgres>
+```
+
+**Why it exists:** the `admin` ROLE is seeded by migration `0001`, but no user is
+granted it. Every user-service admin endpoint — and the isnad-graph admin panels
+behind it — needs an admin JWT, so without a seeded grant they 401/403. Wiring it
+into post-migrate makes the grant self-healing on every deploy instead of a
+forgettable manual step.
+
+**First-login dependency (important).** Account creation in user-service is
+**OAuth-only** — the bootstrap account row does not exist until the owner logs in
+once via Google OAuth as `BOOTSTRAP_ADMIN_EMAIL` (default
+`parametrization@gmail.com`). So:
+
+- On a **brand-new env**, this step correctly **no-ops** (the script logs
+  `user_not_found` and exits 0). It does **not** fail the deploy.
+- After the owner's **first OAuth login**, the grant lands on the **next** deploy.
+- Every subsequent deploy is idempotent — the script reports `already_admin` and
+  exits 0 (no duplicate grant).
+
+**It never fails the migration gate.** The step is deliberately best-effort: it is
+wrapped in `set +e` with an explicit rc check, so the `migrated` output the
+promotion workflow gates on reflects the **alembic** result only — never the admin
+reassertion. The only non-zero exit the script produces is `BootstrapError`
+(rc=1, the `admin` role missing => an unmigrated DB), which is essentially
+impossible here because `alembic upgrade head` just succeeded. If it ever fires it
+is **logged loudly** (a `WARNING:` line in the SSH step output) but does not abort
+the deploy.
+
+**Config sourcing.** `BOOTSTRAP_ADMIN_EMAIL` and the DB connection are sourced from
+the deploy env's existing user-service config, not hardcoded in the workflow:
+
+- DB — the asyncpg `DATABASE_URL` assembled from the VPS `.env` `USER_POSTGRES_*`
+  values (the same URL the alembic step uses), passed via `--database-url`.
+- Email — read from the VPS `.env` (`set -a; . ./.env` export). Documented as an
+  optional override in `compose/.env.example`; unset → the script's default. Like
+  `USER_POSTGRES_PASSWORD`, it is sourced from the VPS env-file, not pushed through
+  the GH Actions transport.
+
+**Manual run.** To grant out-of-band (e.g. right after the owner's first login,
+without waiting for the next deploy), run the user-service target directly on the
+VPS image, or from a user-service checkout:
+
+```bash
+make bootstrap-admin            # uv run python scripts/bootstrap_admin.py
+# or, one-shot against the deployed DB from the user-service image:
+docker run --rm --network noorinalabs_user-backend \
+  ghcr.io/noorinalabs/noorinalabs-user-service:<env>-latest \
+  /app/.venv/bin/python scripts/bootstrap_admin.py \
+    --database-url "postgresql+asyncpg://<user>:<pass>@user-postgres:5432/<db>"
+```
+
 ## Escalation
 
 | Failure | Primary | Secondary |
@@ -153,6 +215,7 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 | `alembic upgrade head` fails on prod | Bereket.Tadesse (IM) | Nadia.Boukhari (user-service manager) |
 | SSH / VPS state problem | Lucas.Ferreira | Weronika.Zielinska (Platform Architect) |
 | Secret mismatch / env-file drift | Nino.Kavtaradze (Security) | Bereket.Tadesse |
+| admin bootstrap `WARNING` (rc=1) | Lucas.Ferreira | Anya.Kowalczyk (user-service) |
 
 ## Observability
 
