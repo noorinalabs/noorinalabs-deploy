@@ -243,9 +243,14 @@ jobs:
             #
             # Config sourcing (not hardcoded in the pipeline):
             #   * DATABASE_URL — the asyncpg URL assembled above from the VPS
-            #     .env USER_POSTGRES_* values (passed via --database-url so the
-            #     script need not import full app settings in the one-shot
-            #     container).
+            #     .env USER_POSTGRES_* values. Passed as an ENV var (NOT on argv)
+            #     so the password-bearing URL never lands in /proc/<pid>/cmdline
+            #     or the one-shot container's PID-1 argv (CWE-214 — Nino, security
+            #     review). The script's _resolve_database_url() falls back to the
+            #     app settings' effective_database_url, which reads DATABASE_URL
+            #     from env; every other Settings field has a default, so the
+            #     one-shot container needs no further config. Mirrors the adjacent
+            #     alembic invocations, which also pass DATABASE_URL via -e.
             #   * BOOTSTRAP_ADMIN_EMAIL — read from the VPS .env (exported by the
             #     `set -a; . ./.env` sourcing above). Absent → the script's own
             #     default (the owner's bootstrap email). Like USER_POSTGRES_*,
@@ -255,10 +260,10 @@ jobs:
             set +e
             docker run --rm \
               --network noorinalabs_user-backend \
+              -e DATABASE_URL="${DATABASE_URL}" \
               -e BOOTSTRAP_ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:-}" \
               "${IMAGE}" \
-              /app/.venv/bin/python scripts/bootstrap_admin.py \
-                --database-url "${DATABASE_URL}"
+              /app/.venv/bin/python scripts/bootstrap_admin.py
             BOOTSTRAP_RC=$?
             set -e
             if [ "${BOOTSTRAP_RC}" -eq 0 ]; then

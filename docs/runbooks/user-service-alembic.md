@@ -187,7 +187,10 @@ the deploy.
 the deploy env's existing user-service config, not hardcoded in the workflow:
 
 - DB — the asyncpg `DATABASE_URL` assembled from the VPS `.env` `USER_POSTGRES_*`
-  values (the same URL the alembic step uses), passed via `--database-url`.
+  values (the same URL the alembic step uses), passed as an `-e DATABASE_URL` env
+  var — **not** on argv — so the password-bearing URL never appears in the
+  container's PID-1 argv / `/proc/<pid>/cmdline` (CWE-214). The script reads it via
+  the app settings' `effective_database_url`.
 - Email — read from the VPS `.env` (`set -a; . ./.env` export). Documented as an
   optional override in `compose/.env.example`; unset → the script's default. Like
   `USER_POSTGRES_PASSWORD`, it is sourced from the VPS env-file, not pushed through
@@ -199,11 +202,13 @@ VPS image, or from a user-service checkout:
 
 ```bash
 make bootstrap-admin            # uv run python scripts/bootstrap_admin.py
-# or, one-shot against the deployed DB from the user-service image:
+# or, one-shot against the deployed DB from the user-service image. Pass the
+# password-bearing URL via -e (NOT --database-url on argv) so it never lands in
+# the container's PID-1 argv / /proc/<pid>/cmdline (CWE-214):
 docker run --rm --network noorinalabs_user-backend \
+  -e DATABASE_URL="postgresql+asyncpg://<user>:<pass>@user-postgres:5432/<db>" \
   ghcr.io/noorinalabs/noorinalabs-user-service:<env>-latest \
-  /app/.venv/bin/python scripts/bootstrap_admin.py \
-    --database-url "postgresql+asyncpg://<user>:<pass>@user-postgres:5432/<db>"
+  /app/.venv/bin/python scripts/bootstrap_admin.py
 ```
 
 ## Escalation
