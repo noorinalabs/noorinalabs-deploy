@@ -15,8 +15,9 @@ promotion workflow (promote.yml — deploy#155, merged)
     ├── pre-deploy gate (this workflow): db-migrate.yml
     │       │
     │       ├── step 1: alembic heads  (belt-and-suspenders)
-    │       │     ├── must print exactly 1 line with "(head)"
-    │       │     └── that line must contain EXPECTED_MERGE_HEAD (currently 0040)
+    │       │     ├── must print exactly 1 line with "(head)"  ← the real safety
+    │       │     ├── DERIVE that head's revision from the image (deploy#412)
+    │       │     └── optional: if EXPECTED_MERGE_HEAD pin is set, assert match
     │       │
     │       └── step 2: alembic upgrade head  (singular)
     │             └── runs inside ghcr.io/noorinalabs/noorinalabs-user-service:<tag>
@@ -59,24 +60,42 @@ ERROR: [stg] alembic heads reported 2 heads, expected exactly 1.
 
 **Do not bypass the gate.** The gate is protecting prod.
 
-### 2. Heads-count assertion fails — head != EXPECTED_MERGE_HEAD
+### 2. Optional pin tripwire fails — derived head != EXPECTED_MERGE_HEAD
+
+> **deploy#412 changed this.** The gate now **derives** the expected head from
+> the image it is about to deploy; it no longer requires a hardcoded revision.
+> `EXPECTED_MERGE_HEAD` defaults to `""` (derive mode) and a normal new migration
+> can no longer wedge a deploy. This failure mode only fires if a maintainer has
+> deliberately set a non-empty `EXPECTED_MERGE_HEAD` pin.
 
 ```
-ERROR: [stg] alembic heads reports a single head, but it is NOT the
-       expected merge-migration revision '0040'.
+ERROR: [stg] optional EXPECTED_MERGE_HEAD pin is '0041', but the image's
+       single head is '0042'. Exactly one is true:
+         (a) STALE-PIN DRIFT ...
+         (b) REAL MISMATCH ...
 ```
 
-**Cause:** a new migration landed in user-service (probably another merge migration down the line) and `EXPECTED_MERGE_HEAD` in `db-migrate.yml` was not bumped in the same PR.
+**Cause — discriminate the two the error names:**
+
+- **(a) Stale-pin drift** — a legitimate new migration shipped and the optional
+  pin was not updated. This is the *expected* benign case if anyone re-pinned.
+- **(b) Real mismatch** — an unexpected or older image is being deployed (a
+  tag-resolution bug); the head moving *backwards* or to an unrelated id.
 
 **Recovery:**
 
-1. Confirm the migration chain in user-service:
+1. Confirm the image's actual head:
    ```bash
    docker run --rm ghcr.io/noorinalabs/noorinalabs-user-service:<tag> \
      /app/.venv/bin/alembic heads
    ```
-2. If the new head is legitimate, open a same-wave PR in `noorinalabs-deploy` that updates `EXPECTED_MERGE_HEAD` in `.github/workflows/db-migrate.yml` to the new revision id. Merge that PR, then retry the promotion.
-3. If the new head is NOT legitimate (someone committed it by mistake), revert in user-service and restart the promotion.
+2. **(a)** If the new head is the legitimately-deployed one, the durable fix is to
+   **clear** `EXPECTED_MERGE_HEAD` back to `""` in `.github/workflows/db-migrate.yml`
+   (return to drift-proof derive mode) — or bump it to the new revision if you are
+   intentionally keeping a pin for this promotion. Merge, then retry.
+3. **(b)** If the head is NOT what should be deploying (wrong/older image), do not
+   bump the pin — investigate image-tag resolution (`<env>-latest` routing, GHCR
+   digest) per the deploy/promote workflow. The pin caught a real problem.
 
 ### 3. `alembic upgrade head` fails
 
@@ -142,7 +161,7 @@ If a migration needs to land urgently (e.g., a prod outage fix):
 1. Land the alembic migration in `noorinalabs-user-service` → merge to the wave branch.
 2. Wait for the image publish workflow to produce a new `<env>-latest` tag.
 3. Promote via the normal promotion workflow (`promote.yml`, deploy#155). Do NOT bypass the gate — even for hotfixes.
-4. If the gate flags an unexpected head and the migration is genuinely additive and safe, the correct action is still to update `EXPECTED_MERGE_HEAD` in `db-migrate.yml` — not to skip the assertion. This is a 1-line PR and reviewable in minutes.
+4. As of deploy#412 a genuinely additive, safe new migration **no longer trips the gate** — the head is derived from the image, so the hotfix flows through with no deploy-repo PR. The gate still hard-stops on multiple heads (§1) — never skip that assertion. (Only if someone pinned the optional `EXPECTED_MERGE_HEAD` does a head change require a 1-line PR to clear/bump it — see §2.)
 
 ## Admin bootstrap
 

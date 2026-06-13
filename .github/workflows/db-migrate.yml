@@ -5,15 +5,25 @@ name: DB Migrate (user-service alembic)
 # against the target env's user-postgres. Fails fast on migration failure;
 # a stg failure must block the prod promotion in the caller's job graph.
 #
-# Belt-and-suspenders (deploy#85, per Anya.Kowalczyk 2026-04-23): before
-# `alembic upgrade head`, assert that `alembic heads` reports exactly ONE
-# line containing the expected head — currently `0041`
-# (`0041_add_subscriptions_user_id_index`, down_revision `0040`; the `0040`
-# merge-migration was introduced by user-service#80). This catches a future
-# migration landing without bumping `down_revision` properly (a silent
-# divergence `alembic upgrade head` alone would mask). Bump EXPECTED_MERGE_HEAD
-# (below) in lockstep whenever user-service adds a migration — deploy#407 was a
-# wedged stg deploy caused by `0041` landing (us#54/#520) without this bump.
+# Single-head assertion — DERIVE, don't pin (deploy#412, supersedes the
+# literal-pin design of deploy#85/#407). Before `alembic upgrade head`, assert
+# that `alembic heads` (run inside the very image we are about to deploy)
+# reports exactly ONE head, then DERIVE that head's revision from the image
+# itself rather than comparing it to a hardcoded revision. The image is the
+# single source of truth for "what head should the DB be at", so a normal new
+# migration in user-service can no longer wedge the deploy. This kills the
+# recurring EXPECTED_MERGE_HEAD drift (deploy#407: `0041` landed in us#54/#520
+# without a lockstep bump and hard-stopped every stg deploy until someone
+# noticed). The single-head assertion is what actually catches the dangerous
+# case — a migration added without a proper `down_revision`, which produces TWO
+# heads and which `alembic upgrade head` would mishandle.
+#
+# EXPECTED_MERGE_HEAD (below) is now an OPTIONAL opt-in tripwire, default "".
+# Leave it empty for the drift-proof derive behavior. Set it to a revision id
+# only to pin a specific high-stakes promotion; a mismatch then is reported as
+# EITHER stale-pin drift (bump/clear the pin) OR a real unexpected-image
+# mismatch (investigate tag resolution) — see the assertion block below and
+# docs/runbooks/user-service-alembic.md §2.
 #
 # Post-migrate admin bootstrap (deploy#426): right after `alembic upgrade head`
 # the same SSH step reasserts the `admin` role grant on the bootstrap account via
@@ -73,10 +83,11 @@ jobs:
     outputs:
       migrated: ${{ steps.record.outputs.migrated }}
     env:
-      # Expected merge-migration revision. Bump this line in the same PR that
-      # lands a future alembic merge migration in user-service. A mismatch
-      # here means "the migration DAG moved under us" and is a hard stop.
-      EXPECTED_MERGE_HEAD: "0041"
+      # OPTIONAL opt-in head pin. Default "" → derive the expected head from the
+      # image (drift-proof; the normal mode). Set to a revision id ONLY to pin a
+      # specific promotion; the gate then additionally asserts the image's single
+      # head equals it. See the header comment and the assertion block below.
+      EXPECTED_MERGE_HEAD: ""
     steps:
       - uses: actions/checkout@v6
 
@@ -186,29 +197,41 @@ jobs:
             echo "$HEADS_OUT"
 
             # Count non-empty lines. alembic prints one revision per line in
-            # the form "<revid> (head)". Any count != 1 is a hard stop.
+            # the form "<revid> (head)". Any count != 1 is a REAL DAG divergence
+            # (not pin drift) and a hard stop.
             HEADS_COUNT="$(printf '%s\n' "$HEADS_OUT" | grep -cE '\(head\)')"
             if [ "$HEADS_COUNT" -ne 1 ]; then
               echo "ERROR: [${ENV_NAME}] alembic heads reported ${HEADS_COUNT} heads, expected exactly 1."
-              echo "       Multiple heads means a migration was added without bumping down_revision,"
-              echo "       or the merge migration was reverted. \`alembic upgrade head\` would fail"
-              echo "       or silently pick a branch. Fix upstream in user-service before retrying."
+              echo "       This is a REAL migration-DAG divergence, not pin drift: a migration"
+              echo "       landed without a proper down_revision, or the merge migration was"
+              echo "       reverted. \`alembic upgrade head\` would fail or silently pick a branch."
+              echo "       Fix upstream in user-service before retrying — runbook §1."
               exit 1
             fi
 
-            # Confirm the single head matches the expected merge-migration id.
-            # If a future merge migration lands in user-service, the PR that
-            # lands it must also bump EXPECTED_MERGE_HEAD in this workflow.
-            if ! printf '%s' "$HEADS_OUT" | grep -qE "^${EXPECTED_MERGE_HEAD}[[:space:]]+\(head\)"; then
-              echo "ERROR: [${ENV_NAME}] alembic heads reports a single head, but it is NOT the"
-              echo "       expected merge-migration revision '${EXPECTED_MERGE_HEAD}'."
-              echo "       A new merge migration was probably added in user-service without"
-              echo "       bumping EXPECTED_MERGE_HEAD in .github/workflows/db-migrate.yml."
-              echo "       Update the workflow in the same PR as the migration, then retry."
+            # DERIVE the single head from the image itself (deploy#412). The image
+            # we are about to deploy is the source of truth; we no longer compare
+            # against a hardcoded revision, so a normal new migration cannot wedge
+            # the deploy. Line shape: "<revid> (head)" — take the first field.
+            DERIVED_HEAD="$(printf '%s\n' "$HEADS_OUT" | grep -E '\(head\)' | head -n1 | awk '{print $1}')"
+            echo "==> [${ENV_NAME}] derived single head from image: ${DERIVED_HEAD}"
+
+            # OPTIONAL opt-in tripwire. Only fires if a maintainer set a non-empty
+            # EXPECTED_MERGE_HEAD. The message names BOTH possible causes so the
+            # operator can tell stale-pin drift from a real unexpected-image bug.
+            if [ -n "${EXPECTED_MERGE_HEAD}" ] && [ "${DERIVED_HEAD}" != "${EXPECTED_MERGE_HEAD}" ]; then
+              echo "ERROR: [${ENV_NAME}] optional EXPECTED_MERGE_HEAD pin is '${EXPECTED_MERGE_HEAD}',"
+              echo "       but the image's single head is '${DERIVED_HEAD}'. Exactly one is true:"
+              echo "         (a) STALE-PIN DRIFT — a legitimate new migration shipped and the optional"
+              echo "             pin was not updated. Fix: clear or bump EXPECTED_MERGE_HEAD in"
+              echo "             .github/workflows/db-migrate.yml (default \"\" = derive, no pin)."
+              echo "         (b) REAL MISMATCH — an unexpected/older image is being deployed."
+              echo "             Investigate image-tag resolution before proceeding."
+              echo "       Runbook §2."
               exit 1
             fi
 
-            echo "==> [${ENV_NAME}] heads-count assertion passed: 1 head, matches ${EXPECTED_MERGE_HEAD}"
+            echo "==> [${ENV_NAME}] single-head assertion passed (head=${DERIVED_HEAD}${EXPECTED_MERGE_HEAD:+, matches pin})"
 
             # -------- alembic upgrade head (singular) --------
             echo "==> [${ENV_NAME}] alembic upgrade head"
@@ -387,7 +410,7 @@ jobs:
             echo ""
             echo "- **Env:** ${{ inputs.env }}"
             echo "- **Image tag:** ${{ steps.tag.outputs.tag }}"
-            echo "- **Expected head:** ${{ env.EXPECTED_MERGE_HEAD }}"
+            echo "- **Head mode:** ${{ env.EXPECTED_MERGE_HEAD == '' && 'derived-from-image' || format('pinned={0}', env.EXPECTED_MERGE_HEAD) }}"
             echo "- **Migrated output:** ${{ steps.record.outputs.migrated }}"
             echo ""
             if [ "${{ job.status }}" != "success" ]; then

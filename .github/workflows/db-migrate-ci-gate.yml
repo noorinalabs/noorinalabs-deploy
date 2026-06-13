@@ -136,16 +136,29 @@ jobs:
       - name: Verify schema landed (sanity check)
         run: |
           set -euo pipefail
-          # alembic_version row must exist and match the workflow's EXPECTED_MERGE_HEAD.
-          # Read EXPECTED_MERGE_HEAD from db-migrate.yml so this stays in sync
-          # without a second source of truth.
-          EXPECTED_HEAD="$(grep -E '^[[:space:]]*EXPECTED_MERGE_HEAD:' .github/workflows/db-migrate.yml \
-                          | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          # DERIVE the expected head from the SAME image we just migrated from
+          # (deploy#412, mirrors db-migrate.yml's derive-not-pin gate). The image
+          # is the single source of truth — no hardcoded revision to drift.
+          EXPECTED_HEAD="$(docker run --rm "${IMAGE}" /app/.venv/bin/alembic heads 2>&1 \
+                          | grep -E '\(head\)' | head -n1 | awk '{print $1}')"
           if [ -z "${EXPECTED_HEAD}" ]; then
-            echo "ERROR: could not parse EXPECTED_MERGE_HEAD from db-migrate.yml" >&2
+            echo "ERROR: could not derive a single head from the image's \`alembic heads\`." >&2
             exit 1
           fi
-          echo "==> Expected head from db-migrate.yml: ${EXPECTED_HEAD}"
+          echo "==> Derived single head from image: ${EXPECTED_HEAD}"
+
+          # OPTIONAL opt-in pin cross-check, mirroring the SSH gate's tripwire.
+          # db-migrate.yml's EXPECTED_MERGE_HEAD defaults to "" (derive mode); if
+          # a maintainer pinned it, assert the image's head matches and name both
+          # possible causes on mismatch (stale-pin drift vs real image mismatch).
+          PINNED_HEAD="$(grep -E '^[[:space:]]*EXPECTED_MERGE_HEAD:' .github/workflows/db-migrate.yml \
+                          | head -n1 | sed -E 's/.*EXPECTED_MERGE_HEAD:[[:space:]]*"?([^"]*)"?.*/\1/')"
+          if [ -n "${PINNED_HEAD}" ] && [ "${PINNED_HEAD}" != "${EXPECTED_HEAD}" ]; then
+            echo "ERROR: optional EXPECTED_MERGE_HEAD pin '${PINNED_HEAD}' in db-migrate.yml does" >&2
+            echo "       not match the image's single head '${EXPECTED_HEAD}'. Either clear/bump the" >&2
+            echo "       optional pin (stale-pin drift) or investigate the image tag (real mismatch)." >&2
+            exit 1
+          fi
 
           # psql via the postgres image itself (no host psql install needed).
           ACTUAL="$(docker run --rm --network host \
@@ -155,7 +168,8 @@ jobs:
             -c "SELECT version_num FROM alembic_version;")"
           echo "==> alembic_version.version_num = ${ACTUAL}"
           if [ "${ACTUAL}" != "${EXPECTED_HEAD}" ]; then
-            echo "ERROR: alembic_version mismatch — got '${ACTUAL}', expected '${EXPECTED_HEAD}'." >&2
+            echo "ERROR: alembic_version mismatch — DB at '${ACTUAL}', image head '${EXPECTED_HEAD}'." >&2
+            echo "       \`alembic upgrade head\` did not land the image's head — investigate." >&2
             exit 1
           fi
 
