@@ -230,6 +230,42 @@ docker run --rm --network noorinalabs_user-backend \
   /app/.venv/bin/python scripts/bootstrap_admin.py
 ```
 
+### Post-deploy reassertion in the deploy workflows (deploy#445)
+
+`db-migrate.yml`'s reassertion above (deploy#426) only fires where the alembic
+gate runs: on stg **only for the user-service dispatch path**
+(`deploy-stg.yml`'s `migrate` job `if:`), and on prod via `promote.yml`'s prod
+gate. That leaves gaps — an isnad-graph-only or landing-only stg deploy, a
+manual `workflow_dispatch`, or a prod break-glass rollout never re-grants admin.
+
+To make the grant durable across **every** deploy, `deploy-stg.yml` and
+`deploy-prod.yml` each run a `Reassert admin grant (bootstrap_admin.py)` step
+**after** the `Verify health check` step (deploy#445, option 2). Differences
+from the db-migrate path:
+
+- **Live container, not a one-shot image.** It `docker exec`s into the running
+  `noorinalabs-user-service-1` container, so the script resolves `DATABASE_URL`
+  from the container's own environment (compose already injects `DATABASE_*`
+  there). No password-bearing URL is passed on argv.
+- **Waits for health first.** It polls the container's compose healthcheck
+  (`GET /health`) for up to 120s; if user-service is not healthy it **skips and
+  warns** (does not fail the deploy — it reasserts on the next one).
+- **Same no-op-safe / idempotent / best-effort contract.** `--require-user` is
+  intentionally **not** passed (no-op exit 0 before first OAuth login), and the
+  exec is wrapped in `set +e` + rc check so a non-zero rc is logged but never
+  aborts the deploy.
+
+```
+verify health  →  wait user-service healthy  →  docker exec ... bootstrap_admin.py
+```
+
+**Config sourcing here:** the email is read from the GitHub Actions
+**repo/environment variable `BOOTSTRAP_ADMIN_EMAIL`** (passed via the ssh-action
+`envs:` allow-list); when unset the script's own default
+(`parametrization@gmail.com`) applies. The DB URL is **not** supplied by the
+workflow — it comes from the live container's env, so there is no secret on argv
+at all.
+
 ## Escalation
 
 | Failure | Primary | Secondary |

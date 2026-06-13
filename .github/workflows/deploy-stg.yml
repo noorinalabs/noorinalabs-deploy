@@ -261,6 +261,93 @@ jobs:
             docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env ps --format '{{.Name}}\t{{.Status}}'
             echo "==> Stg deployment verified"
 
+      # Post-deploy: reassert the owner's `admin` grant (deploy#445, option 2).
+      #
+      # Runs AFTER the stack is up and user-service is healthy, on EVERY stg
+      # deploy (not just user-service dispatches), so the owner's admin role
+      # survives redeploys and DB resets. This complements the pre-deploy
+      # bootstrap in db-migrate.yml (deploy#426): that gate only fires on the
+      # user-service dispatch path (deploy-stg.yml `migrate` job `if:`) and runs
+      # against a one-shot image BEFORE compose-up; this step closes the gap by
+      # running against the LIVE container after every deploy regardless of which
+      # service triggered it.
+      #
+      # `docker exec` into the running noorinalabs-user-service-1 container so the
+      # script resolves DATABASE_URL from the container's own environment (compose
+      # already injects DATABASE_URL / DATABASE_* there). No password-bearing URL
+      # is passed on argv — the only argv value is the email, which the script
+      # docstring explicitly documents as an identifier, not a credential.
+      #
+      # Safety (why this can never fail the deploy):
+      #   * `--require-user` is intentionally NOT passed. Without it the script is
+      #     a no-op exit 0 when the bootstrap account does not exist yet — the
+      #     account is OAuth-only, so on a fresh env this correctly no-ops until
+      #     the owner logs in once; the grant then lands on the NEXT deploy.
+      #   * Idempotent — a second run reports `already_admin` and exits 0.
+      #   * Best-effort — wrapped in explicit rc handling (not `set -e`); a
+      #     non-zero rc is LOGGED loudly but never aborts the deploy. The deploy's
+      #     success signal must reflect the rollout + api health only.
+      #
+      # Email config (not hardcoded): pass --email only when the repo/env var
+      # BOOTSTRAP_ADMIN_EMAIL is set; otherwise rely on the script's own default
+      # (the owner's bootstrap email). Sourced via GH var, mirroring how
+      # db-migrate.yml keeps the email out of the workflow body.
+      - name: Reassert admin grant (bootstrap_admin.py)
+        uses: appleboy/ssh-action@v1
+        env:
+          BOOTSTRAP_ADMIN_EMAIL: ${{ vars.BOOTSTRAP_ADMIN_EMAIL }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: BOOTSTRAP_ADMIN_EMAIL
+          script: |
+            set -uo pipefail
+            cd /opt/noorinalabs-deploy
+
+            CONTAINER="noorinalabs-user-service-1"
+
+            # Wait for user-service to report healthy before exec-ing into it.
+            # The container ships a compose healthcheck (GET /health); poll it so
+            # the bootstrap runs against a ready app, not a still-starting one.
+            echo "==> [stg] waiting for ${CONTAINER} to be healthy..."
+            us_health="not_found"
+            for i in $(seq 1 24); do
+              us_health=$(docker inspect --format='{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "not_found")
+              echo "Attempt $i/24: user-service=${us_health}"
+              if [ "${us_health}" = "healthy" ]; then
+                break
+              fi
+              sleep 5
+            done
+            if [ "${us_health}" != "healthy" ]; then
+              echo "WARNING: [stg] ${CONTAINER} not healthy after 120s (status=${us_health})." >&2
+              echo "         Skipping admin bootstrap this deploy; it will reassert on the next one." >&2
+              echo "         This does NOT fail the deploy (rollout + api health already verified)." >&2
+              exit 0
+            fi
+
+            # Build args: --email only when the GH var is set, else script default.
+            set --
+            if [ -n "${BOOTSTRAP_ADMIN_EMAIL:-}" ]; then
+              set -- --email "${BOOTSTRAP_ADMIN_EMAIL}"
+            fi
+
+            echo "==> [stg] post-deploy: reassert admin grant (bootstrap_admin.py)"
+            set +e
+            docker exec -e PYTHONPATH=/app -w /app "${CONTAINER}" \
+              /app/.venv/bin/python scripts/bootstrap_admin.py "$@"
+            BOOTSTRAP_RC=$?
+            set -e
+            if [ "${BOOTSTRAP_RC}" -eq 0 ]; then
+              echo "==> [stg] admin bootstrap completed (rc=0: granted / already_admin / no-op user-not-found)"
+            else
+              echo "WARNING: [stg] admin bootstrap exited ${BOOTSTRAP_RC}." >&2
+              echo "         This does NOT fail the deploy (rollout + api health already verified)." >&2
+              echo "         rc=1 means BootstrapError — most likely the 'admin' role is missing." >&2
+              echo "         Investigate per docs/runbooks/user-service-alembic.md#admin-bootstrap." >&2
+            fi
+
       - name: Report status
         if: always()
         run: |
