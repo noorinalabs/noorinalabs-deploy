@@ -124,6 +124,22 @@ this instruction. Pick one:
 reconciled — a deploy would rewrite `.env` from the GH secret and break the
 service whose live DB no longer accepts it.
 
+> **Note — forward-recreate failure is NOT auto-rolled-back.** The script's
+> automatic rollback covers the **health-gate** failure (recreate succeeded but
+> a container never went healthy). If the *forward* `docker compose up
+> --force-recreate` itself errors (e.g. the daemon rejects the recreate),
+> `set -e` aborts the script **before** the health gate, so the auto-rollback
+> does not run: Postgres may already be `ALTER ROLE`d to the new value and
+> `.env` rewritten, while the GH secret is still the old value (the persist step
+> never runs). Treat this exactly like the out-of-sync case above — reconcile
+> via the **Roll the box back** path before deploying.
+
+> **Note — the first run must be after the wave merges to `main`.** The on-box
+> step does `git fetch origin main && git reset --hard origin/main` to pick up
+> `scripts/rotate_db_password.sh`, so a real rotation only works once this PR is
+> on `origin/main`. Before then it would run the pre-existing (or absent) script
+> on the box. Plan the first staging dry run / real run for **post-wave-merge**.
+
 ## Out of scope
 
 - The central-management posture and tool choice — settled in

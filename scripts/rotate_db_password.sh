@@ -178,10 +178,12 @@ rewrite_env() {
   local value="$1" tmp esc
   esc="${value//\'/\'\\\'\'}"
   tmp="$(mktemp "${TMPDIR:-/tmp}/env.write.XXXXXX")"
-  # awk replaces only the matching key line; the new value is passed via -v
-  # (awk variable), never on a child process argv.
-  awk -v key="$ROTATE_SECRET" -v val="$esc" '
-    index($0, key "=") == 1 { printf "%s=\047%s\047\n", key, val; next }
+  # awk replaces only the matching key line. The new value is passed through the
+  # ENVIRONMENT (read via ENVIRON["val"]), never as `-v val=` — `-v` would put
+  # the secret on awk's argv (visible in /proc/<pid>/cmdline). Only the secret
+  # NAME (non-sensitive) stays on -v. (CWE-214 — Nino, PR #438 review.)
+  val="$esc" awk -v key="$ROTATE_SECRET" '
+    index($0, key "=") == 1 { printf "%s=\047%s\047\n", key, ENVIRON["val"]; next }
     { print }
   ' "$ENV_FILE" > "$tmp"
   mv "$tmp" "$ENV_FILE"

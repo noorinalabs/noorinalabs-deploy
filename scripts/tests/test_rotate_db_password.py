@@ -19,6 +19,7 @@ process argv (CWE-214 — it must travel via stdin / env only).
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -82,15 +83,20 @@ def _write_mock_compose(tmp_path: Path, up_log: Path) -> Path:
 
 
 def _run(
-    env_file: Path, mock_docker: Path, mock_compose: Path, secret: str
+    env_file: Path,
+    mock_docker: Path,
+    mock_compose: Path,
+    secret: str,
+    extra_path: str = "",
 ) -> subprocess.CompletedProcess[str]:
+    path = f"{extra_path}:/usr/bin:/bin" if extra_path else "/usr/bin:/bin"
     return subprocess.run(
         ["bash", str(SCRIPT)],
         capture_output=True,
         text=True,
         check=False,
         env={
-            "PATH": "/usr/bin:/bin",
+            "PATH": path,
             "ROTATE_SECRET": secret,
             "NEW_PASSWORD": NEW,
             "ENV_FILE": str(env_file),
@@ -100,6 +106,19 @@ def _run(
             "HEALTH_INTERVAL": "0",
         },
     )
+
+
+def _write_argv_recording_awk(tmp_path: Path, argv_log: Path) -> Path:
+    """A PATH-shadowing `awk` that records its OWN argv then delegates to the
+    real awk (so the .env rewrite still happens). Lets the argv-leak test prove
+    the rewrite passes the secret via ENVIRON, never on `-v val=` / argv."""
+    real_awk = shutil.which("awk", path="/usr/bin:/bin") or "/usr/bin/awk"
+    bindir = tmp_path / "shim-bin"
+    bindir.mkdir()
+    awk = bindir / "awk"
+    awk.write_text(f'#!/bin/sh\necho "$@" >> "{argv_log}"\nexec {real_awk} "$@"\n')
+    awk.chmod(0o755)
+    return bindir
 
 
 def _lines(path: Path) -> list[str]:
@@ -185,17 +204,26 @@ def test_failed_health_gate_rolls_back(tmp_path: Path) -> None:
 
 def test_password_never_on_argv(tmp_path: Path) -> None:
     """CWE-214: neither the old nor the new password may appear in any recorded
-    child-process argv (they travel via stdin / env only)."""
+    child-process argv. Covers the docker/compose mocks AND — via a PATH-shadow
+    `awk` shim — the real `.env`-rewrite awk invocation (which must read the
+    value from ENVIRON, not `-v val=`). Without the shim this would silently
+    miss the awk path (Nino, PR #438 review)."""
     env = _write_env(tmp_path, "POSTGRES_PASSWORD", with_user_db=True)
     exec_log, up_log = tmp_path / "exec.log", tmp_path / "up.log"
+    awk_argv = tmp_path / "awk_argv.log"
+    bindir = _write_argv_recording_awk(tmp_path, awk_argv)
     res = _run(
         env,
         _write_mock_docker(tmp_path, exec_log),
         _write_mock_compose(tmp_path, up_log),
         "POSTGRES_PASSWORD",
+        extra_path=str(bindir),
     )
     assert res.returncode == 0, res.stderr
-    for recorded in _lines(exec_log) + _lines(up_log):
+    # The shim must actually have run (otherwise the awk assertion is vacuous).
+    awk_calls = _lines(awk_argv)
+    assert awk_calls, "awk shim was never invoked — rewrite path not exercised"
+    for recorded in _lines(exec_log) + _lines(up_log) + awk_calls:
         assert OLD not in recorded, f"OLD password leaked to argv: {recorded}"
         assert NEW not in recorded, f"NEW password leaked to argv: {recorded}"
 

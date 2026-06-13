@@ -87,13 +87,22 @@ with the P3 automated mechanism**:
   is only verifiable at runtime.
 - The on-demand `.env`-swap path (the #126 pattern) remains the manual fallback.
 
-## Central management — open decision (owner / ADR)
+## Central management — ~~open decision (owner / ADR)~~ DECIDED
+
+> **Superseded by [ADR 0007](../adr/0007-central-secrets-manager.md) (Accepted
+> 2026-06-12).** The owner chose the **A + B hybrid**: GitHub Environment
+> secrets (per-env) as the baseline store **plus SOPS + age for git-resident
+> config files**. No new managed service; Vault (D) was judged over-scaled and
+> SaaS (C) retained only as the documented fallback. The "deliberately does not
+> pick one / the choice is the owner's" framing below is **historical** — the
+> decision is recorded in ADR 0007; treat the table + recommendation as the
+> options analysis that fed it.
 
 #11 lists four options for *where* secrets live. This is a **security
 architecture decision with real tradeoffs**, and per team convention an
 options-with-tradeoffs choice of this weight is an **owner / ADR call**, not an
-implementer default. This PR deliberately does **not** pick one. The framing,
-for the decision:
+implementer default. This PR deliberately did **not** pick one (ADR 0007 since
+did). The framing, for the decision:
 
 | Option | Pros | Cons / cost |
 |---|---|---|
