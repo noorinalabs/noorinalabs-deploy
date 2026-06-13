@@ -1121,6 +1121,236 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ──────────────────────────────────────────────────────────────────────────
+  # Ingest pipeline workers (deploy#440 — the deploy-side half of ingest-platform#83)
+  #
+  # The streaming pipeline (B2 → Kafka → workers → Neo4j) has never run on
+  # staging: Kafka topics sit at offset 0 and NO worker containers exist
+  # (main#601 criterion #1). These four services are the compose definitions;
+  # ingest-platform#83 publishes the images, wires the deploy fan-in, and runs
+  # the pipeline E2E on the box.
+  #
+  # Stage topology — single source of truth is the ingest-platform
+  # `workers/lib/topics.py` (and now `infra/kafka/init-topics.sh`, reconciled
+  # in this PR):
+  #     pipeline.raw.landed → dedup → pipeline.dedup.done → enrich →
+  #     pipeline.enrich.done → normalize → pipeline.normalize.done → ingest
+  #     → Neo4j      (any stage's failures → pipeline.dlq)
+  #
+  # PROFILE-GATED — all four carry `profiles: ["pipeline"]`, so a plain
+  # `docker compose up -d` (what deploy-stg.yml / deploy-prod.yml run) does NOT
+  # start them. This lets the definitions land now — BEFORE ingest-platform#83
+  # publishes the worker image to GHCR — without breaking app deploys (an
+  # unpublished image would otherwise hard-fail the `compose up` pull). The
+  # deploy-stg pre-flight GHCR manifest check (PULL_SERVICES) likewise does not
+  # include these. `docker compose config` still validates them. ip#83 brings
+  # them up with `docker compose --profile pipeline up -d` once the image exists.
+  #
+  # IMAGE CONTRACT for ip#83: a single multi-worker image published to
+  # `ghcr.io/noorinalabs/noorinalabs-isnad-ingest-platform` containing all of
+  # `workers.{dedup,enrich,normalize,ingest}`; the per-service `command:` below
+  # selects the stage. `INGEST_IMAGE_TAG` is independent of the isnad-graph
+  # `IMAGE_TAG` and user-service `USER_SERVICE_IMAGE_TAG` (per-service tag
+  # routing, deploy#418) and defaults to `stg-latest` — its own last-good
+  # pointer. (If ip#83 prefers four per-worker images, each `image:` line below
+  # is a one-token change; the single-image form is the lighter contract.)
+  #
+  # CREDENTIALS — no new secret keys. The workers read S3-style env
+  # (PIPELINE_BUCKET / S3_ENDPOINT_URL / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+  # via boto3; the deploy stack already owns these as the PIPELINE_B2_* family
+  # (write-deploy-env + deploy-stg `env_keys`), mapped in the environment block
+  # below. Checkpoints persist to Postgres (INGEST_CHECKPOINT_BACKEND=pg, PG_DSN
+  # built from the existing POSTGRES_* vars, same form as the api service).
+  #
+  # NETWORKS — `backend` (internal) for kafka:9092 / neo4j:7687 / postgres:5432,
+  # plus `egress` (outbound-only) for B2 over HTTPS, mirroring the
+  # user-service / alertmanager split. `backend` is `internal: true`, so without
+  # `egress` the workers could not reach Backblaze.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  dedup-worker:
+    image: ghcr.io/noorinalabs/noorinalabs-isnad-ingest-platform:${INGEST_IMAGE_TAG:-stg-latest}
+    profiles: ["pipeline"]
+    # Selects the pipeline stage from the multi-worker image (overrides CMD).
+    command: ["python", "-m", "workers.dedup.main"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=128M
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      INGEST_CHECKPOINT_BACKEND: "pg"
+      PG_DSN: "postgresql://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}"
+      PIPELINE_BUCKET: "${PIPELINE_B2_BUCKET:-noorinalabs-pipeline}"
+      S3_ENDPOINT_URL: "${PIPELINE_B2_ENDPOINT:-https://s3.us-east-005.backblazeb2.com}"
+      AWS_ACCESS_KEY_ID: "${PIPELINE_B2_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${PIPELINE_B2_KEY}"
+      AWS_DEFAULT_REGION: "${PIPELINE_B2_REGION:-us-east-005}"
+      LOG_LEVEL: "INFO"
+      LOG_FORMAT: "json"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
+          cpus: "0.1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  enrich-worker:
+    image: ghcr.io/noorinalabs/noorinalabs-isnad-ingest-platform:${INGEST_IMAGE_TAG:-stg-latest}
+    profiles: ["pipeline"]
+    command: ["python", "-m", "workers.enrich.main"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=128M
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      INGEST_CHECKPOINT_BACKEND: "pg"
+      PG_DSN: "postgresql://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}"
+      PIPELINE_BUCKET: "${PIPELINE_B2_BUCKET:-noorinalabs-pipeline}"
+      S3_ENDPOINT_URL: "${PIPELINE_B2_ENDPOINT:-https://s3.us-east-005.backblazeb2.com}"
+      AWS_ACCESS_KEY_ID: "${PIPELINE_B2_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${PIPELINE_B2_KEY}"
+      AWS_DEFAULT_REGION: "${PIPELINE_B2_REGION:-us-east-005}"
+      LOG_LEVEL: "INFO"
+      LOG_FORMAT: "json"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
+          cpus: "0.1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  normalize-worker:
+    image: ghcr.io/noorinalabs/noorinalabs-isnad-ingest-platform:${INGEST_IMAGE_TAG:-stg-latest}
+    profiles: ["pipeline"]
+    command: ["python", "-m", "workers.normalize.main"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=128M
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      INGEST_CHECKPOINT_BACKEND: "pg"
+      PG_DSN: "postgresql://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}"
+      PIPELINE_BUCKET: "${PIPELINE_B2_BUCKET:-noorinalabs-pipeline}"
+      S3_ENDPOINT_URL: "${PIPELINE_B2_ENDPOINT:-https://s3.us-east-005.backblazeb2.com}"
+      AWS_ACCESS_KEY_ID: "${PIPELINE_B2_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${PIPELINE_B2_KEY}"
+      AWS_DEFAULT_REGION: "${PIPELINE_B2_REGION:-us-east-005}"
+      LOG_LEVEL: "INFO"
+      LOG_FORMAT: "json"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
+          cpus: "0.1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  # graph-load stage. Terminal worker: consumes pipeline.normalize.done and
+  # MERGEs nodes/edges into Neo4j (hence the extra NEO4J_* env + neo4j
+  # dependency). Module is `workers.ingest.main` (the ip repo's name for the
+  # graph-load stage).
+  graph-load-worker:
+    image: ghcr.io/noorinalabs/noorinalabs-isnad-ingest-platform:${INGEST_IMAGE_TAG:-stg-latest}
+    profiles: ["pipeline"]
+    command: ["python", "-m", "workers.ingest.main"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=128M
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      INGEST_CHECKPOINT_BACKEND: "pg"
+      PG_DSN: "postgresql://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}"
+      PIPELINE_BUCKET: "${PIPELINE_B2_BUCKET:-noorinalabs-pipeline}"
+      S3_ENDPOINT_URL: "${PIPELINE_B2_ENDPOINT:-https://s3.us-east-005.backblazeb2.com}"
+      AWS_ACCESS_KEY_ID: "${PIPELINE_B2_KEY_ID}"
+      AWS_SECRET_ACCESS_KEY: "${PIPELINE_B2_KEY}"
+      AWS_DEFAULT_REGION: "${PIPELINE_B2_REGION:-us-east-005}"
+      # NEO4J_USER must be "neo4j" — Neo4j requires the admin account name.
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}"
+      LOG_LEVEL: "INFO"
+      LOG_FORMAT: "json"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
 networks:
   backend:
     driver: bridge
