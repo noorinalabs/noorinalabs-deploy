@@ -14,6 +14,12 @@ name: DB Migrate (user-service alembic)
 # divergence `alembic upgrade head` alone would mask). Bump EXPECTED_MERGE_HEAD
 # (below) in lockstep whenever user-service adds a migration — deploy#407 was a
 # wedged stg deploy caused by `0041` landing (us#54/#520) without this bump.
+#
+# Post-migrate admin bootstrap (deploy#426): right after `alembic upgrade head`
+# the same SSH step reasserts the `admin` role grant on the bootstrap account via
+# user-service's idempotent scripts/bootstrap_admin.py (us#159). It is
+# best-effort and never fails the gate — see the step body and
+# docs/runbooks/user-service-alembic.md#admin-bootstrap.
 
 on:
   workflow_call:
@@ -213,6 +219,61 @@ jobs:
               /app/.venv/bin/alembic upgrade head
 
             echo "==> [${ENV_NAME}] alembic upgrade head succeeded"
+
+            # -------- post-migrate: reassert admin grant (deploy#426) --------
+            # Idempotently grant the `admin` role to the bootstrap account using
+            # user-service's unattended-safe bootstrap script (us#159 / PR #160).
+            # Runs against the just-migrated DB, reusing the SAME one-shot image,
+            # DATABASE_URL, and docker network the alembic step above used.
+            #
+            # Best-effort by design — it NEVER fails the migration gate:
+            #   * No-op exit 0 when the bootstrap account does not exist yet. The
+            #     account is OAuth-only, so on a brand-new env this correctly
+            #     no-ops until the owner logs in once via Google OAuth; the grant
+            #     then lands on the NEXT deploy. `set -e` tolerates this (exit 0).
+            #   * Idempotent across deploys — a second run reports `already_admin`
+            #     and exits 0 (no duplicate grant).
+            #   * A BootstrapError (exit 1, e.g. the `admin` role is missing)
+            #     is essentially impossible here because `alembic upgrade head`
+            #     just succeeded above and migration 0001 seeds that role. If it
+            #     somehow fires we LOG it loudly but do NOT abort: the `migrated`
+            #     output the promotion workflow gates on must reflect the alembic
+            #     result only, never the admin reassertion. Hence `set +e` around
+            #     the run and an explicit rc check (not a bare `set -e` abort).
+            #
+            # Config sourcing (not hardcoded in the pipeline):
+            #   * DATABASE_URL — the asyncpg URL assembled above from the VPS
+            #     .env USER_POSTGRES_* values. Passed as an ENV var (NOT on argv)
+            #     so the password-bearing URL never lands in /proc/<pid>/cmdline
+            #     or the one-shot container's PID-1 argv (CWE-214 — Nino, security
+            #     review). The script's _resolve_database_url() falls back to the
+            #     app settings' effective_database_url, which reads DATABASE_URL
+            #     from env; every other Settings field has a default, so the
+            #     one-shot container needs no further config. Mirrors the adjacent
+            #     alembic invocations, which also pass DATABASE_URL via -e.
+            #   * BOOTSTRAP_ADMIN_EMAIL — read from the VPS .env (exported by the
+            #     `set -a; . ./.env` sourcing above). Absent → the script's own
+            #     default (the owner's bootstrap email). Like USER_POSTGRES_*,
+            #     it is intentionally sourced from the VPS env-file, not pushed
+            #     through the GH Actions transport.
+            echo "==> [${ENV_NAME}] post-migrate: reassert admin grant (bootstrap_admin.py)"
+            set +e
+            docker run --rm \
+              --network noorinalabs_user-backend \
+              -e DATABASE_URL="${DATABASE_URL}" \
+              -e BOOTSTRAP_ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:-}" \
+              "${IMAGE}" \
+              /app/.venv/bin/python scripts/bootstrap_admin.py
+            BOOTSTRAP_RC=$?
+            set -e
+            if [ "${BOOTSTRAP_RC}" -eq 0 ]; then
+              echo "==> [${ENV_NAME}] admin bootstrap completed (rc=0: granted / already_admin / no-op user-not-found)"
+            else
+              echo "WARNING: [${ENV_NAME}] admin bootstrap exited ${BOOTSTRAP_RC}." >&2
+              echo "         This does NOT fail the migration gate (alembic upgrade head already succeeded)." >&2
+              echo "         rc=1 means BootstrapError — most likely the 'admin' role is missing despite a" >&2
+              echo "         successful migrate. Investigate per docs/runbooks/user-service-alembic.md#admin-bootstrap." >&2
+            fi
 
       - name: Record migration result
         id: record

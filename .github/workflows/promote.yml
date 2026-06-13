@@ -944,6 +944,17 @@ jobs:
   trigger-prod-deploy:
     name: Trigger prod VPS rollout
     needs: [plan, retag]
+    # Explicit guard (deploy#427). Without an `if:`, this job inherits the
+    # implicit `if: success()`, which GitHub evaluates over the TRANSITIVE
+    # needs closure — not just direct needs. `retag` deliberately survives a
+    # skipped `migrate-prod` (its own `always() && …` above), but the implicit
+    # success() here re-sees that skipped `migrate-prod` ancestor through
+    # `retag` and returns false, so the rollout silently skipped on every
+    # api/frontend-only promotion (migrate-prod gated on user-service). Key
+    # only on the DIRECT needs instead — `retag` already encodes the
+    # gate-stg-verify + migrate-prod acceptability, so retag==success is
+    # sufficient. Same pattern `retag` uses to ignore a skipped ancestor.
+    if: ${{ always() && needs.plan.result == 'success' && needs.retag.result == 'success' }}
     runs-on: ubuntu-latest
     # NOT env-gated — the approval already happened at retag.
     # Firing deploy-prod.yml here is the rollout-execution step.

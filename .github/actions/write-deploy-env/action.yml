@@ -63,6 +63,30 @@ inputs:
     description: "Whitespace-separated compose service names to pull."
     required: false
     default: "api frontend landing user-service"
+  gated_services:
+    description: >-
+      Whitespace-separated compose service names for the health-GATED app+edge
+      tier of a tiered rollout (deploy#429). When non-empty the remote script
+      uses scripts/compose_tiered_up.sh: tier 1 = these services brought up with
+      `up -d --wait` (a still-unhealthy one fails the deploy); their deps are
+      pulled in transitively. tier 2 = every other non-deferred service
+      (observability) brought up NON-gating; tier 3 = `deferred_services` (the
+      pipeline tier) brought up NON-gating so an unhealthy Kafka broker can never
+      abort the app rollout and leave caddy/frontend in `Created`. When empty
+      (stg / default) the legacy single full-stack `up -d --force-recreate
+      --remove-orphans` is used unchanged. Prod passes
+      "caddy frontend landing api user-service".
+    required: false
+    default: ""
+  deferred_services:
+    description: >-
+      Whitespace-separated compose service names for the NON-gating pipeline
+      tier of a tiered rollout (deploy#429) — only consulted when
+      `gated_services` is set. These are brought up LAST and in isolation so
+      their (broker) health never gates the deploy. Prod passes
+      "kafka kafka-init kafka-ui kafka-exporter".
+    required: false
+    default: ""
   extra_env:
     description: >-
       Newline-separated NAME=value pairs of additional non-secret env
@@ -107,6 +131,8 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         GITHUB_ACTOR: ${{ inputs.github_actor }}
         PULL_SERVICES: ${{ inputs.pull_services }}
+        GATED_SERVICES: ${{ inputs.gated_services }}
+        DEFERRED_SERVICES: ${{ inputs.deferred_services }}
         SLACK_WEBHOOK_URL: ${{ inputs.slack_webhook_url }}
       with:
         host: ${{ inputs.ssh_host }}
@@ -118,7 +144,7 @@ runs:
         # the caller is responsible for including everything its
         # env_keys references. The composite's own pass-throughs below
         # are appended via the composite action's `env:` block above.
-        envs: IMAGE_TAG,EXTRA_IMAGE_TAGS,EXTRA_ENV,BASE_DOMAIN,ENV_KEYS,GITHUB_TOKEN,GITHUB_ACTOR,PULL_SERVICES,SLACK_WEBHOOK_URL,${{ inputs.env_keys }}
+        envs: IMAGE_TAG,EXTRA_IMAGE_TAGS,EXTRA_ENV,BASE_DOMAIN,ENV_KEYS,GITHUB_TOKEN,GITHUB_ACTOR,PULL_SERVICES,GATED_SERVICES,DEFERRED_SERVICES,SLACK_WEBHOOK_URL,${{ inputs.env_keys }}
         script: |
           set -euo pipefail
           cd /opt/noorinalabs-deploy
@@ -258,6 +284,46 @@ runs:
           fi
           echo "==> Kafka cluster-id consistent (or fresh volume) — proceeding."
 
+          # Pre-flight: Kafka KRaft stray non-topic directory detector (deploy#428).
+          # The cluster-id check above only compares ids — it passes clean while a
+          # stray dir is still present. apache/kafka's LogManager ALSO fatally
+          # rejects any DIRECTORY at the log-dir root that is not a topic-partition
+          # dir (a Bitnami-era `config/`, a nested `data/`, an ext4 `lost+found/`).
+          # prod's volume kept the old Bitnami layout (stg migrated onto a fresh
+          # volume in #385/#100), so its leftover `config/` crash-looped the broker
+          # with "Found directory .../config, 'config' is not in the form of
+          # topic-partition", aborting the whole stack on kafka-init. Scan the
+          # persisted volume's log-dir root with scripts/kafka_logdir_preflight.sh
+          # (piped into the apache/kafka image over the mounted volume — no bash in
+          # the image, so the scanner is POSIX sh) and fail loud with the runbook
+          # pointer BEFORE compose up. Only a genuine detection (the scanner's
+          # exit 2) aborts; any other non-zero (fresh volume, image not yet pulled,
+          # transient docker error) only WARNs and proceeds — mirroring the
+          # best-effort tolerance of the cluster-id reader above.
+          echo "==> Pre-flight: scanning Kafka log-dir for stray non-topic directories..."
+          stray_rc=0
+          stray_report="$(docker run --rm -i --entrypoint /bin/sh \
+            -v noorinalabs_kafka_data:/data apache/kafka:3.9.2 \
+            -s /data < scripts/kafka_logdir_preflight.sh 2>&1)" || stray_rc=$?
+          if [ "$stray_rc" -eq 2 ]; then
+            echo "ERROR: Kafka log-dir contains stray non-topic directories — apache/kafka's" >&2
+            echo "       LogManager will reject these on start and crash-loop the broker, aborting" >&2
+            echo "       the whole stack at kafka-init's depends_on. Bringing the stack up now would" >&2
+            echo "       repeat the deploy#428 prod outage." >&2
+            echo "$stray_report" | sed 's/^/         /' >&2
+            echo "       Re-bootstrap (wipe + reformat) the volume per" >&2
+            echo "       docs/runbooks/kafka-cluster-id-rebootstrap.md" >&2
+            echo "       § Variant: stray non-topic directories (stg first), then re-run this deploy." >&2
+            echo "       Aborting before compose up." >&2
+            exit 1
+          elif [ "$stray_rc" -ne 0 ]; then
+            echo "==> WARNING: stray-dir pre-flight could not run (rc=$stray_rc) — the volume is" >&2
+            echo "    likely fresh or the apache/kafka image is not pulled yet. Proceeding." >&2
+            [ -n "$stray_report" ] && echo "$stray_report" | sed 's/^/    /' >&2
+          else
+            echo "==> Kafka log-dir clean (no stray non-topic directories) — proceeding."
+          fi
+
           echo "==> Authenticating to GHCR..."
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
           echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
@@ -267,7 +333,20 @@ runs:
           docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull $PULL_SERVICES
 
           echo "==> Starting services..."
-          docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
+          if [ -n "${GATED_SERVICES:-}" ]; then
+            # Tiered bring-up (deploy#429): only the app+edge tier is health-
+            # gated; observability + the pipeline (Kafka) tier are NON-gating, so
+            # an unhealthy non-app service can never abort the rollout and leave
+            # caddy/frontend in `Created` (total edge outage). Prod sets
+            # gated_services + deferred_services; stg leaves them empty and keeps
+            # the legacy single-`up` path below. See scripts/compose_tiered_up.sh.
+            COMPOSE_CMD="docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env" \
+              GATED_SERVICES="$GATED_SERVICES" \
+              DEFERRED_SERVICES="${DEFERRED_SERVICES:-}" \
+              sh scripts/compose_tiered_up.sh
+          else
+            docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d --force-recreate --remove-orphans
+          fi
 
           echo "==> Waiting for services to stabilize..."
           sleep 15

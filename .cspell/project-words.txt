@@ -48,6 +48,7 @@ keypair
 keypairs
 Krishnamurthy
 Kwame
+logdir
 materialises
 minioadmin
 monkeypatch

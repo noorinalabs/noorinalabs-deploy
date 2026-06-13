@@ -1,9 +1,14 @@
-# Runbook: Kafka KRaft cluster-id re-bootstrap (deploy#393)
+# Runbook: Kafka KRaft log-dir re-bootstrap (deploy#393, deploy#428)
 
-**Scope:** the pipeline Kafka broker (`kafka` service in `compose/docker-compose.prod.yml`) failing its healthcheck on a stg or prod deploy because the persisted `kafka_data` volume was formatted with a cluster ID that no longer matches the `KAFKA_CLUSTER_ID` the broker is started with. This is the documented post-migration step from the Bitnami → `apache/kafka:3.9.2` migration (deploy#100 / PR #385) that re-bootstraps the log directory under the new image's storage format.
+**Scope:** the pipeline Kafka broker (`kafka` service in `compose/docker-compose.prod.yml`) failing its healthcheck on a stg or prod deploy because the persisted `kafka_data` volume's KRaft log directory is in a state `apache/kafka:3.9.2` refuses to start on. Two variants are covered, both leftovers from the Bitnami → `apache/kafka:3.9.2` migration (deploy#100 / PR #385), and both fixed by the SAME re-bootstrap (wipe + reformat the log dir under the new image's storage format):
+
+1. **Cluster-id mismatch** (deploy#393) — the volume was formatted with a cluster id that no longer matches the `KAFKA_CLUSTER_ID` the broker is started with → `InconsistentClusterIdException`. See § Why this happens.
+2. **Stray non-topic directories** (deploy#428) — the log-dir root carries a leftover Bitnami-era `config/` dir (and/or a nested `data/`) that apache-kafka's LogManager fatally rejects. See § Variant: stray non-topic directories.
+
+A volume can hit either or both; the recovery (§ Recovery) is identical.
 
 **NOT in scope:**
-- Routine deploys where the broker is already healthy — this runbook only applies to a cluster-id / storage-format mismatch.
+- Routine deploys where the broker is already healthy — this runbook only applies to a cluster-id mismatch or a stray-non-topic-dir rejection in the log dir.
 - App-tier (frontend / api / user-service) outages — Kafka is the ingestion-pipeline tier, not in the app request path. App health is independent (see `RUNBOOK.md`).
 - Topic layout / retention — owned by `infra/kafka/init-topics.sh`, see `docs/pipeline-kafka.md`.
 
@@ -40,6 +45,51 @@ docker run --rm -v noorinalabs_kafka_data:/data alpine \
 If the two `cluster.id` values differ, this runbook applies. If the volume has no `meta.properties`, the broker will format fresh on next boot — no action needed.
 
 > The volume name is `noorinalabs_kafka_data` — compose project `noorinalabs` (the `-p noorinalabs` flag in the deploy scripts) prefixes the `kafka_data` volume declared in `compose/docker-compose.prod.yml`. Confirm with `docker volume ls | grep kafka_data`.
+
+## Variant: stray non-topic directories (deploy#428)
+
+This is a SEPARATE failure mode from the cluster-id mismatch above, with the same root cause class (a Bitnami-era volume layout the apache image rejects) and the same fix.
+
+`apache/kafka`'s `LogManager` scans every entry at the log-dir root on startup and **fatally rejects any directory that is not a Kafka topic-partition dir** (`<topic>-<partition>`, optionally a `.<uniqueId>-delete` / `-future` suffix). A stray `config/` (empty, dated to the Bitnami era) and/or a nested `data/` left over on the volume make the broker abort with:
+
+```
+ERROR Encountered fatal fault: Error starting LogManager
+org.apache.kafka.common.KafkaException: Found directory /var/lib/kafka/data/config,
+'config' is not in the form of topic-partition or topic-partition.uniqueId-delete ...
+Kafka's log directories (and children) should only contain Kafka topic data.
+```
+
+Like the cluster-id case, the broker never reaches healthy and compose aborts the whole stack on `kafka-init`'s `depends_on: condition: service_healthy`, surfacing only as the opaque `dependency failed to start: container noorinalabs-kafka-1 is unhealthy`. This was the proximate cause of the deploy#428 prod outage (observed 2026-06-12 during the deploy#420 prod rollout): prod's volume retained the old Bitnami directory layout, while stg had been migrated onto a fresh volume in the #385/#100 cutover and was clean.
+
+**Note:** the cluster-id pre-flight does NOT catch this — the ids can match while a stray dir is still present. The stray-dir check is a distinct guard.
+
+### Detecting stray directories
+
+The deploy composite (`.github/actions/write-deploy-env`) runs a second pre-flight — `scripts/kafka_logdir_preflight.sh` piped into the `apache/kafka:3.9.2` image over the mounted volume — that scans the log-dir root and **fails loud with a pointer to this section** before `docker compose up`. If you are reading this because that step failed, the offenders are already named in the failure output — proceed to § Recovery.
+
+To confirm manually on the VPS:
+
+```bash
+cd /opt/noorinalabs-deploy
+
+# List the log-dir root; anything that is NOT a "<topic>-<partition>" dir
+# (or a legitimate file: meta.properties, *.checkpoint, *-offset-checkpoint,
+# bootstrap.checkpoint, .lock) is a stray that will crash the broker.
+docker run --rm --entrypoint /bin/sh \
+    -v noorinalabs_kafka_data:/data apache/kafka:3.9.2 \
+    -c 'ls -la /data'
+
+# Or run the same scanner the pre-flight uses (exit 2 ⇒ stray dirs found):
+docker run --rm -i --entrypoint /bin/sh \
+    -v noorinalabs_kafka_data:/data apache/kafka:3.9.2 \
+    -s /data < scripts/kafka_logdir_preflight.sh
+```
+
+A `config/`, `data/`, or `lost+found/` directory at the root means this variant applies. A clean root (only `__cluster_metadata-0/`, topic-partition dirs, and the files above) means it does not.
+
+### Remediation
+
+Identical to the cluster-id case: **wipe + reformat the log dir** per § Recovery below. Wiping `noorinalabs_kafka_data` removes the stray dirs along with the broker state; `apache/kafka` re-formats the empty log dir on next boot and `kafka-init` re-creates the topics. The replay-from-B2 recovery model (§ Why this happens, "Recovery model") applies unchanged — this is **OWNER / pipeline-owner gated** (volume wipe); surface before applying.
 
 ## Recovery (stg first, then prod)
 
@@ -99,10 +149,12 @@ Do stg first. A stg failure is cheap and proves the procedure before touching pr
 | Broker still unhealthy after re-bootstrap on stg | Lucas.Ferreira (SRE) | Aisha.Idrissi (SRE) |
 | Broker unhealthy on prod | Bereket.Tadesse (IM) | Lucas.Ferreira |
 | `meta.properties` cluster-id mismatch detector mis-fires | Lucas.Ferreira | Weronika.Zielinska (Platform Architect) |
+| Stray-non-topic-dir pre-flight mis-fires (flags a valid topic dir) | Nurul.Hakim (Observability) | Bereket.Tadesse (IM) |
 | Topics do not recreate after wipe | Lucas.Ferreira | Nurul.Hakim (Observability) |
 
 ## Related issues
 
-- **deploy#393** — staging deploy red on kafka healthcheck; this runbook authored alongside.
-- **deploy#100 / PR #385** — Bitnami → `apache/kafka:3.9.2` migration. Side-effects table item 1 deferred this re-bootstrap to a post-merge Test Plan step that was never executed — the proximate cause of #393.
+- **deploy#393** — staging deploy red on kafka healthcheck (cluster-id mismatch); this runbook authored alongside.
+- **deploy#428** — prod kafka crash-loop on Bitnami-era stray `config/`/`data/` dirs in `kafka_data`; added the stray-non-topic-dir pre-flight (`scripts/kafka_logdir_preflight.sh`) + the § Variant section above.
+- **deploy#100 / PR #385** — Bitnami → `apache/kafka:3.9.2` migration. Side-effects table item 1 deferred this re-bootstrap to a post-merge Test Plan step that was never executed — the proximate cause of both #393 and #428.
 - **docs/pipeline-kafka.md** — broker topology, topic inventory, cluster-id stability requirement, observability.
