@@ -8,13 +8,15 @@ Consumers live in `noorinalabs-isnad-ingest-platform` (see `#107`). This repo on
 
 | Topic | Retention | Purpose |
 |---|---|---|
-| `pipeline.raw.new` | 7d | A new file has landed in B2 `raw/{source}/{date}/`. Fan-in for dedup worker. |
+| `pipeline.raw.landed` | 7d | A new file has landed in B2 `raw/{source}/{date}/`. Fan-in for dedup worker. |
 | `pipeline.dedup.done` | 3d | Dedup finished → `dedup/{source}/{batch-id}/`. Consumed by enrich. |
 | `pipeline.enrich.done` | 3d | Enrichment finished → `enriched/{source}/{batch-id}/`. Consumed by normalize. |
-| `pipeline.norm.done` | 3d | Normalization finished → `normalized/{batch-id}/`. Consumed by graph-load. |
+| `pipeline.normalize.done` | 3d | Normalization finished → `normalized/{batch-id}/`. Consumed by graph-load. |
 | `pipeline.dlq` | 30d | Dead-letter queue. Any worker failure lands here with the original message plus `error_code` / `error_stage` headers. Manual triage. |
 
-Longer retention on `raw.new` gives operators a replay window after a downstream stage is fixed. DLQ retention is long enough to diagnose intermittent issues without filling disk.
+Topic names are the canonical set from the ingest-platform `workers/lib/topics.py` (naming locked in ip#192). They were reconciled here in deploy#440 — the prior `pipeline.raw.new` / `pipeline.norm.done` names predated that rename, and the deployed workers (which consume `pipeline.raw.landed` / `pipeline.normalize.done`) would never have found their topics with auto-create disabled.
+
+Longer retention on `raw.landed` gives operators a replay window after a downstream stage is fixed. DLQ retention is long enough to diagnose intermittent issues without filling disk.
 
 Defaults for every topic: 3 partitions, replication factor 1, `cleanup.policy=delete`. Retention is enforced by the init script — Kafka UI runs in read-only mode (`KAFKA_UI_READONLY=true`) so operators cannot drift retention out of source control.
 

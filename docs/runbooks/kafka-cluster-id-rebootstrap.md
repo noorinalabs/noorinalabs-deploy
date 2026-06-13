@@ -131,7 +131,7 @@ Do stg first. A stg failure is cheap and proves the procedure before touching pr
        --env-file .env exec kafka \
        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
    ```
-   Expect the 5 pipeline topics: `pipeline.raw.new`, `pipeline.dedup.done`, `pipeline.enrich.done`, `pipeline.norm.done`, `pipeline.dlq`.
+   Expect the 5 pipeline topics: `pipeline.raw.landed`, `pipeline.dedup.done`, `pipeline.enrich.done`, `pipeline.normalize.done`, `pipeline.dlq`.
 
 6. **Confirm observability re-populates:** `kafka-exporter` scrapes the broker over the wire protocol; the Grafana `kafka-pipeline` dashboard broker/topic gauges should come back within a scrape interval. Consumer-group panels stay empty until ingest-platform workers run — that is expected (see `docs/pipeline-kafka.md` § Observability).
 

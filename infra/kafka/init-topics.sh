@@ -2,12 +2,19 @@
 # Initialize pipeline topics on first boot. Idempotent — safe to re-run.
 # Invoked by the kafka-init one-shot service in docker-compose.prod.yml.
 #
+# Topic names are the canonical set from the ingest-platform workers — single
+# source of truth is `workers/lib/topics.py` (naming locked in ip#192:
+# `pipeline.<stage>.<past-tense-event>`). The earlier `pipeline.raw.new` /
+# `pipeline.norm.done` names here predated that rename, so the deployed workers
+# (which consume `pipeline.raw.landed` / `pipeline.normalize.done`) would never
+# have found their topics with auto-create disabled. Reconciled in deploy#440.
+#
 # Topic retention (ms) comes from the pipeline design (issue #106):
-#   pipeline.raw.new       7d   — upstream of dedup; replay window for missed events
-#   pipeline.dedup.done    3d
-#   pipeline.enrich.done   3d
-#   pipeline.norm.done     3d
-#   pipeline.dlq          30d   — failures across all workers; manual triage window
+#   pipeline.raw.landed     7d   — upstream of dedup; replay window for missed events
+#   pipeline.dedup.done     3d
+#   pipeline.enrich.done    3d
+#   pipeline.normalize.done 3d
+#   pipeline.dlq           30d   — failures across all workers; manual triage window
 #
 # Consumer-group naming convention: pipeline.<stage>.<worker-variant>
 #   e.g. pipeline.dedup.v1, pipeline.enrich.v1
@@ -75,11 +82,11 @@ wait_for_broker() {
 main() {
     wait_for_broker
 
-    create_topic "pipeline.raw.new"       7
-    create_topic "pipeline.dedup.done"    3
-    create_topic "pipeline.enrich.done"   3
-    create_topic "pipeline.norm.done"     3
-    create_topic "pipeline.dlq"          30
+    create_topic "pipeline.raw.landed"     7
+    create_topic "pipeline.dedup.done"     3
+    create_topic "pipeline.enrich.done"    3
+    create_topic "pipeline.normalize.done" 3
+    create_topic "pipeline.dlq"           30
 
     echo "kafka-init: topic inventory:"
     kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --list | sort
