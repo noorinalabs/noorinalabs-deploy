@@ -35,7 +35,7 @@ per-secret runbooks the inventory points at; this file does not duplicate them.
 | B2 master key | on-demand | offboarding / suspected compromise | ADR 0004 Decision D (workstation-only) |
 | SSH deploy/root keys | on-demand | offboarding / suspected compromise | [`ssh-key-rotation.md`](ssh-key-rotation.md) |
 | State-resident app secrets (jwt/ghcr/pipeline) | on-demand | the #172 SSE-window defense-in-depth pass | state-resident-secret-rotation runbook ([#193](https://github.com/noorinalabs/noorinalabs-deploy/issues/193)) |
-| DB / cache passwords | on-demand → **target: automated** | compromise; otherwise see § Automated rotation | per-deploy `.env` swap |
+| DB / cache passwords | **automated** (quarterly + on-demand) | scheduled cadence; compromise; offboarding | [`db-password-rotation.md`](db-password-rotation.md) (`rotate-db-passwords.yml`) |
 | OAuth / PAT / webhook | provider | provider rotation / expiry | provider console |
 
 ## On-demand triggers (apply to every class)
@@ -63,19 +63,29 @@ Until a central manager provides one natively (see § Central management):
 This is a **distributed** audit trail, not a single pane — its consolidation is
 part of the central-management decision below.
 
-## Automated rotation — target, not yet built
+## Automated rotation — built (deploy#387)
+
+> **Superseded by [ADR 0007](../adr/0007-central-secrets-manager.md) (Accepted
+> 2026-06-12) + deploy#387.** The "target, not yet built" framing below is
+> historical; automated DB-password rotation now exists.
 
 #11's acceptance asks that **at least database passwords have automated
-rotation**. That automation is **runtime-gated** (needs a live state backend,
-real credentials, and a scheduled runner against the production stack) and is
-**not** delivered by this PR. The shape it should take:
+rotation**. ADR 0007 chose to build this as a **bespoke scheduled GH Actions
+workflow on the GitHub-Environment-secrets baseline** (Option A — no new secrets
+manager), rotating **per-secret** (S1) on a **P2 cadence (quarterly + on-demand)
+with the P3 automated mechanism**:
 
-- A scheduled GH Actions workflow (or central-manager dynamic secret) that mints
-  a new DB password, updates the GH Environment secret, applies it to the running
-  Postgres/Redis, and redeploys — gated on a green health check, with rollback.
-- Until that exists, DB passwords rotate via the on-demand `.env`-swap path
-  (the #126 pattern). **Filing the automation as its own implementation issue is
-  the next step**; it depends on the central-management choice below.
+- **Workflow:** [`.github/workflows/rotate-db-passwords.yml`](../../.github/workflows/rotate-db-passwords.yml)
+  mints a URL-safe value, applies it to the running Postgres/Redis via
+  [`scripts/rotate_db_password.sh`](../../scripts/rotate_db_password.sh)
+  (health-gated, with automatic rollback), and — only on success — writes it to
+  the GH Environment secret. Scheduled runs target **staging**; **production is
+  owner-gated** (manual `workflow_dispatch` behind the `production` Environment
+  approval rule).
+- **Operator runbook:** [`db-password-rotation.md`](db-password-rotation.md) —
+  on-demand trigger, the `SECRETS_ADMIN_TOKEN` prerequisite, recovery, and what
+  is only verifiable at runtime.
+- The on-demand `.env`-swap path (the #126 pattern) remains the manual fallback.
 
 ## Central management — open decision (owner / ADR)
 
