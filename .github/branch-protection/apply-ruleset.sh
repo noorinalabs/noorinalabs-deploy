@@ -87,5 +87,5 @@ gh api "repos/$REPO/rulesets" \
 echo
 echo "Confirm the rules (pull_request req_approvals=0, deletion, non_fast_forward)"
 echo "and the bypass actor in the ruleset detail (gh api repos/$REPO/rulesets/<id>)"
-echo "before declaring #322 met for this repo. required_status_checks is empty by"
-echo "design (deploy CI is path-filtered) — see SPEC.md."
+echo "before declaring #322 met for this repo. required_status_checks is omitted by"
+echo "design (deploy CI is path-filtered; the API 422s on an empty array) — see SPEC.md."
