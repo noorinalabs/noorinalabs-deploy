@@ -23,6 +23,7 @@ consumergroup
 cookieless
 creds
 cutover
+deadmansswitch
 dedup
 Diallo
 diffable
@@ -36,6 +37,7 @@ footgun
 gatekeeping
 Hadid
 healthcheck
+Healthchecks
 Hiro
 Idrissi
 imagetools
@@ -77,10 +79,14 @@ regen
 Renaud
 retag
 retagging
+runbook
+runbooks
 runcmd
 Ríos
 scrapable
+smarthost
 Sunita
+swappable
 Tadesse
 Tanaka
 Tariq

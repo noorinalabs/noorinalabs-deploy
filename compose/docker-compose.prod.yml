@@ -632,6 +632,16 @@ services:
       # fresh clones. The deploy workflow writes the real secret to
       # `slack_webhook_url.secret` (gitignored) and overrides this var.
       - ../infra/alertmanager/${SLACK_WEBHOOK_FILE:-slack_webhook_url.secret.example}:/etc/alertmanager/slack_webhook_url:ro
+      # Email-backup SMTP password (deploy#452) and Healthchecks.io ping URL
+      # (deploy#453, dead-man's switch). Same `*_file` secret pattern as the
+      # Slack webhook: each defaults to its in-tree `.example` placeholder
+      # (literal "<unset>") so `docker compose config` resolves in CI and on
+      # fresh clones; the deploy workflow writes the real secret to the
+      # gitignored `.secret` file and overrides the FILE var. Resolved at send
+      # time, not config-load, so a "<unset>" placeholder loads cleanly and the
+      # channel is simply a no-op until the secret is set.
+      - ../infra/alertmanager/${SMTP_PASSWORD_FILE:-smtp_password.secret.example}:/etc/alertmanager/smtp_password:ro
+      - ../infra/alertmanager/${HEALTHCHECKS_URL_FILE:-healthchecks_url.secret.example}:/etc/alertmanager/healthchecks_url:ro
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
