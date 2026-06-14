@@ -36,17 +36,8 @@ fixed before the next PR in the offending service merges.
 
 | Path | Owner | Notes |
 |---|---|---|
-| `/auth/callback/*` | frontend | OAuth post-login UI render (`AuthCallbackPage`); MUST be matched **before** `/auth/*` — see Caddyfile comment block at line 32. |
-| `/auth/*` | user-service | OAuth provider redirects (`/auth/oauth/{provider}/login`, `/auth/oauth/{provider}/callback`), login, logout, refresh. |
-| `/.well-known/jwks.json` | user-service | JWT verifier discovery (IETF well-known). |
-| `/api/v1/users`, `/api/v1/users/*` | user-service | User CRUD. |
-| `/api/v1/sessions`, `/api/v1/sessions/*` | user-service | Session lifecycle. |
-| `/api/v1/subscriptions`, `/api/v1/subscriptions/*` | user-service | Billing / subscription. |
-| `/api/v1/verification`, `/api/v1/verification/*` | user-service | Email / phone verification. |
-| `/api/v1/roles`, `/api/v1/roles/*` | user-service | RBAC role assignment. |
-| `/api/v1/2fa`, `/api/v1/2fa/*` | user-service | 2FA enroll / verify (TOTP). |
-| `/api/v1/user-service/health` | user-service | Rewritten to `/health` on user-service — explicit so the isnad-vhost can probe user-service liveness without colliding with the isnad-graph-api `/health`. |
-| `/api/*` (everything else) | isnad-graph-api | Catch-all for the isnad-graph domain. |
+| `/auth/callback/*` | frontend | OAuth post-login UI render (`AuthCallbackPage`); the **only** `/auth/*` path that stays on this vhost post-#245. Matched before the `/api/*` catch-all — see Caddyfile comment block. |
+| `/api/*` | isnad-graph-api | The entire `/api/*` space on this vhost. All user-service routes (`/auth/*`, JWKS, `/api/v1/{users,sessions,subscriptions,verification,roles,2fa}`, and the `/api/v1/user-service/health` rewrite) were **removed** from `isnad.*` in #245 phase 2 (commit `e321e9a7`) and now live solely on `users.{$BASE_DOMAIN}` — see "Vhost split" below. A request for any of those paths on `isnad.*` now hits this catch-all (→ isnad-graph-api 404) or the SPA fallthrough, by design; monitoring probes for them target `users.*` (deploy#449). |
 | `/health` | isnad-graph-api | Liveness probe for isnad-graph-api on this vhost. |
 | `/status` | isnad-graph-api | Status endpoint for isnad-graph-api. |
 | `/metrics` | (none — 403) | Prometheus scrapes `api:8000/metrics` directly via the Docker backend network. |
@@ -97,29 +88,36 @@ in the Caddyfile at line 232.
    isnad-graph-api `/api/*` catch-all. See Caddyfile comment at line 32 for
    the documented precedent.
 
-## Vhost split (post-#241)
+## Vhost split (complete — post-#245)
 
-Post-#241, user-service routes are **dual-bound** on `users.{$BASE_DOMAIN}`
-AND `isnad.{$BASE_DOMAIN}`. This is the pragmatic two-phase migration
-completion documented in the Caddyfile comment at line 18:
+The user-service vhost split is **done**. The migration ran in two phases,
+documented in the Caddyfile comment block on the `isnad.{$BASE_DOMAIN}` site:
 
-- **Phase 1 (current):** dual-binding both vhosts because the frontend
-  hard-codes relative URLs (`/auth/oauth/{provider}/login`, `/api/v1/users`,
-  …) — see `frontend/src/hooks/useAuth.ts` and
-  `frontend/src/pages/LoginPage.tsx`. Removing the user-service routes from
-  `isnad.*` entirely would break login.
-- **Phase 2 (#245):** update the frontend to issue absolute URLs targeting
-  `users.{$BASE_DOMAIN}`, then drop the user-service `handle` blocks from
-  `isnad.*`.
+- **Phase 1 (#241, 2026-05-02):** dual-bound user-service routes on
+  `users.{$BASE_DOMAIN}` AND `isnad.{$BASE_DOMAIN}` because the frontend then
+  hard-coded relative URLs (`/auth/oauth/{provider}/login`, `/api/v1/users`,
+  …). Removing the routes from `isnad.*` at that point would have broken login.
+- **Phase 2 (#245, commit `e321e9a7`):** the frontend cut over to absolute URLs
+  resolved from `window.RUNTIME_CONFIG.USER_SERVICE_ORIGIN =
+  https://users.{$BASE_DOMAIN}` (isnad-graph#932/#934), so the dual-bind was no
+  longer load-bearing and the user-service `handle` blocks were dropped from
+  `isnad.*`. That vhost is now a **pure frontend + isnad-graph-API surface**;
+  the only `/auth/*` path it keeps is the `/auth/callback/*` frontend carve-out
+  (AuthCallbackPage). All user-service routes — `/auth/*`, JWKS, the
+  `/api/v1/*` user prefixes, and the `/api/v1/user-service/health` rewrite —
+  live **solely** on `users.{$BASE_DOMAIN}`.
 
-Until #245 lands, **the partition table above applies to BOTH vhosts** for
-the user-service-owned prefixes — i.e., a new user-service prefix must be
-added to **both** the `isnad.{$BASE_DOMAIN}` block (transitional) and the
-`users.{$BASE_DOMAIN}` block (permanent).
+**Consequence for monitoring (deploy#449):** the post-deploy smoke battery
+(`scripts/verify_{stg,prod}_smoke.sh`) moved its user-service checks to
+`USER_SERVICE_BASE_URL` (the `users.*` vhost) in #414. The Prometheus blackbox
+probes (`infra/prometheus/prometheus.{stg,prod}.yml`) were left probing
+`isnad.*` and so 404'd / fell through to the SPA for those paths; deploy#449
+re-pointed them to `users.*` to re-align with the smoke battery and the
+runtime truth. The regression guard `scripts/tests/test_blackbox_partition.py`
+asserts that no user-service-owned probe targets the `isnad.*` host.
 
-After #245 lands, the user-service rows in the `isnad.{$BASE_DOMAIN}`
-partition table can be removed; the `/auth/callback/*` → frontend carve-out
-and the isnad-graph-api rows remain.
+**Rule going forward:** a new user-service prefix is added to the
+`users.{$BASE_DOMAIN}` block **only** — never to `isnad.*`.
 
 ## References
 
