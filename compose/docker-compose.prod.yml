@@ -5,6 +5,19 @@
 # All application services use pre-built GHCR images (no build contexts).
 # Infrastructure services (neo4j, databases, observability) are configured here.
 
+# Shared log-rotation policy (deploy#450). The VPS docker daemon runs the
+# json-file log driver with NO /etc/docker/daemon.json limits, so any service
+# without an explicit `logging:` block writes an UNBOUNDED container log — a
+# disk-exhaustion risk on the space-constrained VPS. Every service below sets
+# `logging: *default-logging`, so a per-container log is capped at
+# max-size × max-file = 10m × 5 = ~50MB and coverage cannot drift as new
+# services are added (a service without the alias is an obvious review miss).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   neo4j:
     build:
@@ -36,11 +49,7 @@ services:
         reservations:
           memory: 4G
           cpus: "2.0"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *default-logging
     networks:
       - backend
     restart: unless-stopped
@@ -69,11 +78,7 @@ services:
         reservations:
           memory: 1G
           cpus: "0.5"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *default-logging
     networks:
       - backend
     restart: unless-stopped
@@ -102,11 +107,7 @@ services:
         reservations:
           memory: 256M
           cpus: "0.25"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - backend
     restart: unless-stopped
@@ -129,6 +130,16 @@ services:
     tmpfs:
       # Python stdlib (tempfile, multiprocessing) and uvicorn need a writable /tmp
       - /tmp:size=256M
+    volumes:
+      # Shared writable overrides file for Loki's hot-reloadable retention
+      # (deploy#451). The admin "log retention (days)" control (ig#1038) writes
+      # /etc/loki/runtime/overrides.yaml here (in-place truncate-write); Loki
+      # mounts the SAME `loki_runtime` volume read-side and picks the new value
+      # up on its next runtime_config reload (30s) + compaction cycle (10m), with
+      # no Loki restart. The read_only rootfs above does NOT apply to mounted
+      # volumes, so this write path works. Until ig#1038 ships this mount is
+      # inert (nothing writes it); Loki keeps serving the seeded 168h default.
+      - loki_runtime:/etc/loki/runtime
     environment:
       - NEO4J_URI=bolt://neo4j:7687
       # NEO4J_USER must be "neo4j" — Neo4j requires the admin account to use this name
@@ -171,11 +182,7 @@ services:
         reservations:
           memory: 512M
           cpus: "0.5"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *default-logging
     networks:
       - backend
       - frontend
@@ -232,11 +239,7 @@ services:
         reservations:
           memory: 128M
           cpus: "0.25"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - frontend
     restart: unless-stopped
@@ -269,11 +272,7 @@ services:
         reservations:
           memory: 64M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - frontend
     restart: unless-stopped
@@ -323,11 +322,7 @@ services:
         reservations:
           memory: 64M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *default-logging
     networks:
       - backend
       - frontend
@@ -397,11 +392,7 @@ services:
     # migration is fundamentally broken. `no` is the correct choice — the
     # non-zero exit cascades to user-service's depends_on block.
     restart: "no"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   user-service:
     image: ghcr.io/noorinalabs/noorinalabs-user-service:${USER_SERVICE_IMAGE_TAG:-latest}
@@ -475,11 +466,7 @@ services:
         reservations:
           memory: 256M
           cpus: "0.25"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *default-logging
     networks:
       # egress is non-internal — gives user-service outbound reach for OAuth
       # provider calls (Google, GitHub, etc.). Caddy reaches user-service for
@@ -517,11 +504,7 @@ services:
         reservations:
           memory: 512M
           cpus: "0.25"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *default-logging
     networks:
       - user-backend
     restart: unless-stopped
@@ -547,11 +530,7 @@ services:
         limits:
           memory: 512M
           cpus: "0.5"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     networks:
       - user-backend
     restart: unless-stopped
@@ -579,6 +558,7 @@ services:
         limits:
           memory: 128M
           cpus: "0.25"
+    logging: *default-logging
 
   # --- Observability ---
 
@@ -612,6 +592,7 @@ services:
         limits:
           memory: 1G
           cpus: "0.5"
+    logging: *default-logging
 
   alertmanager:
     image: prom/alertmanager:v0.28.1
@@ -632,6 +613,16 @@ services:
       # fresh clones. The deploy workflow writes the real secret to
       # `slack_webhook_url.secret` (gitignored) and overrides this var.
       - ../infra/alertmanager/${SLACK_WEBHOOK_FILE:-slack_webhook_url.secret.example}:/etc/alertmanager/slack_webhook_url:ro
+      # Email-backup SMTP password (deploy#452) and Healthchecks.io ping URL
+      # (deploy#453, dead-man's switch). Same `*_file` secret pattern as the
+      # Slack webhook: each defaults to its in-tree `.example` placeholder
+      # (literal "<unset>") so `docker compose config` resolves in CI and on
+      # fresh clones; the deploy workflow writes the real secret to the
+      # gitignored `.secret` file and overrides the FILE var. Resolved at send
+      # time, not config-load, so a "<unset>" placeholder loads cleanly and the
+      # channel is simply a no-op until the secret is set.
+      - ../infra/alertmanager/${SMTP_PASSWORD_FILE:-smtp_password.secret.example}:/etc/alertmanager/smtp_password:ro
+      - ../infra/alertmanager/${HEALTHCHECKS_URL_FILE:-healthchecks_url.secret.example}:/etc/alertmanager/healthchecks_url:ro
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"
@@ -660,11 +651,7 @@ services:
         reservations:
           memory: 64M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   grafana:
     image: grafana/grafana:11.6.0
@@ -705,12 +692,48 @@ services:
         limits:
           memory: 512M
           cpus: "0.5"
+    logging: *default-logging
+
+  # One-shot seed for Loki's hot-reloadable retention overrides (deploy#451).
+  # Copies the in-tree default overrides file into the writable `loki_runtime`
+  # volume IFF the volume has no overrides.yaml yet — so an admin-set retention
+  # (ig#1038) persists across redeploys and is NOT clobbered by the repo copy on
+  # every `compose up`. Mirrors the kafka-init / minio-setup one-shot idiom.
+  # The chmod makes the file/dir writable by the (non-root) api container uid that
+  # rewrites it — it lives only on the internal `backend` network and holds a
+  # retention duration, so the broad mode is acceptable for this internal config.
+  # busybox is ~4MB — negligible on the space-constrained VPS.
+  loki-runtime-init:
+    image: busybox:1.37
+    command:
+      - /bin/sh
+      - -c
+      - |
+        if [ ! -f /runtime/overrides.yaml ]; then
+          cp /seed/runtime-overrides.yaml /runtime/overrides.yaml;
+          echo "seeded Loki runtime overrides from in-tree default";
+        else
+          echo "Loki runtime overrides already present — leaving admin-set value intact";
+        fi;
+        chmod 666 /runtime/overrides.yaml;
+        chmod 777 /runtime
+    volumes:
+      - ../infra/loki/runtime-overrides.yaml:/seed/runtime-overrides.yaml:ro
+      - loki_runtime:/runtime
+    networks:
+      - backend
+    restart: "no"
+    logging: *default-logging
 
   loki:
     image: grafana/loki:2.9.10
     volumes:
       - ../infra/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
       - loki_data:/loki
+      # Hot-reloadable per-tenant retention overrides (deploy#451). Loki reads
+      # /etc/loki/runtime/overrides.yaml here every runtime_config.period (30s);
+      # seeded by loki-runtime-init, rewritten by the api (ig#1038 admin control).
+      - loki_runtime:/etc/loki/runtime
     command:
       - "-config.file=/etc/loki/local-config.yaml"
     ports:
@@ -721,6 +744,11 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    depends_on:
+      # Ensure the overrides file exists before Loki loads runtime_config, so the
+      # first start always sees a valid file (else Loki logs a load error).
+      loki-runtime-init:
+        condition: service_completed_successfully
     networks:
       - backend
     restart: unless-stopped
@@ -732,11 +760,7 @@ services:
         reservations:
           memory: 256M
           cpus: "0.25"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   alloy:
     # Successor to promtail (deploy#132). River config in infra/alloy/config.alloy
@@ -786,11 +810,7 @@ services:
         reservations:
           memory: 64M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   node-exporter:
     image: prom/node-exporter:v1.9.1
@@ -832,6 +852,7 @@ services:
         limits:
           memory: 128M
           cpus: "0.25"
+    logging: *default-logging
 
   postgres-exporter:
     image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
@@ -855,6 +876,7 @@ services:
         limits:
           memory: 128M
           cpus: "0.25"
+    logging: *default-logging
 
   # blackbox-exporter — continuous external probing of prod public routes
   # (companion to scripts/verify_prod_smoke.sh post-deploy battery, see deploy#183).
@@ -887,11 +909,7 @@ services:
         reservations:
           memory: 32M
           cpus: "0.05"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   # --- Pipeline messaging (Kafka KRaft, single-node) ---
   #
@@ -986,11 +1004,7 @@ services:
         reservations:
           memory: 512M
           cpus: "0.5"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
+    logging: *default-logging
 
   kafka-init:
     # One-shot topic creation. Idempotent: uses --if-not-exists. Exits 0 on success.
@@ -1016,11 +1030,7 @@ services:
     networks:
       - backend
     restart: "no"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   kafka-exporter:
     # Prometheus exporter for Kafka broker + consumer-group metrics (deploy#88).
@@ -1075,11 +1085,7 @@ services:
         reservations:
           memory: 32M
           cpus: "0.05"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   kafka-ui:
     # Admin console for Kafka. Bound to loopback on the VPS — operators reach it
@@ -1115,11 +1121,7 @@ services:
         reservations:
           memory: 128M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   # ──────────────────────────────────────────────────────────────────────────
   # Ingest pipeline workers (deploy#440 — the deploy-side half of ingest-platform#83)
@@ -1205,11 +1207,7 @@ services:
         reservations:
           memory: 128M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     restart: unless-stopped
 
   enrich-worker:
@@ -1248,11 +1246,7 @@ services:
         reservations:
           memory: 128M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     restart: unless-stopped
 
   normalize-worker:
@@ -1291,11 +1285,7 @@ services:
         reservations:
           memory: 128M
           cpus: "0.1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     restart: unless-stopped
 
   # graph-load stage. Terminal worker: consumes pipeline.normalize.done and
@@ -1344,11 +1334,7 @@ services:
         reservations:
           memory: 256M
           cpus: "0.25"
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
     restart: unless-stopped
 
 networks:
@@ -1378,6 +1364,9 @@ volumes:
   caddy_data:
   caddy_config:
   loki_data:
+  # Writable, persisted store for Loki's runtime retention overrides (deploy#451).
+  # Shared rw between loki-runtime-init (seed), loki (read), and api (admin write).
+  loki_runtime:
   kafka_data:
   user_pg_data:
   user_redis_data:

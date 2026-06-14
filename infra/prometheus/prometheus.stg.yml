@@ -75,18 +75,31 @@ scrape_configs:
     metrics_path: /probe
     scrape_interval: 60s
     scrape_timeout: 10s
+    # Host partition (post-#245/#414, fixed in deploy#449): the isnad.* vhost
+    # is a pure frontend + isnad-graph-API surface — the user-service routes
+    # (`/auth/*`, JWKS, the `/api/v1/user-service/health` rewrite) were dropped
+    # from it when the frontend cut over to absolute users.* URLs (#245 phase 2,
+    # commit e321e9a7). The user-service-owned probes below therefore target
+    # the canonical `users.stg.noorinalabs.com` vhost, NOT isnad.*. This
+    # re-aligns the blackbox surface with the post-deploy smoke battery, which
+    # already moved these checks to USER_SERVICE_BASE_URL in #414
+    # (scripts/verify_stg_smoke.sh). Probing them on isnad.* hit the
+    # isnad-graph-api `/api/*` catch-all (→ 404) / SPA fallthrough → red probes
+    # for routes that were never broken — the drift this comment closes.
     static_configs:
       - targets: ["https://isnad.stg.noorinalabs.com/health"]
         labels: { route: "isnad-health", module: "http_2xx_json" }
-      - targets: ["https://isnad.stg.noorinalabs.com/api/v1/user-service/health"]
+      # user-service liveness via its own vhost; smoke battery uses the same
+      # USER_SERVICE_BASE_URL/health (the isnad-vhost rewrite was retired #414).
+      - targets: ["https://users.stg.noorinalabs.com/health"]
         labels: { route: "user-service-health", module: "http_2xx" }
       - targets: ["https://stg.noorinalabs.com/"]
         labels: { route: "landing-root", module: "http_2xx" }
       - targets: ["https://isnad.stg.noorinalabs.com/api/v1/narrators?limit=1"]
         labels: { route: "narrator-401", module: "http_401_json" }
-      - targets: ["https://isnad.stg.noorinalabs.com/.well-known/jwks.json"]
+      - targets: ["https://users.stg.noorinalabs.com/.well-known/jwks.json"]
         labels: { route: "jwks", module: "http_2xx_json" }
-      - targets: ["https://isnad.stg.noorinalabs.com/auth/oauth/google/login"]
+      - targets: ["https://users.stg.noorinalabs.com/auth/oauth/google/login"]
         labels: { route: "auth-login-redirect", module: "http_2xx_json" }
     relabel_configs:
       - source_labels: [__address__]

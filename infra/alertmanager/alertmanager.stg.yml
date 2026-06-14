@@ -1,7 +1,26 @@
 global:
   resolve_timeout: 5m
 
-# STG alertmanager config (deploy#262 receiver wiring; deploy#263 per-env split).
+  # ── Email (independent backup channel) — SMTP settings ────────────────
+  # Email is a SECOND, independent delivery path (different failure domain
+  # than Slack) so a Slack/webhook outage doesn't blind the operator
+  # (deploy#452). Only the password is a secret: it is read at runtime from
+  # `smtp_auth_password_file` (the `*_file` pattern, same as Slack's
+  # api_url_file). The smarthost / from / username below are NON-secret
+  # config — the OWNER edits these literals to point at a real relay (e.g.
+  # a Gmail app-password account or a transactional SMTP free tier) and
+  # redeploys. Editing them is a config-only change (no image rebuild).
+  # While they hold the `.invalid` placeholder the email notifier simply
+  # fails-and-logs; Slack delivery is unaffected (independent notifiers).
+  smtp_smarthost: "smtp.example.com:587"                     # OWNER: real SMTP relay host:port
+  smtp_from: "noorinalabs-alerts@example.invalid"           # OWNER: From address
+  smtp_auth_username: "noorinalabs-alerts@example.invalid"  # OWNER: SMTP username
+  smtp_auth_password_file: /etc/alertmanager/smtp_password  # secret (deploy secret SMTP_PASSWORD)
+  smtp_require_tls: true
+
+# STG alertmanager config (deploy#262 receiver wiring; deploy#263 per-env split;
+# deploy#452 email backup + swappable-channel structure; deploy#453 dead-man's
+# switch).
 #
 # See alertmanager.prod.yml for the receiver-wiring rationale and the
 # api_url_file pattern. The only stg-vs-prod difference is the Slack channel
@@ -12,6 +31,14 @@ global:
 # Stg alerts are intentionally less aggressive: `repeat_interval` 8h for default
 # (vs 4h prod) so noise from stg-specific churn doesn't drown out operator
 # attention. Critical stays at 1h to preserve incident-grade signal.
+#
+# SWAPPABLE CHANNELS: each receiver below is built from Alertmanager's native
+# per-channel `*_configs` blocks — `slack_configs` (primary), `email_configs`
+# (backup), `webhook_configs` (dead-man's switch). Adding, removing, or swapping
+# a channel is a config-only edit of a `*_configs` block (e.g. replace
+# `slack_configs` with `telegram_configs` to move primary to Telegram) — no
+# bespoke notifier service and no image rebuild. See
+# docs/runbooks/alertmanager-slack-routing.md § "Swapping / adding a channel".
 
 route:
   group_by: ["alertname", "severity"]
@@ -20,6 +47,18 @@ route:
   repeat_interval: 8h
   receiver: default
   routes:
+    # Dead-man's switch (deploy#453): the always-firing `Watchdog` alert
+    # (severity: deadmansswitch, infra/prometheus/alerts.yml) is routed to a
+    # webhook that pings Healthchecks.io. Its short repeat_interval is the
+    # heartbeat cadence — Healthchecks.io pages the owner when the pings STOP
+    # (Prometheus/Alertmanager/the whole box died). Matched FIRST and terminal
+    # (no `continue`) so the heartbeat never reaches Slack/Email.
+    - match:
+        severity: deadmansswitch
+      receiver: deadmansswitch
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 5m
     - match:
         severity: critical
       receiver: critical
@@ -27,6 +66,7 @@ route:
 
 receivers:
   - name: default
+    # ── PRIMARY channel: Slack (swap this block to change primary) ──────
     slack_configs:
       - api_url_file: /etc/alertmanager/slack_webhook_url
         channel: "#stg-alerts"
@@ -38,8 +78,15 @@ receivers:
           {{ .Annotations.description }}
           {{ if .Annotations.runbook }}Runbook: {{ .Annotations.runbook }}{{ end }}
           {{ end }}
+    # ── BACKUP channel: Email (independent failure domain) ──────────────
+    email_configs:
+      - to: "owner@example.invalid"   # OWNER: destination inbox
+        send_resolved: true
+        headers:
+          Subject: '[STG {{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
 
   - name: critical
+    # ── PRIMARY channel: Slack (swap this block to change primary) ──────
     slack_configs:
       - api_url_file: /etc/alertmanager/slack_webhook_url
         channel: "#stg-alerts"
@@ -51,6 +98,22 @@ receivers:
           {{ .Annotations.description }}
           {{ if .Annotations.runbook }}Runbook: {{ .Annotations.runbook }}{{ end }}
           {{ end }}
+    # ── BACKUP channel: Email (independent failure domain) ──────────────
+    email_configs:
+      - to: "owner@example.invalid"   # OWNER: destination inbox
+        send_resolved: true
+        headers:
+          Subject: '[STG-CRITICAL {{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+
+  # Dead-man's switch receiver (deploy#453). Posts the always-firing Watchdog
+  # alert to the Healthchecks.io ping URL (read at runtime from the `*_file`
+  # secret). Healthchecks.io records a ping on any HTTP request to the URL
+  # regardless of body, so Alertmanager's JSON webhook payload is accepted as
+  # a heartbeat. send_resolved is false — a heartbeat only ever fires.
+  - name: deadmansswitch
+    webhook_configs:
+      - url_file: /etc/alertmanager/healthchecks_url
+        send_resolved: false
 
 inhibit_rules:
   - source_match:

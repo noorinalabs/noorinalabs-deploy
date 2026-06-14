@@ -97,7 +97,9 @@ hetzner tfstate; a one-time defense-in-depth rotation is tracked in
 | `AUTH_GITHUB_CLIENT_ID` / `AUTH_GITHUB_CLIENT_SECRET` | GitHub OAuth app | Security Eng | per-env | **provider** | rotate in GitHub OAuth app settings |
 | `GH_PACKAGES_TOKEN` | GHCR packages PAT (CI) | Infra Manager | repo-level | **provider** (PAT) | — |
 | `GITHUB_TOKEN` | GH Actions ephemeral token | n/a (per-run) | n/a | per-run (auto) | not operator-rotatable |
-| `SLACK_WEBHOOK_URL` | Alertmanager Slack webhook | Observability Eng | per-env | on-demand | rotate in Slack app config |
+| `SLACK_WEBHOOK_URL` | Alertmanager Slack webhook (primary alert channel) | Observability Eng | per-env | on-demand | rotate in Slack app config |
+| `SMTP_PASSWORD` | Alertmanager Email-backup SMTP password (deploy#452) | Observability Eng | per-env | on-demand | rotate at SMTP relay (app password) |
+| `HEALTHCHECKS_PING_URL` | Alertmanager dead-man's-switch ping URL (deploy#453) | Observability Eng | per-env | on-demand | regenerate check ping URL in Healthchecks.io |
 | `STG_TEST_USER_EMAIL` / `STG_TEST_USER_PASSWORD` | staging smoke-test creds | SRE | staging only | on-demand | low sensitivity (test account) |
 
 ## Maintenance

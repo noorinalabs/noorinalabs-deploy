@@ -246,6 +246,8 @@ jobs:
             PROM_CONFIG_FILE=prometheus.prod.yml
             ALERTMANAGER_CONFIG_FILE=alertmanager.prod.yml
             SLACK_WEBHOOK_FILE=slack_webhook_url.secret
+            SMTP_PASSWORD_FILE=smtp_password.secret
+            HEALTHCHECKS_URL_FILE=healthchecks_url.secret
           base_domain: noorinalabs.com
           # Tiered prod rollout (deploy#429). Only the app+edge tier is health-
           # gated (`up -d --wait`); the Kafka pipeline tier comes up NON-gating so
@@ -265,6 +267,12 @@ jobs:
           # if unset, the composite writes "<unset>" placeholder and logs a
           # WARNING. Set in the `production` Environment.
           slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Email-backup SMTP password (deploy#452) + Healthchecks.io dead-man's
+          # switch ping URL (deploy#453). Both optional — if unset, the composite
+          # writes the "<unset>" placeholder and logs a WARNING. Set in the
+          # `production` Environment.
+          smtp_password: ${{ secrets.SMTP_PASSWORD }}
+          healthchecks_url: ${{ secrets.HEALTHCHECKS_PING_URL }}
 
       - name: Verify health check
         uses: appleboy/ssh-action@v1

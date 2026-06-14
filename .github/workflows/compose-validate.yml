@@ -50,6 +50,10 @@ jobs:
             echo "PROM_CONFIG_FILE=prometheus.prod.yml"
             echo "ALERTMANAGER_CONFIG_FILE=alertmanager.prod.yml"
             echo "SLACK_WEBHOOK_FILE=slack_webhook_url.secret.example"
+            # Email-backup SMTP password (deploy#452) + Healthchecks.io
+            # dead-man's-switch URL (deploy#453) secret files.
+            echo "SMTP_PASSWORD_FILE=smtp_password.secret.example"
+            echo "HEALTHCHECKS_URL_FILE=healthchecks_url.secret.example"
           } >> .env
       - name: Validate compose config
         working-directory: compose

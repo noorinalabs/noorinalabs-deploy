@@ -222,6 +222,8 @@ jobs:
             PROM_CONFIG_FILE=prometheus.stg.yml
             ALERTMANAGER_CONFIG_FILE=alertmanager.stg.yml
             SLACK_WEBHOOK_FILE=slack_webhook_url.secret
+            SMTP_PASSWORD_FILE=smtp_password.secret
+            HEALTHCHECKS_URL_FILE=healthchecks_url.secret
           base_domain: stg.noorinalabs.com
           env_keys: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,JWT_PRIVATE_KEY,JWT_PUBLIC_KEY,KAFKA_CLUSTER_ID,KAFKA_UI_PASSWORD,KAFKA_UI_USER,PIPELINE_B2_BUCKET,PIPELINE_B2_ENDPOINT,PIPELINE_B2_KEY,PIPELINE_B2_KEY_ID,PIPELINE_B2_REGION,BACKUP_B2_KEY_ID,BACKUP_B2_APP_KEY,BACKUP_B2_BUCKET,USER_POSTGRES_DB,USER_POSTGRES_PASSWORD,USER_POSTGRES_USER,USER_REDIS_PASSWORD
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -230,6 +232,12 @@ jobs:
           # if unset, the composite writes "<unset>" placeholder and logs a
           # WARNING. Set in the `staging` Environment.
           slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Email-backup SMTP password (deploy#452) + Healthchecks.io dead-man's
+          # switch ping URL (deploy#453). Both optional — if unset, the composite
+          # writes the "<unset>" placeholder and logs a WARNING. Set in the
+          # `staging` Environment.
+          smtp_password: ${{ secrets.SMTP_PASSWORD }}
+          healthchecks_url: ${{ secrets.HEALTHCHECKS_PING_URL }}
 
       - name: Verify health check
         uses: appleboy/ssh-action@v1

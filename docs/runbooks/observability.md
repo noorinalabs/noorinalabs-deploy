@@ -16,7 +16,7 @@ The list of running containers is canonical in
 |---|---|---|---|
 | Prometheus | metrics scrape | prod VPS, port 9090 (internal) | per-alert links in `infra/prometheus/alerts.yml` |
 | Grafana | metrics + log visualisation | prod VPS, `/grafana` behind Caddy | [§ Grafana access](#grafana-access) |
-| Loki + Alloy | log aggregation | prod VPS, container-side `docker-socket` scrape | [`log-ingestion.md`](log-ingestion.md) |
+| Loki + Alloy | log aggregation | prod VPS, container-side `docker-socket` scrape | [`log-ingestion.md`](log-ingestion.md) · [§ Loki retention](#loki-retention-hot-reloadable) |
 | Alertmanager | alert routing | prod VPS, port 9093 (internal) | [`alertmanager-slack-routing.md`](alertmanager-slack-routing.md) |
 | blackbox-exporter | synthetic probes (HTTP) | prod VPS, container `blackbox-exporter` | [`blackbox-probes.md`](blackbox-probes.md) |
 | Cloudflare Web Analytics (CWA) | real-user RUM | CF dashboard (per zone) | § below |
@@ -106,6 +106,92 @@ this change deploys, an operator confirms on the live host:
 If step 1 or 2 fails after deploy, check that `BASE_DOMAIN` is set in the
 VPS `compose/.env` and that the `isnad` Caddy vhost is serving (the
 Grafana route is nested under it, not a standalone subdomain).
+
+---
+
+## Loki retention (hot-reloadable)
+
+Loki's log retention is **hot-reloadable** — the "keep last X days" window can be
+changed at runtime **without redeploying or restarting** the Loki container
+(deploy#451). This backs the admin-panel "log retention (days)" control
+(isnad-graph ig#1038).
+
+### How it works
+
+Two layers, static default + dynamic override:
+
+| Layer | File | Behavior |
+|---|---|---|
+| Static default / fallback | `infra/loki/loki-config.yml` → `limits_config.retention_period` (`168h` / 7d) | Read at **startup only**. Applies to any tenant with no override entry. |
+| Dynamic override | `infra/loki/runtime-overrides.yaml` → `overrides.fake.retention_period` | Re-read every `runtime_config.period` (`30s`); **takes precedence**; hot-reloadable. |
+
+`auth_enabled: false`, so every log stream lands under the single built-in Loki
+tenant id **`fake`** — that is the key under `overrides:` to edit.
+
+The override file lives on the writable named volume **`loki_runtime`**, mounted
+into three containers (`compose/docker-compose.prod.yml`):
+
+- `loki-runtime-init` (one-shot) — seeds the volume with the in-tree default
+  `infra/loki/runtime-overrides.yaml` **iff** the volume is empty, then `chmod`s
+  it writable. Mirrors the `kafka-init` / `minio-setup` idiom. Loki
+  `depends_on` it with `service_completed_successfully` because **Loki fails to
+  start if the `runtime_config.file` is missing** (verified: the
+  `runtime-config` module errors and the whole process exits) — the seed
+  guarantees a valid file exists before Loki loads.
+- `loki` — reads `/etc/loki/runtime/overrides.yaml` (the volume), re-reading on
+  the 30s reload interval.
+- `api` — the ig#1038 admin endpoint writes the new `retention_period` into the
+  same file (in-place truncate-write — do **not** rename-replace, which changes
+  the inode and breaks the bind/volume view).
+
+Persistence: because the seed only runs when the volume is empty, an admin-set
+value survives redeploys and is not clobbered by the repo copy on every
+`compose up`.
+
+### Timing — two intervals stack
+
+A retention change is visible in two steps:
+
+1. **Config reload** (≤ `runtime_config.period`, 30s): Loki picks up the new
+   value. Observable on the `loki_runtime_config_hash` metric (it changes) and
+   `loki_runtime_config_last_reload_successful` (stays `1`).
+2. **Enforcement** (≤ `compactor.compaction_interval`, 10m): the compactor
+   applies the new window on its next cycle, marking now-expired chunks for
+   deletion (then `retention_delete_delay`, 2h, before the chunk is removed).
+
+So "shrink retention" frees disk within ~10m + 2h, not instantly; "grow
+retention" takes effect immediately for future compaction. Document this lag in
+the admin UI copy so the owner doesn't expect an instant disk drop.
+
+### Verify a retention change (live host)
+
+```bash
+# 1. Read the current effective override
+docker compose -f compose/docker-compose.prod.yml exec loki \
+  cat /etc/loki/runtime/overrides.yaml
+
+# 2. Capture the runtime-config hash BEFORE the change
+docker compose -f compose/docker-compose.prod.yml exec loki \
+  wget -qO- http://localhost:3100/metrics | grep loki_runtime_config_hash
+
+# 3. Change it (the ig#1038 admin control does this; manual edit shown for ops).
+#    Edit overrides.fake.retention_period IN PLACE, e.g. 168h -> 336h.
+
+# 4. After ~30s, confirm the hash CHANGED and the reload succeeded — and that
+#    the container did NOT restart (StartedAt / RestartCount unchanged).
+docker compose -f compose/docker-compose.prod.yml exec loki \
+  wget -qO- http://localhost:3100/metrics \
+  | grep -E 'loki_runtime_config_(hash|last_reload_successful)'
+docker inspect -f 'StartedAt={{.State.StartedAt}} RestartCount={{.RestartCount}}' \
+  "$(docker compose -f compose/docker-compose.prod.yml ps -q loki)"
+```
+
+This exact sequence was validated locally before merge (grafana/loki:2.9.10):
+the hash changed on a 168h→720h edit, `last_reload_successful=1`, and
+`RestartCount=0` / `StartedAt` unchanged — i.e. no restart. The compactor
+deletion step itself only runs against aged data on the live box, so confirming
+that now-expired chunks actually disappear is a **post-merge owner observation**
+(watch `loki_compactor_*` metrics / the Loki disk usage panel after a shrink).
 
 ---
 
