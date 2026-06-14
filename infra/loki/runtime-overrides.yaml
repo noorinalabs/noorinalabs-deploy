@@ -1,0 +1,21 @@
+# Loki runtime overrides — hot-reloadable per-tenant limits (deploy#451).
+#
+# Loki re-reads this file every `runtime_config.period` (30s, see
+# infra/loki/loki-config.yml) and the compactor applies any changed
+# `retention_period` on its next compaction cycle (compaction_interval=10m) —
+# NO Loki restart required. This is the deploy-side half that backs the
+# admin-panel "log retention (days)" control (isnad-graph ig#1038): that
+# endpoint rewrites the `retention_period` value below IN PLACE (open+truncate
+# write — do not rename-replace, which would break the bind/volume inode).
+#
+# auth_enabled is false in loki-config.yml, so every log stream lands under the
+# single built-in tenant id "fake". Keep that key.
+#
+# If this file is absent or a tenant has no entry, Loki falls back to the static
+# limits_config.retention_period (168h / 7d) in loki-config.yml. This in-tree
+# copy is the SEED only: the `loki-runtime-init` one-shot copies it into the
+# writable `loki_runtime` volume on first stack-up if the volume is empty, so
+# admin edits persist across redeploys without being clobbered by the repo copy.
+overrides:
+  fake:
+    retention_period: 168h  # 7 days (default; admin control overwrites this)

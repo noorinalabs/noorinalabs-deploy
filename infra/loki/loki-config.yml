@@ -28,11 +28,29 @@ schema_config:
         period: 24h
 
 limits_config:
+  # Static default / fallback retention (deploy#451). This applies to any tenant
+  # that has NO entry in the runtime_config overrides file below. The admin
+  # "log retention (days)" control (isnad-graph ig#1038) does NOT touch this
+  # line — it writes the per-tenant override, which takes precedence and is
+  # hot-reloadable. Keep 168h as the safe baseline if the overrides file is
+  # ever absent or empty.
   retention_period: 168h  # 7 days
   ingestion_rate_mb: 10
   ingestion_burst_size_mb: 20
   max_streams_per_user: 10000
   max_entries_limit_per_query: 5000
+
+# Hot-reloadable per-tenant overrides (deploy#451). Loki re-reads this file every
+# `period` and the compactor applies any changed `retention_period` on its next
+# compaction cycle (see compactor.compaction_interval below, 10m) WITHOUT a Loki
+# restart. This backs the admin-panel "log retention (days)" control (ig#1038),
+# which rewrites the override value in place. The file is seeded with the static
+# default by the `loki-runtime-init` one-shot (compose) and lives on the writable
+# `loki_runtime` volume shared with the API. auth_enabled is false, so all log
+# streams land under the single built-in tenant id "fake".
+runtime_config:
+  file: /etc/loki/runtime/overrides.yaml
+  period: 30s
 
 compactor:
   working_directory: /loki/compactor

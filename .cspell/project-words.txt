@@ -74,6 +74,7 @@ promtool
 pubkeys
 Rashidi
 regen
+reloadable
 Renaud
 retag
 retagging

@@ -2,8 +2,12 @@
 
 Alloy (container `noorinalabs-alloy-1`, image `grafana/alloy:v1.16.1`) ships
 container stdout/stderr from the Docker socket to Loki (`noorinalabs-loki-1`,
-image `grafana/loki:2.9.10`). Loki retains 7 days of logs and is the only
-ingestion path — there is no Logstash, no Fluent Bit, no alternative shipper.
+image `grafana/loki:2.9.10`). Loki retains 7 days of logs by default and is the
+only ingestion path — there is no Logstash, no Fluent Bit, no alternative
+shipper. The retention window is **hot-reloadable at runtime** (admin "keep last
+X days" control, ig#1038) — see
+[`observability.md` § Loki retention](observability.md#loki-retention-hot-reloadable)
+for the mechanism and how to change it.
 Migrated from promtail in deploy#132; pipeline semantics (Docker SD + JSON
 extraction + level/logger labels + drop-on-empty-level) are unchanged.
 
