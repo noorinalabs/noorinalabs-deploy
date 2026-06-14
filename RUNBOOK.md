@@ -465,20 +465,21 @@ There is no `DeployFailed` Prometheus alert — `verify-deploy.yml` is a
 GitHub Actions job, not a Prometheus signal source. Workflow failures
 surface as red runs in the Actions tab and as `::error::` annotations.
 
-> **External paging is not yet wired.** Both the `default` and `critical`
-> Alertmanager receivers in `infra/alertmanager/alertmanager.yml` point
-> at the literal URL `http://localhost:9095/webhook` — a non-existent
-> local endpoint chosen so the config loads cleanly until real routing
-> (PagerDuty / Slack / email) is provisioned. Until then, Tier-0 alerts
-> fire only into Alertmanager's UI on the prod VPS — they do **not**
-> page anyone. Treat the Tier-1 SRE on-call as the de-facto first
-> responder for any operational incident, and rely on Grafana
-> dashboards plus manual checks (`gh run list --workflow=verify-deploy.yml`)
-> to surface deploy failures. Receiver wiring is the remaining piece
-> after the `#127` config-load fix; tracked in
-> [`deploy#274`](https://github.com/noorinalabs/noorinalabs-deploy/issues/274)
-> as a load-bearing followup that includes "revise this runbook section"
-> in its acceptance criteria.
+> **External paging — wired, owner-secret-gated.** The per-env Alertmanager
+> configs (`infra/alertmanager/alertmanager.{stg,prod}.yml`, deploy#262/#263)
+> route both `default` and `critical` to **Slack** (primary) and **Email**
+> (independent backup), with a **Healthchecks.io dead-man's switch** for the
+> monitor itself (deploy#452/#453). The wiring is complete and validated; each
+> channel goes live the moment its secret is set in the matching GitHub
+> Environment — `SLACK_WEBHOOK_URL`, `SMTP_PASSWORD` (+ owner-edited
+> `smtp_*`/`to:` literals), and `HEALTHCHECKS_PING_URL`. Until a given secret
+> is set, that channel writes the `<unset>` placeholder and no-ops (the config
+> still loads cleanly); other channels are unaffected. Activation, the
+> channel-swap procedure, troubleshooting, and rotation are in
+> [`docs/runbooks/alertmanager-slack-routing.md`](docs/runbooks/alertmanager-slack-routing.md).
+> While paging is unactivated, treat the Tier-1 SRE on-call as the de-facto
+> first responder and rely on Grafana dashboards plus
+> `gh run list --workflow=verify-deploy.yml` to surface deploy failures.
 
 ### Tier 1 — SRE on-call
 

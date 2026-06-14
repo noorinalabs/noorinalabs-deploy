@@ -486,3 +486,39 @@ groups:
             headers (see docs/pipeline-kafka.md § Message schema) to
             identify the failing stage.
           runbook: "docs/runbooks/kafka-pipeline.md#dlq-growing"
+
+  # Dead-man's switch (deploy#453). Alertmanager can page on anything EXCEPT
+  # its own death (or Prometheus's, or the whole VPS's) — it cannot alert you
+  # that it stopped working. `Watchdog` is an always-firing alert: `vector(1)`
+  # is true forever, so as long as Prometheus is evaluating rules AND can reach
+  # Alertmanager, this alert stays firing. Alertmanager routes it (severity:
+  # deadmansswitch) to the `deadmansswitch` webhook receiver, which pings
+  # Healthchecks.io on each `repeat_interval` (5m — see alertmanager.{stg,prod}.yml).
+  # If Prometheus dies, the rule stops evaluating; if Alertmanager dies, the
+  # ping stops; if the box dies, both stop — and Healthchecks.io pages the owner
+  # when the heartbeat lapses past its grace window. This is the inverse of every
+  # other alert here: silence (no heartbeat) is the failure signal.
+  #
+  # Owner step: create a Healthchecks.io check with period 5m + a grace window
+  # (e.g. 10m), set the `HEALTHCHECKS_PING_URL` deploy secret to its ping URL,
+  # and point the check's notification at Slack/Email.
+  # See docs/runbooks/alertmanager-slack-routing.md § "Dead-man's switch".
+  - name: deadmansswitch
+    rules:
+      - alert: Watchdog
+        # `vector(1)` is unconditionally true, so this alert is ALWAYS firing.
+        # Its purpose is to be present, not to detect a condition — its ABSENCE
+        # (the heartbeat ping stopping) is what Healthchecks.io alerts on.
+        expr: vector(1)
+        for: 0m
+        labels:
+          severity: deadmansswitch
+        annotations:
+          summary: "Alertmanager → Healthchecks.io heartbeat"
+          description: >-
+            This alert always fires; it exists so Alertmanager emits a periodic
+            heartbeat to the external Healthchecks.io dead-man's switch. If you
+            are reading this in a chat channel, routing is misconfigured — the
+            Watchdog should only ever reach the `deadmansswitch` webhook
+            receiver, never a human surface.
+          runbook: "docs/runbooks/alertmanager-slack-routing.md#dead-mans-switch"

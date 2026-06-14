@@ -20,8 +20,10 @@ docker-compose.override.yml
 *.env.local
 compose/minio.env
 
-# Secrets written at deploy-time (alertmanager Slack routing, deploy#262)
+# Secrets written at deploy-time (alertmanager routing — deploy#262/#452/#453)
 infra/alertmanager/slack_webhook_url.secret
+infra/alertmanager/smtp_password.secret
+infra/alertmanager/healthchecks_url.secret
 
 # Temp / Cache
 tmp/
