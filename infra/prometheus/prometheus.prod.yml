@@ -93,24 +93,32 @@ scrape_configs:
     # destroyed in the 2026-05-02 emergency reconciliation (#226) and
     # all 5 routes below were resolving to NXDOMAIN, leaving blackbox
     # blind on this surface. Companion to deploy#252 / PR#254 which
-    # fixed the same root cause on the post-deploy smoke side. Per
-    # caddy/Caddyfile the user-service routes (`/auth/*`, JWKS, the
-    # `/api/v1/user-service/health` rewrite) are dual-bound on
-    # `isnad.{$BASE_DOMAIN}` AND `users.{$BASE_DOMAIN}`; we keep the
-    # blackbox surface aligned with the smoke battery (single host
-    # `isnad.noorinalabs.com`) so the two probes share an apex. The
-    # eventual de-duplication onto `users.*` is tracked in the
-    # transitional comment block in caddy/Caddyfile.
+    # fixed the same root cause on the post-deploy smoke side.
+    #
+    # Host partition (de-duplicated onto users.* in deploy#449): the
+    # "eventual de-duplication onto users.*" that this block previously
+    # deferred to the caddy/Caddyfile transitional note has now happened.
+    # #245 phase 2 (commit e321e9a7) dropped ALL user-service routes
+    # (`/auth/*`, JWKS, the `/api/v1/user-service/health` rewrite) from the
+    # isnad.* vhost — it is now a pure frontend + isnad-graph-API surface —
+    # so the user-service-owned probes target the canonical
+    # `users.noorinalabs.com` vhost. The post-deploy smoke battery already
+    # made this move in #414 (scripts/verify_prod_smoke.sh → USER_SERVICE_
+    # BASE_URL); this keeps the blackbox surface aligned with it. Leaving the
+    # probes on isnad.* hit the isnad-graph-api `/api/*` catch-all (→ 404) or
+    # the SPA fallthrough → red probes for routes that were never broken.
     static_configs:
       - targets: ["https://isnad.noorinalabs.com/health"]
         labels: { route: "isnad-health", module: "http_2xx_json" }
-      - targets: ["https://isnad.noorinalabs.com/api/v1/user-service/health"]
+      # user-service liveness via its own vhost; smoke battery uses the same
+      # USER_SERVICE_BASE_URL/health (the isnad-vhost rewrite was retired #414).
+      - targets: ["https://users.noorinalabs.com/health"]
         labels: { route: "user-service-health", module: "http_2xx" }
       - targets: ["https://noorinalabs.com/"]
         labels: { route: "landing-root", module: "http_2xx" }
       - targets: ["https://isnad.noorinalabs.com/api/v1/narrators?limit=1"]
         labels: { route: "narrator-401", module: "http_401_json" }
-      - targets: ["https://isnad.noorinalabs.com/.well-known/jwks.json"]
+      - targets: ["https://users.noorinalabs.com/.well-known/jwks.json"]
         labels: { route: "jwks", module: "http_2xx_json" }
       # Path corrected 2026-05-03 (deploy#255 ChangesRequested) lockstep
       # with deploy#256 / PR#258 (Aisha): user-service exposes
@@ -122,7 +130,8 @@ scrape_configs:
       # historical name to avoid churning `alerts.yml`'s
       # BlackboxUnexpectedStatus matcher; the implicit "expect HTTP
       # 200" branch in that alert is correct for this route post-fix.
-      - targets: ["https://isnad.noorinalabs.com/auth/oauth/google/login"]
+      # Host repointed to users.* in deploy#449 (see partition note above).
+      - targets: ["https://users.noorinalabs.com/auth/oauth/google/login"]
         labels: { route: "auth-login-redirect", module: "http_2xx_json" }
     relabel_configs:
       - source_labels: [__address__]
