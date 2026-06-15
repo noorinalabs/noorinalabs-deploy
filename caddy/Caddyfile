@@ -81,9 +81,58 @@ isnad.{$BASE_DOMAIN} {
 
     # ── Other services ───────────────────────────────────────────────
 
-    # Grafana
+    # Grafana — admin-gated via forward_auth SSO bridge (deploy#458).
+    # An app admin already authenticated to the product reaches Grafana
+    # (dashboards / Explore-Logs / Alerting) with NO second login; a non-admin
+    # or unauthenticated caller is rejected by user-service before a single
+    # Grafana byte is served. This closes the dead-end reported in ig#1073:
+    # the obs quick-links previously landed on Grafana's own login wall because
+    # the app session never carried through.
+    #
+    # CROSS-REPO COMPLETION GATE — this is the DEPLOY slice of a 3-repo feature.
+    # It is INERT-until-coordinated and MUST NOT be promoted to stg/prod ahead
+    # of its companions, because forward_auth is a HARD cutover (once present,
+    # Grafana's own login form is no longer reachable through Caddy — see the
+    # break-glass note in docs/runbooks/grafana-forward-auth-sso.md):
+    #   1. user-service — GET /auth/forward-auth: validates the app session the
+    #      browser carries to isnad.* and the admin role; replies 2xx with
+    #      `X-Webauth-User` (+ `X-Webauth-Role: Admin`) for admins, 401/403
+    #      otherwise. (NOT the existing /auth/token/validate — that one reads an
+    #      Authorization: Bearer header, which a top-level browser NAVIGATION to
+    #      /grafana/ does not send. The app access token lives only in the SPA's
+    #      localStorage, so a session credential the browser auto-sends to
+    #      isnad.* is the companion's job to mint — owner sign-off pending.)
+    #   2. frontend (ig#1073) — re-enable the obs links + carry that session
+    #      credential on the link click.
     handle /grafana/* {
-        reverse_proxy grafana:3000
+        # `route` pins directive order: strip → verify → proxy. Without it
+        # Caddy would re-sort the directives and the up-front strip could run
+        # after forward_auth's copy_headers.
+        route {
+            # ── Anti-spoof, layer 1 (inline security guard) ───────────────
+            # Strip ANY client-supplied auth-proxy identity headers BEFORE the
+            # sub-request, so a forged X-Webauth-* can never be trusted by the
+            # verify endpoint nor survive to Grafana if the endpoint happens
+            # not to overwrite it. The ONLY X-Webauth-* that may reach Grafana
+            # is the one forward_auth copies from the user-service 2xx below.
+            request_header -X-Webauth-User
+            request_header -X-Webauth-Role
+
+            # ── forward_auth RBAC bridge ──────────────────────────────────
+            # Caddy reaches user-service over the shared `backend` network
+            # (same path the users.* vhost uses). The whole original request —
+            # crucially its Cookie header — is forwarded to /auth/forward-auth.
+            # On 2xx the asserted identity headers are copied onto the upstream
+            # request and we continue to Grafana; on 401/403 Caddy relays that
+            # response to the client (→ app login / 403) and Grafana is never
+            # reached.
+            forward_auth user-service:8000 {
+                uri /auth/forward-auth
+                copy_headers X-Webauth-User X-Webauth-Role
+            }
+
+            reverse_proxy grafana:3000
+        }
     }
 
     # Frontend (default)
