@@ -67,8 +67,14 @@ The password is **not** in the repo. On the VPS it lives in
 `compose/.env`, written from the GitHub Actions encrypted secret
 `GRAFANA_ADMIN_PASSWORD` by the deploy workflow. To retrieve it for the
 project owner, read `compose/.env` on the VPS (`grep GRAFANA_ADMIN
-compose/.env`) or rotate it via the GitHub secret + redeploy. There is
-no OAuth integration for Grafana today — admin basic-auth only.
+compose/.env`) or rotate it via the GitHub secret + redeploy.
+
+**App-admin SSO (deploy#458):** app admins reach Grafana with no second login
+via a Caddy `forward_auth` RBAC bridge (`GF_AUTH_PROXY_*` env + the `handle
+/grafana/*` block) — see [`grafana-forward-auth-sso.md`](grafana-forward-auth-sso.md)
+for the design, the anti-spoof controls, the cross-repo completion gate, and the
+SSH-tunnel break-glass to the admin login form. The basic-auth path above is the
+break-glass; there is no Grafana OAuth integration.
 
 ### Dashboards
 

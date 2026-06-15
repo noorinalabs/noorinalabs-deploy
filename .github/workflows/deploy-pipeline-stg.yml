@@ -1,0 +1,215 @@
+# One-click ingest-pipeline bring-up on staging (deploy#443).
+#
+# Background:
+#   The four streaming workers (dedup / enrich / normalize / graph-load) are
+#   defined in compose under the `pipeline` profile (deploy#440), so a plain
+#   `docker compose up -d` — what deploy-stg.yml runs — does NOT start them.
+#   Until now the P4W6 bring-up was a manual gated `docker compose --profile
+#   pipeline up -d` on the box (ip#83 RUNBOOK). This workflow makes that
+#   one-click and per-SHA-pinnable, without touching the running app stack.
+#
+# Triggers:
+#   - workflow_dispatch — the one-click path. `image_tag` pins INGEST_IMAGE_TAG
+#     (default `stg-latest`, the worker image's own last-good stg pointer).
+#   - repository_dispatch (deploy-noorinalabs-isnad-ingest-platform) — the
+#     fan-in target ip#83 wires after its ghcr-publish pushes the worker image's
+#     stg tags. The dispatch `sha` routes to INGEST_IMAGE_TAG only.
+#
+# Per-service tag routing (deploy#418, build-once-promote):
+#   This workflow only ever resolves and writes INGEST_IMAGE_TAG. It never
+#   touches IMAGE_TAG (api+frontend) or USER_SERVICE_IMAGE_TAG — the app stack
+#   keeps whatever the last deploy-stg run pinned. Bringing the workers up names
+#   the four worker services explicitly, so their already-running, unchanged
+#   dependencies (kafka, postgres, neo4j) are left in place, not recreated.
+#
+# Pre-req: an app deploy (deploy-stg.yml) must have run first so `/opt/
+#   noorinalabs-deploy/.env` exists — the workers reuse the app stack's secret
+#   env (POSTGRES_*, PIPELINE_B2_*, NEO4J_PASSWORD, KAFKA_CLUSTER_ID). This
+#   workflow only upserts INGEST_IMAGE_TAG into that file; it does not rewrite
+#   secrets (it has none to write). It fails fast with a pointer if .env is
+#   absent.
+
+name: Deploy pipeline workers to staging
+
+on:
+  repository_dispatch:
+    types:
+      - deploy-noorinalabs-isnad-ingest-platform
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Ingest worker image tag to bring up (default: stg-latest)"
+        default: "stg-latest"
+
+concurrency:
+  # Share the deploy-stg lock: the pipeline workers and the app stack live in
+  # the same compose project on the same box, so a bring-up must never race a
+  # concurrent app `up -d --force-recreate`. cancel-in-progress: false queues.
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  bring-up:
+    name: bring up ingest pipeline workers (stg)
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      packages: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve ingest image tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          MANUAL_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          # Only the ingest worker tag is ever resolved here — the app tags are
+          # owned by deploy-stg.yml (build-once-promote, deploy#418).
+          ingest_tag="stg-latest"
+          if [ "$EVENT_NAME" = "repository_dispatch" ] && [ -n "${DISPATCH_SHA:-}" ]; then
+            # 7-char short SHA per Contract v6 `<short>` definition.
+            short="${DISPATCH_SHA:0:7}"
+            case "${EVENT_ACTION:-}" in
+              deploy-noorinalabs-isnad-ingest-platform) ingest_tag="stg-$short" ;;
+              *) echo "::warning::Unrecognised dispatch action '${EVENT_ACTION:-}' — bringing up stg-latest" ;;
+            esac
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${MANUAL_TAG:-}" ]; then
+            ingest_tag="$MANUAL_TAG"
+          fi
+          echo "Resolved ingest worker tag: $ingest_tag"
+          echo "ingest_tag=$ingest_tag" >> "$GITHUB_OUTPUT"
+
+      # Pre-flight: the resolved worker image manifest must exist in GHCR before
+      # we touch the VPS. A single multi-worker image backs all four services
+      # (compose IMAGE CONTRACT), so one inspect covers the whole bring-up.
+      # Mirrors deploy-stg.yml's pre-flight: fail fast on the runner (which holds
+      # packages:read) rather than as an opaque mid-deploy `compose pull` error.
+      - name: Pre-flight — verify ingest worker image manifest exists in GHCR
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INGEST_TAG: ${{ steps.tag.outputs.ingest_tag }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          ref="ghcr.io/noorinalabs/noorinalabs-isnad-ingest-platform:$INGEST_TAG"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            echo "OK   $ref"
+          else
+            echo "::error::Ingest worker image '$ref' is missing in GHCR. The worker"
+            echo "::error::image must be published (ip#83 ghcr-publish) before bring-up."
+            exit 1
+          fi
+
+      - name: Bring up pipeline workers on stg VPS
+        uses: appleboy/ssh-action@v1
+        env:
+          INGEST_TAG: ${{ steps.tag.outputs.ingest_tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_ACTOR: ${{ github.repository_owner }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: INGEST_TAG,GHCR_TOKEN,GHCR_ACTOR
+          script: |
+            set -euo pipefail
+            cd /opt/noorinalabs-deploy
+
+            COMPOSE="docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env"
+            WORKERS="dedup-worker enrich-worker normalize-worker graph-load-worker"
+
+            echo "==> Pulling latest deploy config..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            # The workers reuse the app stack's .env (POSTGRES_*, PIPELINE_B2_*,
+            # NEO4J_PASSWORD, KAFKA_CLUSTER_ID). It is written by deploy-stg.yml;
+            # a pipeline bring-up before any app deploy has nothing to read.
+            if [ ! -f .env ]; then
+              echo "ERROR: /opt/noorinalabs-deploy/.env is missing — run deploy-stg.yml" >&2
+              echo "       (an app deploy) first; the workers reuse its secret env." >&2
+              exit 1
+            fi
+
+            # Upsert INGEST_IMAGE_TAG (per-SHA pin; controlled value, no shell
+            # metacharacters). Other .env lines — including the app image tags —
+            # are left untouched, so this never disturbs the running app stack.
+            echo "==> Pinning INGEST_IMAGE_TAG=$INGEST_TAG in .env..."
+            if grep -q '^INGEST_IMAGE_TAG=' .env; then
+              sed -i "s|^INGEST_IMAGE_TAG=.*|INGEST_IMAGE_TAG='$INGEST_TAG'|" .env
+            else
+              printf "INGEST_IMAGE_TAG='%s'\n" "$INGEST_TAG" >> .env
+            fi
+
+            echo "==> Authenticating to GHCR..."
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
+
+            echo "==> Pulling ingest worker image ($INGEST_TAG)..."
+            # shellcheck disable=SC2086 # WORKERS is deliberately word-split
+            $COMPOSE --profile pipeline pull $WORKERS
+
+            echo "==> Bringing up pipeline workers (profile: pipeline)..."
+            # Naming the four workers explicitly starts them + any not-yet-running
+            # dependency (kafka/kafka-init/postgres/neo4j) WITHOUT --force-recreate,
+            # so already-healthy app/infra containers are left in place.
+            # shellcheck disable=SC2086 # WORKERS is deliberately word-split
+            $COMPOSE --profile pipeline up -d $WORKERS
+
+            echo "==> Verifying workers reached a stable running state..."
+            # The workers carry no compose healthcheck, so "healthy" here means
+            # every worker container is `running` and has not crash-looped into
+            # `restarting`/`exited` over the observation window.
+            ok=0
+            for attempt in $(seq 1 12); do
+              ok=1
+              for w in $WORKERS; do
+                cname="noorinalabs-${w}-1"
+                status="$(docker inspect --format='{{.State.Status}}' "$cname" 2>/dev/null || echo missing)"
+                echo "Attempt $attempt/12: $cname=$status"
+                if [ "$status" != "running" ]; then
+                  ok=0
+                fi
+              done
+              if [ "$ok" -eq 1 ]; then
+                echo "All pipeline workers are running."
+                break
+              fi
+              sleep 5
+            done
+
+            echo "==> Pipeline worker status:"
+            # shellcheck disable=SC2086 # WORKERS is deliberately word-split
+            $COMPOSE --profile pipeline ps $WORKERS --format '{{.Name}}\t{{.Status}}' || true
+
+            if [ "$ok" -ne 1 ]; then
+              echo "ERROR: one or more pipeline workers did not reach a stable running" >&2
+              echo "       state after 60s. Recent logs follow." >&2
+              # shellcheck disable=SC2086 # WORKERS is deliberately word-split
+              $COMPOSE --profile pipeline logs --tail=50 $WORKERS || true
+              exit 1
+            fi
+            echo "==> Pipeline bring-up verified."
+
+      - name: Report status
+        if: always()
+        run: |
+          {
+            echo "## Deploy pipeline workers to staging: ${{ job.status }}"
+            echo ""
+            if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+              echo "- **Source repo:** ${{ github.event.client_payload.repo }}"
+              echo "- **Source SHA:** ${{ github.event.client_payload.sha }}"
+              echo "- **Event type:** ${{ github.event.action }}"
+            fi
+            echo "- **Ingest worker tag:** ${{ steps.tag.outputs.ingest_tag }}"
+            echo "- **Workers:** dedup, enrich, normalize, graph-load"
+            echo "- **Actor:** ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"

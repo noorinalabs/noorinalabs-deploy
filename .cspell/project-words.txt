@@ -27,6 +27,8 @@ deadmansswitch
 dedup
 Diallo
 diffable
+dispatchable
+distiluse
 dryrun
 emptively
 exfiltrates
@@ -36,6 +38,7 @@ Fjkb
 footgun
 gatekeeping
 Hadid
+hadiths
 healthcheck
 Healthchecks
 Hiro
@@ -75,6 +78,7 @@ promtail
 promtool
 pubkeys
 Rashidi
+reembed
 regen
 reloadable
 Renaud
@@ -93,6 +97,7 @@ Tanaka
 Tariq
 tfstate
 tfvars
+thresholding
 tlnp
 tmpfs
 tomasz
@@ -100,9 +105,11 @@ Tremblay
 vhosts
 visualisation
 Volkov
+Webauth
 Weronika
 worktree
 Worktrees
+writability
 Wójcik
 Yara
 Zielinska
