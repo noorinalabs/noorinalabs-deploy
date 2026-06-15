@@ -207,18 +207,22 @@ services:
   # brought up deliberately as a break-glass with `--profile embed`.
   #
   # NETWORKS — `backend` (internal) for neo4j:7687 / postgres:5432 / redis:6379,
-  # PLUS `egress` (outbound-only) so sentence-transformers can download the
-  # ~470MB model weights from HuggingFace on a cold cache. `backend` is
-  # `internal: true`, so without `egress` the first run could not fetch weights.
-  # This two-network need is why the workflow drives this via `docker compose
-  # run` (attaches both) rather than a single-network raw `docker run`.
+  # PLUS `egress` (outbound-only) for HuggingFace. The embed image (ig#1089)
+  # BAKES the default model, so the happy path needs no download; `egress` is
+  # required for a model SWAP (a non-baked `EMBEDDING_MODEL`) + HF metadata
+  # checks. `backend` is `internal: true`, so the embed container needs both
+  # networks — which is why the workflow drives this via `docker compose run`
+  # (attaches both) rather than a single-network raw `docker run`.
   #
-  # MODEL WEIGHTS — volume-cached, NOT baked into the image (owner decision, ADR
-  # 0008). The named `st_model_cache` volume is mounted at
-  # SENTENCE_TRANSFORMERS_HOME (and HOME, so HF's ~/.cache lands there too) so
-  # the weights download once and persist across runs. read_only rootfs + tmpfs
-  # /tmp keep the security posture the rest of the stack uses; the volume mount
-  # stays writable for the weight download.
+  # MODEL WEIGHTS — the decoupled embed image (ig#1089, NOT the main isnad-graph
+  # image) bakes the default model at `HF_HOME=/opt/hf-cache`. Per the owner's
+  # volume-cache decision (ADR 0008) the named `st_model_cache` volume is mounted
+  # at that SAME path: on first run Docker populates the empty volume from the
+  # baked weights, so they persist across image re-pulls (no re-download), and a
+  # model swap downloads the new model here (egress). HF_HOME /
+  # SENTENCE_TRANSFORMERS_HOME / HOME all point at the volume so every HF cache
+  # write lands on it. read_only rootfs + tmpfs /tmp keep the stack's security
+  # posture; the volume mount stays writable.
   #
   # CREDENTIALS — reuses the SAME DB env the `api` service reads (NEO4J_* /
   # PG_DSN / REDIS_URL), interpolated by compose from the VPS .env, so no
@@ -230,14 +234,21 @@ services:
     tmpfs:
       - /tmp:size=256M
     volumes:
-      - st_model_cache:/opt/st_models
+      # Mounted at the image's baked HF_HOME so the volume is pre-populated from
+      # the baked weights on first run and persists across re-pulls (ig#1089).
+      - st_model_cache:/opt/hf-cache
     environment:
-      # Real 384-dim multilingual model (ADR 0008). Overridable per-dispatch by
-      # the workflow via `-e EMBEDDING_MODEL=...`. MUST stay 384-dim — the
-      # pgvector column is vector(384) with a write-time dimension guard.
+      # Real 384-dim multilingual model (ADR 0008). Baked into the embed image;
+      # overridable per-dispatch by the workflow via `-e EMBEDDING_MODEL=...`.
+      # MUST stay 384-dim — the pgvector column is vector(384) with a write-time
+      # dimension guard.
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}
-      - SENTENCE_TRANSFORMERS_HOME=/opt/st_models
-      - HOME=/opt/st_models
+      # Align with the embed image's baked weights cache (ig#1089). All three
+      # point at the volume mount so the baked weights persist and any HF cache
+      # write (model swap) lands on the volume, not the read_only rootfs.
+      - HF_HOME=/opt/hf-cache
+      - SENTENCE_TRANSFORMERS_HOME=/opt/hf-cache
+      - HOME=/opt/hf-cache
       # Same DB env the api service reads (NEO4J_* / PG_DSN / REDIS_URL).
       - NEO4J_URI=bolt://neo4j:7687
       - NEO4J_USER=neo4j
@@ -1481,8 +1492,9 @@ volumes:
   kafka_data:
   user_pg_data:
   user_redis_data:
-  # Sentence-transformer model weights cache for the one-shot isnad-graph-embed
-  # service (deploy#461, ADR 0008). Mounted at SENTENCE_TRANSFORMERS_HOME so the
-  # ~470MB model downloads once and persists across re-embed runs — volume-cache,
-  # NOT baked into the image (owner decision).
+  # Model weights cache for the one-shot isnad-graph-embed service (deploy#461,
+  # ADR 0008). Mounted at the embed image's baked HF_HOME (/opt/hf-cache,
+  # ig#1089): Docker populates the empty volume from the baked weights on first
+  # run, so they persist across image re-pulls and a model swap's download is
+  # cached here too. Volume-cache per the owner decision.
   st_model_cache:

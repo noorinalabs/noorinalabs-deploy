@@ -43,7 +43,7 @@ Mirrors `db-migrate.yml`'s SSH → `docker run --rm` shape.
 - **Environment protection:** `environment: ${{ inputs.env == 'prod' && 'production' || 'staging' }}` — prod requires manual approval, per-env secrets/host resolve from the matching GH Environment. Same mapping as `db-migrate.yml` / `terraform.yml`.
 - **Concurrency:** `group: reembed-corpus-${{ inputs.env }}`, `cancel-in-progress: false`. A re-embed is a long, write-heavy job against the live pgvector store; two must never overlap on one env (ADR 0005's serialization rationale).
 - **Execution:** SSH as `deploy` → GHCR login → `docker compose --profile embed pull` → run, in order, `isnad embed-hadiths --batch-size <n>` → `isnad reindex-embeddings` (ig#1057) → `isnad verify-recall`, each as a `docker compose --profile embed run --rm --no-deps -e EMBEDDING_MODEL=… isnad-graph-embed <cmd>` against the live project. **The exit code of `verify-recall` is the gate** — a recall-verification failure fails the workflow. DB credentials come from the VPS `.env` via compose interpolation (never on argv).
-  - **Why `docker compose run`, not raw `docker run` (the db-migrate shape):** the embed container needs TWO networks — the internal `backend` (neo4j/postgres/redis) AND `egress` (outbound HTTPS to download the ~470 MB model weights from HuggingFace on a cold cache). A raw `docker run` attaches a single `--network`; `docker compose run` attaches both from the `isnad-graph-embed` service definition and reuses its env/volume, keeping creds in the VPS `.env`. db-migrate needs only one internal network (`user-backend`), so its raw `docker run` is correct there; this op's egress requirement is the deliberate divergence.
+  - **Why `docker compose run`, not raw `docker run` (the db-migrate shape):** the embed container needs TWO networks — the internal `backend` (neo4j/postgres/redis) AND `egress`. The embed image bakes the default model (see § 3), so the happy path needs no download; `egress` is required only for a model **swap** (a non-baked `EMBEDDING_MODEL`) and HuggingFace metadata. A raw `docker run` attaches a single `--network`; `docker compose run` attaches both from the `isnad-graph-embed` service definition and reuses its env/volume, keeping creds in the VPS `.env`. db-migrate needs only one internal network (`user-backend`), so its raw `docker run` is correct there; this op's two-network need is the deliberate divergence.
 - **`dry_run=true` (the default):** plans and logs the resolved invocation (env, host, image, model, batch size, target network) and exits **without** running any of the three mutating/reading commands — it writes no embeddings and rebuilds no index. A real run requires explicitly setting `dry_run=false`.
 - **Observability:** emits a `.prom` textfile-collector file on the VPS on every real run (`if: always()` discipline) with success/exit-status, run timestamp, duration, model label, and a best-effort rows-embedded count — exactly the node-exporter textfile pattern `db-migrate.yml` established (atomic temp+rename, writability pre-check).
 
@@ -53,9 +53,14 @@ Added to `compose/docker-compose.prod.yml` on the `user-service-migrate` pattern
 
 - **Profile-gated** (`profiles: ["embed"]`). A re-embed of 34k hadiths is expensive and must **never** run on an ordinary `docker compose up` (which app deploys execute). The profile keeps the definition validated by `docker compose config` while excluding it from the default up — the same mechanism the `pipeline` workers use. It is brought up deliberately with `docker compose --profile embed run --rm isnad-graph-embed …`.
 
-### 3. Volume-cached model weights (NOT baked into the image)
+### 3. Model weights: baked into the decoupled embed image AND volume-cached
 
-A **named volume** `st_model_cache` is declared and mounted at `SENTENCE_TRANSFORMERS_HOME` (and `HOME`) in both the compose service and the workflow's `docker run`. Owner decision: cache the ~470 MB weights in a volume so they download once and persist across runs, rather than baking them into the isnad-graph image.
+The embed-capable image is a **separate, decoupled** GHCR image (`…-isnad-graph-embed`, published by an independent `build-and-push-embed` job in isnad-graph's `ghcr-publish.yml` — ig#1089), NOT the main `…-isnad-graph` image that every app deploy pulls. It **bakes** the default 384-dim model at `HF_HOME=/opt/hf-cache`. On top of that, per the owner's volume-cache decision, a **named volume** `st_model_cache` is mounted at that **same** `/opt/hf-cache` path (with `SENTENCE_TRANSFORMERS_HOME` and `HOME` also pointed there). The combination is deliberate:
+
+- **Baked** → the default model is present the instant the container starts; the happy-path re-embed has no runtime dependency on HuggingFace being reachable.
+- **Volume mounted at the baked path** → Docker populates the empty volume from the baked weights on first run, so the cache **persists across image re-pulls** (a new image tag does not re-download), and a model **swap** (a non-baked `EMBEDDING_MODEL`) downloads the new model into the same volume (the only path that needs `egress`).
+
+This sidesteps the original objection to baking (§ Alternatives B): the weights are NOT in the main image, so no app deploy pays for them.
 
 ### 4. Runbook
 
@@ -67,9 +72,11 @@ A **named volume** `st_model_cache` is declared and mounted at `SENTENCE_TRANSFO
 
 An operator SSHes to the VPS and runs the embed command by hand once. **Rejected by owner directive 2026-06-15.** It is not repeatable (the next model/corpus change repeats the manual toil), not reviewable (no diff, no PR), unaudited (no environment-protection approval, no `.prom` signal), and not deterministic (no captured inputs). The whole point of this ADR is to replace this with a versioned, dispatchable artifact.
 
-### B. Bake model weights into the isnad-graph image (owner-declined in favour of volume-cache)
+### B. Bake model weights into the **main** isnad-graph image (rejected)
 
-Ship the ~470 MB weights inside the embed image at build time. **Rejected:** it bloats every isnad-graph image build by ~0.5 GB, couples the model choice to an image rebuild (a model swap becomes an image+deploy cycle), and slows *every* isnad-graph deploy's pull even when no re-embed is happening. The volume-cache decouples weights from the image: the model downloads once into `st_model_cache` and persists; swapping models is a workflow input, not an image rebuild. Owner chose volume-cache.
+Ship the ~470 MB weights inside the **main `…-isnad-graph`** image (the one every app deploy pulls) at build time. **Rejected:** it bloats every isnad-graph image build by ~0.5 GB, couples the model choice to the app's image rebuild cadence, and slows *every* isnad-graph deploy's pull even when no re-embed is happening.
+
+What shipped instead (§ 3) keeps the app image lean: the weights are baked into a **separate, decoupled** `…-isnad-graph-embed` image (ig#1089) that only the re-embed op pulls, and a named volume mounted at the baked `HF_HOME` gives persistence across re-pulls and headroom for model swaps. So baking is avoided *where it would hurt* (the app image) and used *where it helps* (a dedicated embed image that is never on the deploy hot path), satisfying the owner's volume-cache intent.
 
 ### C. Interim minimum-similarity floor (owner-declined)
 
@@ -105,7 +112,7 @@ Threshold cosine similarity so low-quality matches are hidden from the UI, leavi
 | What if someone runs an ordinary `docker compose up`? | The `isnad-graph-embed` service is profile-gated (`profiles: ["embed"]`) and does **not** start. No accidental 34k-row re-embed on a routine deploy. |
 | What if a 512-dim model is passed as `model`? | The application's dimension guard rejects the write (the `vector(384)` column). The embed step fails, `verify-recall` never passes, the workflow fails. The runbook calls out the 384-dim constraint. |
 | What if `dry_run` is left at its default? | Nothing is written — the default is `true` precisely so a fat-fingered dispatch is a no-op plan, not a destructive run. A real run is an explicit `dry_run=false`. |
-| What if the model weights are not yet cached? | First real run downloads ~470 MB into `st_model_cache`; subsequent runs reuse it. The runbook notes the first-run duration premium. |
+| What if the model weights are not yet cached? | The default model is **baked** into the embed image at `HF_HOME=/opt/hf-cache`, and the `st_model_cache` volume is populated from it on first run — so the default model needs no download at all. Only a model **swap** (a non-baked `EMBEDDING_MODEL`) downloads (~470 MB) into the volume on first use, then persists. |
 
 ## Refs
 

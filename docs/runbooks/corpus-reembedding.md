@@ -29,7 +29,7 @@ reembed-corpus.yml (workflow_dispatch — env-gated, dry_run-default-true)
            └── emits /var/lib/node_exporter/textfile_collector/corpus_reembed.prom (if: always)
 ```
 
-Each step is a one-shot `--rm` container from the profile-gated `isnad-graph-embed` service, attached to the live project's `backend` (neo4j/postgres/redis) **and** `egress` (HuggingFace weight download) networks, with the `st_model_cache` volume mounted at `SENTENCE_TRANSFORMERS_HOME` so the model downloads once and persists. DB credentials come from the VPS `.env` via compose interpolation — never on argv.
+Each step is a one-shot `--rm` container from the profile-gated `isnad-graph-embed` service, attached to the live project's `backend` (neo4j/postgres/redis) **and** `egress` networks. The embed image (ig#1089) **bakes** the default model at `HF_HOME=/opt/hf-cache`; the `st_model_cache` volume is mounted at that same path, so the baked weights populate the volume on first run and persist across image re-pulls. `egress` is needed only for a model **swap** (a non-baked `EMBEDDING_MODEL`). DB credentials come from the VPS `.env` via compose interpolation — never on argv.
 
 ## How to trigger
 
@@ -51,7 +51,7 @@ Re-embed `stg` first, eyeball search quality, then `prod`. There is no automatic
 
 ## Expected duration
 
-- **Cold model cache (first run on an env):** add the one-time ~470 MB weight download (a few minutes on the VPS link) on top of the embed time.
+- **Default model:** no download — it is baked into the embed image and populates `st_model_cache` on first run. Only a model **swap** (a non-baked `EMBEDDING_MODEL`) adds a one-time ~470 MB download (a few minutes on the VPS link).
 - **Embedding ~34k hadiths** on the single CPU VPS: order of minutes to low tens of minutes depending on `batch_size`. The `concurrency` group serializes runs per env, so a second dispatch queues rather than overlapping.
 - **Index rebuild + recall verify:** seconds to a couple of minutes.
 
@@ -118,11 +118,11 @@ ERROR: /opt/noorinalabs-deploy/.env is missing on <env> VPS.
 
 **Recovery:** run the main deploy workflow (`deploy-<env>` / `deploy-isnad-graph.yml`) once to write `.env`, then re-dispatch. On prod, treat a mid-life disappearance as a sev-2 and escalate to Bereket.
 
-### 5. Cold cache is re-downloading every run
+### 5. A model is re-downloading every run
 
-**Cause:** the `st_model_cache` volume was cleared, or a different `model` id was used (sentence-transformers keys the cache by model id, so each distinct model downloads once).
+**Cause:** the default model is baked into the image (`HF_HOME=/opt/hf-cache`) and should never re-download. A download only happens for a **non-default** `model` id, or if the `st_model_cache` volume was cleared. sentence-transformers keys the cache by model id, so each distinct model downloads once into the volume.
 
-**Recovery:** none needed — it is correct behavior. The next run with the same model reuses the cached weights. If you must reclaim space, see § Clearing the model cache.
+**Recovery:** none needed for the expected case — the next run with the same model reuses the cached weights. If the **default** model is re-downloading every run, the volume is not persisting (check it is mounted at `/opt/hf-cache`, matching the image's baked `HF_HOME`). To reclaim space, see § Clearing the model cache.
 
 ## Abort / rollback
 
@@ -132,7 +132,7 @@ ERROR: /opt/noorinalabs-deploy/.env is missing on <env> VPS.
   ```bash
   docker volume rm noorinalabs_st_model_cache   # only when no embed container is running
   ```
-  The next run re-downloads the weights.
+  The next run re-populates the volume from the image's baked weights (default model: no download; a swapped model re-downloads once).
 
 ## Break-glass (CI cannot reach the box)
 

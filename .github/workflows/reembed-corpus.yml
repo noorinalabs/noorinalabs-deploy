@@ -17,12 +17,13 @@ name: Re-embed corpus (isnad-graph semantic search)
 #
 # Why `docker compose run` (not raw `docker run` like db-migrate): the embed
 # container needs TWO networks — the internal `backend` (neo4j/postgres/redis)
-# AND `egress` (outbound HTTPS to download the ~470MB model weights from
-# HuggingFace on a cold model-cache). A raw `docker run` attaches a single
+# AND `egress`. The embed image (ig#1089) BAKES the default model, so the happy
+# path needs no download; `egress` covers a model SWAP (a non-baked
+# EMBEDDING_MODEL) + HuggingFace metadata. A raw `docker run` attaches a single
 # `--network`; `docker compose run` attaches BOTH from the `isnad-graph-embed`
 # service definition, and reuses that service's env/volume so DB creds stay in
 # the VPS .env and never reach argv. db-migrate needs only one internal network,
-# so its raw `docker run` is fine there; this op's egress requirement is why the
+# so its raw `docker run` is fine there; this op's two-network need is why the
 # shapes differ. The service is profile-gated (`embed`) so an ordinary deploy's
 # `compose up` never triggers it.
 #
@@ -60,8 +61,9 @@ on:
       image:
         description: >-
           Embed-capable isnad-graph image ref. Leave empty to resolve the
-          env-scoped default `ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:<env>-latest`.
-          Final published name/tag is pinned once isnad-graph#1088 ships the embed image.
+          env-scoped default `ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:<env>-latest`
+          (the decoupled, model-baked embed image published by isnad-graph#1089).
+          Pass an explicit ref to pin a specific build.
         required: false
         type: string
         default: ""
