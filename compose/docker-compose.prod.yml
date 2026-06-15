@@ -271,7 +271,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          # 4G (was 2G): a real embed loads the sentence-transformer model +
+          # torch and batches 34k hadiths; 2G left no torch headroom and OOM
+          # pressure is a plausible contributor to the slow/killed run (deploy#465).
+          # Profile-gated (`embed`) so this never runs on an ordinary deploy —
+          # zero blast radius on the live stack; the box (CPX41, 16G) has room.
+          memory: 4G
           cpus: "2.0"
         reservations:
           memory: 512M
