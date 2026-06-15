@@ -80,6 +80,12 @@ jobs:
   reembed:
     name: re-embed corpus (${{ inputs.env }})
     runs-on: ubuntu-latest
+    # A real run embeds the full 34,028-hadith corpus on the VPS CPU, then
+    # rebuilds the pgvector index and verifies recall — minutes-to-tens-of-minutes,
+    # well past the GH default per-step budget. Give the job a generous ceiling so
+    # the runner-side never caps the SSH step short of `command_timeout` below
+    # (deploy#465). The dry-run path returns in seconds and is unaffected.
+    timeout-minutes: 120
     # Maps to GH Environment protection (stg -> staging, prod -> production).
     # prod requires manual approval; per-env secrets/host resolve from the
     # matching Environment. Same pattern as db-migrate.yml / terraform.yml.
@@ -127,6 +133,13 @@ jobs:
         with:
           host: ${{ vars.VPS_HOST }}
           username: deploy
+          # appleboy/ssh-action defaults command_timeout to 10m — far short of a
+          # real CPU embed of the 34,028-hadith corpus + reindex + verify-recall,
+          # which the prior stg run (deploy#465) hit at the 10m mark while still
+          # mid-embed. 60m comfortably covers a full CPU embed with headroom;
+          # capped below the job-level timeout-minutes above. The dry-run path is
+          # seconds, so this only affects real runs.
+          command_timeout: 60m
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
           envs: ENV_NAME,MODEL,BATCH_SIZE,DRY_RUN,IMAGE,GITHUB_TOKEN,GITHUB_ACTOR
           script: |
