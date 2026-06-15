@@ -1,0 +1,289 @@
+name: Re-embed corpus (isnad-graph semantic search)
+
+# Repeatable, observable, env-gated corpus re-embedding (deploy#461, ADR 0008).
+#
+# Semantic search returns lexically-arbitrary results because the 34,028-hadith
+# corpus is embedded with the dependency-free HashingEmbedder (token-overlap,
+# not meaning). The application already supports a real model via
+# EMBEDDING_MODEL; this workflow is the missing OPERATIONAL trigger to re-embed
+# the corpus on the cluster with a real 384-dim multilingual model, rebuild the
+# pgvector index, and verify recall.
+#
+# Shape mirrors db-migrate.yml (the canonical one-shot cluster-data op): SSH to
+# the VPS as `deploy` (appleboy/ssh-action, secrets.DEPLOY_SSH_PRIVATE_KEY,
+# vars.VPS_HOST) and run a one-shot container in the compose network, with DB
+# credentials sourced from the VPS .env (NEVER on argv — CWE-214) and .prom
+# textfile-collector metrics emitted on every real run.
+#
+# Why `docker compose run` (not raw `docker run` like db-migrate): the embed
+# container needs TWO networks — the internal `backend` (neo4j/postgres/redis)
+# AND `egress` (outbound HTTPS to download the ~470MB model weights from
+# HuggingFace on a cold model-cache). A raw `docker run` attaches a single
+# `--network`; `docker compose run` attaches BOTH from the `isnad-graph-embed`
+# service definition, and reuses that service's env/volume so DB creds stay in
+# the VPS .env and never reach argv. db-migrate needs only one internal network,
+# so its raw `docker run` is fine there; this op's egress requirement is why the
+# shapes differ. The service is profile-gated (`embed`) so an ordinary deploy's
+# `compose up` never triggers it.
+#
+# Constraints (ADR 0008):
+#   - Model MUST be 384-dim — the pgvector column is vector(384) with a dim
+#     guard. `paraphrase-multilingual-MiniLM-L12-v2` is 384-dim + multilingual.
+#     Do NOT default to a 512-dim model (e.g. distiluse-*-v2) — it fails the
+#     write-time dimension guard.
+#   - dry_run defaults to TRUE — a fat-fingered dispatch is a no-op plan, not a
+#     destructive 34k-row re-embed. A real run is an explicit dry_run=false.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Target env — stg or prod"
+        required: true
+        type: choice
+        options: [stg, prod]
+      model:
+        description: "Sentence-transformer model id (MUST be 384-dim; see ADR 0008)"
+        required: false
+        type: string
+        default: "paraphrase-multilingual-MiniLM-L12-v2"
+      batch_size:
+        description: "Embedding batch size"
+        required: false
+        type: string
+        default: "256"
+      dry_run:
+        description: "Plan/log only — write no embeddings, rebuild no index"
+        required: false
+        type: boolean
+        default: true
+      image:
+        description: >-
+          Embed-capable isnad-graph image ref. Leave empty to resolve the
+          env-scoped default `ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:<env>-latest`.
+          Final published name/tag is pinned once isnad-graph#1088 ships the embed image.
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  # Serialize re-embeds per env. A re-embed is a long, write-heavy job against
+  # the live pgvector store; two must never overlap on one env (ADR 0005's
+  # serialization rationale). Queue, don't cancel — a mid-run cancel could leave
+  # a partially-embedded corpus.
+  group: reembed-corpus-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  reembed:
+    name: re-embed corpus (${{ inputs.env }})
+    runs-on: ubuntu-latest
+    # Maps to GH Environment protection (stg -> staging, prod -> production).
+    # prod requires manual approval; per-env secrets/host resolve from the
+    # matching Environment. Same pattern as db-migrate.yml / terraform.yml.
+    environment: ${{ inputs.env == 'prod' && 'production' || 'staging' }}
+    permissions:
+      # GHCR pull of the embed image happens on the VPS via the runtime
+      # GITHUB_TOKEN; packages:read lets that token pull.
+      contents: read
+      packages: read
+    steps:
+      - name: Resolve embed image ref
+        id: resolve
+        env:
+          ENV_NAME: ${{ inputs.env }}
+          IMAGE_INPUT: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          img="${IMAGE_INPUT}"
+          if [ -z "${img}" ]; then
+            # Env-scoped default; mirrors db-migrate.yml's <env>-latest fallback.
+            img="ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:${ENV_NAME}-latest"
+          fi
+          # Guard: refuse to re-embed prod with a stg-tagged image. The reverse
+          # (a prod tag on stg) is benign and allowed.
+          if [ "${ENV_NAME}" = "prod" ] && printf '%s' "${img}" | grep -qE ':stg(-|-latest$|$)'; then
+            echo "::error::Refusing to re-embed prod with a stg-tagged image ('${img}'). Pass an explicit prod image ref via the 'image' input."
+            exit 1
+          fi
+          echo "image=${img}" >> "$GITHUB_OUTPUT"
+          echo "Resolved embed image: ${img}"
+
+      - name: Re-embed corpus on ${{ inputs.env }} VPS
+        uses: appleboy/ssh-action@v1
+        env:
+          ENV_NAME: ${{ inputs.env }}
+          MODEL: ${{ inputs.model }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          # GHCR pull credentials — runtime token + owner actor, same as
+          # db-migrate.yml. DB credentials are NOT pushed through the GH Actions
+          # transport: compose sources them from the VPS .env inside the script.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.repository_owner }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: ENV_NAME,MODEL,BATCH_SIZE,DRY_RUN,IMAGE,GITHUB_TOKEN,GITHUB_ACTOR
+          script: |
+            set -uo pipefail
+
+            cd /opt/noorinalabs-deploy
+
+            echo "==> [${ENV_NAME}] corpus re-embed — model=${MODEL} batch_size=${BATCH_SIZE} dry_run=${DRY_RUN}"
+            echo "==> [${ENV_NAME}] image=${IMAGE}"
+
+            # .env on the VPS (mode 600, written by the deploy workflow) is the
+            # single source of truth for DB credentials. compose interpolates the
+            # isnad-graph-embed service env (NEO4J_PASSWORD / POSTGRES_* / ...)
+            # from it — the creds never reach this script's argv or the
+            # container's argv (CWE-214). Same .env contract as db-migrate.yml.
+            if [ ! -f .env ]; then
+              echo "ERROR: /opt/noorinalabs-deploy/.env is missing on ${ENV_NAME} VPS." >&2
+              echo "       The deploy workflow has never written an env-file here, or it was removed." >&2
+              exit 1
+            fi
+
+            # Pin the embed image for the compose `isnad-graph-embed` service.
+            # EMBED_IMAGE overrides the compose default (env wins over .env).
+            export EMBED_IMAGE="${IMAGE}"
+
+            # Same project name + compose file the deploys use, so `run` attaches
+            # to the live project's networks (backend + egress) and reuses the
+            # model-cache volume. --profile embed activates the otherwise-gated
+            # service. --no-deps: the DBs are already up (live stack) — do NOT
+            # let `run` recreate neo4j/postgres.
+            COMPOSE="docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env --profile embed"
+
+            # One-shot embed runner: fresh --rm container on the service's
+            # networks with the model-cache volume; EMBEDDING_MODEL overridden
+            # per-dispatch via -e (container env, not argv).
+            embed_run() {
+              ${COMPOSE} run --rm --no-deps -e EMBEDDING_MODEL="${MODEL}" isnad-graph-embed "$@"
+            }
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "==> [${ENV_NAME}] DRY RUN — no embeddings written, no index rebuilt."
+              echo "    image: ${EMBED_IMAGE}"
+              echo "    would run (compose service isnad-graph-embed, networks backend+egress):"
+              echo "      isnad embed-hadiths --batch-size ${BATCH_SIZE}"
+              echo "      isnad reindex-embeddings"
+              echo "      isnad verify-recall   (exit code = gate)"
+              # Read-only: confirm the embed service resolves under the live .env
+              # (catches config/secret drift without writing anything).
+              if ${COMPOSE} config isnad-graph-embed >/dev/null 2>&1; then
+                echo "    compose config: isnad-graph-embed resolves OK under live .env"
+              else
+                echo "    WARNING: compose config for isnad-graph-embed did not resolve under live .env" >&2
+              fi
+              echo "==> [${ENV_NAME}] dry run complete (exit 0)."
+              exit 0
+            fi
+
+            # GHCR login so the embed image can be pulled; trap logs out at
+            # end-of-run so no credentials persist on the box.
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+            echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin \
+              || { echo "ERROR: [${ENV_NAME}] GHCR login failed." >&2; exit 1; }
+
+            echo "==> [${ENV_NAME}] pulling embed image ${EMBED_IMAGE} ..."
+            ${COMPOSE} pull isnad-graph-embed \
+              || { echo "ERROR: [${ENV_NAME}] compose pull isnad-graph-embed (${EMBED_IMAGE}) failed." >&2; exit 1; }
+
+            START_TS="$(date -u +%s)"
+            RC=0
+
+            # --- embed ---
+            echo "==> [${ENV_NAME}] isnad embed-hadiths --batch-size ${BATCH_SIZE}"
+            EMBED_OUT="$(embed_run isnad embed-hadiths --batch-size "${BATCH_SIZE}" 2>&1)" || RC=$?
+            printf '%s\n' "${EMBED_OUT}"
+            # Best-effort rows-embedded parse from a final "embedded <n>" line.
+            # Degrades to -1 (unknown) if the shape changes — never fails the run.
+            ROWS="$(printf '%s\n' "${EMBED_OUT}" | grep -oiE 'embedded[^0-9]*[0-9]+' | grep -oE '[0-9]+' | tail -n1 || true)"
+            ROWS="${ROWS:--1}"
+
+            # --- reindex (only if embed succeeded) ---
+            if [ "${RC}" -eq 0 ]; then
+              echo "==> [${ENV_NAME}] isnad reindex-embeddings"
+              embed_run isnad reindex-embeddings || RC=$?
+            fi
+
+            # --- verify-recall (the gate; only if prior steps succeeded) ---
+            if [ "${RC}" -eq 0 ]; then
+              echo "==> [${ENV_NAME}] isnad verify-recall (gate — its exit code fails the job)"
+              embed_run isnad verify-recall || RC=$?
+            fi
+
+            END_TS="$(date -u +%s)"
+            DURATION=$(( END_TS - START_TS ))
+            [ "${DURATION}" -lt 0 ] && DURATION=0
+            if [ "${RC}" -eq 0 ]; then SUCCESS=1; else SUCCESS=0; fi
+
+            # --- emit .prom textfile-collector metrics (always, success or fail) ---
+            # Same atomic temp+rename + writability discipline as db-migrate.yml.
+            # node-exporter mounts the dir read-only and scrapes *.prom files.
+            TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+            if ! [ -w "${TEXTFILE_DIR}" ]; then
+              echo "WARNING: ${TEXTFILE_DIR} is not writable by deploy user — skipping metric emission." >&2
+              echo "         cloud-init may not have provisioned it; see" >&2
+              echo "         docs/runbooks/user-service-alembic.md#observability (recovery)." >&2
+            else
+              FINAL="${TEXTFILE_DIR}/corpus_reembed.prom"
+              TMP="${FINAL}.$$"
+              {
+                echo "# HELP corpus_reembed_last_run_success 1 if the most recent corpus re-embed (embed+reindex+verify-recall) succeeded for the labeled env, else 0."
+                echo "# TYPE corpus_reembed_last_run_success gauge"
+                echo "corpus_reembed_last_run_success{env=\"${ENV_NAME}\",model=\"${MODEL}\"} ${SUCCESS}"
+                echo "# HELP corpus_reembed_last_run_timestamp_seconds Unix timestamp of the most recent corpus re-embed run for the labeled env."
+                echo "# TYPE corpus_reembed_last_run_timestamp_seconds gauge"
+                echo "corpus_reembed_last_run_timestamp_seconds{env=\"${ENV_NAME}\",model=\"${MODEL}\"} ${END_TS}"
+                echo "# HELP corpus_reembed_last_run_duration_seconds Wall-clock duration of the most recent corpus re-embed run for the labeled env."
+                echo "# TYPE corpus_reembed_last_run_duration_seconds gauge"
+                echo "corpus_reembed_last_run_duration_seconds{env=\"${ENV_NAME}\",model=\"${MODEL}\"} ${DURATION}"
+                echo "# HELP corpus_reembed_rows_embedded Rows embedded by the most recent corpus re-embed run (best-effort; -1 if unparsed)."
+                echo "# TYPE corpus_reembed_rows_embedded gauge"
+                echo "corpus_reembed_rows_embedded{env=\"${ENV_NAME}\",model=\"${MODEL}\"} ${ROWS}"
+              } > "${TMP}"
+              chmod 0644 "${TMP}"
+              mv -f "${TMP}" "${FINAL}"
+              echo "Wrote ${FINAL}: success=${SUCCESS} duration=${DURATION}s rows=${ROWS} model=${MODEL} env=${ENV_NAME}"
+            fi
+
+            if [ "${RC}" -ne 0 ]; then
+              echo "ERROR: [${ENV_NAME}] corpus re-embed failed (rc=${RC})." >&2
+              echo "       The verify-recall gate or an earlier step did not pass — see logs above" >&2
+              echo "       and docs/runbooks/corpus-reembedding.md." >&2
+              exit "${RC}"
+            fi
+            echo "==> [${ENV_NAME}] corpus re-embed complete — recall verified (rows=${ROWS}, ${DURATION}s)."
+
+      - name: Report
+        if: always()
+        env:
+          ENV_NAME: ${{ inputs.env }}
+          MODEL: ${{ inputs.model }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          JOB_STATUS: ${{ job.status }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Corpus re-embed (${ENV_NAME}): ${JOB_STATUS}"
+            echo ""
+            echo "- **Env:** ${ENV_NAME}"
+            echo "- **Model:** ${MODEL}"
+            echo "- **Batch size:** ${BATCH_SIZE}"
+            echo "- **Dry run:** ${DRY_RUN}"
+            echo "- **Image:** ${IMAGE}"
+            echo ""
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "Dry run — no embeddings written, no index rebuilt."
+            fi
+            if [ "${JOB_STATUS}" != "success" ]; then
+              echo "Runbook: [docs/runbooks/corpus-reembedding.md](../blob/${GITHUB_SHA}/docs/runbooks/corpus-reembedding.md)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

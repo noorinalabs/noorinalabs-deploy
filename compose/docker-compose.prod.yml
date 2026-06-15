@@ -192,6 +192,87 @@ services:
     command: /app/.venv/bin/uvicorn src.api.app:create_app --factory --host 0.0.0.0 --port 8000 --workers 4
     restart: unless-stopped
 
+  # One-shot corpus re-embedding runner (deploy#461, ADR 0008). Re-embeds the
+  # 34k-hadith corpus with a REAL 384-dim multilingual model (replacing the
+  # meaningless HashingEmbedder vectors), rebuilds the pgvector index, and
+  # verifies recall. Mirrors the user-service-migrate one-shot pattern:
+  # `restart: "no"`, depends_on the DBs healthy, exits when done.
+  #
+  # PROFILE-GATED (`embed`) — a re-embed of 34k rows is expensive and must NEVER
+  # run on an ordinary `docker compose up` (which app deploys execute). The
+  # profile keeps the definition validated by `docker compose config` while
+  # excluding it from the default up — same mechanism the `pipeline` workers use.
+  # It is driven by `.github/workflows/reembed-corpus.yml` via
+  # `docker compose --profile embed run --rm isnad-graph-embed isnad <cmd>`, or
+  # brought up deliberately as a break-glass with `--profile embed`.
+  #
+  # NETWORKS — `backend` (internal) for neo4j:7687 / postgres:5432 / redis:6379,
+  # PLUS `egress` (outbound-only) so sentence-transformers can download the
+  # ~470MB model weights from HuggingFace on a cold cache. `backend` is
+  # `internal: true`, so without `egress` the first run could not fetch weights.
+  # This two-network need is why the workflow drives this via `docker compose
+  # run` (attaches both) rather than a single-network raw `docker run`.
+  #
+  # MODEL WEIGHTS — volume-cached, NOT baked into the image (owner decision, ADR
+  # 0008). The named `st_model_cache` volume is mounted at
+  # SENTENCE_TRANSFORMERS_HOME (and HOME, so HF's ~/.cache lands there too) so
+  # the weights download once and persist across runs. read_only rootfs + tmpfs
+  # /tmp keep the security posture the rest of the stack uses; the volume mount
+  # stays writable for the weight download.
+  #
+  # CREDENTIALS — reuses the SAME DB env the `api` service reads (NEO4J_* /
+  # PG_DSN / REDIS_URL), interpolated by compose from the VPS .env, so no
+  # password ever lands on argv (CWE-214) and no NEW required secret is added.
+  isnad-graph-embed:
+    image: ${EMBED_IMAGE:-ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:stg-latest}
+    profiles: ["embed"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M
+    volumes:
+      - st_model_cache:/opt/st_models
+    environment:
+      # Real 384-dim multilingual model (ADR 0008). Overridable per-dispatch by
+      # the workflow via `-e EMBEDDING_MODEL=...`. MUST stay 384-dim — the
+      # pgvector column is vector(384) with a write-time dimension guard.
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}
+      - SENTENCE_TRANSFORMERS_HOME=/opt/st_models
+      - HOME=/opt/st_models
+      # Same DB env the api service reads (NEO4J_* / PG_DSN / REDIS_URL).
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      - PG_DSN=postgresql://${POSTGRES_USER:?POSTGRES_USER must be set}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379/0
+    # Default command (break-glass `--profile embed up` path) runs the full
+    # sequence. The reembed-corpus.yml workflow overrides this, invoking
+    # `isnad embed-hadiths` / `reindex-embeddings` / `verify-recall` as separate
+    # `docker compose run` calls so each step's exit code is observed.
+    command:
+      - sh
+      - -c
+      - isnad embed-hadiths --batch-size ${EMBED_BATCH_SIZE:-256} && isnad reindex-embeddings && isnad verify-recall
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+    logging: *default-logging
+    networks:
+      - backend
+      - egress
+    # One-shot: never restart. A re-embed is operator-triggered, not a daemon;
+    # a non-zero exit must surface (the workflow's verify-recall gate), not loop.
+    restart: "no"
+
   frontend:
     # GHCR-only — no local-build fallback. The deploy workflow logs into ghcr.io
     # using the auto-provisioned GITHUB_TOKEN (workflow `permissions: packages: read`
@@ -1400,3 +1481,8 @@ volumes:
   kafka_data:
   user_pg_data:
   user_redis_data:
+  # Sentence-transformer model weights cache for the one-shot isnad-graph-embed
+  # service (deploy#461, ADR 0008). Mounted at SENTENCE_TRANSFORMERS_HOME so the
+  # ~470MB model downloads once and persists across re-embed runs — volume-cache,
+  # NOT baked into the image (owner decision).
+  st_model_cache:
