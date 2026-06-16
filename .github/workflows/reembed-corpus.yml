@@ -136,10 +136,11 @@ jobs:
           # appleboy/ssh-action defaults command_timeout to 10m — far short of a
           # real CPU embed of the 34,028-hadith corpus + reindex + verify-recall,
           # which the prior stg run (deploy#465) hit at the 10m mark while still
-          # mid-embed. 60m comfortably covers a full CPU embed with headroom;
+          # mid-embed. The first successful stg run took ~47.5m (2853s); 90m gives
+          # comfortable margin over that for the slower/larger prod run (deploy#468),
           # capped below the job-level timeout-minutes above. The dry-run path is
           # seconds, so this only affects real runs.
-          command_timeout: 60m
+          command_timeout: 90m
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
           envs: ENV_NAME,MODEL,BATCH_SIZE,DRY_RUN,IMAGE,GITHUB_TOKEN,GITHUB_ACTOR
           script: |
