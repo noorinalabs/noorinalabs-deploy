@@ -330,6 +330,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install pytest
-        run: pip install pytest
+        # PyYAML: test_check_service_tier_subset.py imports the gate module,
+        # which parses the deploy workflows via `import yaml` (deploy#434). The
+        # setup-python tool-cache interpreter has no PyYAML preinstalled (unlike
+        # the system python the compose-config job's gate step runs on).
+        run: pip install pytest pyyaml
       - name: Run scripts unit tests
         run: python3 -m pytest scripts/tests -q
