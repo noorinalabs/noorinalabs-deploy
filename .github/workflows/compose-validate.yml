@@ -58,6 +58,21 @@ jobs:
       - name: Validate compose config
         working-directory: compose
         run: docker compose -f docker-compose.prod.yml --env-file .env config --quiet
+      - name: Tiered-rollout service lists ⊆ compose services (deploy#434)
+        # gated_services + deferred_services (the deploy#429 tier inputs on
+        # write-deploy-env in deploy-prod.yml) must each name a REAL compose
+        # service. A rename/removal/typo silently drops a name from its tier —
+        # a stale gated name fails `compose up --wait` mid-rollout in prod; a
+        # stale deferred name stops excluding the pipeline from the non-gating
+        # tier. The authoritative set is `config --services` with NO --profile,
+        # the same view compose_tiered_up.sh + the deploy itself see (the four
+        # `profiles: ["pipeline"]` workers are legitimately absent). Reuses the
+        # .env materialized above so the placeholder block can't drift between
+        # two jobs.
+        working-directory: compose
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file .env config --services \
+            | python3 ../scripts/check_service_tier_subset.py
 
   shellcheck:
     # deploy#74: backup/restore are critical DR scripts only exercised in
@@ -315,6 +330,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install pytest
-        run: pip install pytest
+        # PyYAML: test_check_service_tier_subset.py imports the gate module,
+        # which parses the deploy workflows via `import yaml` (deploy#434). The
+        # setup-python tool-cache interpreter has no PyYAML preinstalled (unlike
+        # the system python the compose-config job's gate step runs on).
+        run: pip install pytest pyyaml
       - name: Run scripts unit tests
         run: python3 -m pytest scripts/tests -q
