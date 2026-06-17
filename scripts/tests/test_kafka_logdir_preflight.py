@@ -82,7 +82,7 @@ def test_delete_and_future_suffix_dirs_are_valid(tmp_path: Path) -> None:
         tmp_path,
         [
             "topic-0",
-            "pipeline.raw.new-1.abc123ef-delete",
+            "pipeline.raw.landed-1.abc123ef-delete",
             "pipeline.enrich.done-3.0000000000000000abcd-future",
         ],
     )
