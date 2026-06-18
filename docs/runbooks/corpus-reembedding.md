@@ -76,6 +76,23 @@ corpus_reembed_rows_embedded{env="...",model="..."}               <n | -1 if unp
 
 `node-exporter` mounts the textfile directory read-only and scrapes it. If the directory is missing/unwritable, metric emission is skipped with a `WARNING` (the run itself is unaffected) — recover the directory per `docs/runbooks/user-service-alembic.md#observability`.
 
+A small Grafana dashboard renders these gauges per env: **Corpus re-embed** (`infra/grafana/dashboards/corpus-reembed.json`, uid `corpus-reembed`) — last-run status, time-since-last-run (with a 30-day amber/red threshold matching `CorpusReembedStale`), rows embedded, and run duration.
+
+### Alerts
+
+Two Prometheus alerts (`infra/prometheus/alerts.yml`, group `corpus_reembed`, deploy#467) fire on the gauges above and route through Alertmanager → Slack at **warning** severity (see [alertmanager-slack-routing.md](alertmanager-slack-routing.md)). Neither is a prod outage: semantic search stays up, it may just return degraded/lexical results.
+
+| Alert | Fires when | What it catches |
+|---|---|---|
+| `CorpusReembedFailed` | `corpus_reembed_last_run_success == 0` per `env`,`model` (`for: 0m`) | The last real run's embed, reindex, or `verify-recall` gate returned non-zero. The corpus is untrustworthy until a clean re-run. |
+| `CorpusReembedStale` | `time() - corpus_reembed_last_run_timestamp_seconds > 30d` (`for: 1h`) | Either a real run was killed at the `command_timeout` (90m) / job (120m) ceiling **before** the `if: always` `.prom` write — so the timestamp never advanced (the failed Actions run is the immediate signal; this is the metric-layer backstop) — or the corpus has drifted embedding-stale (data grew, never re-embedded). |
+
+**Staleness threshold rationale.** `reembed-corpus.yml` is `workflow_dispatch`-only — there is **no cron cadence**, so 30 days is not cadence-derived; it is an embedding-freshness SLO. It is long enough that a deliberately-stable corpus does not nag, and short enough to bound undetected drift or a silently-killed run. It is tunable — raise it if re-embeds become rare-by-design post-launch. The timestamp series is absent until the first real run, so the alert never fires on a corpus that has simply never been embedded.
+
+**On `CorpusReembedFailed`:** diagnose per § Failure modes and recovery, then re-dispatch with `dry_run=false` — embed + reindex are idempotent, so a clean re-run overwrites a partial one and replaces the `_success=0` gauge.
+
+**On `CorpusReembedStale`:** check the most recent `reembed-corpus.yml` run in the Actions UI first. A red run that died at the timeout ceiling explains the stale gauge (forward fix: re-dispatch); a clean run history means the corpus is simply due for a refresh.
+
 ## Failure modes and recovery
 
 ### 1. `verify-recall` fails after the embed
