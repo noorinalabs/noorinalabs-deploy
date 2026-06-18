@@ -184,6 +184,98 @@ groups:
             production` runs before assuming the gate itself is at fault.
           runbook: "docs/runbooks/user-service-alembic.md#observability"
 
+  # Corpus re-embed observability (deploy#467). reembed-corpus.yml emits
+  # textfile-collector gauges on every REAL run (skipped on dry_run):
+  #   corpus_reembed_last_run_success{env,model}            <0|1>
+  #   corpus_reembed_last_run_timestamp_seconds{env,model}  <unix-ts>
+  #   corpus_reembed_last_run_duration_seconds{env,model}   <seconds>
+  #   corpus_reembed_rows_embedded{env,model}               <n | -1 unparsed>
+  # at /var/lib/node_exporter/textfile_collector/corpus_reembed.prom (atomic
+  # temp+rename, mode 0644 — same discipline as db-migrate.yml). The file is
+  # fully rewritten each run, so there is exactly one (env,model) series per env
+  # (the last run's model) — no stale per-model series accumulate.
+  #
+  # Two failure modes were silent before this group:
+  #
+  #   - App-level failure: embed / reindex / verify-recall returned non-zero,
+  #     the workflow correctly wrote _success=0, but nothing paged.
+  #     -> CorpusReembedFailed.
+  #
+  #   - Hard timeout-kill: appleboy/ssh-action's command_timeout (90m) or the
+  #     job timeout-minutes (120m) ceiling (deploy#465) aborts the SSH command
+  #     BEFORE the `if: always` .prom write, so NO fresh metric is emitted at
+  #     all — _success is NOT updated to 0; the prior run's gauges simply go
+  #     stale. A bare _success==0 rule cannot see this; only a staleness rule on
+  #     the timestamp catches it. -> CorpusReembedStale.
+  #
+  # Both route through Alertmanager `default` -> Slack (warning severity; see
+  # docs/runbooks/alertmanager-slack-routing.md). Neither is a prod OUTAGE —
+  # semantic search stays up, it may just return degraded/lexical results — so
+  # warning (default receiver), not critical.
+  - name: corpus_reembed
+    rules:
+      - alert: CorpusReembedFailed
+        # Bare equality on _success, for: 0m — same reasoning as
+        # UserServiceAlembicGateFailure above: every failed run is
+        # operator-actionable, and a stuck _success=0 must not be silenced by a
+        # freshness window (the corpus stays untrustworthy until a clean re-run
+        # replaces the gauge). embed + reindex are idempotent, so the forward
+        # fix is a re-dispatch with dry_run=false (see runbook).
+        expr: |
+          corpus_reembed_last_run_success == 0
+        for: 0m
+        labels:
+          severity: warning
+          service: isnad-graph
+        annotations:
+          summary: "Corpus re-embed FAILED in {{ $labels.env }} (model {{ $labels.model }})"
+          description: >-
+            The most recent corpus re-embed in {{ $labels.env }} reported
+            _success=0 — embed, reindex, or the verify-recall gate did not pass.
+            Semantic search for that corpus may return degraded/lexical results
+            until a clean re-run. embed + reindex are idempotent; re-dispatch
+            reembed-corpus.yml with dry_run=false after diagnosing.
+          runbook: "docs/runbooks/corpus-reembedding.md#alerts"
+
+      - alert: CorpusReembedStale
+        # reembed-corpus.yml is workflow_dispatch ONLY — there is NO cron
+        # cadence, so this threshold is NOT cadence-derived; it is an
+        # embedding-freshness SLO: a corpus whose embeddings are older than
+        # 30 days warrants a human glance, for either reason below.
+        #
+        #   (1) Timeout-kill backstop: a real run aborted at the command_timeout
+        #       (90m) / job (120m) ceiling never reaches the `if: always` .prom
+        #       write, so the timestamp gauge does not advance. The failed
+        #       workflow RUN (appleboy returns non-zero) is the immediate
+        #       signal; this is the slower metric-layer catch for a killed run
+        #       nobody re-ran.
+        #   (2) Embedding drift: the corpus grew (new ingestion) but was never
+        #       re-embedded, so search quality silently lags the data.
+        #
+        # 30 days balances nag-avoidance (a deliberately-stable corpus must not
+        # page) against bounding undetected drift / silent-failure. Tunable —
+        # raise it if re-embeds become rare-by-design post-launch. The series is
+        # absent until the first real run, so this never fires on a corpus that
+        # has simply never been embedded (empty set, like the alembic Stale
+        # rule). warning + for: 1h to ride out a node-exporter / Prometheus
+        # restart on this slow-moving comparison.
+        expr: |
+          (time() - corpus_reembed_last_run_timestamp_seconds) > 30 * 86400
+        for: 1h
+        labels:
+          severity: warning
+          service: isnad-graph
+        annotations:
+          summary: "Corpus re-embed in {{ $labels.env }} is stale (>30d, model {{ $labels.model }})"
+          description: >-
+            The last corpus re-embed in {{ $labels.env }} completed more than
+            30 days ago, or a dispatched run was killed at the timeout ceiling
+            before emitting a fresh metric. Confirm whether a re-embed is due
+            (corpus growth / model swap) or whether the most recent
+            reembed-corpus.yml run died — check the latest run in the Actions UI
+            before assuming drift.
+          runbook: "docs/runbooks/corpus-reembedding.md#alerts"
+
   - name: blackbox_probes
     rules:
       # Any of the 6 prod-route probes failing for >2m. Companion to the
