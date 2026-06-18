@@ -1003,7 +1003,14 @@ jobs:
           echo "  user-service: ${user_service_tag:-<unset — will fall back to prod-latest>}"
           echo "  landing:      ${landing_tag:-<unset — will fall back to prod-latest>}"
 
+          # This job has NO actions/checkout step, so `gh` has no git remote to
+          # infer the target repo from and aborts with
+          # "failed to run git: fatal: not a git repository" — silently skipping
+          # the prod rollout after the retag gate was approved (promote run
+          # 27734863228). Pass --repo explicitly so the dispatch never depends on
+          # a checkout. Keep this flag on any gh call added to a checkout-less job.
           gh workflow run deploy-prod.yml \
+            --repo "${{ github.repository }}" \
             --ref "${{ github.ref }}" \
             -f api_frontend_tag="$api_frontend_tag" \
             -f user_service_tag="$user_service_tag" \
