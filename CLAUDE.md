@@ -35,6 +35,18 @@ This file provides guidance to Claude Code when working in the deployment orches
 - `terraform/hetzner/main.tf` — VPS provisioning
 - `scripts/verify_deployment.sh` — post-deploy verification script
 
+## Project Memory
+
+Project memory for this repo is **version-controlled in-repo** at `.claude/memory/`, not in the user-space auto-memory directory. This makes the accumulated state **transferable**: a developer who pulls a branch gets the memory with it, with zero per-machine setup. The index below is auto-loaded into every session via this committed CLAUDE.md import:
+
+@.claude/memory/MEMORY.md
+
+`MEMORY.md` is the always-loaded index (one line per memory); the individual topic files in `.claude/memory/*.md` are read on demand when a line looks relevant. This repo is **self-contained** — it imports only its own `.claude/memory/`, never the parent org corpus or sibling repos. The deploy-specific memories here were split out of the org-level `noorinalabs-main` corpus (deploy#479, from main#740 / driver main#732).
+
+**Recording a memory:** create or edit `.claude/memory/<kebab-slug>.md` with the standard frontmatter (`name`, `description`, `metadata.type` = `user` | `feedback` | `project` | `reference`), add a one-line pointer to `MEMORY.md` (`- [Title](file.md) — hook`), and **commit it** so it travels with the branch. Link related memories with `[[other-slug]]`; cross-repo links into the org-level corpus are acceptable soft pointers and may dangle here. Before adding, check for an existing file covering the same fact and update it instead of duplicating; delete memories that turn out to be wrong.
+
+> `.claude/memory/**` is excluded from the markdown/cspell/lychee linters (dense append-only note prose with names, SHAs, `[[wikilinks]]`, and Arabic) — same rationale as the org corpus, mirrored into this repo's `.markdownlint-cli2.jsonc`, `.cspell.json`, and `.lychee.toml`.
+
 ## Team
 
 | Role | Level | Name | Roster File |

@@ -51,6 +51,12 @@
     "**/*.md"
   ],
   "ignores": [
+    // .claude/memory/** — the version-controlled in-repo project-memory corpus
+    // (seeded deploy#479, from main#740 / driver main#732). Same rationale as the
+    // parent's exclusion: dense append-only personal-note prose (names, SHAs,
+    // [[wikilinks]], Arabic), not published docs — linting it to a style guide adds
+    // noise without catching real rendering breakage.
+    ".claude/memory/**",
     "node_modules/**",
     ".venv/**"
   ]
