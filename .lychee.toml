@@ -34,6 +34,10 @@ exclude = [
 
 # Skip generated/vendored trees.
 exclude_path = [
+  # In-repo project-memory corpus (seeded deploy#479, from main#740 / driver
+  # main#732) — uses [[wikilink]] shorthand and bare refs, not lychee-checkable
+  # relative links; excluded like the other append-only records.
+  ".claude/memory",
   "node_modules",
   ".venv",
 ]

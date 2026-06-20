@@ -24,6 +24,7 @@
     ".claude/team/charter.md"
   ],
   "ignorePaths": [
+    ".claude/memory/**",
     "node_modules/**",
     ".venv/**"
   ]
