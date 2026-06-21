@@ -94,6 +94,85 @@ jobs:
         self.assertNotIn("ruff-lint", kinds)
 
 
+class CspellKindClassification(unittest.TestCase):
+    """noorinalabs-main#684: the spell-check blind spot. The `Spellcheck (cspell)`
+    CI job (docs.yml) must classify as the `cspell` kind on EITHER expression —
+    the `streetsidesoftware/cspell-action` `uses:` ref, the bundled-CLI `cspell`
+    step/run, or the generic `spellcheck` word — and a pre-commit cspell hook must
+    classify too, so a CI spell gate with no local mirror produces harmful drift
+    instead of silence."""
+
+    def test_cspell_action_uses_ref_classified(self) -> None:
+        wf = """
+jobs:
+  spellcheck:
+    name: Spellcheck (cspell)
+    steps:
+      - name: cspell
+        uses: streetsidesoftware/cspell-action@de2a73e # v8.4.0
+"""
+        self.assertIn("cspell", kinds_from_ci(wf))
+
+    def test_cspell_cli_run_step_classified(self) -> None:
+        wf = """
+jobs:
+  spell:
+    steps:
+      - run: npx cspell --config .cspell.json "**/*.md"
+"""
+        self.assertIn("cspell", kinds_from_ci(wf))
+
+    def test_generic_spellcheck_word_classified(self) -> None:
+        # A repo that names the step/run with the generic word still registers.
+        self.assertIn("cspell", kinds_from_ci("      - run: make spellcheck\n"))
+
+    def test_precommit_cspell_hook_classified(self) -> None:
+        cfg = """
+repos:
+  - repo: https://github.com/streetsidesoftware/cspell-cli
+    rev: v8.4.0
+    hooks:
+      - id: cspell
+        name: cspell
+"""
+        self.assertIn("cspell", kinds_from_precommit(cfg))
+
+    def test_ci_cspell_without_precommit_is_harmful_drift(self) -> None:
+        # The exact divergence #684 exists to catch: CI enforces cspell, the
+        # pre-commit config does not mirror it.
+        wf = """
+jobs:
+  spellcheck:
+    steps:
+      - uses: streetsidesoftware/cspell-action@de2a73e
+"""
+        cfg = """
+repos:
+  - repo: local
+    hooks:
+      - id: actionlint
+"""
+        harmful, _ = compute_drift(kinds_from_precommit(cfg), kinds_from_ci(wf))
+        self.assertIn("cspell", harmful)
+
+    def test_ci_cspell_with_precommit_mirror_no_drift(self) -> None:
+        wf = """
+jobs:
+  spellcheck:
+    steps:
+      - uses: streetsidesoftware/cspell-action@de2a73e
+"""
+        cfg = """
+repos:
+  - repo: https://github.com/streetsidesoftware/cspell-cli
+    rev: v8.4.0
+    hooks:
+      - id: cspell
+"""
+        harmful, _ = compute_drift(kinds_from_precommit(cfg), kinds_from_ci(wf))
+        self.assertNotIn("cspell", harmful)
+
+
 class BuildKindNarrowing(unittest.TestCase):
     """deploy-specific: runtime `docker buildx`/`docker build` lines are this
     repo's job, NOT a mirrorable CI build-quality gate, so they must not

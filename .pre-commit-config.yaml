@@ -55,6 +55,29 @@ repos:
       - id: actionlint
         name: actionlint
 
+  # --- Spellcheck (mirrors the `Spellcheck (cspell)` job in docs.yml) ---
+  # The sync-drift gate now classifies the `cspell` kind (noorinalabs-main#684),
+  # so a CI-enforced spell gate not mirrored here turns the gate red — same
+  # contract as actionlint above. New infra/domain vocabulary then fails
+  # `pre-commit run` locally instead of only surfacing as a CI red after push.
+  # Pinned to v8.4.0 of cspell-cli to match the exact cspell the
+  # `streetsidesoftware/cspell-action@…v8.4.0` CI step bundles — same engine +
+  # dictionaries on both sides. `language: node`, so pre-commit provisions its
+  # own node/cspell env (no system cspell required).
+  #
+  # `files` is the regex equivalent of the CI action's authored-prose glob set
+  # (docs/, RUNBOOK, CLAUDE.md, the team charter — identical to docs.yml's
+  # `files:` and .cspell.json's `files`); `--config .cspell.json` reuses the same
+  # dictionaries + ignore rules CI loads, so a word that passes locally passes in
+  # CI and vice-versa.
+  - repo: https://github.com/streetsidesoftware/cspell-cli
+    rev: v8.4.0
+    hooks:
+      - id: cspell
+        name: cspell
+        args: ["--no-must-find-files", "--no-progress", "--no-summary", "--config", ".cspell.json"]
+        files: ^(docs/.*\.md|RUNBOOK\.md|CLAUDE\.md|\.claude/team/charter\.md)$
+
   # --- Python lint/format (mirrors hooks-lint.yml + compose-validate.yml) ---
   # Pinned to ruff 0.15.11 (the org-canonical pin — matches ig/da/us/ingest/main).
   # Scoped to the repo's Python:
