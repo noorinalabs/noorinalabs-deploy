@@ -56,13 +56,14 @@ repos:
         name: actionlint
 
   # --- Python lint/format (mirrors hooks-lint.yml + compose-validate.yml) ---
-  # Pinned to ruff 0.11.6 (the org rollout pin). Scoped to the repo's Python:
+  # Pinned to ruff 0.15.11 (the org-canonical pin — matches ig/da/us/ingest/main).
+  # Scoped to the repo's Python:
   #   * .claude/hooks/ ............ mirrors hooks-lint.yml (no-op today; no hooks)
   #   * scripts/ + .github/workflows/scripts/ .. mirrors compose-validate.yml's
   #     python-lint job (noorinalabs-main#326) so local pre-commit catches the
   #     same ruff drift CI does (#327 fail-fast parity).
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.6
+    rev: v0.15.11
     hooks:
       - id: ruff-format
         name: ruff-format
