@@ -73,3 +73,14 @@ See the org-level charter at `noorinalabs-main/.claude/team/charter.md` and this
 - **VPS:** Hetzner CPX41 (8 vCPU, 16GB RAM), Ubuntu 24.04, Ashburn
 - **Services:** Neo4j, PostgreSQL+pgvector, Redis, FastAPI, React/nginx, Caddy, Prometheus, Grafana, Loki
 - **Secrets:** Managed via GitHub Actions encrypted secrets with environment protection rules
+
+## Shell environment
+
+The development shell is **zsh** (not bash). Write zsh-safe terminal commands and
+avoid bash-only idioms (`declare -A`, `${!arr[@]}`, unquoted `?`/`*` globs such as
+`…?ref=main` URLs). Prefer POSIX-portable constructs; use `bash -c '...'` explicitly
+when bash is genuinely required. This is a guidance note for terminal commands only —
+the repo's own shell scripts run under shellcheck and are unaffected.
+
+Canonical do/don't list: org `docs/TOOLCHAIN.md` § "Shell environment" +
+`ontology/conventions.md` in `noorinalabs-main`.
