@@ -153,8 +153,13 @@ async def test_oauth_callback_to_token_issue(
             f"callback redirected with error={qs.get('error')} — check user-service "
             f"logs for the provider/exchange failure. Location={location}"
         )
-        assert qs.get("token"), f"no token in callback redirect: {location}"
-        access_token = qs["token"][0]
+        # Per user-service#68, the access token is delivered in the URL *fragment*
+        # (`#token=<access>`) so it never leaks via the Referer header / server
+        # logs; the non-secret flags (is_new_user, needs_verification, error) stay
+        # as query params. Read the token from the fragment, the flags from query.
+        frag = parse_qs(parsed.fragment)
+        assert frag.get("token"), f"no token in callback redirect fragment: {location}"
+        access_token = frag["token"][0]
         assert qs.get("is_new_user") == ["1"], (
             f"expected a newly-created user on first callback; got is_new_user="
             f"{qs.get('is_new_user')}"
