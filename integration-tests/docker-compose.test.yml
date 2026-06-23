@@ -41,6 +41,13 @@ services:
       JWT_ALGORITHM: RS256
       JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "15"
       JWT_REFRESH_TOKEN_EXPIRE_DAYS: "7"
+      # Disable the per-IP auth rate limiter for the hermetic E2E. All test
+      # traffic originates from a single runner IP, so the limiter (token /
+      # login / refresh / validate / callback buckets) trips and returns 429,
+      # which is not what these functional flows exercise. user-service config
+      # explicitly sanctions disabling it "for local dev / tests where the
+      # speed-bump gets in the way" (config.py AUTH_RATE_LIMIT_ENABLED).
+      AUTH_RATE_LIMIT_ENABLED: "false"
       CORS_ORIGINS: '["http://testnet"]'
       AUTH_OAUTH_REDIRECT_BASE_URL: http://user-service:8000
       AUTH_GOOGLE_CLIENT_ID: fake-google-client-id
