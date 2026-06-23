@@ -1,0 +1,68 @@
+name: CI — Dockerfile base-image pinning
+
+# Enforces tech-decisions.md § Base Image Pinning (noorinalabs-main#735, the
+# cross-repo rollout #744): every `FROM` in every Dockerfile must be
+# digest-pinned (image:tag@sha256:<digest>) AND carry the matching distro
+# upgrade (apk/apt), with the section's exemptions (scratch, distroless,
+# stage references, vendor `# RATIONALE:`). This closes the two drift modes the
+# section names — floating-tag drift and within-tag package drift.
+#
+# deploy builds three Dockerfiles (the integration-tests runner, the fake-oauth
+# stub, and the neo4j+GDS image), so this gate applies here. The same check runs
+# locally as the `dockerfile-base-pin` pre-commit hook; the pre-commit ⇄ CI
+# sync-drift gate classifies the `dockerfile-base-pin` kind so this CI gate
+# cannot drift ahead of that local mirror (#327 fail-fast parity).
+#
+# Triggered when a Dockerfile, the check script, its tests, or this workflow
+# changes.
+
+on:
+  push:
+    branches: [main, "deployments/**"]
+    paths:
+      - "**/Dockerfile"
+      - "**/Dockerfile.*"
+      - ".claude/lib/check_dockerfile_base_pin.py"
+      - ".claude/lib/tests/test_check_dockerfile_base_pin.py"
+      - ".github/workflows/dockerfile-base-pin.yml"
+  pull_request:
+    branches: [main, "deployments/**"]
+    paths:
+      - "**/Dockerfile"
+      - "**/Dockerfile.*"
+      - ".claude/lib/check_dockerfile_base_pin.py"
+      - ".claude/lib/tests/test_check_dockerfile_base_pin.py"
+      - ".github/workflows/dockerfile-base-pin.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  base-pin:
+    name: Dockerfile base-pin gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Lint every Dockerfile FROM (digest pin + distro upgrade)
+        # Collect all Dockerfiles repo-wide and run the gate over them. -print0 /
+        # -0 are null-delimited so paths with spaces are safe; -r skips the run
+        # when there are no Dockerfiles (script would otherwise exit 2 on no args).
+        run: |
+          find . -type f \( -name 'Dockerfile' -o -name 'Dockerfile.*' \) \
+            -not -path './.git/*' -print0 \
+            | xargs -0 -r python3 .claude/lib/check_dockerfile_base_pin.py
+
+  base-pin-tests:
+    name: Base-pin gate unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - name: Run check_dockerfile_base_pin tests
+        run: python3 -m pytest .claude/lib/tests/test_check_dockerfile_base_pin.py -q
