@@ -99,6 +99,21 @@ repos:
   # --- Local hooks ---
   - repo: local
     hooks:
+      # Dockerfile Base Image Pinning gate (mirrors dockerfile-base-pin.yml).
+      # Enforces tech-decisions.md § Base Image Pinning (noorinalabs-main#735,
+      # #744): every FROM digest-pinned (image:tag@sha256:<digest>) AND carrying
+      # the matching distro upgrade, with the section's exemptions (scratch,
+      # distroless, stage refs, vendor `# RATIONALE:`). Runs over staged
+      # Dockerfiles at commit time; CI runs the same script over ALL Dockerfiles.
+      # The sync-drift gate classifies this as the `dockerfile-base-pin` kind, so
+      # the CI gate cannot drift ahead of this local mirror. pass_filenames=true:
+      # pre-commit hands the matched Dockerfile paths to the script as argv.
+      - id: dockerfile-base-pin
+        name: dockerfile-base-pin
+        entry: python3 .claude/lib/check_dockerfile_base_pin.py
+        language: system
+        files: (^|/)Dockerfile(\.[^/]+)?$
+        stages: [pre-commit]
       # mypy over .claude/hooks (mirrors hooks-lint.yml) + scripts/ and
       # .github/workflows/scripts/ (mirrors compose-validate.yml's python-lint
       # job, noorinalabs-main#326). Heavier, so pre-push. The .claude/hooks/

@@ -8,6 +8,12 @@
 #   https://graphdatascience.ninja/versions.json
 
 ARG NEO4J_VERSION=5-community
+# The official `neo4j` vendor image is consumed as-is, with the version chosen by
+# the NEO4J_VERSION build-arg so Neo4j<->GDS compatibility stays adjustable at
+# build time (see the GDS-version note above). A `@sha256:` digest pin would
+# hard-code the version and defeat that parameterization, and we add no
+# app-controlled package layer here (only the GDS jar below).
+# RATIONALE: build-arg-parameterized vendor base (tech-decisions.md § Base Image Pinning, noorinalabs-main#735); digest-pin + apt-upgrade intentionally exempted for this single FROM.
 FROM neo4j:${NEO4J_VERSION}
 
 ARG GDS_VERSION=2.13.8

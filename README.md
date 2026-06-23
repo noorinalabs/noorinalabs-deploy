@@ -20,17 +20,27 @@ pre-commit install --hook-type pre-push  # push-stage checks
 ```
 
 - **Commit stage** runs: `terraform-fmt`, `terraform-validate`, `gitleaks`,
-  `actionlint`, `ruff-format`, `ruff-lint`, and `env-example-check`.
+  `actionlint`, `cspell`, `ruff-format`, `ruff-lint`, the Dockerfile base-image
+  pinning gate (`dockerfile-base-pin`), and `env-example-check`.
 - **Pre-push stage** runs: `mypy` (over `scripts/`, `.github/workflows/scripts/`,
   and `.claude/hooks/` when present), `pytest` for the sync-gate unit tests
   (`.claude/lib/tests/`), and `pytest` for the scripts tests (`scripts/tests/`).
 
 These mirror the repo's CI workflows (`terraform.yml`, `lint-workflows.yml` /
-`docs.yml`, `hooks-lint.yml`, `compose-validate.yml`, `precommit-ci-sync.yml`) so
-failures surface locally before a PR — running BOTH installs is mandatory under
-the org-wide local⇄CI parity rule (noorinalabs-main#684). The
-`Pre-commit ⇄ CI sync-drift gate` (`.claude/lib/pre_commit_ci_sync.py`) fails the
-build if a check CI enforces is dropped from this mirror.
+`docs.yml`, `hooks-lint.yml`, `compose-validate.yml`, `dockerfile-base-pin.yml`,
+`precommit-ci-sync.yml`) so failures surface locally before a PR — running BOTH
+installs is mandatory under the org-wide local⇄CI parity rule
+(noorinalabs-main#684). The `Pre-commit ⇄ CI sync-drift gate`
+(`.claude/lib/pre_commit_ci_sync.py`) fails the build if a check CI enforces
+(including `cspell` and `dockerfile-base-pin`) is dropped from this mirror.
+
+The `dockerfile-base-pin` gate (`.claude/lib/check_dockerfile_base_pin.py`)
+enforces `tech-decisions.md § Base Image Pinning` (noorinalabs-main#735): every
+Dockerfile `FROM` must be digest-pinned (`image:tag@sha256:<digest>`) AND carry
+the matching distro upgrade (`apk`/`apt`), exempting `scratch`, distroless
+(pin-only), stage references, and a vendor image documented with an inline
+`# RATIONALE:` comment. Refresh a digest when bumping a base tag with
+`docker buildx imagetools inspect <image>:<tag>`.
 
 Never bypass a hook with `--no-verify`, and never push, PR, or merge with a
 known-failing check without explicit owner permission. If `pre-commit install`

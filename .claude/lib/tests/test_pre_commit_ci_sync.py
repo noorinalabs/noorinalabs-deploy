@@ -173,6 +173,61 @@ repos:
         self.assertNotIn("cspell", harmful)
 
 
+class DockerfileBasePinKindClassification(unittest.TestCase):
+    """noorinalabs-main#744/#735: the Base Image Pinning gate
+    (check_dockerfile_base_pin.py) must classify as the `dockerfile-base-pin`
+    kind on EITHER side — the CI `run:` line that invokes the script and a
+    pre-commit hook that does the same — so a CI base-pin gate without a local
+    mirror is caught as harmful drift (#327 fail-fast contract)."""
+
+    def test_ci_run_step_classified(self) -> None:
+        wf = """
+jobs:
+  dockerfile-base-pin:
+    steps:
+      - run: python3 .claude/lib/check_dockerfile_base_pin.py infra/neo4j/Dockerfile
+"""
+        self.assertIn("dockerfile-base-pin", kinds_from_ci(wf))
+
+    def test_precommit_hook_classified(self) -> None:
+        cfg = """
+repos:
+  - repo: local
+    hooks:
+      - id: dockerfile-base-pin
+        entry: python3 .claude/lib/check_dockerfile_base_pin.py
+"""
+        self.assertIn("dockerfile-base-pin", kinds_from_precommit(cfg))
+
+    def test_ci_without_precommit_is_harmful_drift(self) -> None:
+        wf = """
+jobs:
+  dockerfile-base-pin:
+    steps:
+      - run: python3 .claude/lib/check_dockerfile_base_pin.py infra/neo4j/Dockerfile
+"""
+        cfg = "repos: []\n"
+        harmful, _ = compute_drift(kinds_from_precommit(cfg), kinds_from_ci(wf))
+        self.assertIn("dockerfile-base-pin", harmful)
+
+    def test_ci_with_precommit_mirror_no_drift(self) -> None:
+        wf = """
+jobs:
+  dockerfile-base-pin:
+    steps:
+      - run: python3 .claude/lib/check_dockerfile_base_pin.py infra/neo4j/Dockerfile
+"""
+        cfg = """
+repos:
+  - repo: local
+    hooks:
+      - id: dockerfile-base-pin
+        entry: python3 .claude/lib/check_dockerfile_base_pin.py
+"""
+        harmful, _ = compute_drift(kinds_from_precommit(cfg), kinds_from_ci(wf))
+        self.assertNotIn("dockerfile-base-pin", harmful)
+
+
 class BuildKindNarrowing(unittest.TestCase):
     """deploy-specific: runtime `docker buildx`/`docker build` lines are this
     repo's job, NOT a mirrorable CI build-quality gate, so they must not

@@ -98,6 +98,14 @@ _KIND_PATTERNS: dict[str, tuple[str, ...]] = {
     # vocabulary would fail only after push. Patterns cover the action ref, the
     # bundled-CLI step, and the generic job/step word.
     "cspell": ("cspell", "spellcheck", "streetsidesoftware/cspell"),
+    # `dockerfile-base-pin` tracks the Base Image Pinning gate
+    # (.claude/lib/check_dockerfile_base_pin.py, tech-decisions.md § Base Image
+    # Pinning / noorinalabs-main#735, #744). deploy builds Dockerfiles (the
+    # integration-tests runner, the fake-oauth stub, the neo4j+GDS image), so a
+    # CI base-pin gate must be mirrored by a local pre-commit hook or this gate
+    # goes red. Patterns cover the script ref (both sides reference the module)
+    # and the generic kind word used in job/hook ids.
+    "dockerfile-base-pin": ("check_dockerfile_base_pin", "dockerfile-base-pin"),
 }
 
 # `ruff-lint` is a substring of nothing problematic, but `ruff format` also
