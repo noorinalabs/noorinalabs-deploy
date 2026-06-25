@@ -106,6 +106,15 @@ _KIND_PATTERNS: dict[str, tuple[str, ...]] = {
     # goes red. Patterns cover the script ref (both sides reference the module)
     # and the generic kind word used in job/hook ids.
     "dockerfile-base-pin": ("check_dockerfile_base_pin", "dockerfile-base-pin"),
+    # `structural-ontology` is the C×T2 structural index staleness gate
+    # (scripts/structural_ontology.py + .github/workflows/structural-ontology.yml,
+    # deploy#493 / noorinalabs-main#820). Classifying it makes the drift gate
+    # DEMAND the local<->CI mirror (noorinalabs-main#684 contract): a CI
+    # `structural-ontology.yml` job with no matching pre-commit hook is harmful
+    # drift. Patterns cover the hook id (`structural-ontology-staleness`), the
+    # CI job name (`structural-ontology`), and the script both sides invoke
+    # (`structural_ontology`).
+    "structural-ontology": ("structural_ontology", "structural-ontology"),
 }
 
 # `ruff-lint` is a substring of nothing problematic, but `ruff format` also
