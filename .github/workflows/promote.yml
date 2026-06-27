@@ -292,9 +292,44 @@ jobs:
               token=$(curl -s -u "${GH_ACTOR}:${GH_TOKEN}" \
                 "https://${REGISTRY}/token?scope=repository:${image_path}:pull" \
                 | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
-              tags=$(curl -sH "Authorization: Bearer $token" \
-                "https://${REGISTRY}/v2/${image_path}/tags/list" \
-                | python3 -c "import sys,json;print('\n'.join(json.load(sys.stdin).get('tags') or []))")
+              # List ALL tags, following RFC 5988 Link-header pagination.
+              # GHCR caps tags/list at 100 tags per page; the ig images now
+              # exceed that, so a single un-paginated GET drops the newest
+              # sha-<short> and the stg-latest walk below would never find a
+              # match → "Could not resolve sha-<short>" (deploy#496). Mirrors
+              # check_tag_invariants.py::_list_tags.
+              tags=$(REGISTRY="$REGISTRY" IMAGE_PATH="$image_path" TOKEN="$token" python3 - <<'PYTAGS'
+          import json, os, urllib.request
+          registry = os.environ["REGISTRY"]
+          image_path = os.environ["IMAGE_PATH"]
+          token = os.environ["TOKEN"]
+          url = f"https://{registry}/v2/{image_path}/tags/list"
+          headers = {"Authorization": f"Bearer {token}"}
+          all_tags = []
+          while url:
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as resp:
+                  all_tags.extend(json.loads(resp.read()).get("tags") or [])
+                  link = resp.headers.get("Link", "") or ""
+              nxt = None
+              for part in link.split(","):
+                  seg = part.strip()
+                  if 'rel="next"' not in seg:
+                      continue
+                  lt, gt = seg.find("<"), seg.find(">")
+                  if lt == -1 or gt == -1 or gt < lt:
+                      continue
+                  target = seg[lt + 1 : gt].strip()
+                  if target.startswith(("http://", "https://")):
+                      nxt = target
+                  elif target.startswith("/"):
+                      nxt = f"https://{registry}{target}"
+                  else:
+                      nxt = f"https://{registry}/{target}"
+              url = nxt
+          print("\n".join(all_tags))
+          PYTAGS
+          )
               short=""
               while IFS= read -r tag; do
                 case "$tag" in
