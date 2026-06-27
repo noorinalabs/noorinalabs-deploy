@@ -39,9 +39,27 @@ def test_next_page_url_relative_rebased_on_registry():
     assert nxt == f"https://{cti.REGISTRY}/v2/noorinalabs/img/tags/list?last=sha-abc1234&n=100"
 
 
-def test_next_page_url_absolute_passthrough():
+def test_next_page_url_absolute_ghcr_preserved():
+    # A legitimate absolute next on the registry origin is rebuilt to the same
+    # URL (path+query preserved; scheme/host forced to https + REGISTRY).
     absolute = "https://ghcr.io/v2/noorinalabs/img/tags/list?last=z&n=100"
     assert cti._next_page_url(_link(absolute)) == absolute
+
+
+def test_next_page_url_foreign_host_is_pinned_to_registry():
+    # Token-exfil guard: an absolute next on an ATTACKER host must be rebuilt
+    # to ghcr.io (path+query only), so _list_tags' bearer token can never be
+    # sent off-origin.
+    nxt = cti._next_page_url(_link("https://attacker.example/v2/x/tags/list?last=y"))
+    assert nxt == f"https://{cti.REGISTRY}/v2/x/tags/list?last=y"
+    assert "attacker.example" not in (nxt or "")
+
+
+def test_next_page_url_cleartext_http_is_pinned_and_upgraded():
+    # A cleartext http:// next must not downgrade nor leave-origin: rebuilt as
+    # https on the registry host.
+    nxt = cti._next_page_url(_link("http://attacker.example/v2/x/tags/list?last=y"))
+    assert nxt == f"https://{cti.REGISTRY}/v2/x/tags/list?last=y"
 
 
 def test_next_page_url_missing_leading_slash_is_rooted():
@@ -96,3 +114,72 @@ def test_list_tags_single_page_no_link(monkeypatch):
 
     monkeypatch.setattr(cti, "_http_get_page", fake_get_page)
     assert cti._list_tags("noorinalabs/img", "tok") == ["latest", "sha-1234567"]
+
+
+def test_list_tags_never_fetches_off_origin(monkeypatch):
+    """A foreign-host `next` must not cause a fetch (token send) off ghcr.io."""
+    calls: list[str] = []
+
+    def fake_get_page(url, headers):
+        calls.append(url)
+        if "last=" not in url:
+            # Server hands back an attacker host; _next_page_url must pin it
+            # back to ghcr.io so the SECOND fetch stays on origin.
+            return json.dumps({"tags": ["latest"]}).encode(), _link(
+                "https://attacker.example/v2/noorinalabs/img/tags/list?last=z"
+            )
+        return json.dumps({"tags": ["sha-1234567"]}).encode(), ""
+
+    monkeypatch.setattr(cti, "_http_get_page", fake_get_page)
+
+    tags = cti._list_tags("noorinalabs/img", "tok")
+
+    assert tags == ["latest", "sha-1234567"]
+    # Every URL the walk fetched (i.e. every place the bearer token was sent)
+    # is on the registry origin — the attacker host was never contacted.
+    assert all(u.startswith(f"https://{cti.REGISTRY}/") for u in calls), calls
+    assert not any("attacker.example" in u for u in calls)
+
+
+def test_list_tags_terminates_on_cyclic_next(monkeypatch):
+    """A cyclic server `next` (a→b→a) terminates via the visited-URL set."""
+    base = "/v2/noorinalabs/img/tags/list"
+    calls: list[str] = []
+
+    def fake_get_page(url, headers):
+        calls.append(url)
+        if "cursor=a" in url:
+            return json.dumps({"tags": ["a"]}).encode(), _link(f"https://ghcr.io{base}?cursor=b")
+        if "cursor=b" in url:
+            return json.dumps({"tags": ["b"]}).encode(), _link(f"https://ghcr.io{base}?cursor=a")
+        # First (base) page → enter the cycle.
+        return json.dumps({"tags": ["base"]}).encode(), _link(f"https://ghcr.io{base}?cursor=a")
+
+    monkeypatch.setattr(cti, "_http_get_page", fake_get_page)
+
+    tags = cti._list_tags("noorinalabs/img", "tok")
+
+    # base → cursor=a → cursor=b → (cursor=a already seen) STOP. Finite.
+    assert tags == ["base", "a", "b"]
+    assert len(calls) == 3
+
+
+def test_list_tags_bounded_by_page_cap(monkeypatch):
+    """An ever-advancing (never-repeating) `next` is capped at _MAX_TAG_PAGES."""
+    counter = {"n": 0}
+
+    def fake_get_page(url, headers):
+        counter["n"] += 1
+        i = counter["n"]
+        # Always a fresh cursor → the visited set never trips; only the page
+        # cap can stop the walk.
+        return json.dumps({"tags": [f"t{i}"]}).encode(), _link(
+            f"https://ghcr.io/v2/noorinalabs/img/tags/list?cursor={i}"
+        )
+
+    monkeypatch.setattr(cti, "_http_get_page", fake_get_page)
+
+    tags = cti._list_tags("noorinalabs/img", "tok")
+
+    assert counter["n"] == cti._MAX_TAG_PAGES
+    assert len(tags) == cti._MAX_TAG_PAGES

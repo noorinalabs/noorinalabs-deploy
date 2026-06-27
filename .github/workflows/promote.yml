@@ -299,14 +299,20 @@ jobs:
               # match → "Could not resolve sha-<short>" (deploy#496). Mirrors
               # check_tag_invariants.py::_list_tags.
               tags=$(REGISTRY="$REGISTRY" IMAGE_PATH="$image_path" TOKEN="$token" python3 - <<'PYTAGS'
-          import json, os, urllib.request
+          import json, os, urllib.parse, urllib.request
           registry = os.environ["REGISTRY"]
           image_path = os.environ["IMAGE_PATH"]
           token = os.environ["TOKEN"]
           url = f"https://{registry}/v2/{image_path}/tags/list"
           headers = {"Authorization": f"Bearer {token}"}
           all_tags = []
-          while url:
+          seen = set()
+          # Bounded walk (page cap + visited set) so a cyclic server `next`
+          # cannot hang this job.
+          for _ in range(50):
+              if not url or url in seen:
+                  break
+              seen.add(url)
               req = urllib.request.Request(url, headers=headers)
               with urllib.request.urlopen(req) as resp:
                   all_tags.extend(json.loads(resp.read()).get("tags") or [])
@@ -320,12 +326,11 @@ jobs:
                   if lt == -1 or gt == -1 or gt < lt:
                       continue
                   target = seg[lt + 1 : gt].strip()
-                  if target.startswith(("http://", "https://")):
-                      nxt = target
-                  elif target.startswith("/"):
-                      nxt = f"https://{registry}{target}"
-                  else:
-                      nxt = f"https://{registry}/{target}"
+                  # Origin-pin: the bearer token may only ever go to ghcr.io.
+                  # Rebuild from the target's path+query alone, discarding any
+                  # attacker-supplied scheme/host (mirrors _next_page_url).
+                  sp = urllib.parse.urlsplit(target)
+                  nxt = urllib.parse.urlunsplit(("https", registry, sp.path, sp.query, ""))
               url = nxt
           print("\n".join(all_tags))
           PYTAGS
