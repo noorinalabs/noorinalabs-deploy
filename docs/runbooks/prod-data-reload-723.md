@@ -59,7 +59,23 @@ sudo --preserve-env=B2_KEY_ID,B2_APP_KEY,B2_BUCKET ./scripts/backup.sh
 As an admin user (the `/admin/data/*` router is `require_admin`-gated), capture and SAVE:
 
 ```bash
-# TOKEN = an admin JWT (mint via the normal OAuth login flow; do NOT inline any secret)
+# --- Mint an admin JWT (user-service https://users.noorinalabs.com issues it) ---
+# Email/password path — providers `email/password` is enabled. The password is
+# prompted (never echoed / never in shell history); no secret is hard-coded here.
+read -rs -p "Admin password: " PW; echo
+TOKEN=$(curl -s -X POST https://users.noorinalabs.com/auth/login \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg e 'YOUR_ADMIN_EMAIL' --arg p "$PW" '{email:$e, password:$p}')" \
+  | jq -r '.access_token')
+unset PW
+# Sanity-check without dumping the JWT:  echo "${TOKEN:0:18}…"
+# The /auth/login response is {access_token, refresh_token, token_type:"bearer"}.
+#
+# If /auth/login returns 401 (admin account is OAuth-only, no password set): log in
+# via the browser, then take the access token from the post-login redirect URL
+# *fragment* (…#token=<access>), or from devtools → Network → the `Authorization:
+# Bearer` header on any API XHR. The admin endpoints are role-gated, so the token
+# must belong to your admin account.
 BASE=https://isnad.noorinalabs.com
 curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/admin/data/overview" | tee before_overview.json
 curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/admin/data/sources"  | tee before_sources.json
