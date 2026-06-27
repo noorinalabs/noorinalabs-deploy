@@ -120,30 +120,66 @@ path and is the procedure below.
 > stale cross-corpus edges).
 
 The per-source purge endpoint (`src/api/routes/admin/data.py`, ig#989) is **one corpus per call**,
-two-phase (dry-run preview → typed-confirmation real run). For **each** `source_corpus` value `C`
-from the section-1b `/sources` list — i.e. every corpus present, e.g. `sanadset`, `sunnah`, `lk`,
-`thaqalayn`, `fawaz`, `open_hadith`, `muhaddithat`, `itqan`, `halimbahae`, `mis`, `bihar`, `tusi`
-(use the ACTUAL present list, not this enum dump):
+two-phase (dry-run preview → typed-confirmation real run). Because it is one-corpus-per-call, drive
+it with an **array of every `source_corpus` present** and loop the call over the array — first a
+full dry-run pass, then (after you've reviewed the previews) a guarded real-run pass.
 
 ```bash
-BASE=https://isnad.noorinalabs.com
-C=sanadset   # repeat for EACH present corpus
+BASE=https://isnad.noorinalabs.com   # TOKEN already exported from §1b
 
-# 2a. DRY RUN first — preview counts, touches nothing (dry_run defaults true)
-curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  "$BASE/api/v1/admin/data/purge" \
-  -d "{\"source_corpus\":\"$C\",\"dry_run\":true}" | jq .
+# --- Build the corpus array -------------------------------------------------
+# PREFERRED — derive it straight from the §1b baseline so it is EXACTLY the set
+# present in prod (no guesswork). Confirm the jq path matches before_sources.json's
+# actual shape; the `// .[]` fallback handles a bare-array root.
+CORPORA=( $(jq -r '(.sources // .)[].source_corpus' before_sources.json | sort -u) )
 
-# 2b. REAL RUN — requires confirmation to echo source_corpus EXACTLY  [DESTRUCTIVE]
-curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  "$BASE/api/v1/admin/data/purge" \
-  -d "{\"source_corpus\":\"$C\",\"dry_run\":false,\"confirmation\":\"$C\"}" | jq .
+# FALLBACK — if you don't have before_sources.json handy, paste the explicit list
+# you noted from /sources. This is the full SourceCorpus enum as a TEMPLATE; replace
+# it with the ACTUAL present values — do NOT ship this dump blindly.
+# CORPORA=( sanadset sunnah lk thaqalayn fawaz open_hadith muhaddithat itqan halimbahae mis bihar tusi )
+
+# Sanity-check the array BEFORE touching anything destructive.
+printf 'Will purge %d corpora: %s\n' "${#CORPORA[@]}" "${CORPORA[*]}"
+test "${#CORPORA[@]}" -gt 0 || { echo "EMPTY corpus array — STOP, fix the source list"; }
+```
+
+```bash
+# 2a. DRY RUN over EVERY corpus first — previews counts, touches nothing
+#     (dry_run defaults true). Review all previews before running 2b.
+for C in "${CORPORA[@]}"; do
+  echo "=== DRY RUN: $C ==="
+  curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    "$BASE/api/v1/admin/data/purge" \
+    -d "{\"source_corpus\":\"$C\",\"dry_run\":true}" | jq .
+done
+```
+
+```bash
+# 2b. REAL RUN over EVERY corpus — DESTRUCTIVE. Run ONLY after reviewing 2a.
+#     confirmation must echo source_corpus EXACTLY, so we pass "$C".
+#     The HTTP-code guard makes a failed call STOP the loop (see 503 note below)
+#     instead of continuing on through the remaining corpora.
+for C in "${CORPORA[@]}"; do
+  echo "=== PURGE (real): $C ==="
+  resp=$(curl -sS -w '\n%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' "$BASE/api/v1/admin/data/purge" \
+    -d "{\"source_corpus\":\"$C\",\"dry_run\":false,\"confirmation\":\"$C\"}")
+  code=$(printf '%s\n' "$resp" | tail -1)
+  printf '%s\n' "$resp" | sed '$d' | jq .
+  if [ "$code" != "200" ]; then
+    echo "ABORT: purge of '$C' returned HTTP $code (expected 200). This call did NOT modify the graph — STOP, investigate, then resume from the remaining corpora." >&2
+    break
+  fi
+done
 ```
 
 - Real run does `MATCH (n) WHERE n.source_corpus = $corpus DETACH DELETE n` and writes an audit entry.
-- A failed destructive write surfaces as **503** (it does NOT degrade to a silent success) — if you
-  get 503, STOP, the graph was not modified; investigate Neo4j health before retrying.
-- After purging all corpora, confirm the graph is empty of content nodes (section 5.1 returns ~0 Hadith).
+- A failed destructive write surfaces as **503** (it does NOT degrade to a silent success). The loop's
+  `code != 200` guard catches the 503 and any other non-success and **breaks** — when it fires,
+  the graph was not modified by that call; investigate Neo4j health, then re-run 2b (already-purged
+  corpora dry-run/real-run cleanly to ~0, so a resume over the full array is safe and idempotent).
+- After the loop completes for all corpora, confirm the graph is empty of content nodes (section 5.1
+  returns ~0 Hadith).
 
 > Scope note: this purge is **graph-level** (Neo4j nodes/edges). It is distinct from the
 > ingest-platform pipeline reset (ig#970, `/admin/reset/*`) which wipes the staging store — not needed
