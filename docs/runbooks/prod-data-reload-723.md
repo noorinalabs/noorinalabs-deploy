@@ -287,6 +287,18 @@ sudo --preserve-env=B2_KEY_ID,B2_APP_KEY,B2_BUCKET \
 - After restore, re-run section 5.5 prod smoke to confirm the service is healthy on the restored
   data, then triage what failed before re-attempting the reload.
 
+> **Caveat (deploy#498):** `restore.sh` defaults `COMPOSE_FILE` to `docker-compose.prod.yml`,
+> whereas `backup.sh` uses `compose/docker-compose.prod.yml` — the two scripts disagree on the
+> compose-file default. Until deploy#498 aligns them, set `COMPOSE_FILE=compose/docker-compose.prod.yml`
+> explicitly when invoking `restore.sh`, or the restore may resolve the wrong / non-existent compose
+> file mid-rollback. With the explicit override:
+>
+> ```bash
+> COMPOSE_FILE=compose/docker-compose.prod.yml \
+>   sudo --preserve-env=B2_KEY_ID,B2_APP_KEY,B2_BUCKET,COMPOSE_FILE \
+>   ./scripts/restore.sh daily/<YYYY-MM-DD>
+> ```
+
 ---
 
 ## Quick reference — exact command surface
