@@ -32,6 +32,7 @@ distiluse
 dryrun
 emptively
 exfiltrates
+fawaz
 Ferreira
 firstname
 Fjkb
@@ -40,6 +41,7 @@ frontmatter
 gatekeeping
 Hadid
 hadiths
+halimbahae
 healthcheck
 Healthchecks
 Hiro
@@ -48,6 +50,7 @@ imagetools
 ingester
 inlines
 isnad
+itqan
 Jelani
 Kavtaradze
 keypair
@@ -58,6 +61,7 @@ logdir
 materialises
 minioadmin
 monkeypatch
+muhaddithat
 Mwangi
 Méndez
 Nakamura
@@ -89,20 +93,24 @@ runbook
 runbooks
 runcmd
 Ríos
+sanadset
 scrapable
 smarthost
 Sunita
+sunnah
 swappable
 Tadesse
 Tanaka
 Tariq
 tfstate
 tfvars
+thaqalayn
 thresholding
 tlnp
 tmpfs
 tomasz
 Tremblay
+tusi
 vhosts
 visualisation
 Volkov
