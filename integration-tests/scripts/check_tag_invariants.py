@@ -36,11 +36,61 @@ SHA_SHORT_RE = re.compile(r"^sha-([0-9a-f]{7})$")
 STG_SHORT_RE = re.compile(r"^stg-([0-9a-f]{7})$")
 PROD_SHORT_RE = re.compile(r"^prod-([0-9a-f]{7})$")
 
+# Upper bound on tags/list pages walked. At 100 tags/page this covers 5,000
+# tags — far beyond any real package — while capping a cyclic/self-referential
+# server `next` so the walk cannot loop the CI job forever.
+_MAX_TAG_PAGES = 50
 
-def _http_get(url: str, headers: dict[str, str]) -> bytes:
+
+def _http_get_page(url: str, headers: dict[str, str]) -> tuple[bytes, str]:
+    """GET a URL, returning (body, Link-header).
+
+    The registry paginates `tags/list` and signals continuation via the
+    RFC 5988 ``Link: <…>; rel="next"`` header, so callers that paginate
+    need the response header alongside the body. The header is "" when
+    absent (no further pages).
+    """
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req) as r:
-        return r.read()
+        body = r.read()
+        link = r.headers.get("Link", "") or ""
+    return body, link
+
+
+def _http_get(url: str, headers: dict[str, str]) -> bytes:
+    body, _link = _http_get_page(url, headers)
+    return body
+
+
+def _next_page_url(link_header: str) -> str | None:
+    """Resolve the ``rel="next"`` target of an RFC 5988 Link header.
+
+    Origin-pinned: the next-page URL is ALWAYS rebuilt as
+    ``https://{REGISTRY}{path}?{query}`` using only the path + query of the
+    Link target — any scheme/host in the target is discarded. This is a
+    security guard, not cosmetics: ``_list_tags`` re-attaches the GHCR
+    ``Authorization: Bearer <token>`` on every page, so a malicious or
+    cleartext ``Link: <https://attacker/…>; rel="next"`` (or ``http://…``)
+    must never receive that token — the bearer credential may only ever go
+    to ghcr.io over https. GHCR's own next-link is a relative path, so this
+    rewrite is transparent for legitimate pagination. Returns None when
+    there is no next page (the terminal condition for the walk).
+    """
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        seg = part.strip()
+        if 'rel="next"' not in seg:
+            continue
+        lt = seg.find("<")
+        gt = seg.find(">")
+        if lt == -1 or gt == -1 or gt < lt:
+            continue
+        target = seg[lt + 1 : gt].strip()
+        split = urllib.parse.urlsplit(target)
+        # Keep ONLY path + query; force scheme=https, host=REGISTRY.
+        return urllib.parse.urlunsplit(("https", REGISTRY, split.path, split.query, ""))
+    return None
 
 
 def _bearer_token(image_path: str) -> str:
@@ -59,10 +109,32 @@ def _bearer_token(image_path: str) -> str:
 
 
 def _list_tags(image_path: str, token: str) -> list[str]:
-    url = f"https://{REGISTRY}/v2/{image_path}/tags/list"
+    """Return the COMPLETE tag set, following Link-header pagination.
+
+    GHCR caps a single `tags/list` page at 100 tags; an image with more
+    than 100 tags returns only the first page unless the caller walks the
+    ``rel="next"`` Link header. The previous single-GET implementation
+    silently truncated, so once a package crossed 100 tags the newest
+    publish shorts (`sha-<short>`/`stg-<short>`) fell off the page and the
+    invariant check false-failed for them (deploy#496). Walking every page
+    is the only complete fix — the endpoint exposes no recency sort.
+
+    The walk is bounded (page cap + visited-URL set) so a cyclic or
+    self-referential server ``next`` cannot loop the CI job forever.
+    """
+    url: str | None = f"https://{REGISTRY}/v2/{image_path}/tags/list"
     headers = {"Authorization": f"Bearer {token}"}
-    data = json.loads(_http_get(url, headers))
-    return list(data.get("tags") or [])
+    tags: list[str] = []
+    seen: set[str] = set()
+    for _ in range(_MAX_TAG_PAGES):
+        if not url or url in seen:
+            break
+        seen.add(url)
+        body, link = _http_get_page(url, headers)
+        page = json.loads(body).get("tags") or []
+        tags.extend(page)
+        url = _next_page_url(link)
+    return tags
 
 
 def _resolve_digest(image_path: str, tag: str, token: str) -> str:
