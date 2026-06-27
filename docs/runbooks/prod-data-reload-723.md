@@ -223,14 +223,17 @@ MATCH ()-[r:STUDIED_UNDER]->() RETURN count(r) AS studied_under_edges;
 ```
 
 PASS = `studied_under_edges` materially above the broken-state 186 (the W20 re-segmentation feeds
-real narrators into the chain, so STUDIED_UNDER is no longer starved). Also confirm chains exist:
+real narrators into the chain, so STUDIED_UNDER is no longer starved). Also confirm isnad chains
+exist — a chain is represented as `TRANSMITTED_TO` relationships carrying a `chain_id` property
+(there is no `HAS_CHAIN` / `HAS_ISNAD` edge), so count the distinct chains by `chain_id`:
 
 ```cypher
-MATCH (h:Hadith)-[:HAS_CHAIN|HAS_ISNAD]->(ch) RETURN count(DISTINCT ch) AS chains;  // expect >> 0
+MATCH ()-[r:TRANSMITTED_TO]->() WHERE r.chain_id IS NOT NULL
+RETURN count(DISTINCT r.chain_id) AS chains;  // expect >> 0
 ```
 
-(Use the actual chain relationship/label from the loaded schema if it differs — check
-`/admin/data/overview` `relationship_counts` for the real edge names.)
+(Confirm the exact edge/property and labels against the loaded schema at run time — check
+`/admin/data/overview` `relationship_counts` for the live edge names.)
 
 ### 5.3 Criterion #3 — search returns Hadith; semantic search 200 not 500
 
