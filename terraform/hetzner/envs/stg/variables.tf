@@ -54,3 +54,16 @@ variable "user_service_jwt_secret" {
   sensitive   = true
   default     = ""
 }
+
+variable "test_user_email" {
+  description = "Email of the stg NON-ADMIN QA test account (deploy#508). An identifier, not a secret; set via the `staging` GH Environment variable TEST_USER_EMAIL. Empty disables the seed."
+  type        = string
+  default     = ""
+}
+
+variable "test_user_password" {
+  description = "Password for the stg NON-ADMIN QA test account (deploy#508; min 16 chars when set in the module). Set via the `staging` GH Environment secret TEST_USER_PASSWORD. Empty disables the seed."
+  type        = string
+  sensitive   = true
+  default     = ""
+}

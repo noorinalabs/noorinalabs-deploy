@@ -298,6 +298,45 @@ jobs:
               echo "         successful migrate. Investigate per docs/runbooks/user-service-alembic.md#admin-bootstrap." >&2
             fi
 
+            # -------- post-migrate: seed non-admin QA test user (deploy#508) --------
+            # Idempotently create a NON-ADMIN (`reader`) email/password QA account so a
+            # known test login survives migrations AND a user-postgres DB wipe. Mirrors
+            # the admin bootstrap above: same one-shot image, DATABASE_URL, and docker
+            # network. Best-effort — it NEVER fails the migration gate:
+            #   * No-op exit 0 when TEST_USER_EMAIL / TEST_USER_PASSWORD are unset — the
+            #     seed script short-circuits. They are sourced from the VPS .env above
+            #     (the `set -a; . ./.env` sourcing), where deploy-{stg,prod}.yml's
+            #     write-deploy-env step lands them; on a first deploy before that step
+            #     has run they are simply absent and the seed correctly no-ops.
+            #   * Idempotent across deploys (`already_exists` on re-run).
+            #   * REFUSES to grant admin (enforced inside the script).
+            #   * The script only lands in the image after user-service #198 merges and
+            #     the image rebuilds; until then `docker run` exits non-zero. We LOG it
+            #     loudly but do NOT abort — the `migrated` output the promotion workflow
+            #     gates on must reflect the alembic result only, never this seed.
+            #   * Creds passed via -e (NOT argv) so the password never lands in the
+            #     one-shot container's PID-1 argv (CWE-214), matching the admin block.
+            echo "==> [${ENV_NAME}] post-migrate: seed non-admin QA test user (bootstrap_test_user.py)"
+            set +e
+            docker run --rm \
+              --network noorinalabs_user-backend \
+              -e DATABASE_URL="${DATABASE_URL}" \
+              -e TEST_USER_EMAIL="${TEST_USER_EMAIL:-}" \
+              -e TEST_USER_PASSWORD="${TEST_USER_PASSWORD:-}" \
+              "${IMAGE}" \
+              /app/.venv/bin/python scripts/bootstrap_test_user.py
+            SEED_RC=$?
+            set -e
+            if [ "${SEED_RC}" -eq 0 ]; then
+              echo "==> [${ENV_NAME}] test-user seed completed (rc=0: created / already_exists / no-op creds-unset)"
+            else
+              echo "WARNING: [${ENV_NAME}] test-user seed exited ${SEED_RC}." >&2
+              echo "         This does NOT fail the migration gate (alembic upgrade head already succeeded)." >&2
+              echo "         rc!=0 most likely means scripts/bootstrap_test_user.py is not yet in the" >&2
+              echo "         deployed image (user-service #198 not merged/rebuilt). It seeds once the" >&2
+              echo "         image carries the script. See deploy#508." >&2
+            fi
+
       - name: Record migration result
         id: record
         # Runner-side step — `$GITHUB_OUTPUT` is only writeable from runner

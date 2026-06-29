@@ -229,6 +229,11 @@ jobs:
           USER_POSTGRES_PASSWORD: ${{ secrets.USER_POSTGRES_PASSWORD }}
           USER_POSTGRES_USER: ${{ secrets.USER_POSTGRES_USER }}
           USER_REDIS_PASSWORD: ${{ secrets.USER_REDIS_PASSWORD }}
+          # QA test-user seed creds (deploy#508). TEST_USER_EMAIL is a non-secret
+          # var (an identifier); TEST_USER_PASSWORD is a secret. Both land in the
+          # host .env via env_keys below so the seed survives a user-postgres wipe.
+          TEST_USER_EMAIL: ${{ vars.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
         with:
           ssh_host: ${{ vars.VPS_HOST }}
           ssh_key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
@@ -260,7 +265,7 @@ jobs:
           # scripts/compose_tiered_up.sh. stg omits both → legacy single-`up`.
           gated_services: caddy frontend landing api user-service
           deferred_services: kafka kafka-init kafka-ui kafka-exporter
-          env_keys: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,JWT_PRIVATE_KEY,JWT_PUBLIC_KEY,KAFKA_CLUSTER_ID,KAFKA_UI_PASSWORD,KAFKA_UI_USER,PIPELINE_B2_BUCKET,PIPELINE_B2_ENDPOINT,PIPELINE_B2_KEY,PIPELINE_B2_KEY_ID,PIPELINE_B2_REGION,BACKUP_B2_KEY_ID,BACKUP_B2_APP_KEY,BACKUP_B2_BUCKET,USER_POSTGRES_DB,USER_POSTGRES_PASSWORD,USER_POSTGRES_USER,USER_REDIS_PASSWORD
+          env_keys: NEO4J_PASSWORD,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,AUTH_GOOGLE_CLIENT_ID,AUTH_GOOGLE_CLIENT_SECRET,AUTH_GITHUB_CLIENT_ID,AUTH_GITHUB_CLIENT_SECRET,GRAFANA_ADMIN_PASSWORD,JWT_PRIVATE_KEY,JWT_PUBLIC_KEY,KAFKA_CLUSTER_ID,KAFKA_UI_PASSWORD,KAFKA_UI_USER,PIPELINE_B2_BUCKET,PIPELINE_B2_ENDPOINT,PIPELINE_B2_KEY,PIPELINE_B2_KEY_ID,PIPELINE_B2_REGION,BACKUP_B2_KEY_ID,BACKUP_B2_APP_KEY,BACKUP_B2_BUCKET,USER_POSTGRES_DB,USER_POSTGRES_PASSWORD,USER_POSTGRES_USER,USER_REDIS_PASSWORD,TEST_USER_EMAIL,TEST_USER_PASSWORD
           github_token: ${{ secrets.GITHUB_TOKEN }}
           github_actor: ${{ github.repository_owner }}
           # Slack webhook for alertmanager routing (deploy#262). Optional —
@@ -384,6 +389,83 @@ jobs:
               echo "         This does NOT fail the deploy (rollout + api health already verified)." >&2
               echo "         rc=1 means BootstrapError — most likely the 'admin' role is missing." >&2
               echo "         Investigate per docs/runbooks/user-service-alembic.md#admin-bootstrap." >&2
+            fi
+
+      # Post-deploy: seed the NON-ADMIN QA test user (deploy#508).
+      #
+      # Mirrors the admin-reassert step above, but for a NON-ADMIN (`reader`)
+      # email/password account, so a known QA login survives redeploys AND a
+      # user-postgres DB wipe. Runs on EVERY prod deploy after the stack is
+      # healthy, against the LIVE container — the same survives-the-wipe gap the
+      # admin reassert closes for the owner account.
+      #
+      # Idempotent + best-effort, by the same discipline as the admin reassert:
+      #   * No-op exit 0 when TEST_USER_EMAIL / TEST_USER_PASSWORD are unset — the
+      #     seed script (user-service scripts/bootstrap_test_user.py) short-circuits.
+      #   * Idempotent — a second run reports `already_exists` and exits 0.
+      #   * REFUSES to grant admin (enforced inside the script).
+      #   * Sequencing: bootstrap_test_user.py only lands in the image after
+      #     user-service #198 merges and the image rebuilds. Until then it is
+      #     ABSENT and `docker exec` exits non-zero; we LOG that loudly but NEVER
+      #     abort the deploy (rollout + api health already verified) — matching
+      #     the admin step's tolerance. The seed lands automatically once the image
+      #     carries the script.
+      #
+      # Creds flow via the step `env:` (vars.TEST_USER_EMAIL + secrets.
+      # TEST_USER_PASSWORD), passed to the container with `docker exec -e` so the
+      # password never lands on argv. DATABASE_URL resolves from the container's
+      # own compose-injected environment, exactly like the admin reassert.
+      - name: Seed QA test user (bootstrap_test_user.py)
+        uses: appleboy/ssh-action@v1
+        env:
+          TEST_USER_EMAIL: ${{ vars.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          envs: TEST_USER_EMAIL,TEST_USER_PASSWORD
+          script: |
+            set -uo pipefail
+            cd /opt/noorinalabs-deploy
+
+            CONTAINER="noorinalabs-user-service-1"
+
+            # Wait for user-service to report healthy before exec-ing into it.
+            echo "==> [prod] waiting for ${CONTAINER} to be healthy..."
+            us_health="not_found"
+            for i in $(seq 1 24); do
+              us_health=$(docker inspect --format='{{.State.Health.Status}}' "${CONTAINER}" 2>/dev/null || echo "not_found")
+              echo "Attempt $i/24: user-service=${us_health}"
+              if [ "${us_health}" = "healthy" ]; then
+                break
+              fi
+              sleep 5
+            done
+            if [ "${us_health}" != "healthy" ]; then
+              echo "WARNING: [prod] ${CONTAINER} not healthy after 120s (status=${us_health})." >&2
+              echo "         Skipping test-user seed this deploy; it will reseed on the next one." >&2
+              echo "         This does NOT fail the deploy (rollout + api health already verified)." >&2
+              exit 0
+            fi
+
+            echo "==> [prod] post-deploy: seed non-admin QA test user (bootstrap_test_user.py)"
+            set +e
+            docker exec -e PYTHONPATH=/app -w /app \
+              -e TEST_USER_EMAIL="${TEST_USER_EMAIL:-}" \
+              -e TEST_USER_PASSWORD="${TEST_USER_PASSWORD:-}" \
+              "${CONTAINER}" \
+              /app/.venv/bin/python scripts/bootstrap_test_user.py
+            SEED_RC=$?
+            set -e
+            if [ "${SEED_RC}" -eq 0 ]; then
+              echo "==> [prod] test-user seed completed (rc=0: created / already_exists / no-op creds-unset)"
+            else
+              echo "WARNING: [prod] test-user seed exited ${SEED_RC}." >&2
+              echo "         This does NOT fail the deploy (rollout + api health already verified)." >&2
+              echo "         rc!=0 most likely means scripts/bootstrap_test_user.py is not yet in the" >&2
+              echo "         deployed image (user-service #198 not merged/rebuilt). It seeds once the" >&2
+              echo "         image carries the script. See deploy#508." >&2
             fi
 
       - name: Report status

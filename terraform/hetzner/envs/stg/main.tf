@@ -17,4 +17,6 @@ module "vps" {
   user_postgres_password  = var.user_postgres_password
   user_redis_password     = var.user_redis_password
   user_service_jwt_secret = var.user_service_jwt_secret
+  test_user_email         = var.test_user_email
+  test_user_password      = var.test_user_password
 }

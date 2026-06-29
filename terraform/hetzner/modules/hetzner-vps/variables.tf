@@ -90,3 +90,26 @@ variable "user_service_jwt_secret" {
     error_message = "user_service_jwt_secret must be at least 32 characters when set."
   }
 }
+
+# Non-admin QA test-user seed (deploy#508). Threaded into the VPS
+# .env.user-service at provisioning so user-service's idempotent
+# scripts/bootstrap_test_user.py can create a known NON-ADMIN (reader)
+# email/password account that survives a user-postgres DB wipe. Empty (the
+# default) disables the seed — the script no-ops when either value is unset.
+variable "test_user_email" {
+  description = "Email/identity of the NON-ADMIN QA test account seeded by user-service's scripts/bootstrap_test_user.py (deploy#508). An identifier, not a secret. Empty disables the seed (the script no-ops)."
+  type        = string
+  default     = ""
+}
+
+variable "test_user_password" {
+  description = "Password for the NON-ADMIN QA test account seeded by user-service's scripts/bootstrap_test_user.py (deploy#508). Empty disables the seed (the script no-ops)."
+  type        = string
+  sensitive   = true
+  default     = ""
+
+  validation {
+    condition     = var.test_user_password == "" || length(var.test_user_password) >= 16
+    error_message = "test_user_password must be at least 16 characters when set."
+  }
+}
