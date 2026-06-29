@@ -44,6 +44,13 @@ REPO_URL="https://github.com/noorinalabs/noorinalabs-deploy.git"
 INSTALL_DIR="/opt/noorinalabs-deploy"
 DEPLOY_USER="deploy"
 
+# Host swapfile size (Step 5). Both stg + prod are 15 GB RAM / 0-swap hosts;
+# the #723 data-reload OOM-killed the graph-load loader because Neo4j (heap
+# 5G + pagecache 3G + overhead) left too little headroom and there was no
+# swap to absorb the spike. 8 GB is the default; override with SWAP_SIZE.
+SWAP_SIZE="${SWAP_SIZE:-8G}"
+SWAPFILE="/swapfile"
+
 # Auxiliary repo directories pre-provisioned under /opt/ (see Step 3).
 # Single source of truth. To add a new repo to the deploy pipeline: append
 # it here, re-run this
@@ -128,7 +135,7 @@ fi
 # Residual value of the merge (post-exclusion): operators who add PERSONAL admin
 # keys to /root/.ssh/authorized_keys post-provision and want them reachable from
 # the deploy user too. Idempotent append-with-fingerprint-dedup (#287).
-echo "==> [1/4] Merging /root/.ssh/authorized_keys → deploy (idempotent)..."
+echo "==> [1/5] Merging /root/.ssh/authorized_keys → deploy (idempotent)..."
 DEPLOY_AUTH_KEYS="/home/$DEPLOY_USER/.ssh/authorized_keys"
 mkdir -p "/home/$DEPLOY_USER/.ssh"
 touch "$DEPLOY_AUTH_KEYS"
@@ -224,7 +231,7 @@ fi
 # /opt/ is root-owned by default, so the deploy user cannot create
 # $INSTALL_DIR itself on a first run. Pre-create + chown it first (same shape
 # as the Step 3 aux-repo dirs below), then clone into it as the deploy user.
-echo "==> [2/4] Refreshing $INSTALL_DIR as $DEPLOY_USER (idempotent)..."
+echo "==> [2/5] Refreshing $INSTALL_DIR as $DEPLOY_USER (idempotent)..."
 mkdir -p "$INSTALL_DIR"
 chown "$DEPLOY_USER:$DEPLOY_USER" "$INSTALL_DIR"
 if [ -d "$INSTALL_DIR/.git" ]; then
@@ -249,7 +256,7 @@ chown -R "$DEPLOY_USER:$DEPLOY_USER" "$INSTALL_DIR"
 # these dirs — until that gap is closed, this script is the canonical place
 # they live. To add a new repo to the deploy pipeline: append it to
 # AUX_REPOS at the top of this script, re-run (idempotent).
-echo "==> [3/4] Pre-provisioning auxiliary repo directories under /opt/..."
+echo "==> [3/5] Pre-provisioning auxiliary repo directories under /opt/..."
 for repo in "${AUX_REPOS[@]}"; do
   dir="/opt/$repo"
   if [ ! -d "$dir" ]; then
@@ -272,7 +279,7 @@ echo "    Auxiliary repo dirs ready."
 # so we no longer write a CHANGE-ME stub here. For first-time MANUAL
 # bring-ups (no CI yet), copy compose/env.example and edit by hand:
 #   cp $INSTALL_DIR/compose/env.example $INSTALL_DIR/.env && chmod 600 $INSTALL_DIR/.env
-echo "==> [4/4] Installing backup timer..."
+echo "==> [4/5] Installing backup timer..."
 if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
   install -m 644 "$INSTALL_DIR/systemd/isnad-backup.service"               /etc/systemd/system/
   install -m 644 "$INSTALL_DIR/systemd/isnad-backup.timer"                 /etc/systemd/system/
@@ -299,6 +306,57 @@ if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
   echo "    Start with: systemctl start isnad-backup.timer"
 else
   echo "    Backup systemd files not found, skipping (did the repo refresh in Step 2 succeed?)."
+fi
+
+# ── Step 5: Ensure a persistent host swapfile (deploy#504) ──────────────────
+# CLOUD-INIT GAP: the 15 GB stg/prod hosts ship with 0 swap. The #723 prod
+# data-reload rehearsal OOM-killed the graph-load loader on stg because Neo4j
+# (heap 5G + pagecache 3G + JVM/page-cache overhead, capped at a 10G container
+# limit) left too little headroom on a swapless box. The operator hand-added an
+# 8 GB swapfile to unblock the rehearsal, but it was ephemeral (no /etc/fstab
+# entry → lost on reboot). This step codifies that swapfile as IaC so it is
+# provisioned on bootstrap AND persists across reboots — for stg today and prod
+# before its data-load.
+#
+# Idempotent: if ANY swap is already active (e.g. the operator's live swapfile,
+# or a swap partition), it is left untouched. Otherwise the file is created only
+# if absent, then activated; the /etc/fstab entry is added only if not already
+# present. Re-runs are safe. Size is overridable via SWAP_SIZE (default 8G).
+echo "==> [5/5] Ensuring persistent host swap (size ${SWAP_SIZE}, override with SWAP_SIZE)..."
+if [ "$(swapon --show --noheadings | wc -l)" -gt 0 ]; then
+  echo "    Swap already active — leaving existing swap untouched:"
+  swapon --show | sed 's/^/      /'
+else
+  if [ ! -e "$SWAPFILE" ]; then
+    echo "    No active swap and $SWAPFILE absent — creating ${SWAP_SIZE} swapfile..."
+    # Prefer fallocate; fall back to dd if the backing FS doesn't support it.
+    if ! fallocate -l "$SWAP_SIZE" "$SWAPFILE" 2>/dev/null; then
+      echo "    fallocate unsupported on this FS — falling back to dd..."
+      # Strip a trailing G/g suffix for the dd MiB count (8G -> 8192 x 1MiB).
+      swap_gib="${SWAP_SIZE%[Gg]}"
+      dd if=/dev/zero of="$SWAPFILE" bs=1M count="$((swap_gib * 1024))" status=none
+    fi
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE" >/dev/null
+  else
+    echo "    $SWAPFILE already exists but is not active — (re)activating it..."
+    chmod 600 "$SWAPFILE"
+    # mkswap only if it lacks a swap signature (avoid clobbering live data).
+    if ! blkid "$SWAPFILE" 2>/dev/null | grep -q 'TYPE="swap"'; then
+      mkswap "$SWAPFILE" >/dev/null
+    fi
+  fi
+  swapon "$SWAPFILE"
+  echo "    Swap activated:"
+  swapon --show | sed 's/^/      /'
+fi
+
+# Persist across reboots via /etc/fstab — guarded so re-runs don't duplicate.
+if ! grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
+  echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
+  echo "    Added persistent /etc/fstab entry: ${SWAPFILE} none swap sw 0 0"
+else
+  echo "    /etc/fstab already has a ${SWAPFILE} swap entry — not duplicating."
 fi
 
 # ── Done ────────────────────────────────────────────────────────────────────

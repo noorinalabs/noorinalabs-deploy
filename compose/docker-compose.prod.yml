@@ -30,8 +30,8 @@ services:
     environment:
       NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}"
       NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
-      NEO4J_server_memory_heap_max__size: 4G
-      NEO4J_server_memory_pagecache_size: 2G
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-5G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-3G}
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -44,8 +44,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8G
-          cpus: "4.0"
+          memory: ${NEO4J_MEM_LIMIT:-10G}
+          cpus: "${NEO4J_CPUS:-6.0}"
         reservations:
           memory: 4G
           cpus: "2.0"
