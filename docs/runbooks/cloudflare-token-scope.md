@@ -55,7 +55,9 @@ both the `plan-cloudflare` and `apply-cloudflare` jobs of
 [`.github/workflows/terraform.yml`](../../.github/workflows/terraform.yml),
 before the `terraform` steps. It:
 
-1. Verifies the token is valid + active (`GET /user/tokens/verify`).
+1. Verifies the token is valid + active at the **token-verify endpoint** — the
+   account endpoint when `CLOUDFLARE_ACCOUNT_ID` is set, else the user endpoint
+   (see [User vs Account-Owned API tokens](#user-vs-account-owned-api-tokens-511)).
 2. Probes `GET /zones/<id>/rulesets` for each redirect zone — a non-destructive
    proxy for "the token covers this zone and can touch the rulesets API."
 
@@ -63,11 +65,59 @@ A miss fails the job early with a pointed `::error::` instead of a half-applied
 prod run. Run it locally the same way:
 
 ```bash
+# Account-owned token: set CLOUDFLARE_ACCOUNT_ID → account verify endpoint.
+CLOUDFLARE_API_TOKEN=… \
+CLOUDFLARE_ACCOUNT_ID="$(…cloudflare account id)" \
+NET_ZONE_ID="$(…noorinalabs.net zone id)" \
+ORG_ZONE_ID="$(…noorinalabs.org zone id)" \
+  scripts/cf_token_preflight.sh
+
+# User token: omit CLOUDFLARE_ACCOUNT_ID → user verify endpoint (fallback).
 CLOUDFLARE_API_TOKEN=… \
 NET_ZONE_ID="$(…noorinalabs.net zone id)" \
 ORG_ZONE_ID="$(…noorinalabs.org zone id)" \
   scripts/cf_token_preflight.sh
 ```
+
+### User vs Account-Owned API tokens (#511)
+
+Cloudflare has **two API-token kinds**, and they verify at **different
+endpoints**:
+
+| Token kind | Verify endpoint | Notes |
+|---|---|---|
+| **User API Token** | `GET /user/tokens/verify` | Tied to a user's profile; ~40-char value. |
+| **Account-Owned API Token** | `GET /accounts/{account_id}/tokens/verify` | Tied to the account; ~53-char value. |
+
+An **account-owned** token returns `success:false` with
+`code 1000 "Invalid API Token"` at the **user** endpoint even when it is valid
+and correctly scoped — it only verifies at the account endpoint. The Cloudflare
+Terraform provider (`~> 4.43`) auths with `api_token` and makes **zone-scoped**
+calls, so it works with either token kind unchanged; only the preflight's
+verify step is endpoint-sensitive.
+
+The preflight is therefore endpoint-aware: when `CLOUDFLARE_ACCOUNT_ID` is set
+it verifies at `GET /accounts/${CLOUDFLARE_ACCOUNT_ID}/tokens/verify`; otherwise
+it falls back to `GET /user/tokens/verify`. Both endpoints return the same
+envelope (`.success` / `.result.status`), so the downstream assertions are
+identical.
+
+**`CLOUDFLARE_ACCOUNT_ID` is a repo variable, not a secret** — the account ID is
+public account metadata, like the zone IDs already stored as `vars`. It is wired
+into the `Cloudflare token-scope preflight` step of both the `plan-cloudflare`
+and `apply-cloudflare` jobs as `${{ vars.CLOUDFLARE_ACCOUNT_ID }}`. Set it once
+(owner action — account IDs are not secret):
+
+```bash
+gh variable set CLOUDFLARE_ACCOUNT_ID \
+  --repo noorinalabs/noorinalabs-deploy --body <account_id>
+```
+
+Find the account ID in the Cloudflare dashboard (any zone → **Overview** →
+right-hand sidebar **Account ID**), or via
+`GET /accounts` with the token. If the variable is left unset, the preflight
+falls back to the user endpoint — which fails for the org's current
+account-owned `CLOUDFLARE_API_TOKEN`.
 
 ### Residual apply-gated gap
 

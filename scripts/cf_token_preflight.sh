@@ -22,7 +22,7 @@
 #   missing scope as an early, actionable CI failure instead.
 #
 # What it checks:
-#   1. Token is valid + active            (GET /user/tokens/verify)
+#   1. Token is valid + active            (token-verify endpoint, see below)
 #   2. Token can authenticate against the rulesets endpoint of EACH redirect
 #      zone (GET /zones/<id>/rulesets) — i.e. the zone is in the token's
 #      Zone Resources and the token can read rulesets. A 10000/9109 here is
@@ -37,7 +37,23 @@
 #     permission group specifically — is documented in the runbook and is the
 #     one apply-gated case that remains. See docs/runbooks/cloudflare-token-scope.md.
 #
+# User vs Account-Owned API tokens (#511):
+#   Cloudflare has two token kinds and they verify at DIFFERENT endpoints:
+#     - User API Token       → GET /user/tokens/verify
+#     - Account-Owned Token  → GET /accounts/<account_id>/tokens/verify
+#   An account-owned token returns `code 1000 "Invalid API Token"` at the user
+#   endpoint even when it is valid and correctly scoped. So step 1 is endpoint-
+#   aware: when CLOUDFLARE_ACCOUNT_ID is set we verify via the account endpoint;
+#   otherwise we fall back to the user endpoint (backward compatible). Both
+#   endpoints return the same envelope shape (.success / .result.status), so the
+#   downstream assertions are identical. CLOUDFLARE_ACCOUNT_ID is account
+#   metadata, not a secret — wired in CI as the repo variable vars.CLOUDFLARE_ACCOUNT_ID.
+#
 # Usage:
+#   # account-owned token (set CLOUDFLARE_ACCOUNT_ID → account verify endpoint):
+#   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... NET_ZONE_ID=... ORG_ZONE_ID=... \
+#     scripts/cf_token_preflight.sh
+#   # user token (omit CLOUDFLARE_ACCOUNT_ID → user verify endpoint):
 #   CLOUDFLARE_API_TOKEN=... NET_ZONE_ID=... ORG_ZONE_ID=... \
 #     scripts/cf_token_preflight.sh
 #
@@ -49,6 +65,11 @@ set -euo pipefail
 : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN must be set}"
 : "${NET_ZONE_ID:?NET_ZONE_ID (noorinalabs.net zone id) must be set}"
 : "${ORG_ZONE_ID:?ORG_ZONE_ID (noorinalabs.org zone id) must be set}"
+# CLOUDFLARE_ACCOUNT_ID is OPTIONAL (#511): set it for an account-owned token to
+# verify via the account endpoint; leave it unset to fall back to the user
+# endpoint (a user API token). Do NOT add a `:?` required-guard here — that would
+# break the user-token fallback.
+CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
 
 CF_API="https://api.cloudflare.com/client/v4"
 
@@ -71,12 +92,24 @@ cf_get() {
 }
 
 # 1. Token validity + active status.
-verify_resp=$(cf_get "/user/tokens/verify") || {
-  err "Could not reach Cloudflare token-verify endpoint."
+#    Endpoint-aware (#511): an Account-Owned API token verifies only at the
+#    account endpoint and returns code 1000 "Invalid API Token" at the user
+#    endpoint. Pick the endpoint from whether CLOUDFLARE_ACCOUNT_ID is set.
+if [ -n "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+  verify_path="/accounts/${CLOUDFLARE_ACCOUNT_ID}/tokens/verify"
+else
+  verify_path="/user/tokens/verify"
+fi
+verify_resp=$(cf_get "${verify_path}") || {
+  err "Could not reach Cloudflare token-verify endpoint (${verify_path})."
   exit 1
 }
 if [ "$(printf '%s' "${verify_resp}" | jq -r '.success')" != "true" ]; then
-  err "CLOUDFLARE_API_TOKEN failed /user/tokens/verify — the token is invalid, expired, or revoked."
+  err "CLOUDFLARE_API_TOKEN failed ${verify_path} — the token is invalid, expired, or revoked."
+  if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+    err "If this token is an Account-Owned API token it must verify at the account"
+    err "endpoint: set CLOUDFLARE_ACCOUNT_ID (CI: vars.CLOUDFLARE_ACCOUNT_ID) and re-run."
+  fi
   err "Fix: mint a new token and re-set the GH secret (see docs/runbooks/cloudflare-token-scope.md)."
   printf '%s\n' "${verify_resp}" | jq -c '.errors' >&2 || true
   exit 1
@@ -86,7 +119,7 @@ if [ "${token_status}" != "active" ]; then
   err "CLOUDFLARE_API_TOKEN status is '${token_status}', expected 'active'."
   exit 1
 fi
-echo "Token verify: OK (status=active)"
+echo "Token verify: OK (status=active, endpoint=${verify_path})"
 
 # 2. Per-zone rulesets read — proves the zone is in the token's Zone Resources
 #    and the token can touch the rulesets API on it. A miss here is the same
