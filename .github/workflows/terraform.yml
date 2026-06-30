@@ -267,6 +267,11 @@ jobs:
       - name: Cloudflare token-scope preflight
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Account-owned tokens verify at the account endpoint, not /user/...
+          # (#511). Account ID is public account metadata like the zone IDs
+          # above — a repo variable, not a secret. Optional: if unset the
+          # preflight falls back to the user-token verify endpoint.
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
           ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
         run: ../../scripts/cf_token_preflight.sh
@@ -465,6 +470,11 @@ jobs:
       - name: Cloudflare token-scope preflight
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Account-owned tokens verify at the account endpoint, not /user/...
+          # (#511). Account ID is public account metadata like the zone IDs
+          # above — a repo variable, not a secret. Optional: if unset the
+          # preflight falls back to the user-token verify endpoint.
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           NET_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_NET_ZONE_ID }}
           ORG_ZONE_ID: ${{ vars.CLOUDFLARE_NOORINALABS_ORG_ZONE_ID }}
         run: ../../scripts/cf_token_preflight.sh
