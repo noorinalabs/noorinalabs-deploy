@@ -19,3 +19,9 @@ ghcr_auth_b64 = "base64('username:ghcr-token')"
 user_postgres_password  = "a-strong-prod-password-at-least-16-chars"
 user_redis_password     = "a-strong-prod-password-at-least-16-chars"
 user_service_jwt_secret = "a-strong-prod-secret-at-least-32-chars"
+
+# Non-admin QA test-user seed (prod, deploy#508). Leave both empty to disable
+# the seed. test_user_email is an identifier (non-secret); test_user_password
+# must be at least 16 chars when set.
+test_user_email    = "qa+test@noorinalabs.com"
+test_user_password = "a-strong-qa-password-at-least-16-chars"

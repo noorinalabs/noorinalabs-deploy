@@ -139,6 +139,12 @@ write_files:
       USER_POSTGRES_PASSWORD=${user_postgres_password}
       USER_REDIS_PASSWORD=${user_redis_password}
       USER_SERVICE_JWT_SECRET=${user_service_jwt_secret}
+      # Non-admin QA test-user seed (deploy#508). Injected here so the seed
+      # survives a user-postgres DB wipe; empty values disable the seed (the
+      # bootstrap_test_user.py script no-ops). TEST_USER_EMAIL is an identifier,
+      # TEST_USER_PASSWORD is a secret.
+      TEST_USER_EMAIL=${test_user_email}
+      TEST_USER_PASSWORD=${test_user_password}
 
   # Deploy directory marker
   - path: /opt/noorinalabs-deploy/.cloud-init-provisioned
