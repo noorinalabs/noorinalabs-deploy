@@ -99,6 +99,12 @@ Prod and stg VPS IPs are read automatically from the hetzner per-env Terraform r
 
 - [Terraform >= 1.6](https://developer.hashicorp.com/terraform/install)
 - `CLOUDFLARE_API_TOKEN` — Cloudflare API token. **Permissions:** `Zone:DNS:Edit`, `Zone:Zone Settings:Edit`, `Zone:Zone:Read`, **and `Zone:Dynamic Redirect:Edit`** (the last is required for the `.net`/`.org` canonical-redirect rulesets — DNS edit alone is insufficient for ruleset management). **Zone Resources:** must cover all three zones — `noorinalabs.com`, `noorinalabs.net`, `noorinalabs.org` (or "All zones in account"). A token scoped to `.com` only authenticates for `.com` DNS but fails the redirect apply with `Authentication error (10000)` — see [token-scope runbook](../../docs/runbooks/cloudflare-token-scope.md) and #347.
+  - **Token kind — User vs Account-Owned (#511):** Cloudflare API tokens come in two kinds. A **User API Token** verifies at `GET /user/tokens/verify`; an **Account-Owned API Token** verifies only at `GET /accounts/{account_id}/tokens/verify` and returns `code 1000 "Invalid API Token"` at the user endpoint despite being valid. The Terraform provider (`~> 4.43`) auths the same way for both (zone-scoped `api_token` calls), so **no resource change is needed** for either kind — but the CI **token-scope preflight** must hit the matching verify endpoint. The org's `CLOUDFLARE_API_TOKEN` is now account-owned, so `CLOUDFLARE_ACCOUNT_ID` (below) must be set. See the [token-scope runbook § User vs Account-Owned API tokens](../../docs/runbooks/cloudflare-token-scope.md#user-vs-account-owned-api-tokens-511).
+- `CLOUDFLARE_ACCOUNT_ID` — Cloudflare **account** ID (public metadata, **not a secret**). Required when `CLOUDFLARE_API_TOKEN` is an account-owned token so the preflight verifies at the account endpoint; omit it for a user token (the preflight falls back to `/user/tokens/verify`). In CI it is the repo variable `vars.CLOUDFLARE_ACCOUNT_ID`, wired into the `Cloudflare token-scope preflight` step of both `plan-cloudflare` and `apply-cloudflare`. Set it with:
+  ```bash
+  gh variable set CLOUDFLARE_ACCOUNT_ID --repo noorinalabs/noorinalabs-deploy --body <account_id>
+  ```
+  Find the account ID in the Cloudflare dashboard (any zone → Overview → Account ID in the sidebar).
 - `cloudflare_zone_id` — Zone ID for `noorinalabs.com` (Cloudflare dashboard → Overview → Zone ID)
 - Backblaze B2 credentials (to read hetzner remote state — same creds as the cloudflare module's own backend)
 
