@@ -5,6 +5,7 @@ on:
       - 'compose/**'
       - 'infra/**'
       - 'scripts/**'
+      - 'integration-tests/scripts/**'
       - '.github/workflows/**'
   push:
     branches: [main]
@@ -12,6 +13,7 @@ on:
       - 'compose/**'
       - 'infra/**'
       - 'scripts/**'
+      - 'integration-tests/scripts/**'
       - '.github/workflows/**'
 
 permissions:
@@ -133,12 +135,19 @@ jobs:
     # cold_rebuild_static_checks.py were ungated despite being CI-critical
     # (the TF-apply-lock regression guard and the cold-rebuild shape guards
     # run from these). This job is the missing Python floor, mirroring
-    # hooks-lint.yml's ruff/mypy pattern. Pinned to ruff 0.11.6 — the same
-    # version the .pre-commit-config.yaml mirror + org rollout ship — so local
-    # `pre-commit` and CI run the identical tool (#327 fail-fast parity).
-    # integration-tests/ is out of scope here: it is pytest-gated by
-    # integration-tests.yml and carries its own dev-deps/config.
-    name: ruff + mypy (scripts)
+    # hooks-lint.yml's ruff/mypy pattern. Pinned to ruff 0.15.11 — the same
+    # version the .pre-commit-config.yaml mirror + org-canonical pin
+    # (ig/da/us/ingest/main) ship — so local `pre-commit` and CI run the
+    # identical tool (#327 fail-fast parity). deploy#500 folds
+    # integration-tests/scripts/ INTO scope: its CLI helpers (today
+    # check_tag_invariants.py, the GHCR Contract-v6 tag-count checker used by
+    # promote.yml + image-tag-invariants.yml) were ungated by every Python
+    # floor — this job's old scripts-only scope, hooks-lint.yml's
+    # .claude/hooks/ scope, and the shellcheck *.sh job — so ruff/mypy drift
+    # there went uncaught (an unused import + >100-col lines shipped). The rest
+    # of integration-tests/ (the hermetic pytest suite) stays out: it is gated
+    # by integration-tests.yml and carries its own dev-deps/live-stack config.
+    name: ruff + mypy (scripts + integration-tests/scripts)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -149,7 +158,7 @@ jobs:
         id: discover
         shell: bash
         run: |
-          mapfile -t files < <(find scripts .github/workflows/scripts -type f -name '*.py' 2>/dev/null)
+          mapfile -t files < <(find scripts .github/workflows/scripts integration-tests/scripts -type f -name '*.py' 2>/dev/null)
           if [ ${#files[@]} -eq 0 ]; then
             echo "No Python scripts found — nothing to lint."
             echo "found=0" >> "$GITHUB_OUTPUT"
@@ -159,20 +168,20 @@ jobs:
           echo "found=1" >> "$GITHUB_OUTPUT"
       - name: Install ruff + mypy (pinned)
         if: steps.discover.outputs.found == '1'
-        # ruff 0.11.6 matches .pre-commit-config.yaml's ruff-pre-commit rev and
-        # the org rollout pin. types-PyYAML supplies the stubs for
-        # check_tf_apply_locking.py's `import yaml` so mypy doesn't trip on
-        # import-untyped (which --ignore-missing-imports does NOT suppress).
-        run: pip install ruff==0.11.6 mypy types-PyYAML
+        # ruff 0.15.11 matches .pre-commit-config.yaml's ruff-pre-commit rev and
+        # the org-canonical pin (ig/da/us/ingest/main). types-PyYAML supplies the
+        # stubs for check_tf_apply_locking.py's `import yaml` so mypy doesn't trip
+        # on import-untyped (which --ignore-missing-imports does NOT suppress).
+        run: pip install ruff==0.15.11 mypy types-PyYAML
       - name: Ruff lint (scripts)
         if: steps.discover.outputs.found == '1'
-        run: ruff check scripts .github/workflows/scripts
+        run: ruff check scripts .github/workflows/scripts integration-tests/scripts
       - name: Ruff format --check (scripts)
         if: steps.discover.outputs.found == '1'
-        run: ruff format --check scripts .github/workflows/scripts
+        run: ruff format --check scripts .github/workflows/scripts integration-tests/scripts
       - name: Mypy type check (scripts)
         if: steps.discover.outputs.found == '1'
-        run: mypy scripts .github/workflows/scripts --ignore-missing-imports --no-error-summary
+        run: mypy scripts .github/workflows/scripts integration-tests/scripts --ignore-missing-imports --no-error-summary
 
   passlist-drift:
     # deploy#97: catch drift between compose's :?-required vars and the
@@ -337,3 +346,28 @@ jobs:
         run: pip install pytest pyyaml
       - name: Run scripts unit tests
         run: python3 -m pytest scripts/tests -q
+
+  integration-scripts-pytest:
+    # deploy#500 — unit tests for the standalone CLI helpers under
+    # integration-tests/scripts/ (today check_tag_invariants.py, the GHCR
+    # Contract-v6 tag-count checker used by promote.yml + image-tag-invariants.yml).
+    # Those helpers had no behavioral CI floor: the hermetic integration-tests.yml
+    # suite needs a live docker stack, and its conftest.py imports asyncpg/httpx/
+    # redis and raises at import — so the stdlib-only urllib-mock unit tests for
+    # this checker cannot live under integration-tests/tests/. They live in
+    # integration-tests/scripts/tests/ instead (a dependency-light home with its
+    # own pytest.ini so the run does NOT inherit integration-tests/pytest.ini's
+    # asyncio config). Installs only pytest — no live-stack deps. Mirrored in
+    # .pre-commit-config.yaml (pytest-integration-scripts pre-push hook) so the
+    # sync-drift gate stays green.
+    name: pytest (integration-scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run integration-tests/scripts unit tests
+        run: python3 -m pytest integration-tests/scripts/tests -q
