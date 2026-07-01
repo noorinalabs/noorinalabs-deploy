@@ -43,24 +43,71 @@ set -euo pipefail
 
 # swap_size_to_mib SIZE
 #   Echo SIZE expressed in whole MiB, for the `dd bs=1M count=…` fallback used
-#   when the backing FS doesn't support fallocate. Understands only a bare
-#   integer GiB value with an optional G/g suffix (8, 8G, 8g). Any other unit
-#   (e.g. 4096M, 512K, a partition-style value) is rejected with a non-zero
-#   return rather than being silently mis-sized by the `$(( ))` arithmetic (the
-#   fallocate path handles arbitrary suffixes; this fallback must not guess).
-#   Broader multi-unit parsing is deploy#507.
+#   when the backing FS doesn't support fallocate. Accepts an integer with an
+#   optional unit suffix: bare or G/g = GiB (8, 8G, 8g), M/m = MiB (8192M), and
+#   K/k = KiB (2097152K). Every arithmetic path forces base-10 (`10#…`) so a
+#   leading-zero value is never read as OCTAL and silently mis-sized (deploy#507
+#   review: `010G` is 10 GiB, not 8). Rejected with a non-zero return — rather
+#   than silently mis-sized — are: a KiB value that is not a whole number of MiB
+#   (the dd fallback is an integer `count=`); a zero result (would make an empty
+#   swapfile — the 0-headroom OOM this step exists to prevent); an implausibly
+#   long value (guards `$(( ))` 64-bit overflow); an unrecognized unit; and a
+#   non-integer. The fallocate path handles arbitrary suffixes; this fallback
+#   must not guess. Generalized from the G-only #506 helper by deploy#507.
 swap_size_to_mib() {
-  local size gib
+  local size num unit mib
   size="${1:-}"
-  gib="${size%[Gg]}"
-  case "$gib" in
+  # Strip a single trailing unit char if present: `num` is the integer part and
+  # `unit` is "" (bare) or that char. A bare value or garbage strips nothing, so
+  # num=size and the numeric check below rejects any non-integer.
+  num="${size%[GgMmKk]}"
+  unit="${size#"$num"}"
+  case "$num" in
     '' | *[!0-9]*)
       echo "swap_size_to_mib: unsupported SWAP_SIZE '${size}'" \
-        "(dd fallback needs a GiB value like 8 or 8G)" >&2
+        "(need an integer with an optional G/M/K unit, e.g. 8, 8G, 8192M, 2097152K)" >&2
       return 1
       ;;
   esac
-  echo "$((gib * 1024))"
+  # Bound the digit count so the base-10 arithmetic below stays well inside the
+  # signed-64-bit range (10#<=15 digits> * 1024 < 2^63). A >15-digit swap size is
+  # nonsensical and, unguarded, would overflow `$(( ))` into a wrong/negative count.
+  if [ "${#num}" -gt 15 ]; then
+    echo "swap_size_to_mib: SWAP_SIZE '${size}' is implausibly large (more than 15 digits)" >&2
+    return 1
+  fi
+  # `10#$num` forces base-10 so a leading zero is NOT parsed as octal (010 -> 10,
+  # not 8; 077 -> 77, not 63) — an octal mis-read silently under-sizes the file.
+  case "$unit" in
+    '' | G | g) mib=$((10#$num * 1024)) ;;
+    M | m) mib=$((10#$num)) ;;
+    K | k)
+      # The dd fallback is `bs=1M count=N` (integer MiB), so a KiB value that is
+      # not a whole number of MiB cannot be expressed exactly — reject it loudly
+      # rather than truncate to a wrong (possibly 0) size.
+      if [ "$((10#$num % 1024))" -ne 0 ]; then
+        echo "swap_size_to_mib: SWAP_SIZE '${size}' is not a whole number of MiB" \
+          "(dd fallback needs integer MiB; use a KiB value divisible by 1024)" >&2
+        return 1
+      fi
+      mib=$((10#$num / 1024))
+      ;;
+    *)
+      # Unreachable given the strip above only removes G/g/M/m/K/k, but kept as a
+      # defensive floor for a script that runs as root.
+      echo "swap_size_to_mib: unsupported SWAP_SIZE '${size}'" \
+        "(need an integer with an optional G/M/K unit, e.g. 8, 8G, 8192M, 2097152K)" >&2
+      return 1
+      ;;
+  esac
+  # A parsed size of 0 (e.g. 0, 00, 0G) would create a 0-byte swapfile — the exact
+  # 0-headroom OOM this step exists to prevent. Hard-fail loud instead.
+  if [ "$mib" -le 0 ]; then
+    echo "swap_size_to_mib: SWAP_SIZE '${size}' resolves to 0 MiB" \
+      "— refusing to create an empty swapfile" >&2
+    return 1
+  fi
+  echo "$mib"
 }
 
 # swap_fstab_entry_wanted SWAPFILE
@@ -105,7 +152,8 @@ DEPLOY_USER="deploy"
 # Host swapfile size (Step 5). Both stg + prod are 15 GB RAM / 0-swap hosts;
 # the #723 data-reload OOM-killed the graph-load loader because Neo4j (heap
 # 5G + pagecache 3G + overhead) left too little headroom and there was no
-# swap to absorb the spike. 8 GB is the default; override with SWAP_SIZE.
+# swap to absorb the spike. 8 GB is the default; override with SWAP_SIZE, which
+# accepts an integer plus an optional G/M/K unit (bare = GiB), e.g. 8G, 8192M.
 SWAP_SIZE="${SWAP_SIZE:-8G}"
 SWAPFILE="/swapfile"
 
@@ -390,9 +438,10 @@ else
     # Prefer fallocate; fall back to dd if the backing FS doesn't support it.
     if ! fallocate -l "$SWAP_SIZE" "$SWAPFILE" 2>/dev/null; then
       echo "    fallocate unsupported on this FS — falling back to dd..."
-      # dd needs an explicit MiB count. swap_size_to_mib (deploy#506) converts
-      # the GiB SWAP_SIZE and aborts on an unsupported unit rather than letting
-      # a non-numeric value silently break the `$(( ))` arithmetic (8G -> 8192).
+      # dd needs an explicit MiB count. swap_size_to_mib (deploy#506, multi-unit
+      # since #507) converts the G/M/K SWAP_SIZE and aborts on an unsupported
+      # unit or a sub-MiB KiB value rather than letting it silently break the
+      # `$(( ))` arithmetic (8G -> 8192, 8192M -> 8192, 2097152K -> 2048).
       swap_mib="$(swap_size_to_mib "$SWAP_SIZE")"
       dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mib" status=none
     fi
