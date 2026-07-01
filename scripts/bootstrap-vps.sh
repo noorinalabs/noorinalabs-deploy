@@ -34,6 +34,64 @@
 # =============================================================================
 set -euo pipefail
 
+# ── Swap-provisioning helpers (deploy#506) ──────────────────────────────────
+# Two small, pure helpers used by Step 5. Kept INLINE (not a sourced library)
+# because this script is delivered standalone via `curl … | bash` (RUNBOOK.md),
+# where a sibling lib file would not be present. The constrained `--selftest`
+# dispatch below lets scripts/tests exercise them in isolation without running
+# the privileged bootstrap body.
+
+# swap_size_to_mib SIZE
+#   Echo SIZE expressed in whole MiB, for the `dd bs=1M count=…` fallback used
+#   when the backing FS doesn't support fallocate. Understands only a bare
+#   integer GiB value with an optional G/g suffix (8, 8G, 8g). Any other unit
+#   (e.g. 4096M, 512K, a partition-style value) is rejected with a non-zero
+#   return rather than being silently mis-sized by the `$(( ))` arithmetic (the
+#   fallocate path handles arbitrary suffixes; this fallback must not guess).
+#   Broader multi-unit parsing is deploy#507.
+swap_size_to_mib() {
+  local size gib
+  size="${1:-}"
+  gib="${size%[Gg]}"
+  case "$gib" in
+    '' | *[!0-9]*)
+      echo "swap_size_to_mib: unsupported SWAP_SIZE '${size}'" \
+        "(dd fallback needs a GiB value like 8 or 8G)" >&2
+      return 1
+      ;;
+  esac
+  echo "$((gib * 1024))"
+}
+
+# swap_fstab_entry_wanted SWAPFILE
+#   Succeed (0) only when SWAPFILE actually exists, so the persistent
+#   /etc/fstab entry is written only for a swapfile this script created or
+#   (re)activated — never for a host whose active swap is a FOREIGN device (a
+#   swap partition), where SWAPFILE was intentionally left absent. A fstab line
+#   for an absent file makes systemd-fstab-generator fail the .swap unit
+#   (ENOENT) on the next boot and bring the host up degraded.
+swap_fstab_entry_wanted() {
+  [ -e "${1:-}" ]
+}
+
+# Test-only dispatch: `bootstrap-vps.sh --selftest <helper> [args…]` runs a
+# single named helper and exits, so scripts/tests can assert on it. Restricted
+# to the two helpers above (never an arbitrary command) since this script runs
+# as root. No effect on a normal run, where $1 is unset/empty.
+if [ "${1:-}" = "--selftest" ]; then
+  shift
+  case "${1:-}" in
+    swap_size_to_mib | swap_fstab_entry_wanted)
+      "$@"
+      exit "$?"
+      ;;
+    *)
+      echo "bootstrap-vps.sh: unknown --selftest target '${1:-}'" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 # Suppress all interactive debconf prompts during any apt operations this
 # script may trigger transitively (e.g. via `apt-get update` if a re-run
 # refreshes lists). Cloud-init's own apt: conf: handles --force-conf{def,old}
@@ -332,9 +390,11 @@ else
     # Prefer fallocate; fall back to dd if the backing FS doesn't support it.
     if ! fallocate -l "$SWAP_SIZE" "$SWAPFILE" 2>/dev/null; then
       echo "    fallocate unsupported on this FS — falling back to dd..."
-      # Strip a trailing G/g suffix for the dd MiB count (8G -> 8192 x 1MiB).
-      swap_gib="${SWAP_SIZE%[Gg]}"
-      dd if=/dev/zero of="$SWAPFILE" bs=1M count="$((swap_gib * 1024))" status=none
+      # dd needs an explicit MiB count. swap_size_to_mib (deploy#506) converts
+      # the GiB SWAP_SIZE and aborts on an unsupported unit rather than letting
+      # a non-numeric value silently break the `$(( ))` arithmetic (8G -> 8192).
+      swap_mib="$(swap_size_to_mib "$SWAP_SIZE")"
+      dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mib" status=none
     fi
     chmod 600 "$SWAPFILE"
     mkswap "$SWAPFILE" >/dev/null
@@ -351,12 +411,22 @@ else
   swapon --show | sed 's/^/      /'
 fi
 
-# Persist across reboots via /etc/fstab — guarded so re-runs don't duplicate.
-if ! grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
-  echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
-  echo "    Added persistent /etc/fstab entry: ${SWAPFILE} none swap sw 0 0"
+# Persist across reboots via /etc/fstab — but only for a swapfile that actually
+# exists (deploy#506). If the host's active swap is a foreign device (a swap
+# partition, not $SWAPFILE), the block above took the "leave existing swap
+# untouched" branch and never created $SWAPFILE; appending a fstab line for that
+# absent file would make systemd-fstab-generator fail the .swap unit (ENOENT) on
+# the next boot and bring the host up degraded. The inner grep still guards
+# re-runs against duplicate entries.
+if swap_fstab_entry_wanted "$SWAPFILE"; then
+  if ! grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
+    echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
+    echo "    Added persistent /etc/fstab entry: ${SWAPFILE} none swap sw 0 0"
+  else
+    echo "    /etc/fstab already has a ${SWAPFILE} swap entry — not duplicating."
+  fi
 else
-  echo "    /etc/fstab already has a ${SWAPFILE} swap entry — not duplicating."
+  echo "    Active swap is a foreign device (not ${SWAPFILE}) — skipping ${SWAPFILE} fstab entry."
 fi
 
 # ── Done ────────────────────────────────────────────────────────────────────
