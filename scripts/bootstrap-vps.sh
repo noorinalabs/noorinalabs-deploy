@@ -45,14 +45,17 @@ set -euo pipefail
 #   Echo SIZE expressed in whole MiB, for the `dd bs=1M count=…` fallback used
 #   when the backing FS doesn't support fallocate. Accepts an integer with an
 #   optional unit suffix: bare or G/g = GiB (8, 8G, 8g), M/m = MiB (8192M), and
-#   K/k = KiB (2097152K). A KiB value that is not a whole number of MiB (the dd
-#   fallback is an integer `count=`), any unrecognized unit, and any non-integer
-#   value are rejected with a non-zero return rather than being silently
-#   mis-sized by the `$(( ))` arithmetic (the fallocate path handles arbitrary
-#   suffixes; this fallback must not guess). Generalized from the G-only #506
-#   helper by deploy#507.
+#   K/k = KiB (2097152K). Every arithmetic path forces base-10 (`10#…`) so a
+#   leading-zero value is never read as OCTAL and silently mis-sized (deploy#507
+#   review: `010G` is 10 GiB, not 8). Rejected with a non-zero return — rather
+#   than silently mis-sized — are: a KiB value that is not a whole number of MiB
+#   (the dd fallback is an integer `count=`); a zero result (would make an empty
+#   swapfile — the 0-headroom OOM this step exists to prevent); an implausibly
+#   long value (guards `$(( ))` 64-bit overflow); an unrecognized unit; and a
+#   non-integer. The fallocate path handles arbitrary suffixes; this fallback
+#   must not guess. Generalized from the G-only #506 helper by deploy#507.
 swap_size_to_mib() {
-  local size num unit
+  local size num unit mib
   size="${1:-}"
   # Strip a single trailing unit char if present: `num` is the integer part and
   # `unit` is "" (bare) or that char. A bare value or garbage strips nothing, so
@@ -66,19 +69,28 @@ swap_size_to_mib() {
       return 1
       ;;
   esac
+  # Bound the digit count so the base-10 arithmetic below stays well inside the
+  # signed-64-bit range (10#<=15 digits> * 1024 < 2^63). A >15-digit swap size is
+  # nonsensical and, unguarded, would overflow `$(( ))` into a wrong/negative count.
+  if [ "${#num}" -gt 15 ]; then
+    echo "swap_size_to_mib: SWAP_SIZE '${size}' is implausibly large (more than 15 digits)" >&2
+    return 1
+  fi
+  # `10#$num` forces base-10 so a leading zero is NOT parsed as octal (010 -> 10,
+  # not 8; 077 -> 77, not 63) — an octal mis-read silently under-sizes the file.
   case "$unit" in
-    '' | G | g) echo "$((num * 1024))" ;;
-    M | m) echo "$num" ;;
+    '' | G | g) mib=$((10#$num * 1024)) ;;
+    M | m) mib=$((10#$num)) ;;
     K | k)
       # The dd fallback is `bs=1M count=N` (integer MiB), so a KiB value that is
       # not a whole number of MiB cannot be expressed exactly — reject it loudly
       # rather than truncate to a wrong (possibly 0) size.
-      if [ "$((num % 1024))" -ne 0 ]; then
+      if [ "$((10#$num % 1024))" -ne 0 ]; then
         echo "swap_size_to_mib: SWAP_SIZE '${size}' is not a whole number of MiB" \
           "(dd fallback needs integer MiB; use a KiB value divisible by 1024)" >&2
         return 1
       fi
-      echo "$((num / 1024))"
+      mib=$((10#$num / 1024))
       ;;
     *)
       # Unreachable given the strip above only removes G/g/M/m/K/k, but kept as a
@@ -88,6 +100,14 @@ swap_size_to_mib() {
       return 1
       ;;
   esac
+  # A parsed size of 0 (e.g. 0, 00, 0G) would create a 0-byte swapfile — the exact
+  # 0-headroom OOM this step exists to prevent. Hard-fail loud instead.
+  if [ "$mib" -le 0 ]; then
+    echo "swap_size_to_mib: SWAP_SIZE '${size}' resolves to 0 MiB" \
+      "— refusing to create an empty swapfile" >&2
+    return 1
+  fi
+  echo "$mib"
 }
 
 # swap_fstab_entry_wanted SWAPFILE

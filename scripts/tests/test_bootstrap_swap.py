@@ -104,6 +104,71 @@ def test_size_lowercase_k_suffix_whole_mib() -> None:
     assert result.stdout.strip() == "1024"
 
 
+# ── swap_size_to_mib: leading-zero forms are base-10, never octal (deploy#507
+#    review — Bereket Tadesse) ────────────────────────────────────────────────
+
+
+def test_size_leading_zero_gib_is_base10_not_octal() -> None:
+    """`010G` must be 10 GiB (10240 MiB), NOT octal-8 (8192) — the mis-size bug."""
+    result = _selftest("swap_size_to_mib", "010G")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "10240"
+
+
+def test_size_octal_valid_leading_zero_gib_is_base10() -> None:
+    """`016G` (octal-valid) must be 16 GiB (16384), NOT octal-14 (14336)."""
+    result = _selftest("swap_size_to_mib", "016G")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "16384"
+
+
+def test_size_leading_zero_08g_now_parses_base10() -> None:
+    """`08G` is invalid octal but valid base-10 = 8 GiB (8192) under the fix."""
+    result = _selftest("swap_size_to_mib", "08G")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "8192"
+
+
+def test_size_leading_zero_mebibyte_is_base10() -> None:
+    """`0010M` must be 10 MiB, not passed verbatim / octal-mangled into dd."""
+    result = _selftest("swap_size_to_mib", "0010M")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "10"
+
+
+# ── swap_size_to_mib: a zero result must hard-fail (never a 0-byte swapfile) ──
+
+
+def test_size_zero_is_rejected() -> None:
+    result = _selftest("swap_size_to_mib", "0")
+    assert result.returncode != 0
+    assert "0 MiB" in result.stderr
+    assert result.stdout.strip() == ""
+
+
+def test_size_double_zero_is_rejected() -> None:
+    """`00` is base-10 zero → an empty swapfile → must hard-fail."""
+    result = _selftest("swap_size_to_mib", "00")
+    assert result.returncode != 0
+    assert result.stdout.strip() == ""
+
+
+def test_size_zero_gib_is_rejected() -> None:
+    result = _selftest("swap_size_to_mib", "0G")
+    assert result.returncode != 0
+    assert result.stdout.strip() == ""
+
+
+# ── swap_size_to_mib: overflow guard on an implausibly long value ────────────
+
+
+def test_size_implausibly_long_is_rejected() -> None:
+    """A >15-digit value is rejected before it can overflow `$(( ))` to garbage."""
+    result = _selftest("swap_size_to_mib", "9999999999999999G")  # 16 digits
+    assert result.returncode != 0
+    assert result.stdout.strip() == ""
+
+
 # ── swap_size_to_mib: rejected (sub-MiB / bad unit / malformed) forms ───────
 
 
@@ -124,7 +189,8 @@ def test_size_terabyte_suffix_is_rejected() -> None:
 
 
 def test_size_double_unit_is_rejected() -> None:
-    """`8GB` strips only the trailing G, leaving `8B` — must be rejected."""
+    """`8GB` ends in `B` (not a G/M/K unit) so nothing strips → num=`8GB` →
+    rejected as non-numeric."""
     result = _selftest("swap_size_to_mib", "8GB")
     assert result.returncode != 0
 
