@@ -20,6 +20,7 @@ Auth: uses GH_ACTOR + GH_TOKEN from env if set (supplied by the CI job);
 otherwise falls back to an anonymous ghcr.io pull token which works for
 public packages.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,7 +29,6 @@ import re
 import sys
 import urllib.parse
 import urllib.request
-from collections import defaultdict
 
 REGISTRY = "ghcr.io"
 
@@ -102,6 +102,7 @@ def _bearer_token(image_path: str) -> str:
     headers: dict[str, str] = {}
     if actor and gh_token:
         import base64
+
         auth = base64.b64encode(f"{actor}:{gh_token}".encode()).decode()
         headers["Authorization"] = f"Basic {auth}"
     data = json.loads(_http_get(url, headers))
@@ -146,12 +147,14 @@ def _resolve_digest(image_path: str, tag: str, token: str) -> str:
     media types.
     """
     url = f"https://{REGISTRY}/v2/{image_path}/manifests/{tag}"
-    accept = ", ".join([
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.docker.distribution.manifest.list.v2+json",
-        "application/vnd.docker.distribution.manifest.v2+json",
-    ])
+    accept = ", ".join(
+        [
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        ]
+    )
     req = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": accept},
@@ -183,11 +186,7 @@ def check_publish_side(image_path: str, tags: list[str], token: str) -> list[str
     for tag in tags:
         if tag == "latest":
             continue
-        if not (
-            SHA_SHORT_RE.match(tag)
-            or STG_SHORT_RE.match(tag)
-            or tag == "stg-latest"
-        ):
+        if not (SHA_SHORT_RE.match(tag) or STG_SHORT_RE.match(tag) or tag == "stg-latest"):
             continue
         try:
             d = _resolve_digest(image_path, tag, token)
@@ -205,11 +204,13 @@ def check_publish_side(image_path: str, tags: list[str], token: str) -> list[str
 
     if len(sha_short) != 1:
         errors.append(
-            f"[publish] {image_path}: expected exactly 1 sha-<short> tag at latest digest, got {len(sha_short)}: {sha_short}"
+            f"[publish] {image_path}: expected exactly 1 sha-<short> tag at latest "
+            f"digest, got {len(sha_short)}: {sha_short}"
         )
     if len(stg_short) != 1:
         errors.append(
-            f"[publish] {image_path}: expected exactly 1 stg-<short> tag at latest digest, got {len(stg_short)}: {stg_short}"
+            f"[publish] {image_path}: expected exactly 1 stg-<short> tag at latest "
+            f"digest, got {len(stg_short)}: {stg_short}"
         )
     if not has_latest:
         errors.append(f"[publish] {image_path}: `latest` tag missing from latest-digest group")
@@ -219,19 +220,22 @@ def check_publish_side(image_path: str, tags: list[str], token: str) -> list[str
     # Invariant: the group size is exactly 4 — catches the "added a 5th tag" regression too.
     if len(grouped) != 4:
         errors.append(
-            f"[publish] {image_path}: Contract-v6 requires EXACTLY 4 tags per push at the publish digest. "
-            f"Found {len(grouped)}: {sorted(grouped)}"
+            f"[publish] {image_path}: Contract-v6 requires EXACTLY 4 tags per push "
+            f"at the publish digest. Found {len(grouped)}: {sorted(grouped)}"
         )
     else:
         print(f"[publish] {image_path}: OK — 4 tags at latest digest: {sorted(grouped)}")
 
     # Short-SHA parity: the 7-char suffixes on sha-* and stg-* must match.
+    # sha_short/stg_short were built by matching SHA_SHORT_RE/STG_SHORT_RE, so
+    # the re-match below is always non-None; guard it anyway to stay type-safe.
     if len(sha_short) == 1 and len(stg_short) == 1:
-        s_sha = SHA_SHORT_RE.match(sha_short[0]).group(1)
-        s_stg = STG_SHORT_RE.match(stg_short[0]).group(1)
-        if s_sha != s_stg:
+        m_sha = SHA_SHORT_RE.match(sha_short[0])
+        m_stg = STG_SHORT_RE.match(stg_short[0])
+        if m_sha and m_stg and m_sha.group(1) != m_stg.group(1):
             errors.append(
-                f"[publish] {image_path}: short-SHA mismatch between sha-{s_sha} and stg-{s_stg} at same digest"
+                f"[publish] {image_path}: short-SHA mismatch between "
+                f"sha-{m_sha.group(1)} and stg-{m_stg.group(1)} at same digest"
             )
 
     return errors
@@ -244,7 +248,9 @@ def check_promote_side(image_path: str, tags: list[str], token: str) -> list[str
     """
     errors: list[str] = []
     if "prod-latest" not in tags:
-        print(f"[promote] {image_path}: no `prod-latest` tag yet; skipping (no promotion observed).")
+        print(
+            f"[promote] {image_path}: no `prod-latest` tag yet; skipping (no promotion observed)."
+        )
         return errors
 
     prod_digest = _resolve_digest(image_path, "prod-latest", token)
@@ -266,12 +272,13 @@ def check_promote_side(image_path: str, tags: list[str], token: str) -> list[str
     prod_short = [t for t in grouped if PROD_SHORT_RE.match(t)]
     if len(prod_short) != 1:
         errors.append(
-            f"[promote] {image_path}: expected exactly 1 prod-<short> at prod-latest digest, got {len(prod_short)}: {prod_short}"
+            f"[promote] {image_path}: expected exactly 1 prod-<short> at prod-latest "
+            f"digest, got {len(prod_short)}: {prod_short}"
         )
     if len(grouped) != 2:
         errors.append(
-            f"[promote] {image_path}: Contract-v6 requires EXACTLY 2 tags per promotion at the prod digest. "
-            f"Found {len(grouped)}: {sorted(grouped)}"
+            f"[promote] {image_path}: Contract-v6 requires EXACTLY 2 tags per "
+            f"promotion at the prod digest. Found {len(grouped)}: {sorted(grouped)}"
         )
     else:
         print(f"[promote] {image_path}: OK — 2 tags at prod-latest digest: {sorted(grouped)}")
