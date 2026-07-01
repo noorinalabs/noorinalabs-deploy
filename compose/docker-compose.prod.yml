@@ -228,7 +228,15 @@ services:
   # PG_DSN / REDIS_URL), interpolated by compose from the VPS .env, so no
   # password ever lands on argv (CWE-214) and no NEW required secret is added.
   isnad-graph-embed:
-    image: ${EMBED_IMAGE:-ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:stg-latest}
+    # EMBED_IMAGE default is `prod-latest` — the FAIL-SAFE direction (deploy#470).
+    # reembed-corpus.yml always sets EMBED_IMAGE explicitly per-env (<env>-latest),
+    # so this default is only hit by a manual break-glass `--profile embed up`.
+    # This compose file is shared by both VPS boxes; defaulting to `prod-latest`
+    # means a manual break-glass on PROD pulls the correct prod embed image
+    # (previously it silently defaulted to a stg tag on prod — the cross-env
+    # hazard flagged in deploy#470), while on STG the reverse (a prod tag on stg)
+    # is explicitly benign per the reembed-corpus.yml env guard.
+    image: ${EMBED_IMAGE:-ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:prod-latest}
     profiles: ["embed"]
     read_only: true
     tmpfs:

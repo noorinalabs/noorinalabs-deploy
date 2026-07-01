@@ -49,6 +49,36 @@ Each step is a one-shot `--rm` container from the profile-gated `isnad-graph-emb
 
 Re-embed `stg` first, eyeball search quality, then `prod`. There is no automatic stg→prod chaining — each env is a separate dispatch (and prod is approval-gated).
 
+### Prerequisite for `prod`: promote the embed image to a prod tag (deploy#470)
+
+Unlike the stack services, the `isnad-graph-embed` image is **not** promoted by a
+routine `deploy-prod` roll — it is a one-shot, profile-gated image with its own
+lifecycle. A prod re-embed resolves its default image to
+`ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:prod-latest`, and
+`reembed-corpus.yml` **refuses to re-embed `prod` with a `stg-*`-tagged image**
+(env guard). So before the first prod re-embed, that `prod-*` tag must exist.
+
+`promote.yml` can now promote the embed image (opt-in — it is NOT in the default
+promotion set). Promote it **alone** so no prod VPS stack roll is triggered:
+
+```bash
+gh workflow run promote.yml --repo noorinalabs/noorinalabs-deploy \
+  --ref main -f images=embed
+# approve the `production` Environment gate on the retag job when prompted
+```
+
+This writes `prod-<short>` + `prod-latest` for `noorinalabs-isnad-graph-embed`
+via a registry-side retag of its current `stg-latest` digest (no VPS rollout —
+the `trigger-prod-deploy` job is guarded to skip when only `embed` is promoted).
+Confirm the tag landed:
+
+```bash
+docker buildx imagetools inspect \
+  ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:prod-latest
+```
+
+Only then dispatch `reembed-corpus.yml` with `env=prod`.
+
 ## Expected duration
 
 - **Default model:** no download — it is baked into the embed image and populates `st_model_cache` on first run. Only a model **swap** (a non-baked `EMBEDDING_MODEL`) adds a one-time ~470 MB download (a few minutes on the VPS link).
