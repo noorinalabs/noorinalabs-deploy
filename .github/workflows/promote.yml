@@ -49,7 +49,17 @@ on:
         required: false
         default: ""
       images:
-        description: "Comma-separated image set to promote (default: all)."
+        description: >-
+          Comma-separated image set to promote. Default promotes the four
+          daemon-stack services. `embed`
+          (noorinalabs-isnad-graph-embed) is also promotable but is OPT-IN
+          (deploy#470): it is a one-shot, profile-gated re-embed image with
+          its own lifecycle — not part of the prod VPS stack roll — so it is
+          only retagged when explicitly requested (e.g. `images=embed` for a
+          prod re-embed cutover, or `api,frontend,user-service,landing,embed`
+          to move it alongside a stack promotion). An `embed`-only promotion
+          writes `prod-<short>`/`prod-latest` for the embed image and does NOT
+          trigger a prod VPS rollout (see trigger-prod-deploy guard below).
         required: false
         default: "api,frontend,user-service,landing"
       skip_stg_verify:
@@ -220,8 +230,20 @@ jobs:
               "frontend":     "noorinalabs/noorinalabs-isnad-graph-frontend",
               "user-service": "noorinalabs/noorinalabs-user-service",
               "landing":      "noorinalabs/noorinalabs-landing-page",
+              # Opt-in (deploy#470): the decoupled one-shot re-embed image
+              # (isnad-graph#1089). Retagged stg -> prod via the same
+              # sha-<short>-sourced imagetools path as the stack services so a
+              # prod re-embed (reembed-corpus.yml, env=prod) has a `prod-latest`
+              # to pull instead of falling back to a stg tag. NOT in the default
+              # set and NOT part of the prod VPS stack roll — see trigger-prod-deploy.
+              "embed":        "noorinalabs/noorinalabs-isnad-graph-embed",
           }
-          raw = os.environ.get("IMAGES_INPUT", "").strip() or ",".join(mapping)
+          # Implicit "all" (empty input) = the four daemon-stack services only.
+          # `embed` is opt-in (deploy#470) and must be named explicitly — it is
+          # NOT swept in by the empty-input fallback (that would give an
+          # implicit promotion an unexpected embed retag).
+          _default_set = ["api", "frontend", "user-service", "landing"]
+          raw = os.environ.get("IMAGES_INPUT", "").strip() or ",".join(_default_set)
           requested = [s.strip() for s in raw.split(",") if s.strip()]
           unknown = [s for s in requested if s not in mapping]
           if unknown:
@@ -994,7 +1016,15 @@ jobs:
     # only on the DIRECT needs instead — `retag` already encodes the
     # gate-stg-verify + migrate-prod acceptability, so retag==success is
     # sufficient. Same pattern `retag` uses to ignore a skipped ancestor.
-    if: ${{ always() && needs.plan.result == 'success' && needs.retag.result == 'success' }}
+    # The final clause gates the prod VPS rollout on at least one DAEMON-STACK
+    # service being in the promotion set. `embed` (deploy#470) is a one-shot,
+    # profile-gated re-embed image that deploy-prod.yml does NOT roll — so an
+    # `embed`-only promotion leaves all four stack shorts empty. Without this
+    # clause, deploy-prod.yml would be dispatched with all-empty tags and fall
+    # back to `prod-latest` for EVERY stack service, silently re-rolling the
+    # entire prod stack as a side effect of an embed-only retag. The embed prod
+    # tag is consumed by reembed-corpus.yml, not by a VPS rollout.
+    if: ${{ always() && needs.plan.result == 'success' && needs.retag.result == 'success' && (needs.plan.outputs.api_short != '' || needs.plan.outputs.frontend_short != '' || needs.plan.outputs.user_service_short != '' || needs.plan.outputs.landing_short != '') }}
     runs-on: ubuntu-latest
     # NOT env-gated — the approval already happened at retag.
     # Firing deploy-prod.yml here is the rollout-execution step.
