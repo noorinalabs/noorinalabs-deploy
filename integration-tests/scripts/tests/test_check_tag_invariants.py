@@ -1,12 +1,14 @@
 """Unit tests for integration-tests/scripts/check_tag_invariants.py (deploy#496).
 
 These are pure, dependency-light urllib-mock tests — they do NOT touch the
-network, a registry, or the integration-test stack. They live in
-``scripts/tests/`` (run by the ``pytest (scripts)`` CI job, which installs only
-pytest) rather than ``integration-tests/tests/`` because the latter's
-``conftest.py`` imports asyncpg/httpx/redis and raises at module-load unless
-the live-stack env vars are set — that harness is for the hermetic/remote
-integration suite, not a stdlib-only unit test.
+network, a registry, or the integration-test stack. They live co-located in
+``integration-tests/scripts/tests/`` (run by the ``pytest (integration-scripts)``
+CI job, which installs only pytest) rather than ``integration-tests/tests/``
+because the latter's ``conftest.py`` imports asyncpg/httpx/redis and raises at
+module-load unless the live-stack env vars are set — that harness is for the
+hermetic/remote integration suite, not a stdlib-only unit test. This directory
+is the formal dependency-light home for unit tests of the ``integration-tests/
+scripts/`` CLI helpers (deploy#500).
 
 Regression under test: GHCR caps ``tags/list`` at 100 tags per page and
 paginates via the RFC 5988 ``Link: <…>; rel="next"`` header. The old
@@ -21,10 +23,10 @@ import json
 import sys
 from pathlib import Path
 
-# The script under test lives in integration-tests/scripts/ (a CLI script, not
-# an installed package). Mirror the sys.path-insert + import pattern the sibling
-# scripts/tests modules use for scripts/*.py, pointed at that directory.
-_CTI_DIR = Path(__file__).resolve().parents[2] / "integration-tests" / "scripts"
+# The script under test lives one directory up, in integration-tests/scripts/
+# (a CLI script, not an installed package). Mirror the sys.path-insert + import
+# pattern the sibling scripts/tests modules use, pointed at the parent dir.
+_CTI_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_CTI_DIR))
 
 import check_tag_invariants as cti  # noqa: E402

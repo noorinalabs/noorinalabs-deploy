@@ -12,7 +12,10 @@
 # Optional environment variables:
 #   POSTGRES_USER   — PostgreSQL user (default: isnad)
 #   POSTGRES_DB     — PostgreSQL database (default: isnad_graph)
-#   COMPOSE_FILE    — Docker Compose file (default: docker-compose.prod.yml)
+#   COMPOSE_FILE    — Docker Compose file (default: compose/docker-compose.prod.yml,
+#                     resolved relative to /opt/noorinalabs-deploy/ — MUST match
+#                     backup.sh so a restore rolls back the same stack backup captured;
+#                     see deploy#498)
 #   RESTORE_DIR     — Local restore staging directory (default: /tmp/isnad-restore)
 #
 # Usage:
@@ -28,7 +31,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 POSTGRES_USER="${POSTGRES_USER:-isnad}"
 POSTGRES_DB="${POSTGRES_DB:-isnad_graph}"
-COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-compose/docker-compose.prod.yml}"
 RESTORE_DIR="${RESTORE_DIR:-/tmp/isnad-restore}"
 
 RCLONE_REMOTE="isnad"

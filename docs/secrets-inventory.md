@@ -102,6 +102,18 @@ hetzner tfstate; a one-time defense-in-depth rotation is tracked in
 | `HEALTHCHECKS_PING_URL` | Alertmanager dead-man's-switch ping URL (deploy#453) | Observability Eng | per-env | on-demand | regenerate check ping URL in Healthchecks.io |
 | `STG_TEST_USER_EMAIL` / `STG_TEST_USER_PASSWORD` | staging smoke-test creds | SRE | staging only | on-demand | low sensitivity (test account) |
 
+## Machine-readable counterpart (deploy#513)
+
+This human table has a structured counterpart at
+[`../scripts/secret_rotation_inventory.yaml`](../scripts/secret_rotation_inventory.yaml),
+consumed by the deterministic rotation engine
+[`../scripts/secret_rotation.py`](../scripts/secret_rotation.py) to compute
+rotation-due status, per-class refresh plans, and self-rescheduling (see
+[`runbooks/secret-rotation-policy.md`](runbooks/secret-rotation-policy.md) §
+Deterministic rotation engine). Its test suite reconciles the YAML secret-name
+set against this file, so the two inventories cannot silently drift — when you
+edit the table below, mirror the change into the YAML.
+
 ## Maintenance
 
 Update this table whenever the secret surface changes (a new GH secret, a new

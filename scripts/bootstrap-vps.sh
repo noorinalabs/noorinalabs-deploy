@@ -34,6 +34,111 @@
 # =============================================================================
 set -euo pipefail
 
+# ── Swap-provisioning helpers (deploy#506) ──────────────────────────────────
+# Two small, pure helpers used by Step 5. Kept INLINE (not a sourced library)
+# because this script is delivered standalone via `curl … | bash` (RUNBOOK.md),
+# where a sibling lib file would not be present. The constrained `--selftest`
+# dispatch below lets scripts/tests exercise them in isolation without running
+# the privileged bootstrap body.
+
+# swap_size_to_mib SIZE
+#   Echo SIZE expressed in whole MiB, for the `dd bs=1M count=…` fallback used
+#   when the backing FS doesn't support fallocate. Accepts an integer with an
+#   optional unit suffix: bare or G/g = GiB (8, 8G, 8g), M/m = MiB (8192M), and
+#   K/k = KiB (2097152K). Every arithmetic path forces base-10 (`10#…`) so a
+#   leading-zero value is never read as OCTAL and silently mis-sized (deploy#507
+#   review: `010G` is 10 GiB, not 8). Rejected with a non-zero return — rather
+#   than silently mis-sized — are: a KiB value that is not a whole number of MiB
+#   (the dd fallback is an integer `count=`); a zero result (would make an empty
+#   swapfile — the 0-headroom OOM this step exists to prevent); an implausibly
+#   long value (guards `$(( ))` 64-bit overflow); an unrecognized unit; and a
+#   non-integer. The fallocate path handles arbitrary suffixes; this fallback
+#   must not guess. Generalized from the G-only #506 helper by deploy#507.
+swap_size_to_mib() {
+  local size num unit mib
+  size="${1:-}"
+  # Strip a single trailing unit char if present: `num` is the integer part and
+  # `unit` is "" (bare) or that char. A bare value or garbage strips nothing, so
+  # num=size and the numeric check below rejects any non-integer.
+  num="${size%[GgMmKk]}"
+  unit="${size#"$num"}"
+  case "$num" in
+    '' | *[!0-9]*)
+      echo "swap_size_to_mib: unsupported SWAP_SIZE '${size}'" \
+        "(need an integer with an optional G/M/K unit, e.g. 8, 8G, 8192M, 2097152K)" >&2
+      return 1
+      ;;
+  esac
+  # Bound the digit count so the base-10 arithmetic below stays well inside the
+  # signed-64-bit range (10#<=15 digits> * 1024 < 2^63). A >15-digit swap size is
+  # nonsensical and, unguarded, would overflow `$(( ))` into a wrong/negative count.
+  if [ "${#num}" -gt 15 ]; then
+    echo "swap_size_to_mib: SWAP_SIZE '${size}' is implausibly large (more than 15 digits)" >&2
+    return 1
+  fi
+  # `10#$num` forces base-10 so a leading zero is NOT parsed as octal (010 -> 10,
+  # not 8; 077 -> 77, not 63) — an octal mis-read silently under-sizes the file.
+  case "$unit" in
+    '' | G | g) mib=$((10#$num * 1024)) ;;
+    M | m) mib=$((10#$num)) ;;
+    K | k)
+      # The dd fallback is `bs=1M count=N` (integer MiB), so a KiB value that is
+      # not a whole number of MiB cannot be expressed exactly — reject it loudly
+      # rather than truncate to a wrong (possibly 0) size.
+      if [ "$((10#$num % 1024))" -ne 0 ]; then
+        echo "swap_size_to_mib: SWAP_SIZE '${size}' is not a whole number of MiB" \
+          "(dd fallback needs integer MiB; use a KiB value divisible by 1024)" >&2
+        return 1
+      fi
+      mib=$((10#$num / 1024))
+      ;;
+    *)
+      # Unreachable given the strip above only removes G/g/M/m/K/k, but kept as a
+      # defensive floor for a script that runs as root.
+      echo "swap_size_to_mib: unsupported SWAP_SIZE '${size}'" \
+        "(need an integer with an optional G/M/K unit, e.g. 8, 8G, 8192M, 2097152K)" >&2
+      return 1
+      ;;
+  esac
+  # A parsed size of 0 (e.g. 0, 00, 0G) would create a 0-byte swapfile — the exact
+  # 0-headroom OOM this step exists to prevent. Hard-fail loud instead.
+  if [ "$mib" -le 0 ]; then
+    echo "swap_size_to_mib: SWAP_SIZE '${size}' resolves to 0 MiB" \
+      "— refusing to create an empty swapfile" >&2
+    return 1
+  fi
+  echo "$mib"
+}
+
+# swap_fstab_entry_wanted SWAPFILE
+#   Succeed (0) only when SWAPFILE actually exists, so the persistent
+#   /etc/fstab entry is written only for a swapfile this script created or
+#   (re)activated — never for a host whose active swap is a FOREIGN device (a
+#   swap partition), where SWAPFILE was intentionally left absent. A fstab line
+#   for an absent file makes systemd-fstab-generator fail the .swap unit
+#   (ENOENT) on the next boot and bring the host up degraded.
+swap_fstab_entry_wanted() {
+  [ -e "${1:-}" ]
+}
+
+# Test-only dispatch: `bootstrap-vps.sh --selftest <helper> [args…]` runs a
+# single named helper and exits, so scripts/tests can assert on it. Restricted
+# to the two helpers above (never an arbitrary command) since this script runs
+# as root. No effect on a normal run, where $1 is unset/empty.
+if [ "${1:-}" = "--selftest" ]; then
+  shift
+  case "${1:-}" in
+    swap_size_to_mib | swap_fstab_entry_wanted)
+      "$@"
+      exit "$?"
+      ;;
+    *)
+      echo "bootstrap-vps.sh: unknown --selftest target '${1:-}'" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 # Suppress all interactive debconf prompts during any apt operations this
 # script may trigger transitively (e.g. via `apt-get update` if a re-run
 # refreshes lists). Cloud-init's own apt: conf: handles --force-conf{def,old}
@@ -47,7 +152,8 @@ DEPLOY_USER="deploy"
 # Host swapfile size (Step 5). Both stg + prod are 15 GB RAM / 0-swap hosts;
 # the #723 data-reload OOM-killed the graph-load loader because Neo4j (heap
 # 5G + pagecache 3G + overhead) left too little headroom and there was no
-# swap to absorb the spike. 8 GB is the default; override with SWAP_SIZE.
+# swap to absorb the spike. 8 GB is the default; override with SWAP_SIZE, which
+# accepts an integer plus an optional G/M/K unit (bare = GiB), e.g. 8G, 8192M.
 SWAP_SIZE="${SWAP_SIZE:-8G}"
 SWAPFILE="/swapfile"
 
@@ -332,9 +438,12 @@ else
     # Prefer fallocate; fall back to dd if the backing FS doesn't support it.
     if ! fallocate -l "$SWAP_SIZE" "$SWAPFILE" 2>/dev/null; then
       echo "    fallocate unsupported on this FS — falling back to dd..."
-      # Strip a trailing G/g suffix for the dd MiB count (8G -> 8192 x 1MiB).
-      swap_gib="${SWAP_SIZE%[Gg]}"
-      dd if=/dev/zero of="$SWAPFILE" bs=1M count="$((swap_gib * 1024))" status=none
+      # dd needs an explicit MiB count. swap_size_to_mib (deploy#506, multi-unit
+      # since #507) converts the G/M/K SWAP_SIZE and aborts on an unsupported
+      # unit or a sub-MiB KiB value rather than letting it silently break the
+      # `$(( ))` arithmetic (8G -> 8192, 8192M -> 8192, 2097152K -> 2048).
+      swap_mib="$(swap_size_to_mib "$SWAP_SIZE")"
+      dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mib" status=none
     fi
     chmod 600 "$SWAPFILE"
     mkswap "$SWAPFILE" >/dev/null
@@ -351,12 +460,22 @@ else
   swapon --show | sed 's/^/      /'
 fi
 
-# Persist across reboots via /etc/fstab — guarded so re-runs don't duplicate.
-if ! grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
-  echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
-  echo "    Added persistent /etc/fstab entry: ${SWAPFILE} none swap sw 0 0"
+# Persist across reboots via /etc/fstab — but only for a swapfile that actually
+# exists (deploy#506). If the host's active swap is a foreign device (a swap
+# partition, not $SWAPFILE), the block above took the "leave existing swap
+# untouched" branch and never created $SWAPFILE; appending a fstab line for that
+# absent file would make systemd-fstab-generator fail the .swap unit (ENOENT) on
+# the next boot and bring the host up degraded. The inner grep still guards
+# re-runs against duplicate entries.
+if swap_fstab_entry_wanted "$SWAPFILE"; then
+  if ! grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
+    echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
+    echo "    Added persistent /etc/fstab entry: ${SWAPFILE} none swap sw 0 0"
+  else
+    echo "    /etc/fstab already has a ${SWAPFILE} swap entry — not duplicating."
+  fi
 else
-  echo "    /etc/fstab already has a ${SWAPFILE} swap entry — not duplicating."
+  echo "    Active swap is a foreign device (not ${SWAPFILE}) — skipping ${SWAPFILE} fstab entry."
 fi
 
 # ── Done ────────────────────────────────────────────────────────────────────

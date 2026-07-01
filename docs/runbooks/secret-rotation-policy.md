@@ -116,11 +116,47 @@ status quo + this policy + SOPS-for-git-resident-config is the lowest-friction
 defensible path; Vault is over-scaled. But the choice is the owner's. When made,
 record it as an ADR and supersede the relevant rows of this policy.
 
+## Deterministic rotation engine (deploy#513)
+
+The cadence table above is now backed by a **machine-readable inventory** and a
+**deterministic decision engine**, so rotation-due status is computed rather than
+tracked by hand (the gap behind the CF / B2 fire-drills of #510 / #511):
+
+- **Inventory (ground truth):** [`scripts/secret_rotation_inventory.yaml`](../../scripts/secret_rotation_inventory.yaml)
+  is the structured counterpart of [`../secrets-inventory.md`](../secrets-inventory.md) —
+  per secret: scope, owner role, refresh method, cadence, apply process, owner-gate
+  flag, and last-rotated date. Names and metadata only, never a value. The test
+  suite reconciles its name set against the markdown inventory so the two cannot
+  drift.
+- **Engine:** [`scripts/secret_rotation.py`](../../scripts/secret_rotation.py) is a
+  pure, injected-clock decision engine. It derives a TTL per cadence
+  (annual/semiannual/quarterly; on-demand / on-deploy / provider have no calendar
+  TTL), computes `next_due = last_rotated + TTL`, schedules a task at
+  `next_due − lead_time` (the "TTL − ~1 day" of the design), self-reschedules a
+  completed rotation to its next fire time, and classifies each due secret as
+  fully programmatic vs owner-notify (a human inflection point — a provider
+  console re-roll, a prod-gate approval, a promote sign-off).
+- **Per-class refresh:** each secret declares a refresh method — `generate_and_replace`
+  (we mint a URL-safe value via CSPRNG), `provider_reroll` (re-roll upstream, capture
+  the new value), or `provider_managed` (lifecycle owned by the provider). The plan
+  generalizes the mint → verify → store → apply pattern of
+  [`../../scripts/rotate_db_password.sh`](../../scripts/rotate_db_password.sh)
+  (health-gated, with rollback) and the fix_b2_plan_key routine from #510. Plans are
+  value-free by construction — the engine never prints or logs a secret value.
+- **Usage:** `python3 scripts/secret_rotation.py {validate,status,due,plan,next-due}`.
+  `--now YYYY-MM-DD` fixes the clock so output is deterministic (and testable).
+
+This engine is the **unit-mechanic core**. It does not itself run a live rotation.
+
 ## What this PR delivers vs. defers
 
 - **Delivered (PR-time, static):** the secrets inventory; this rotation policy;
   per-env-separation principle; cadence table; audit-trail-today description;
-  the central-management decision framing.
-- **Deferred (runtime / decision-gated):** automated DB-password rotation (its
-  own follow-up issue); the central-secrets-manager tool choice (owner/ADR);
-  a consolidated audit pane (falls out of the tool choice).
+  the central-management decision framing; and (deploy#513) the machine-readable
+  inventory + deterministic TTL-due / refresh-plan / self-reschedule engine above.
+- **Deferred (runtime / decision-gated):** the live GitHub Actions cron workflow
+  that *runs* the self-rescheduling tasks; owner-notification delivery
+  (Slack/email/issue); the session-start hook wiring that renders the rotation-due
+  surface; provider-specific re-roll execution (CF/B2 console automation); and
+  auto-generating the inventory skeleton from `gh secret list`. Tracked as a
+  deploy#513 follow-up.
