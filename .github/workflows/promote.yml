@@ -1026,6 +1026,19 @@ jobs:
     # tag is consumed by reembed-corpus.yml, not by a VPS rollout.
     if: ${{ always() && needs.plan.result == 'success' && needs.retag.result == 'success' && (needs.plan.outputs.api_short != '' || needs.plan.outputs.frontend_short != '' || needs.plan.outputs.user_service_short != '' || needs.plan.outputs.landing_short != '') }}
     runs-on: ubuntu-latest
+    permissions:
+      # `actions: write` is required to dispatch another workflow
+      # (`gh workflow run deploy-prod.yml`) via the workflow_dispatch API.
+      # The workflow-level `permissions:` block (contents:read, packages:write,
+      # issues:write) omits `actions:` entirely, and a job-level `permissions:`
+      # block fully REPLACES the workflow-level one at YAML resolution time (same
+      # mechanic noted on `gate-stg-verify` above) — so without re-listing here,
+      # the dispatch 403s "Resource not accessible by integration" and the prod
+      # VPS rollout silently never fires after a successful retag (deploy#521).
+      actions: write
+      # `contents: read` re-listed because the job-level block replaces the
+      # workflow-level grant; `gh` reads repo context for the dispatch target.
+      contents: read
     # NOT env-gated — the approval already happened at retag.
     # Firing deploy-prod.yml here is the rollout-execution step.
     #
