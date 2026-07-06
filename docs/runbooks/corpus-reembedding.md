@@ -79,6 +79,14 @@ docker buildx imagetools inspect \
 
 Only then dispatch `reembed-corpus.yml` with `env=prod`.
 
+> **Second consumer of the embed prod tag (deploy#523):** the live `api` service now
+> *runs* the `-embed` image too (it needs torch + `MiniLM` to embed queries in parity
+> with the corpus). Unlike this re-embed prerequisite — which promotes `embed` **alone**
+> — an `api` rollout needs `embed:prod-<sha>` at the **same sha as the stack**, so a
+> prod promotion must include embed in the stack set
+> (`images=api,frontend,user-service,landing,embed`), not promote it separately. See
+> [semantic-embedder-parity-523.md](semantic-embedder-parity-523.md).
+
 ## Expected duration
 
 - **Default model:** no download — it is baked into the embed image and populates `st_model_cache` on first run. Only a model **swap** (a non-baked `EMBEDDING_MODEL`) adds a one-time ~470 MB download (a few minutes on the VPS link).

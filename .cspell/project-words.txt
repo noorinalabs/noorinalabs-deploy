@@ -30,6 +30,8 @@ diffable
 dispatchable
 distiluse
 dryrun
+embedder
+embedders
 emptively
 exfiltrates
 fawaz
@@ -85,6 +87,7 @@ pubkeys
 Rashidi
 reembed
 regen
+reindex
 reloadable
 Renaud
 retag
