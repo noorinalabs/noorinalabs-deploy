@@ -156,8 +156,14 @@ jobs:
             fi
           }
           # Cover every service compose pulls on stg (PULL_SERVICES =
-          # api frontend landing user-service).
-          check "ghcr.io/noorinalabs/noorinalabs-isnad-graph:$AF_TAG"
+          # api frontend landing user-service). The api pulls the model-capable
+          # `-embed` image, NOT the torch-free `isnad-graph` runtime image
+          # (deploy#523): it shares AF_TAG (embed:<env>-<sha> is built on the same
+          # isnad-graph main push), so this pre-flight must inspect the embed manifest
+          # — otherwise it would guard a manifest nothing pulls and let a missing
+          # embed:$AF_TAG surface only as a mid-deploy `compose pull` error (the exact
+          # deploy#418 hazard this gate exists to prevent).
+          check "ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed:$AF_TAG"
           check "ghcr.io/noorinalabs/noorinalabs-isnad-graph-frontend:$AF_TAG"
           check "ghcr.io/noorinalabs/noorinalabs-user-service:$US_TAG"
           check "ghcr.io/noorinalabs/noorinalabs-landing-page:$LD_TAG"

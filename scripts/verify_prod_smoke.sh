@@ -51,6 +51,9 @@ USER_SERVICE_BASE_URL="${USER_SERVICE_BASE_URL:-https://users.noorinalabs.com}"
 LANDING_BASE_URL="${LANDING_BASE_URL:-https://noorinalabs.com}"
 SMOKE_REPORT="${SMOKE_REPORT:-smoke-report.md}"
 TIMEOUT="${TIMEOUT:-5}"
+# Semantic-search probe (check 8) gets a longer timeout than the static routes:
+# the query is embedded at request time (torch+MiniLM), slower than a plain GET.
+SEMANTIC_TIMEOUT="${SEMANTIC_TIMEOUT:-15}"
 
 # Result tracking ----------------------------------------------------
 PASS=0
@@ -89,6 +92,69 @@ read_body() {
 
 ms_from_secs() {
   awk -v t="$1" 'BEGIN { printf("%d", t * 1000) }'
+}
+
+# semantic_keywords <query> → space-separated topical keywords.
+# Mirrors isnad-graph src/enrich/embeddings.py `_RECALL_KEYWORDS` so this HTTP smoke
+# and the DB-side `isnad verify-recall` gate judge topical relevance identically.
+semantic_keywords() {
+  case "$1" in
+    patience) echo "patience patient sabr persever endur" ;;
+    prayer)   echo "prayer pray salah salat worship" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
+# semantic_probe <query> — exercise GET /api/v1/search/semantic and assert it is
+# FUNCTIONAL, not merely reachable (deploy#523 / ig#1148). The endpoint-level
+# counterpart of `isnad verify-recall`: a plain "200 + non-empty" probe passes on
+# garbage, so we additionally require a strictly-positive top similarity AND a
+# topical keyword in the top-5 hits' title/title_ar. That last assertion catches the
+# SILENT failure this guards against — an environment whose API queries with a
+# different embedder (lexical hashing) than the corpus was embedded with (MiniLM):
+# both are vector(384) so cosine raises no error → HTTP 200 with results but a
+# meaningless ranking. A graceful 503 (embeddings not provisioned) also fails, with
+# a distinguishing detail.
+semantic_probe() {
+  local q="$1" url out code secs body ms top_score hay matched kw
+  local keywords=()
+  url="${ISNAD_BASE_URL}/api/v1/search/semantic?q=${q}&limit=5"
+  out="$(curl -sS -o "$SMOKE_BODY" -w '%{http_code} %{time_total}' \
+              --max-time "$SEMANTIC_TIMEOUT" "$url" 2>/dev/null || echo '000 0')"
+  code="$(echo "$out" | awk '{print $1}')"
+  secs="$(echo "$out" | awk '{print $2}')"
+  body="$(read_body)"
+  ms="$(ms_from_secs "$secs")"
+  if [ "$code" = "503" ]; then
+    record "semantic /search ($q)" fail "$ms" "HTTP 503 — semantic search not provisioned here (embeddings/pgvector absent)"
+    return
+  fi
+  if [ "$code" != "200" ]; then
+    record "semantic /search ($q)" fail "$ms" "HTTP $code (expected 200)"
+    return
+  fi
+  if ! echo "$body" | jq -e '.results | length > 0' >/dev/null 2>&1; then
+    record "semantic /search ($q)" fail "$ms" "HTTP 200 but empty result set — corpus embeddings not backfilled"
+    return
+  fi
+  top_score="$(echo "$body" | jq -r '.results[0].score // 0')"
+  if ! awk -v s="$top_score" 'BEGIN { exit (s > 0 ? 0 : 1) }'; then
+    record "semantic /search ($q)" fail "$ms" "HTTP 200 with results but non-positive top similarity (degenerate embeddings)"
+    return
+  fi
+  hay="$(echo "$body" | jq -r '[.results[:5][] | (.title // "") + " " + (.title_ar // "")] | join(" ") | ascii_downcase')"
+  read -r -a keywords <<<"$(semantic_keywords "$q")"
+  matched=0
+  for kw in "${keywords[@]}"; do
+    case "$hay" in
+      *"$kw"*) matched=1; break ;;
+    esac
+  done
+  if [ "$matched" = "1" ]; then
+    record "semantic /search ($q)" pass "$ms" "HTTP 200, top_score=$top_score, topical keyword match"
+  else
+    record "semantic /search ($q)" fail "$ms" "HTTP 200 + results but none topically relevant — query embedder likely != corpus embedder (embedder/corpus mismatch, deploy#523)"
+  fi
 }
 
 # --- 1. isnad-graph /health -----------------------------------------
@@ -255,6 +321,13 @@ ms_from_secs() {
     record "runtime-config.js" pass "$ms" "HTTP 200 + JS, RUNTIME_CONFIG → $us_host"
   fi
 }
+
+# --- 8. semantic search topical relevance (deploy#523 / ig#1148) ----
+# Guards the query↔corpus embedder-parity regression: the api must serve semantic
+# queries with the SAME embedder (MiniLM) the corpus was embedded with. Probes the
+# verify-recall vocabulary; both must pass (a hashing↔MiniLM mismatch fails BOTH).
+semantic_probe "patience"
+semantic_probe "prayer"
 
 # --- Summary --------------------------------------------------------
 END_NS="$(date +%s%N)"

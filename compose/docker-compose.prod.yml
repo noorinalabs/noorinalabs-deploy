@@ -120,7 +120,26 @@ services:
     # at pull — that's intentional; deploys go through the workflow. See the
     # cutover meta (noorinalabs-main#145) and #103 for the rationale (VPS has no
     # Node toolchain, so the previous local-build path was never viable).
-    image: ghcr.io/noorinalabs/noorinalabs-isnad-graph:${IMAGE_TAG:-latest}
+    #
+    # Semantic-search embedder parity (deploy#523). The api serves queries with the
+    # SAME embedder the corpus was embedded with (paraphrase-multilingual-MiniLM-
+    # L12-v2). The torch-free `noorinalabs-isnad-graph` runtime image cannot load
+    # MiniLM, so `src/config.py` silently fell back to the lexical HashingEmbedder —
+    # a query↔corpus mismatch that returns HTTP 200 with a MEANINGLESS ranking (both
+    # are vector(384), so cosine raises no error). The decoupled `-embed` image
+    # (built `--target embed --extra ml`, ig#1089) already carries fastapi +
+    # uvicorn[standard] + the `src` wheel + torch + sentence-transformers + baked
+    # MiniLM weights, and is published with the SAME `<env>-<sha>` tag scheme as the
+    # api image (built on the same isnad-graph main push) — so it serves
+    # `uvicorn src.api.app:create_app` with NO isnad-graph change. Repointing this one
+    # compose file (shared by BOTH stg and prod boxes) preserves stg↔prod parity by
+    # construction. `API_IMAGE` is an indirection var for clean break-glass rollback:
+    # set it to `ghcr.io/noorinalabs/noorinalabs-isnad-graph` in the VPS .env to
+    # revert the api to the torch-free image without a compose PR (drop the
+    # `EMBEDDING_MODEL` env below in the same step, else the model-less image raises
+    # constructing the embedder → 503). `${IMAGE_TAG}` keeps the api version-aligned
+    # with the deploy sha (embed:<env>-<sha> == the isnad-graph sha).
+    image: ${API_IMAGE:-ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed}:${IMAGE_TAG:-latest}
     expose:
       - "8000"
     # Security: read_only prevents runtime writes to the container filesystem.
@@ -161,12 +180,28 @@ services:
       - AUTH_OAUTH_REDIRECT_BASE_URL=https://users.${BASE_DOMAIN}
       - AUTH_OAUTH_POST_LOGIN_URL=https://isnad.${BASE_DOMAIN}/auth/callback
       - AUTH_USER_SERVICE_URL=http://user-service:8000
+      # Semantic-search embedder parity (deploy#523). The api MUST embed queries with
+      # the SAME model the corpus was embedded with (the one-shot isnad-graph-embed
+      # job bakes this exact model into the pgvector table). Set explicitly even
+      # though the `-embed` image bakes it as its default — documents intent, matches
+      # src/config.py's expectation, and pins the api to MiniLM if the image default
+      # ever drifts. MUST stay 384-dim (the pgvector column is vector(384) with a
+      # write-time dimension guard); a different-width model would raise or 200-with-
+      # garbage. See the `image:` note above for the break-glass rollback interaction.
+      - EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 5
-      start_period: 20s
+      # Extended 20s → 60s for the MiniLM cold-start (deploy#523). The api now loads
+      # torch + the sentence-transformer model at startup (per uvicorn worker, from
+      # the baked weights — no network download), which the torch-free image never
+      # did. 20s risked the container flapping to `unhealthy` mid-model-load on
+      # rollout (and blocking the frontend/caddy `service_healthy` gates); 60s covers
+      # the cold load on the constrained VPS before the retries×interval unhealthy
+      # window opens.
+      start_period: 60s
     depends_on:
       neo4j:
         condition: service_healthy
@@ -177,10 +212,19 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          # 2G → 4G (deploy#523): the api now loads torch + MiniLM. Each uvicorn
+          # worker imports torch and loads the model independently (no cross-process
+          # share) — the same envelope the one-shot embed job needed 2G→4G for
+          # (deploy#465). Paired with `--workers 4 → 2` below so ~2 × ~1.5–3G fits
+          # under this ceiling with headroom on the 16G box. Prod is the constraining
+          # box (measured ~8.2G available / 3G swap in use before this change);
+          # `--workers 2` ≈ ~3G keeps ~5G headroom vs `--workers 4` which would push
+          # prod hard into swap.
+          memory: 4G
           cpus: "2.0"
         reservations:
-          memory: 512M
+          # 512M → 1G so the scheduler guarantees room for the model resident set.
+          memory: 1G
           cpus: "0.5"
     logging: *default-logging
     networks:
@@ -189,7 +233,10 @@ services:
     # Uses the venv baked into the image at build time — NOT `uv run`, which would
     # trigger a full dependency reinstall at startup and fail on a read_only filesystem.
     # This is the single source of truth for the uvicorn command (Dockerfile has no CMD).
-    command: /app/.venv/bin/uvicorn src.api.app:create_app --factory --host 0.0.0.0 --port 8000 --workers 4
+    # --workers 2 (was 4): each worker loads torch + MiniLM independently, so worker
+    # count multiplies the model's memory footprint (deploy#523). 2 fits the 4G limit
+    # above with headroom on the constraining prod box; 4 would swap.
+    command: /app/.venv/bin/uvicorn src.api.app:create_app --factory --host 0.0.0.0 --port 8000 --workers 2
     restart: unless-stopped
 
   # One-shot corpus re-embedding runner (deploy#461, ADR 0008). Re-embeds the
