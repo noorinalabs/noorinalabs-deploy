@@ -133,12 +133,15 @@ services:
     # api image (built on the same isnad-graph main push) — so it serves
     # `uvicorn src.api.app:create_app` with NO isnad-graph change. Repointing this one
     # compose file (shared by BOTH stg and prod boxes) preserves stg↔prod parity by
-    # construction. `API_IMAGE` is an indirection var for clean break-glass rollback:
-    # set it to `ghcr.io/noorinalabs/noorinalabs-isnad-graph` in the VPS .env to
-    # revert the api to the torch-free image without a compose PR (drop the
-    # `EMBEDDING_MODEL` env below in the same step, else the model-less image raises
-    # constructing the embedder → 503). `${IMAGE_TAG}` keeps the api version-aligned
-    # with the deploy sha (embed:<env>-<sha> == the isnad-graph sha).
+    # construction. `API_IMAGE` is an IaC rollback SEAM: to revert the api to the
+    # torch-free image, flip this default (or `git revert` this change) in a one-line
+    # PR and redeploy — durable + reviewable — and drop the `EMBEDDING_MODEL` env below
+    # in the same change (else the model-less image raises constructing the embedder →
+    # 503). Do NOT hand-set API_IMAGE in the VPS `.env`: `write-deploy-env` TRUNCATES
+    # `.env` on every deploy and does not re-emit API_IMAGE, so a box-edit silently
+    # reverts on the next deploy (owner directive: rollback is IaC, not a box one-off).
+    # `${IMAGE_TAG}` keeps the api version-aligned with the deploy sha
+    # (embed:<env>-<sha> == the isnad-graph sha).
     image: ${API_IMAGE:-ghcr.io/noorinalabs/noorinalabs-isnad-graph-embed}:${IMAGE_TAG:-latest}
     expose:
       - "8000"
@@ -194,13 +197,14 @@ services:
       interval: 15s
       timeout: 10s
       retries: 5
-      # Extended 20s → 60s for the MiniLM cold-start (deploy#523). The api now loads
-      # torch + the sentence-transformer model at startup (per uvicorn worker, from
-      # the baked weights — no network download), which the torch-free image never
-      # did. 20s risked the container flapping to `unhealthy` mid-model-load on
-      # rollout (and blocking the frontend/caddy `service_healthy` gates); 60s covers
-      # the cold load on the constrained VPS before the retries×interval unhealthy
-      # window opens.
+      # Conservative 20s → 60s slack for the heavier `-embed` image (deploy#523). NOTE
+      # the model is NOT loaded at startup: isnad-graph `get_embedder()` is @lru_cache
+      # and constructs the SentenceTransformer lazily from the semantic-search REQUEST
+      # handler (src/api/routes/search.py), never from `lifespan` — so /health does not
+      # gate on model load and this is not a startup/outage concern. The cold-load cost
+      # is FIRST-semantic-request latency per uvicorn worker, not container readiness
+      # (eager warmup tracked in ig#1175). 60s is just harmless headroom for the larger
+      # image's general init; it does not — and need not — cover a startup model load.
       start_period: 60s
     depends_on:
       neo4j:
@@ -212,18 +216,21 @@ services:
     deploy:
       resources:
         limits:
-          # 2G → 4G (deploy#523): the api now loads torch + MiniLM. Each uvicorn
-          # worker imports torch and loads the model independently (no cross-process
-          # share) — the same envelope the one-shot embed job needed 2G→4G for
-          # (deploy#465). Paired with `--workers 4 → 2` below so ~2 × ~1.5–3G fits
-          # under this ceiling with headroom on the 16G box. Prod is the constraining
-          # box (measured ~8.2G available / 3G swap in use before this change);
-          # `--workers 2` ≈ ~3G keeps ~5G headroom vs `--workers 4` which would push
-          # prod hard into swap.
+          # 2G → 4G (deploy#523): each uvicorn worker loads MiniLM independently on
+          # first search (no cross-process share) — the same model the one-shot embed
+          # job needed 2G→4G for (deploy#465), though single-query INFERENCE RSS is
+          # lower than that batch job. `--workers 2` × ~1.5–3G spans ~3–6G against this
+          # 4G HARD cap: fine at the realistic low end, container-level OOM (api only,
+          # NOT host-wide) at the pessimistic high end. So validate real api RSS on stg
+          # after rollout BEFORE promoting prod (runbook step); if RSS nears 4G, drop to
+          # `--workers 1` or raise the cap within prod's ~8.2G headroom. `--workers 4`
+          # would exceed 4G and/or push the 16G box into swap — hence 2.
           memory: 4G
           cpus: "2.0"
         reservations:
-          # 512M → 1G so the scheduler guarantees room for the model resident set.
+          # 512M → 1G — a SOFT/advisory reservation (compose outside Swarm does NOT
+          # enforce it like `limits`; it is a scheduling hint only), raised to reflect
+          # the model's larger resident set. The enforced ceiling is `limits.memory` 4G.
           memory: 1G
           cpus: "0.5"
     logging: *default-logging
@@ -233,9 +240,10 @@ services:
     # Uses the venv baked into the image at build time — NOT `uv run`, which would
     # trigger a full dependency reinstall at startup and fail on a read_only filesystem.
     # This is the single source of truth for the uvicorn command (Dockerfile has no CMD).
-    # --workers 2 (was 4): each worker loads torch + MiniLM independently, so worker
-    # count multiplies the model's memory footprint (deploy#523). 2 fits the 4G limit
-    # above with headroom on the constraining prod box; 4 would swap.
+    # --workers 2 (was 4): each worker loads MiniLM independently on first search, so
+    # worker count multiplies the resident model footprint (deploy#523). 2 fits the 4G
+    # hard cap above at realistic single-query inference RSS (validate on stg — see the
+    # runbook); 4 would risk the cap and/or push the 16G box into swap.
     command: /app/.venv/bin/uvicorn src.api.app:create_app --factory --host 0.0.0.0 --port 8000 --workers 2
     restart: unless-stopped
 

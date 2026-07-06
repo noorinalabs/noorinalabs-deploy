@@ -30,13 +30,18 @@ compose file drives both boxes). A plain "200 + non-empty" probe passes on the b
   serves `uvicorn src.api.app:create_app` with **no isnad-graph change**.
 - **`EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2`** added to the `api`
   environment (explicit even though baked into the image).
-- **`--workers 4` → `--workers 2`** — each worker imports torch + loads the model
-  independently (no cross-process share), so worker count multiplies the memory
+- **`--workers 4` → `--workers 2`** — each worker loads MiniLM independently on first
+  search (no cross-process share), so worker count multiplies the resident model
   footprint.
-- **`mem_limit` 2G → 4G**, reservations 512M → 1G — the measured envelope
-  (`--workers 2` × ~1.5–3G) with headroom on the constraining prod box.
-- **Healthcheck `start_period` 20s → 60s** — absorbs the model cold-load so the
-  container does not flap to `unhealthy` mid-load on rollout.
+- **`mem_limit` 2G → 4G** (hard cap), reservations 512M → 1G (soft/advisory outside
+  Swarm) — the envelope `--workers 2` × ~1.5–3G ≈ 3–6G spans against the 4G cap:
+  fine at the realistic inference low end, container-level OOM risk (api only) at the
+  high end → **validate stg api RSS before promoting prod** (stg capacity check below).
+- **Healthcheck `start_period` 20s → 60s** — conservative slack for the heavier
+  image. NOTE this does **not** cover a startup model load: `get_embedder()` is
+  `@lru_cache` and loads MiniLM lazily from the semantic-search **request** handler,
+  never `lifespan`, so `/health` does not gate on it. The cold-load cost is
+  first-semantic-request latency **per worker** (eager warmup tracked in ig#1175).
 - **stg pre-flight** (`deploy-stg.yml`) now inspects the `-embed` manifest for `api`
   (it shares `AF_TAG`), not the torch-free image — otherwise the deploy#418 tag
   pre-flight would guard a manifest nothing pulls.
@@ -52,7 +57,25 @@ Merge the compose PR first (staging deploys automatically on merge to main).
 1. **stg** — the api + smoke change deploy together. `embed:stg-<sha>` already exists
    for every push, so the stg rollout pulls it with no extra step. Verify: the new
    `semantic /search (patience)` + `semantic /search (prayer)` smoke rows PASS.
-2. **prod** — promote, then approve the prod deploy. See the caveat below **before**
+2. **stg capacity check (gate before prod).** The 4G limit is a HARD cap and each
+   worker's model RSS loads lazily on first search, so real footprint only appears
+   under traffic. After warming both workers (hit `/api/v1/search/semantic` a few
+   times — see the first-hit latency note below), check api RSS on the stg box:
+
+   ```bash
+   ssh <stg> 'docker stats --no-stream noorinalabs-api-1'   # MEM USAGE / LIMIT
+   ```
+
+   If RSS sits comfortably below 4G (expected for single-query inference), promote
+   prod as-is. If it approaches 4G, **do not promote** — drop to `--workers 1` (or
+   raise `limits.memory` within prod's ~8.2G headroom) in a follow-up PR first. A
+   container-level OOM would restart-loop the api (api only, not host-wide).
+
+   > First-hit latency: because the model loads lazily per worker, the first
+   > semantic query each worker serves is several seconds slower (cold load). The
+   > smoke's 15s `SEMANTIC_TIMEOUT` tolerates one cold load; a deterministic per-worker
+   > warmup is the ig#1175 follow-up.
+3. **prod** — promote, then approve the prod deploy. See the caveat below **before**
    promoting.
 
 ## CRITICAL prod caveat — the prod promotion MUST include `embed`
@@ -82,14 +105,27 @@ is registry-side retag (IaC), not a VPS one-off. `stg` needs no such step.
 
 ## Rollback
 
-- **Tag rollback** (`rollback.yml -f service=all -f image_tag=prod-<older-sha>`) works
-  only if `embed:prod-<older-sha>` exists — i.e. that older sha was promoted **with
-  embed**. Make "include embed" the standing prod-promotion habit so every promoted
-  sha is rollback-eligible.
-- **Break-glass image revert** — set `API_IMAGE=ghcr.io/noorinalabs/noorinalabs-isnad-graph`
-  in the VPS `.env` and drop the api's `EMBEDDING_MODEL`, then redeploy: reverts the
-  api to the torch-free image without a compose PR. (Semantic search returns to
-  consistent-lexical `hashing`, not garbage — acceptable as a temporary floor.)
+Rollback is **IaC, never a hand-edit on the box** (owner directive). Two paths:
+
+1. **Tag rollback** (`rollback.yml -f service=all -f image_tag=prod-<older-sha>`) —
+   rolls image tags back to an earlier promoted sha. Works only if
+   `embed:prod-<older-sha>` exists, i.e. that older sha was promoted **with embed**.
+   Make "include embed" the standing prod-promotion habit so every promoted sha is
+   rollback-eligible.
+2. **Image revert to the torch-free API** (reverts the parity change itself, back to
+   consistent-lexical `hashing` — a degraded-but-not-broken floor): **`git revert`**
+   the compose change (or a one-line PR flipping the `API_IMAGE` default back to
+   `ghcr.io/noorinalabs/noorinalabs-isnad-graph` **and** dropping the api's
+   `EMBEDDING_MODEL`), then redeploy. Durable, reviewed, and survives the next deploy.
+
+> Do **NOT** rely on hand-setting `API_IMAGE` in the VPS `.env`: `write-deploy-env`
+> **truncates** `.env` on every deploy and does not re-emit `API_IMAGE`, so a box-edit
+> silently reverts on the next deploy. If an operator must intervene between deploys as
+> a stop-gap, treat any SSH `.env` override as **ephemeral** (reapply, or land the IaC
+> revert above). A durable fast-override would require threading `API_IMAGE` as a
+> `deploy-{stg,prod}.yml` input into the persisted env write — a possible follow-up if
+> PR-speed rollback proves too slow (it should not: lexical-vs-garbage is degradation,
+> not an outage).
 
 ## Follow-up (not a blocker)
 
@@ -98,3 +134,9 @@ release-critical (previously it mattered only for re-embed jobs). It already bui
 every isnad-graph main push; hardening it into the required publish set — and making
 `embed` part of the default prod-promotion set now that the stack depends on it — is
 worth a follow-up.
+
+- **ig#1175** — eager MiniLM warmup in isnad-graph `lifespan` (+ deterministic
+  per-worker post-deploy warmup) so the first-semantic-request cold load doesn't land
+  on a real user. App-side fix; do not implement from this repo.
+- Review comments already filed as out-of-scope follow-ups: **ig#1174** (embed-image
+  Trivy scan gap) and **deploy#526** (promote digest-gate).
