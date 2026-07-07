@@ -144,6 +144,22 @@ jobs:
 
             cd /opt/noorinalabs-deploy
 
+            # Refresh the on-box checkout to origin/main BEFORE any compose
+            # command, exactly as the sibling deploy-isnad-graph.yml does after
+            # its cd. The box's /opt/noorinalabs-deploy holds a git checkout that
+            # deploys refresh, but this op-workflow did not — so it ran against a
+            # stale pre-#533 compose file that lacked the profile-gated graph-ops
+            # service (added deploy#533; migrate index pre-step deploy#535),
+            # failing at `compose pull` with "no such service: graph-ops"
+            # (deploy#536). Placed above the dry-run early-exit so BOTH the
+            # dry-run (compose config) and real (compose pull/run) paths validate
+            # against the current compose file. Idempotent; updates the on-disk
+            # files only — graph-ops uses `run --rm`, not `up`, so the running
+            # stack is untouched.
+            echo "==> Pulling latest deploy config..."
+            git fetch origin main
+            git reset --hard origin/main
+
             # Map the operation input to the loader CLI subcommand. The image
             # ENTRYPOINT is `python -m src.cli`, so the subcommand is the full
             # arg list (creds come from the container env, never argv).
