@@ -193,6 +193,14 @@ jobs:
             if [ "${DRY_RUN}" = "true" ]; then
               echo "==> [${ENV_NAME}] DRY RUN — no Cypher issued, no edges rewritten, no centrality computed."
               echo "    image: ${GRAPH_OPS_IMAGE}"
+              if [ "${OPERATION}" = "migrate" ]; then
+                # Mirrors the real-run pre-step below: migrate-only, before the
+                # rewrite. Dry run only DESCRIBES it — issues no Cypher (deploy#534).
+                echo "    would first ensure the TRANSMITTED_TO(hadith_id) rel-property index"
+                echo "    (idempotent; cypher-shell in the neo4j container, awaited ONLINE before the rewrite):"
+                echo "      CREATE INDEX transmitted_to_hadith_id IF NOT EXISTS FOR ()-[t:TRANSMITTED_TO]-() ON (t.hadith_id);"
+                echo "      CALL db.awaitIndexes(600);"
+              fi
               echo "    would run (compose service graph-ops, network backend):"
               echo "      docker compose --profile graph-ops run --rm --no-deps graph-ops ${SUBCMD}"
               echo "    would then verify (cypher-shell in the neo4j container):"
@@ -223,6 +231,30 @@ jobs:
             echo "==> [${ENV_NAME}] pulling loader image ${GRAPH_OPS_IMAGE} ..."
             ${COMPOSE_OPS} pull graph-ops \
               || { echo "ERROR: [${ENV_NAME}] compose pull graph-ops (${GRAPH_OPS_IMAGE}) failed." >&2; exit 1; }
+
+            # --- migrate pre-step: ensure the TRANSMITTED_TO(hadith_id) rel-property
+            #     index exists and is ONLINE before the in-place rewrite (deploy#534).
+            #     migrate-transmitted-hadith-ids matches
+            #     ()-[t:TRANSMITTED_TO {hadith_id: raw}]->() per value across ~523k
+            #     distinct ids / ~2.68M edges; with no rel-property index each MATCH
+            #     is a full relationship scan and the rewrite can't finish in the SSH
+            #     window. IF NOT EXISTS makes it idempotent; db.awaitIndexes blocks
+            #     until the index is ONLINE/populated so the rewrite reads an indexed
+            #     graph. Same credential handling as the verification gate
+            #     (run_cypher): password from the neo4j container's own NEO4J_AUTH,
+            #     never on argv/log. enrich does not need it, so it is migrate-only.
+            #     Fail the job if the index cannot be ensured/awaited — never run the
+            #     rewrite against an unindexed graph. Run as two statements (schema
+            #     create, then await) rather than one multi-statement string.
+            if [ "${OPERATION}" = "migrate" ]; then
+              echo "==> [${ENV_NAME}] ensure rel-property index transmitted_to_hadith_id (idempotent, pre-migrate)"
+              run_cypher 'CREATE INDEX transmitted_to_hadith_id IF NOT EXISTS FOR ()-[t:TRANSMITTED_TO]-() ON (t.hadith_id)' \
+                || { echo "ERROR: [${ENV_NAME}] could not create/ensure the TRANSMITTED_TO(hadith_id) rel-property index; refusing to run migrate against an unindexed graph." >&2; exit 1; }
+              echo "==> [${ENV_NAME}] await index ONLINE (db.awaitIndexes, up to 600s) before the rewrite"
+              run_cypher 'CALL db.awaitIndexes(600)' \
+                || { echo "ERROR: [${ENV_NAME}] TRANSMITTED_TO(hadith_id) index did not come ONLINE within the await window; refusing to run migrate against an unindexed graph." >&2; exit 1; }
+              echo "    index transmitted_to_hadith_id present and ONLINE."
+            fi
 
             # --- run the op (--no-deps: DBs are already up on the live stack;
             #     do NOT let `run` recreate neo4j) ---
