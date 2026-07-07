@@ -352,6 +352,85 @@ services:
     # a non-zero exit must surface (the workflow's verify-recall gate), not loop.
     restart: "no"
 
+  # -------------------------------------------------------------------------
+  # PROFILE-GATED (`graph-ops`) — one-shot Neo4j graph-remediation ops driven
+  # by the data-acquisition loader image (deploy#532). Two ops run here:
+  #   * migrate — `migrate-transmitted-hadith-ids` (da#325): canonicalize the
+  #     ~2.68M TRANSMITTED_TO.hadith_id edge ids in place so chain
+  #     reconstruction joins against Hadith.id (fixes the empty-isnad-chain bug).
+  #   * enrich  — `enrich` (da#326): GDS narrator centrality (sampled
+  #     betweenness + pagerank + louvain + degree) surfacing transmission
+  #     choke points.
+  # Both are Neo4j-ONLY (no egress, no Postgres/Redis at startup — see below),
+  # so the profile keeps the service validated by `docker compose config` while
+  # excluding it from an ordinary `docker compose up` (which app deploys run).
+  # Driven by `.github/workflows/graph-ops.yml` via
+  # `docker compose --profile graph-ops run --rm graph-ops <subcommand>`, or a
+  # deliberate break-glass with `--profile graph-ops`.
+  #
+  # NETWORKS — `backend` (internal) ONLY. Both ops issue Cypher to
+  # neo4j:7687 and need nothing off-box: the loader image (da Dockerfile.load)
+  # BAKES every dependency at build time precisely because the target Neo4j is
+  # reachable only on the internet-isolated `backend` network. No `egress`
+  # (unlike isnad-graph-embed, which needs it for a HuggingFace model swap).
+  #
+  # CREDENTIALS — reuses the SAME NEO4J_* env the api/embed services read,
+  # interpolated by compose from the VPS .env, so no password ever lands on
+  # argv (CWE-214) and no NEW required secret is added. PG_DSN / REDIS_URL are
+  # deliberately OMITTED: the loader CLI's config (da src/config.py) gives
+  # Postgres a default DSN and never reads Redis, and neither migrate nor
+  # enrich touches Postgres — so a bare NEO4J_* env is sufficient for startup
+  # and the op. GDS runs INSIDE the neo4j container; this loader container just
+  # issues the Cypher/GDS calls, hence the modest limits below.
+  graph-ops:
+    # GRAPH_OPS_IMAGE default is `prod-latest` — the FAIL-SAFE direction
+    # (deploy#470, same rationale as EMBED_IMAGE). graph-ops.yml always sets
+    # GRAPH_OPS_IMAGE explicitly per-env (<env>-latest), so this default is only
+    # hit by a manual break-glass `--profile graph-ops` on a box: on PROD it
+    # pulls the correct prod loader image; on STG a prod tag is benign per the
+    # graph-ops.yml env guard.
+    image: ${GRAPH_OPS_IMAGE:-ghcr.io/noorinalabs/noorinalabs-data-acquisition-load:prod-latest}
+    profiles: ["graph-ops"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+    environment:
+      # Same DB env the api/embed services read (NEO4J_* only — the loader CLI
+      # reads NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD via the NEO4J_ env_prefix).
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+    # Safe default (break-glass `--profile graph-ops up` path): print CLI help
+    # and exit non-destructively. graph-ops.yml overrides this per operation,
+    # invoking `migrate-transmitted-hadith-ids` / `enrich` as separate
+    # `docker compose run` calls so each op's exit code is observed. The image
+    # ENTRYPOINT is `python -m src.cli`, so the command below is just args.
+    command: ["--help"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          # The loader just issues Cypher/GDS calls and streams small result
+          # sets — the heavy betweenness/pagerank compute (and its heap
+          # headroom) is a NEO4J-container concern, NOT this container's.
+          # Verify GDS betweenness heap headroom on the neo4j container on stg
+          # first (da#326). Profile-gated so this never runs on an ordinary
+          # deploy — zero blast radius on the live stack.
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    logging: *default-logging
+    networks:
+      - backend
+    # One-shot: never restart. A graph op is operator-triggered, not a daemon;
+    # a non-zero exit must surface (the workflow's post-op verification gate),
+    # not loop.
+    restart: "no"
+
   frontend:
     # GHCR-only — no local-build fallback. The deploy workflow logs into ghcr.io
     # using the auto-provisioned GITHUB_TOKEN (workflow `permissions: packages: read`
