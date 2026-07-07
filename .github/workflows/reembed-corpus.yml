@@ -2,9 +2,10 @@ name: Re-embed corpus (isnad-graph semantic search)
 
 # Repeatable, observable, env-gated corpus re-embedding (deploy#461, ADR 0008).
 #
-# Semantic search returns lexically-arbitrary results because the 34,028-hadith
-# corpus is embedded with the dependency-free HashingEmbedder (token-overlap,
-# not meaning). The application already supports a real model via
+# Semantic search returns lexically-arbitrary results because the Hadith corpus
+# (776,239 nodes total — ~650,983 bulk `sanadset` + ~125,256 canonical) is
+# embedded with the dependency-free HashingEmbedder (token-overlap, not
+# meaning). The application already supports a real model via
 # EMBEDDING_MODEL; this workflow is the missing OPERATIONAL trigger to re-embed
 # the corpus on the cluster with a real 384-dim multilingual model, rebuild the
 # pgvector index, and verify recall.
@@ -64,6 +65,10 @@ on:
           NOT here. Passed through verbatim as a single comma-separated value;
           if the isnad-graph CLI lands a repeatable `--exclude-collections`
           form instead, the script below must repeat the flag per name.
+          REQUIRES an embed image built from isnad-graph#1177 (the image that
+          adds the `--exclude-collections` CLI flag) — against a pre-#1177
+          image the flag fails loud at arg-parse (non-destructive: nothing is
+          embedded). Leave EMPTY when running a pre-#1177 image.
         required: false
         type: string
         default: ""
