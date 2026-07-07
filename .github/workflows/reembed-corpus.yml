@@ -53,6 +53,20 @@ on:
         required: false
         type: string
         default: "256"
+      exclude_collections:
+        description: >-
+          Comma-separated collection names to EXCLUDE from the embed. Maps to
+          `isnad embed-hadiths --exclude-collections <value>` (isnad-graph#1177).
+          Leave EMPTY to embed the full corpus (unchanged default — every
+          collection). Set to `sanadset` to load only the canonical corpus
+          (~125k rows, ~3.3h) — the bulk `sanadset` collection (~650k, ~20h) is
+          embedded separately by the detached long-running job (deploy#530),
+          NOT here. Passed through verbatim as a single comma-separated value;
+          if the isnad-graph CLI lands a repeatable `--exclude-collections`
+          form instead, the script below must repeat the flag per name.
+        required: false
+        type: string
+        default: ""
       dry_run:
         description: "Plan/log only — write no embeddings, rebuild no index"
         required: false
@@ -80,12 +94,16 @@ jobs:
   reembed:
     name: re-embed corpus (${{ inputs.env }})
     runs-on: ubuntu-latest
-    # A real run embeds the full 34,028-hadith corpus on the VPS CPU, then
-    # rebuilds the pgvector index and verifies recall — minutes-to-tens-of-minutes,
-    # well past the GH default per-step budget. Give the job a generous ceiling so
-    # the runner-side never caps the SSH step short of `command_timeout` below
-    # (deploy#465). The dry-run path returns in seconds and is unaffected.
-    timeout-minutes: 120
+    # A real run embeds the corpus on the VPS CPU, then rebuilds the pgvector
+    # index and verifies recall. At the measured ~640 rows/min the CANONICAL
+    # (non-`sanadset`) corpus of ~125k rows is a ~3.3h embed (deploy#529), well
+    # past the GH default per-step budget. Give the job a ceiling ABOVE the SSH
+    # `command_timeout` below so the runner-side never caps the SSH step short of
+    # it (deploy#465). NOTE: GitHub-hosted runners hard-cap a job at 6h (360m),
+    # so this ceiling AND `command_timeout` both live under 360m — the full
+    # 650k-row `sanadset` embed (~20h) can't run here at all and is a separate
+    # detached job (deploy#530). The dry-run path returns in seconds, unaffected.
+    timeout-minutes: 330
     # Maps to GH Environment protection (stg -> staging, prod -> production).
     # prod requires manual approval; per-env secrets/host resolve from the
     # matching Environment. Same pattern as db-migrate.yml / terraform.yml.
@@ -123,6 +141,7 @@ jobs:
           ENV_NAME: ${{ inputs.env }}
           MODEL: ${{ inputs.model }}
           BATCH_SIZE: ${{ inputs.batch_size }}
+          EXCLUDE_COLLECTIONS: ${{ inputs.exclude_collections }}
           DRY_RUN: ${{ inputs.dry_run }}
           IMAGE: ${{ steps.resolve.outputs.image }}
           # GHCR pull credentials — runtime token + owner actor, same as
@@ -134,15 +153,19 @@ jobs:
           host: ${{ vars.VPS_HOST }}
           username: deploy
           # appleboy/ssh-action defaults command_timeout to 10m — far short of a
-          # real CPU embed of the 34,028-hadith corpus + reindex + verify-recall,
-          # which the prior stg run (deploy#465) hit at the 10m mark while still
-          # mid-embed. The first successful stg run took ~47.5m (2853s); 90m gives
-          # comfortable margin over that for the slower/larger prod run (deploy#468),
-          # capped below the job-level timeout-minutes above. The dry-run path is
-          # seconds, so this only affects real runs.
-          command_timeout: 90m
+          # real CPU embed + reindex + verify-recall. The earlier 90m ceiling
+          # (deploy#465) was itself too short: a CANONICAL (non-`sanadset`) embed
+          # of ~125k rows is ~3.3h at ~640 rows/min (deploy#529), so the full
+          # embed → reindex → verify-recall never finished in one SSH session and
+          # the run went red on this timeout mid-embed. 5h gives comfortable
+          # margin over a canonical embed while staying UNDER the 6h (360m)
+          # GitHub-hosted-runner job hard cap, and below `timeout-minutes: 330`
+          # above so the SSH timeout — not a hard runner kill — is the binding
+          # limit. The bulk 650k `sanadset` embed (~20h) does NOT fit here and is
+          # a separate detached job (deploy#530). Dry-run is seconds, unaffected.
+          command_timeout: 5h
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-          envs: ENV_NAME,MODEL,BATCH_SIZE,DRY_RUN,IMAGE,GITHUB_TOKEN,GITHUB_ACTOR
+          envs: ENV_NAME,MODEL,BATCH_SIZE,EXCLUDE_COLLECTIONS,DRY_RUN,IMAGE,GITHUB_TOKEN,GITHUB_ACTOR
           script: |
             set -uo pipefail
 
@@ -180,11 +203,25 @@ jobs:
               ${COMPOSE} run --rm --no-deps -e EMBEDDING_MODEL="${MODEL}" isnad-graph-embed "$@"
             }
 
+            # Assemble the embed-hadiths arg list once (used by both the dry-run
+            # preview and the real run). When EXCLUDE_COLLECTIONS is set, scope
+            # the embed to non-excluded collections (e.g. `sanadset` ->
+            # canonical-only ~125k rows, deploy#529 / isnad-graph#1177); empty =
+            # embed the full corpus (unchanged default). Passed as a single
+            # comma-separated value matching the isnad-graph `--exclude-collections`
+            # flag; if that CLI ships a repeatable form instead, repeat the flag
+            # per name here. Collection names are simple tokens (no spaces), so the
+            # word-split of ${EMBED_ARGS} below is intentional.
+            EMBED_ARGS="embed-hadiths --batch-size ${BATCH_SIZE}"
+            if [ -n "${EXCLUDE_COLLECTIONS}" ]; then
+              EMBED_ARGS="${EMBED_ARGS} --exclude-collections ${EXCLUDE_COLLECTIONS}"
+            fi
+
             if [ "${DRY_RUN}" = "true" ]; then
               echo "==> [${ENV_NAME}] DRY RUN — no embeddings written, no index rebuilt."
               echo "    image: ${EMBED_IMAGE}"
               echo "    would run (compose service isnad-graph-embed, networks backend+egress):"
-              echo "      isnad embed-hadiths --batch-size ${BATCH_SIZE}"
+              echo "      isnad ${EMBED_ARGS}"
               echo "      isnad reindex-embeddings"
               echo "      isnad verify-recall   (exit code = gate)"
               # Read-only: confirm the embed service resolves under the live .env
@@ -212,8 +249,9 @@ jobs:
             RC=0
 
             # --- embed ---
-            echo "==> [${ENV_NAME}] isnad embed-hadiths --batch-size ${BATCH_SIZE}"
-            EMBED_OUT="$(embed_run isnad embed-hadiths --batch-size "${BATCH_SIZE}" 2>&1)" || RC=$?
+            echo "==> [${ENV_NAME}] isnad ${EMBED_ARGS}"
+            # shellcheck disable=SC2086  # intentional word-split of the assembled arg list
+            EMBED_OUT="$(embed_run isnad ${EMBED_ARGS} 2>&1)" || RC=$?
             printf '%s\n' "${EMBED_OUT}"
             # Best-effort rows-embedded parse from a final "embedded <n>" line.
             # Degrades to -1 (unknown) if the shape changes — never fails the run.
