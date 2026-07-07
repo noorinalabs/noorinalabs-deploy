@@ -84,11 +84,23 @@ jobs:
       # `users.stg.noorinalabs.com` cutover lives in the wave's Caddyfile.
       ISNAD_BASE_URL: https://isnad.stg.noorinalabs.com
       USER_SERVICE_BASE_URL: https://users.stg.noorinalabs.com
-      # Stg test-user creds. No-op for the 3 health tests that currently
-      # run remote-mode (those don't authenticate); #204 expands coverage
-      # by populating these as the per-test refactor lands.
-      STG_TEST_USER_EMAIL: ${{ secrets.STG_TEST_USER_EMAIL }}
-      STG_TEST_USER_PASSWORD: ${{ secrets.STG_TEST_USER_PASSWORD }}
+      # QA test-user creds for the smoke's authenticated semantic probe
+      # (check 8 / deploy#527). This is the SAME identity the deploy seeds
+      # via bootstrap_test_user.py (deploy#508): TEST_USER_EMAIL is a
+      # non-secret var (qa-stg@noorinalabs.com), TEST_USER_PASSWORD the
+      # secret. Both are ENVIRONMENT-scoped on `staging`, which the job's
+      # `environment: staging` above makes resolvable — the previous
+      # `secrets.STG_TEST_USER_*` names never existed (no repo/env secret by
+      # that name) so they resolved BLANK, which is why check 8 hit the
+      # semantic endpoint unauthenticated and 401'd (the deploy#527 bug).
+      TEST_USER_EMAIL: ${{ vars.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+      # Integration suite (conftest/run-tests.sh) keys its refresh-token
+      # auth_session flow off STG_TEST_USER_EMAIL; point it at the same var
+      # so the identity is honest (was `secrets.STG_TEST_USER_EMAIL`, which
+      # never existed → blank). STG_TEST_USER_REFRESH_TOKEN remains unset, so
+      # those auth_session tests still skip until it is provisioned (#204).
+      STG_TEST_USER_EMAIL: ${{ vars.TEST_USER_EMAIL }}
     if: >-
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.name == 'Deploy to staging' &&
@@ -131,6 +143,9 @@ jobs:
       # landing is the apex stg.noorinalabs.com (vs prod's noorinalabs.com),
       # so it's set here rather than at job level. The script defaults to
       # the same values if the env is unset (see scripts/verify_stg_smoke.sh).
+      # TEST_USER_EMAIL / TEST_USER_PASSWORD are inherited from the job env
+      # too — they drive check 8's authenticated semantic probe (deploy#527);
+      # absent, that check degrades to an auth-gated reachability assertion.
       - name: Run stg smoke battery (fast-fail gate)
         working-directory: noorinalabs-deploy
         env:

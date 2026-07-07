@@ -19,9 +19,16 @@
 # surface that in seconds instead of paying the full suite's wall-clock
 # only to fail at the end. It is a pre-flight, not a replacement.
 #
-# Like the prod battery, this script does NOT mint real auth tokens. The
-# full login+refresh flow is exercised by the integration suite that runs
-# after this gate in the same verify-stg job.
+# Token-minting contract (deploy#527): checks 1–7 are stateless and do NOT
+# mint auth tokens. Check 8 (semantic ranking) is the ONE exception — the
+# assertion it makes (topical relevance of ranked results) can only be
+# exercised behind the `/api/v1/*` gateway auth, so when QA test-user creds
+# (TEST_USER_EMAIL + TEST_USER_PASSWORD) are supplied it mints a short-lived
+# access token via POST ${USER_SERVICE_BASE_URL}/auth/login and sends it as a
+# Bearer on the semantic request. With no creds present it degrades to an
+# auth-gated reachability assertion (like check 4). The full login+refresh
+# flow for the OTHER surfaces is still exercised by the integration suite
+# that runs after this gate in the same verify-stg job.
 #
 # Checks (mirror of verify_prod_smoke.sh):
 #   1. isnad-graph /health    → HTTP 200, JSON .status in {healthy,degraded,ok}
@@ -46,6 +53,13 @@
 #                                  user-service origin. Anti-drift guard
 #                                  for the prod-lagging-stg login bug —
 #                                  see deploy#420.
+#   8. /api/v1/search/semantic → authenticated (Bearer) HTTP 200 with a
+#                                  strictly-positive top similarity AND a
+#                                  topical keyword in the top-5 titles —
+#                                  the embedder/corpus parity guard
+#                                  (deploy#523/#527). Degrades to an
+#                                  auth-gated (401/403) reachability check
+#                                  when no TEST_USER creds are supplied.
 #
 # Env (stg topology — BASE_DOMAIN=stg.noorinalabs.com, deploy-stg.yml:158):
 # the Caddyfile is env-templated by {$BASE_DOMAIN}, so stg's vhosts are
@@ -60,6 +74,11 @@
 #   SMOKE_REPORT            Path to write GH-summary-formatted markdown
 #                           (default: smoke-report.md)
 #   TIMEOUT                 Per-check curl timeout, seconds (default: 5)
+#   TEST_USER_EMAIL         QA test-user email for check 8's authenticated
+#                           semantic probe (the identity the deploy seeds via
+#                           bootstrap_test_user.py — vars.TEST_USER_EMAIL).
+#                           Unset → check 8 degrades to a reachability check.
+#   TEST_USER_PASSWORD      That QA user's password (secrets.TEST_USER_PASSWORD).
 
 set -euo pipefail
 
@@ -71,6 +90,11 @@ TIMEOUT="${TIMEOUT:-5}"
 # Semantic-search probe (check 8) gets a longer timeout than the static routes:
 # the query is embedded at request time (torch+MiniLM), slower than a plain GET.
 SEMANTIC_TIMEOUT="${SEMANTIC_TIMEOUT:-15}"
+# QA test-user creds for check 8's authenticated semantic probe. Both must be
+# present for the ranking assertion to run; absent → auth-gated reachability
+# degrade. See deploy#527.
+TEST_USER_EMAIL="${TEST_USER_EMAIL:-}"
+TEST_USER_PASSWORD="${TEST_USER_PASSWORD:-}"
 
 # Runtime budget: 5 minutes. Looser than prod's 60s because stg runs on a
 # smaller box (CPX21 vs CPX41) and may be mid-deploy-settle when this
@@ -118,6 +142,31 @@ ms_from_secs() {
   awk -v t="$1" 'BEGIN { printf("%d", t * 1000) }'
 }
 
+# mint_access_token — POST the QA creds to user-service /auth/login and echo
+# the access_token (empty on any failure). Result is cached in
+# SMOKE_ACCESS_TOKEN so the two semantic probes share ONE login — faster and
+# kind to user-service's per-IP login rate-limiter. Returns empty (never
+# errors) so callers decide how to treat a failed mint. The JSON body is
+# built with jq -n so a password containing quotes/backslashes is safe.
+SMOKE_ACCESS_TOKEN=""
+SMOKE_TOKEN_TRIED=0
+mint_access_token() {
+  if [ "$SMOKE_TOKEN_TRIED" = "1" ]; then
+    printf '%s' "$SMOKE_ACCESS_TOKEN"
+    return
+  fi
+  SMOKE_TOKEN_TRIED=1
+  local resp
+  resp="$(curl -sS --max-time "$TIMEOUT" \
+               -H 'Content-Type: application/json' \
+               -X POST "${USER_SERVICE_BASE_URL}/auth/login" \
+               -d "$(jq -nc --arg e "$TEST_USER_EMAIL" --arg p "$TEST_USER_PASSWORD" \
+                        '{email: $e, password: $p}')" \
+               2>/dev/null || echo '')"
+  SMOKE_ACCESS_TOKEN="$(printf '%s' "$resp" | jq -r '.access_token // empty' 2>/dev/null || echo '')"
+  printf '%s' "$SMOKE_ACCESS_TOKEN"
+}
+
 # semantic_keywords <query> → space-separated topical keywords.
 # Mirrors isnad-graph src/enrich/embeddings.py `_RECALL_KEYWORDS` so this HTTP smoke
 # and the DB-side `isnad verify-recall` gate judge topical relevance identically.
@@ -130,25 +179,60 @@ semantic_keywords() {
 }
 
 # semantic_probe <query> — exercise GET /api/v1/search/semantic and assert it is
-# FUNCTIONAL, not merely reachable (deploy#523 / ig#1148). The endpoint-level
-# counterpart of `isnad verify-recall`: a plain "200 + non-empty" probe passes on
-# garbage, so we additionally require a strictly-positive top similarity AND a
-# topical keyword in the top-5 hits' title/title_ar. That last assertion catches the
-# SILENT failure this guards against — an environment whose API queries with a
-# different embedder (lexical hashing) than the corpus was embedded with (MiniLM):
-# both are vector(384) so cosine raises no error → HTTP 200 with results but a
-# meaningless ranking. A graceful 503 (embeddings not provisioned) also fails, with
-# a distinguishing detail.
+# FUNCTIONAL, not merely reachable (deploy#523 / ig#1148 / deploy#527). The
+# endpoint-level counterpart of `isnad verify-recall`: a plain "200 + non-empty"
+# probe passes on garbage, so we additionally require a strictly-positive top
+# similarity AND a topical keyword in the top-5 hits' title/title_ar. That last
+# assertion catches the SILENT failure this guards against — an environment whose
+# API queries with a different embedder (lexical hashing) than the corpus was
+# embedded with (MiniLM): both are vector(384) so cosine raises no error → HTTP 200
+# with results but a meaningless ranking. A graceful 503 (embeddings not
+# provisioned) also fails, with a distinguishing detail.
+#
+# Auth (deploy#527): /api/v1/* is gated by user-service JWT (the same gate that
+# makes check 4 assert 401), so the ranking assertion needs a Bearer token. When
+# TEST_USER_EMAIL + TEST_USER_PASSWORD are set we mint one via /auth/login and run
+# the full assertion; when they are absent we cannot judge ranking, so we DEGRADE
+# to an auth-gated reachability assertion (expect 401/403 + JSON, like check 4)
+# rather than hard-failing an env that has no QA creds wired.
 semantic_probe() {
-  local q="$1" url out code secs body ms top_score hay matched kw
+  local q="$1" url out code secs body ms top_score hay matched kw token
   local keywords=()
+  ms=0
   url="${ISNAD_BASE_URL}/api/v1/search/semantic?q=${q}&limit=5"
+
+  # Degrade path: no creds → assert the endpoint is auth-gated and reachable.
+  if [ -z "$TEST_USER_EMAIL" ] || [ -z "$TEST_USER_PASSWORD" ]; then
+    read -r code secs <<<"$(http_check "$url")"
+    body="$(read_body)"
+    ms="$(ms_from_secs "$secs")"
+    if { [ "$code" = "401" ] || [ "$code" = "403" ]; } &&
+       echo "$body" | jq -e '.detail or .error or .message' >/dev/null 2>&1; then
+      record "semantic /search ($q)" pass "$ms" "auth-gated ($code) — ranking check skipped (no TEST_USER creds in this env)"
+    else
+      record "semantic /search ($q)" fail "$ms" "HTTP $code — expected auth gate 401/403 with JSON body when no creds; endpoint may be unprotected or down"
+    fi
+    return
+  fi
+
+  # Authenticated path: mint (or reuse) a Bearer token, then assert ranking.
+  token="$(mint_access_token)"
+  if [ -z "$token" ]; then
+    record "semantic /search ($q)" fail "$ms" "could not mint QA access token via ${USER_SERVICE_BASE_URL}/auth/login (creds supplied but login failed)"
+    return
+  fi
+
   out="$(curl -sS -o "$SMOKE_BODY" -w '%{http_code} %{time_total}' \
+              -H "Authorization: Bearer $token" \
               --max-time "$SEMANTIC_TIMEOUT" "$url" 2>/dev/null || echo '000 0')"
   code="$(echo "$out" | awk '{print $1}')"
   secs="$(echo "$out" | awk '{print $2}')"
   body="$(read_body)"
   ms="$(ms_from_secs "$secs")"
+  if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+    record "semantic /search ($q)" fail "$ms" "HTTP $code with a minted Bearer token — auth rejected a fresh QA token (token/JWKS drift?)"
+    return
+  fi
   if [ "$code" = "503" ]; then
     record "semantic /search ($q)" fail "$ms" "HTTP 503 — semantic search not provisioned here (embeddings/pgvector absent)"
     return
@@ -347,10 +431,12 @@ semantic_probe() {
   fi
 }
 
-# --- 8. semantic search topical relevance (deploy#523 / ig#1148) ----
+# --- 8. semantic search topical relevance (deploy#523 / ig#1148 / deploy#527) ----
 # Guards the query↔corpus embedder-parity regression: the api must serve semantic
 # queries with the SAME embedder (MiniLM) the corpus was embedded with. Probes the
 # verify-recall vocabulary; both must pass (a hashing↔MiniLM mismatch fails BOTH).
+# Authenticated when TEST_USER_* creds are wired (see semantic_probe); the single
+# minted token is reused across both probes.
 semantic_probe "patience"
 semantic_probe "prayer"
 
