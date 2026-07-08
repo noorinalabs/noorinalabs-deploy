@@ -1,8 +1,8 @@
-name: Graph ops (Neo4j migrate / enrich)
+name: Graph ops (Neo4j migrate / enrich / prune-orphans)
 
 # Repeatable, observable, env-gated Neo4j graph-remediation ops (deploy#532).
 #
-# Two graph ops need to run against stg/prod Neo4j and MUST be IaC
+# Three graph ops need to run against stg/prod Neo4j and MUST be IaC
 # (workflow-driven, reproducible, stg-gated) — not box one-offs:
 #   1. migrate — `migrate-transmitted-hadith-ids` (da#325): canonicalize the
 #      ~2.68M TRANSMITTED_TO.hadith_id edge ids in place so chain
@@ -10,10 +10,21 @@ name: Graph ops (Neo4j migrate / enrich)
 #   2. enrich  — `enrich` (da#326): GDS narrator centrality (sampled
 #      betweenness + pagerank + louvain + degree) surfacing transmission
 #      choke points.
+#   3. prune-orphans — delete orphaned TRANSMITTED_TO edges whose hadith_id
+#      joins no Hadith node (deploy#538): the ~196k fawaz six-books chains that
+#      duplicate lk's canonical chains. Neo4j-ONLY (no loader image) — batched
+#      DELETE via cypher-shell in the neo4j container, reusing the run_cypher
+#      credential helper. MUST run AFTER migrate on an env: before
+#      canonicalization every edge id is raw-form and would count as dangling,
+#      so pruning first would wipe the graph. Guarded by a raw-id==0 pre-check
+#      (refuses to prune an un-canonicalized graph — see the prune-orphans block).
 #
-# Both are driven by the data-acquisition loader image
+# migrate + enrich are driven by the data-acquisition loader image
 # (ghcr.io/noorinalabs/noorinalabs-data-acquisition-load) whose ENTRYPOINT is
-# `python -m src.cli`, so the op is just the CLI subcommand. There is no
+# `python -m src.cli`, so the op is just the CLI subcommand. prune-orphans needs
+# no loader image — it is pure Cypher run via cypher-shell in the neo4j
+# container (the same run_cypher helper the verification gates use), so its path
+# skips the GHCR login + image pull + rel-index pre-step entirely. There is no
 # existing Neo4j graph-op vehicle: db-migrate.yml is user-service
 # alembic/Postgres only, and reembed-corpus.yml is embed-specific. This
 # workflow is the missing OPERATIONAL trigger.
@@ -32,8 +43,10 @@ name: Graph ops (Neo4j migrate / enrich)
 # triggers it.
 #
 # stg-gated (deploy#532): prod runs ONLY as a promotion of a verified-good stg
-# run. Sequencing at run time is migrate (stg then prod) BEFORE enrich, so
-# centrality computes on the corrected graph.
+# run. Sequencing at run time is migrate (stg then prod) FIRST, then
+# prune-orphans (removes the migrate-exposed dangling duplicates), then enrich,
+# so centrality computes on the corrected, pruned graph. prune-orphans MUST
+# NEVER precede migrate on an env (raw-id==0 guard enforces this).
 #
 # dry_run defaults to TRUE — a fat-fingered dispatch is a no-op plan, not a
 # destructive in-place edge rewrite. A real run is an explicit dry_run=false.
@@ -47,10 +60,10 @@ on:
         type: choice
         options: [stg, prod]
       operation:
-        description: "Graph op to run"
+        description: "Graph op to run (prune-orphans MUST run after migrate on the env)"
         required: true
         type: choice
-        options: [migrate, enrich]
+        options: [migrate, enrich, prune-orphans]
       image:
         description: >-
           Loader image ref. Leave empty to resolve the env-scoped default
@@ -67,10 +80,11 @@ on:
         default: true
 
 concurrency:
-  # Serialize graph ops per env. Both ops are write-heavy against the live graph
-  # (migrate rewrites ~2.68M edge ids; enrich runs GDS on the neo4j container);
-  # two must never overlap on one env. Queue, don't cancel — a mid-run cancel
-  # could leave a partially-migrated graph.
+  # Serialize graph ops per env. All three ops are write-heavy against the live
+  # graph (migrate rewrites ~2.68M edge ids; prune-orphans batch-DELETEs the
+  # ~196k dangling duplicates; enrich runs GDS on the neo4j container); two must
+  # never overlap on one env. Queue, don't cancel — a mid-run cancel could leave
+  # a partially-migrated or partially-pruned graph.
   group: graph-ops-${{ inputs.env }}
   cancel-in-progress: false
 
@@ -171,8 +185,11 @@ jobs:
             # ENTRYPOINT is `python -m src.cli`, so the subcommand is the full
             # arg list (creds come from the container env, never argv).
             case "${OPERATION}" in
-              migrate) SUBCMD="migrate-transmitted-hadith-ids" ;;
-              enrich)  SUBCMD="enrich" ;;
+              migrate)       SUBCMD="migrate-transmitted-hadith-ids" ;;
+              enrich)        SUBCMD="enrich" ;;
+              # prune-orphans is Neo4j-only: no loader CLI subcommand, no image.
+              # Its whole path runs below via run_cypher (cypher-shell in neo4j).
+              prune-orphans) SUBCMD="" ;;
               *) echo "ERROR: unknown operation '${OPERATION}'." >&2; exit 2 ;;
             esac
 
@@ -213,7 +230,65 @@ jobs:
                 _ "$1"
             }
 
+            # Run a single-column count() query via run_cypher and echo just the
+            # integer (--format plain header line stripped, non-digits removed).
+            # Used by the migration invariant gate and the prune-orphans gate.
+            run_count() {
+              _out="$(run_cypher "$1")" || return 1
+              printf '%s\n' "${_out}" | tail -n +2 | head -n1 | tr -dc '0-9'
+            }
+
+            # --- prune-orphans + migration-invariant Cypher (deploy#538).
+            #     Shared by the dry-run and real-run paths. Each is a SINGLE
+            #     statement (da#319: never a multi-statement string) with
+            #     double-quoted string literals inside the single-quoted shell
+            #     string. cypher-shell wraps statements in an explicit
+            #     transaction by default, but `CALL {} IN TRANSACTIONS` may run
+            #     ONLY in an implicit (auto-commit) transaction — so PRUNE_Q is
+            #     prefixed with the cypher-shell `:auto` command.
+            #
+            #   RAW_Q       run-order guard / migration invariant: count edges
+            #               whose id is still raw-form (not `hdt:`-prefixed). >0
+            #               means canonicalization is incomplete (migrate) or the
+            #               graph is un-canonicalized (prune refuses).
+            #   DANGLING_Q  count edges whose hadith_id joins no Hadith node
+            #               (the orphans prune removes; reported as info by migrate).
+            #   RESOLVING_Q count edges whose hadith_id DOES join a Hadith node
+            #               (includes the lk six-books canonical chains). The
+            #               prune non-over-deletion gate asserts this is UNCHANGED.
+            #   PRUNE_Q     batched DELETE of dangling edges only.
+            RAW_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND NOT t.hadith_id STARTS WITH "hdt:" RETURN count(t) AS raw_remaining'
+            DANGLING_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND NOT EXISTS { MATCH (:Hadith {id: t.hadith_id}) } RETURN count(t) AS dangling'
+            RESOLVING_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND EXISTS { MATCH (:Hadith {id: t.hadith_id}) } RETURN count(t) AS resolving'
+            PRUNE_Q=':auto MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND NOT EXISTS { MATCH (:Hadith {id: t.hadith_id}) } CALL (t) { DELETE t } IN TRANSACTIONS OF 10000 ROWS'
+
             if [ "${DRY_RUN}" = "true" ]; then
+              if [ "${OPERATION}" = "prune-orphans" ]; then
+                # prune-orphans dry run: DESCRIBE the plan and issue a READ-ONLY
+                # pre-count (the run-order guard state + dangling count). It
+                # issues NO writes and NO delete (deploy#538). No loader image is
+                # involved, so no GHCR login / compose pull happens on this path.
+                echo "==> [${ENV_NAME}] DRY RUN (prune-orphans) — read-only pre-count only; NO edges deleted."
+                echo "    would first assert the run-order guard (refuse the prune if raw-form ids remain):"
+                echo "      ${RAW_Q}"
+                echo "    would then batch-DELETE dangling edges (cypher-shell in the neo4j container):"
+                echo "      ${PRUNE_Q}"
+                echo "    would then verify: 0 dangling remain AND resolving-chain count UNCHANGED from pre-count."
+                echo "==> [${ENV_NAME}] read-only pre-count (issues no writes):"
+                RAW="$(run_count "${RAW_Q}")" \
+                  || { echo "ERROR: [${ENV_NAME}] raw-id guard pre-count failed to execute." >&2; exit 1; }
+                RAW="${RAW:-0}"
+                DANGLING_PRE="$(run_count "${DANGLING_Q}")" \
+                  || { echo "ERROR: [${ENV_NAME}] dangling pre-count failed to execute." >&2; exit 1; }
+                DANGLING_PRE="${DANGLING_PRE:-0}"
+                echo "    raw-form (non-hdt:) ids: ${RAW}  (must be 0 for a real prune to proceed)"
+                echo "    dangling edges that WOULD be deleted: ${DANGLING_PRE}"
+                if [ "${RAW}" -ne 0 ]; then
+                  echo "    NOTE: raw-form ids > 0 — a real prune would be REFUSED here; run 'migrate' on this env first."
+                fi
+                echo "==> [${ENV_NAME}] dry run complete (exit 0)."
+                exit 0
+              fi
               echo "==> [${ENV_NAME}] DRY RUN — no Cypher issued, no edges rewritten, no centrality computed."
               echo "    image: ${GRAPH_OPS_IMAGE}"
               if [ "${OPERATION}" = "migrate" ]; then
@@ -228,8 +303,9 @@ jobs:
               echo "      docker compose --profile graph-ops run --rm --no-deps graph-ops ${SUBCMD}"
               echo "    would then verify (cypher-shell in the neo4j container):"
               if [ "${OPERATION}" = "migrate" ]; then
-                echo "      - da#325 validation query queries/validation/transmitted_to_hadith_ref.cypher: dangling-ref count == 0"
+                echo "      - migration invariant: 0 raw-form (non-hdt:) TRANSMITTED_TO.hadith_id edges remain"
                 echo "      - sample chain reconstructs non-empty"
+                echo "      - (informational) dangling-ref count reported, NOT gated — completeness is prune-orphans' job"
               else
                 echo "      - MATCH (n:Narrator) WHERE n.betweenness_centrality IS NOT NULL RETURN count(n) > 0"
                 echo "      - echo top-k narrators by betweenness"
@@ -242,6 +318,71 @@ jobs:
                 echo "    WARNING: compose config for graph-ops did not resolve under live .env" >&2
               fi
               echo "==> [${ENV_NAME}] dry run complete (exit 0)."
+              exit 0
+            fi
+
+            # ===================== prune-orphans (real run) =====================
+            # Neo4j-ONLY op (deploy#538): no loader image, so this path runs
+            # BEFORE the GHCR login + compose pull + rel-index pre-step below and
+            # exits when done. Deletes ONLY dangling TRANSMITTED_TO edges
+            # (hadith_id joins no Hadith), batched. Guarded so it can NEVER run
+            # before migrate: pre-canonicalization every edge id is raw-form and
+            # would match the dangling predicate — pruning first would wipe the
+            # graph.
+            if [ "${OPERATION}" = "prune-orphans" ]; then
+              # --- run-order guard: refuse to prune an un-canonicalized graph ---
+              echo "==> [${ENV_NAME}] prune guard: assert graph is canonicalized (raw-form id count == 0)"
+              RAW="$(run_count "${RAW_Q}")" \
+                || { echo "ERROR: [${ENV_NAME}] raw-id guard query failed to execute." >&2; exit 1; }
+              RAW="${RAW:-0}"
+              echo "    raw-form (non-hdt:) TRANSMITTED_TO.hadith_id edges: ${RAW}"
+              if [ "${RAW}" -ne 0 ]; then
+                echo "ERROR: [${ENV_NAME}] refusing to prune — ${RAW} raw-form edge id(s) remain; the graph is NOT canonicalized. Run 'migrate' on this env FIRST (deploy#538 run-order guard)." >&2
+                exit 1
+              fi
+
+              # --- pre-counts: dangling (to delete) + resolving (must be UNCHANGED) ---
+              echo "==> [${ENV_NAME}] prune pre-count: dangling + resolving TRANSMITTED_TO edges"
+              DANGLING_PRE="$(run_count "${DANGLING_Q}")" \
+                || { echo "ERROR: [${ENV_NAME}] dangling pre-count query failed to execute." >&2; exit 1; }
+              DANGLING_PRE="${DANGLING_PRE:-0}"
+              RESOLVING_PRE="$(run_count "${RESOLVING_Q}")" \
+                || { echo "ERROR: [${ENV_NAME}] resolving pre-count query failed to execute." >&2; exit 1; }
+              RESOLVING_PRE="${RESOLVING_PRE:-0}"
+              echo "    dangling (to delete): ${DANGLING_PRE} | resolving (must stay): ${RESOLVING_PRE}"
+
+              # --- batched delete (single statement; :auto → implicit tx) ---
+              # `CALL {} IN TRANSACTIONS` may run ONLY in an implicit (auto-commit)
+              # transaction; cypher-shell wraps a query in an explicit tx by
+              # default. Feed the `:auto`-prefixed statement on STDIN (not argv) so
+              # cypher-shell's statement parser reliably honors the `:auto` client
+              # command. Same in-container credential handling as run_cypher:
+              # password from the neo4j container's own NEO4J_AUTH, never on
+              # argv/log; the query text is not a secret.
+              echo "==> [${ENV_NAME}] prune: batched DELETE of dangling edges (CALL {} IN TRANSACTIONS OF 10000 ROWS)"
+              printf '%s\n' "${PRUNE_Q}" | ${COMPOSE} exec -T neo4j sh -c \
+                'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain' \
+                || { echo "ERROR: [${ENV_NAME}] prune DELETE failed to execute." >&2; exit 1; }
+
+              # --- post-op gate: 0 dangling remain AND resolving count UNCHANGED ---
+              echo "==> [${ENV_NAME}] prune verify: 0 dangling remain AND resolving count unchanged (non-over-deletion)"
+              DANGLING_POST="$(run_count "${DANGLING_Q}")" \
+                || { echo "ERROR: [${ENV_NAME}] dangling post-count query failed to execute." >&2; exit 1; }
+              DANGLING_POST="${DANGLING_POST:-0}"
+              RESOLVING_POST="$(run_count "${RESOLVING_Q}")" \
+                || { echo "ERROR: [${ENV_NAME}] resolving post-count query failed to execute." >&2; exit 1; }
+              RESOLVING_POST="${RESOLVING_POST:-0}"
+              echo "    dangling now: ${DANGLING_POST} (was ${DANGLING_PRE}) | resolving now: ${RESOLVING_POST} (was ${RESOLVING_PRE})"
+              if [ "${DANGLING_POST}" -ne 0 ]; then
+                echo "ERROR: [${ENV_NAME}] prune verification FAILED — ${DANGLING_POST} dangling edge(s) still remain after prune." >&2
+                exit 1
+              fi
+              if [ "${RESOLVING_POST}" -ne "${RESOLVING_PRE}" ]; then
+                echo "ERROR: [${ENV_NAME}] prune verification FAILED — resolving-chain count changed (${RESOLVING_PRE} -> ${RESOLVING_POST}); prune deleted non-dangling edges. Investigate before re-running." >&2
+                exit 1
+              fi
+              echo "    deleted ${DANGLING_PRE} dangling edge(s); 0 remain; resolving chains unchanged (${RESOLVING_PRE})."
+              echo "==> [${ENV_NAME}] graph op 'prune-orphans' complete — post-op verification PASSED."
               exit 0
             fi
 
@@ -291,23 +432,32 @@ jobs:
 
             # --- post-op verification gate ---
             if [ "${OPERATION}" = "migrate" ]; then
-              echo "==> [${ENV_NAME}] verify: da#325 dangling-ref count (queries/validation/transmitted_to_hadith_ref.cypher, shipped in the image)"
-              # Read the shipped validation query out of the loader image and run
-              # it against the live graph. It RETURNs distinct dangling edge ids
-              # (LIMIT 100); a healthy graph returns 0 data rows. --entrypoint cat
-              # overrides `python -m src.cli` to print the baked query file.
-              VQUERY="$(${COMPOSE_OPS} run --rm --no-deps --entrypoint cat graph-ops queries/validation/transmitted_to_hadith_ref.cypher)" \
-                || { echo "ERROR: [${ENV_NAME}] could not read the validation query from the image." >&2; exit 1; }
-              VOUT="$(run_cypher "${VQUERY}")" \
-                || { echo "ERROR: [${ENV_NAME}] validation query failed to execute." >&2; exit 1; }
-              printf '%s\n' "${VOUT}"
-              # --format plain emits a header line then one line per dangling id.
-              DANGLING="$(printf '%s\n' "${VOUT}" | tail -n +2 | grep -c . || true)"
-              echo "    dangling TRANSMITTED_TO.hadith_id refs: ${DANGLING}"
-              if [ "${DANGLING}" -ne 0 ]; then
-                echo "ERROR: [${ENV_NAME}] migrate verification FAILED — ${DANGLING} dangling TRANSMITTED_TO.hadith_id ref(s) still join no Hadith node (da#325)." >&2
+              # Migration INVARIANT (deploy#538): migrate's job is
+              # canonicalization, NOT completeness. Gate on (a) 0 raw-form
+              # (non-`hdt:`) ids remaining and (b) a sample chain resolving
+              # non-empty. The absolute dangling-ref count is REPORTED as
+              # informational only — it is legitimately non-zero due to
+              # pre-existing orphaned duplicate chains (the ~196k fawaz six-books
+              # edges) whose removal is the separate prune-orphans op's job.
+              # Failing migrate on dangling refs would conflate canonicalization
+              # with completeness and — worse — cannot be migrate's gate at all,
+              # since prune MUST run AFTER migrate (see the run-order guard).
+              echo "==> [${ENV_NAME}] verify (invariant): 0 raw-form (non-hdt:) TRANSMITTED_TO.hadith_id ids remain"
+              RAW_REMAINING="$(run_count "${RAW_Q}")" \
+                || { echo "ERROR: [${ENV_NAME}] raw-id invariant query failed to execute." >&2; exit 1; }
+              RAW_REMAINING="${RAW_REMAINING:-0}"
+              echo "    raw-form (non-hdt:) TRANSMITTED_TO.hadith_id edges: ${RAW_REMAINING}"
+              if [ "${RAW_REMAINING}" -ne 0 ]; then
+                echo "ERROR: [${ENV_NAME}] migrate verification FAILED — ${RAW_REMAINING} TRANSMITTED_TO.hadith_id edge(s) still carry a raw-form (non-'hdt:') id; canonicalization is INCOMPLETE (da#325)." >&2
                 exit 1
               fi
+
+              # Informational only — do NOT fail migrate on dangling refs.
+              echo "==> [${ENV_NAME}] report (informational, NOT gated): dangling TRANSMITTED_TO.hadith_id refs"
+              DANGLING="$(run_count "${DANGLING_Q}")" \
+                || { echo "ERROR: [${ENV_NAME}] dangling info-count query failed to execute." >&2; exit 1; }
+              DANGLING="${DANGLING:-0}"
+              echo "    dangling refs (edges whose hadith_id joins no Hadith): ${DANGLING} — INFO ONLY; run 'prune-orphans' to remove them."
 
               echo "==> [${ENV_NAME}] verify: a sample chain reconstructs non-empty"
               # Pick one edge's hadith_id and confirm it (a) joins an existing
@@ -324,7 +474,7 @@ jobs:
                 exit 1
               fi
               echo "    sample chain reconstructs non-empty (chain_edges=${CHAIN_EDGES})."
-              echo "==> [${ENV_NAME}] migrate verified — dangling-ref=0, sample chain non-empty."
+              echo "==> [${ENV_NAME}] migrate verified (invariant) — 0 raw-form ids, sample chain non-empty (dangling refs=${DANGLING}, informational)."
 
             else
               echo "==> [${ENV_NAME}] verify: narrator betweenness_centrality is populated"
@@ -368,5 +518,5 @@ jobs:
               echo "Dry run — no Cypher issued, no edges rewritten, no centrality computed."
             fi
             echo "stg-gated (deploy#532): prod runs ONLY as a promotion of a verified-good stg run."
-            echo "Run order: migrate (stg then prod) BEFORE enrich, so centrality computes on the corrected graph."
+            echo "Run order per env: migrate FIRST, then prune-orphans (needs a canonicalized graph; guarded), then enrich."
           } >> "$GITHUB_STEP_SUMMARY"
