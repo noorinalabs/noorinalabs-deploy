@@ -503,7 +503,7 @@ jobs:
               fi
               echo "    narrators with betweenness_centrality: ${CNT}"
               echo "==> [${ENV_NAME}] top-k choke-point narrators by betweenness:"
-              run_cypher 'MATCH (n:Narrator) WHERE n.betweenness_centrality IS NOT NULL RETURN n.id AS id, n.name_arabic AS name, n.betweenness_centrality AS bc ORDER BY bc DESC LIMIT 10' \
+              run_cypher 'MATCH (n:Narrator) WHERE n.betweenness_centrality IS NOT NULL RETURN n.id AS id, coalesce(n.name_ar, n.name) AS name, n.betweenness_centrality AS bc ORDER BY bc DESC LIMIT 10' \
                 || echo "    WARNING: top-k echo query failed (non-fatal)." >&2
               echo "==> [${ENV_NAME}] enrich verified — betweenness_centrality populated on ${CNT} narrators."
             fi
