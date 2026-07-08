@@ -464,10 +464,20 @@ jobs:
               echo "    dangling refs (edges whose hadith_id joins no Hadith): ${DANGLING} — INFO ONLY; run 'prune-orphans' to remove them."
 
               echo "==> [${ENV_NAME}] verify: a sample chain reconstructs non-empty"
-              # Pick one edge's hadith_id and confirm it (a) joins an existing
-              # Hadith node and (b) yields a non-empty set of chain edges — the
-              # exact join GET /graph/hadith/{id}/chain performs.
-              CHAIN_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" WITH t.hadith_id AS hid LIMIT 1 MATCH (:Hadith {id: hid}) MATCH p=()-[:TRANSMITTED_TO {hadith_id: hid}]->() RETURN count(p) AS chain_edges'
+              # Sample a hadith_id from a RESOLVING edge ONLY — one whose
+              # hadith_id joins an existing Hadith node — then confirm it yields
+              # a non-empty set of chain edges (the exact join
+              # GET /graph/hadith/{id}/chain performs). The `EXISTS { MATCH
+              # (:Hadith {id: t.hadith_id}) }` predicate before `LIMIT 1` is what
+              # makes this consistent with the migrate-invariant design (deploy#542):
+              # migrate verifies canonicalization + that a *resolving* chain
+              # reconstructs, independent of the pre-existing dangling fawaz
+              # orphans (whose removal is prune-orphans' job, reported info-only
+              # above). Without it, `LIMIT 1` could land on one of the ~196k
+              # dangling orphan edges — a non-deterministic pick by storage scan
+              # order — and the downstream `MATCH (:Hadith {id: hid})` would drop
+              # the row, false-failing an otherwise-correct migration.
+              CHAIN_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND EXISTS { MATCH (:Hadith {id: t.hadith_id}) } WITH t.hadith_id AS hid LIMIT 1 MATCH (:Hadith {id: hid}) MATCH p=()-[:TRANSMITTED_TO {hadith_id: hid}]->() RETURN count(p) AS chain_edges'
               COUT="$(run_cypher "${CHAIN_Q}")" \
                 || { echo "ERROR: [${ENV_NAME}] sample-chain query failed to execute." >&2; exit 1; }
               printf '%s\n' "${COUT}"
