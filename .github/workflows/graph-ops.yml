@@ -242,10 +242,12 @@ jobs:
             #     Shared by the dry-run and real-run paths. Each is a SINGLE
             #     statement (da#319: never a multi-statement string) with
             #     double-quoted string literals inside the single-quoted shell
-            #     string. cypher-shell wraps statements in an explicit
-            #     transaction by default, but `CALL {} IN TRANSACTIONS` may run
-            #     ONLY in an implicit (auto-commit) transaction — so PRUNE_Q is
-            #     prefixed with the cypher-shell `:auto` command.
+            #     string. `CALL {} IN TRANSACTIONS` may run ONLY in an implicit
+            #     (auto-commit) transaction. cypher-shell 5.x removed the `:auto`
+            #     client command (a 4.x mechanism); non-interactive cypher-shell
+            #     auto-commits statements fed on STDIN by default, which is
+            #     exactly the implicit-tx context CALL {} IN TRANSACTIONS needs —
+            #     so PRUNE_Q carries NO client-command prefix (deploy#540).
             #
             #   RAW_Q       run-order guard / migration invariant: count edges
             #               whose id is still raw-form (not `hdt:`-prefixed). >0
@@ -260,7 +262,7 @@ jobs:
             RAW_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND NOT t.hadith_id STARTS WITH "hdt:" RETURN count(t) AS raw_remaining'
             DANGLING_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND NOT EXISTS { MATCH (:Hadith {id: t.hadith_id}) } RETURN count(t) AS dangling'
             RESOLVING_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND EXISTS { MATCH (:Hadith {id: t.hadith_id}) } RETURN count(t) AS resolving'
-            PRUNE_Q=':auto MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND NOT EXISTS { MATCH (:Hadith {id: t.hadith_id}) } CALL (t) { DELETE t } IN TRANSACTIONS OF 10000 ROWS'
+            PRUNE_Q='MATCH ()-[t:TRANSMITTED_TO]->() WHERE t.hadith_id IS NOT NULL AND t.hadith_id <> "" AND NOT EXISTS { MATCH (:Hadith {id: t.hadith_id}) } CALL (t) { DELETE t } IN TRANSACTIONS OF 10000 ROWS'
 
             if [ "${DRY_RUN}" = "true" ]; then
               if [ "${OPERATION}" = "prune-orphans" ]; then
@@ -351,14 +353,16 @@ jobs:
               RESOLVING_PRE="${RESOLVING_PRE:-0}"
               echo "    dangling (to delete): ${DANGLING_PRE} | resolving (must stay): ${RESOLVING_PRE}"
 
-              # --- batched delete (single statement; :auto → implicit tx) ---
+              # --- batched delete (single statement; implicit auto-commit tx) ---
               # `CALL {} IN TRANSACTIONS` may run ONLY in an implicit (auto-commit)
-              # transaction; cypher-shell wraps a query in an explicit tx by
-              # default. Feed the `:auto`-prefixed statement on STDIN (not argv) so
-              # cypher-shell's statement parser reliably honors the `:auto` client
-              # command. Same in-container credential handling as run_cypher:
-              # password from the neo4j container's own NEO4J_AUTH, never on
-              # argv/log; the query text is not a secret.
+              # transaction. cypher-shell 5.x removed the `:auto` client command
+              # (a 4.x construct); a non-interactive cypher-shell auto-commits each
+              # statement fed on STDIN by default, so the single PRUNE_Q statement
+              # runs in the implicit tx CALL {} IN TRANSACTIONS requires with NO
+              # client-command prefix. It MUST be fed on STDIN (not argv) and stay
+              # a single statement (deploy#540). Same in-container credential
+              # handling as run_cypher: password from the neo4j container's own
+              # NEO4J_AUTH, never on argv/log; the query text is not a secret.
               echo "==> [${ENV_NAME}] prune: batched DELETE of dangling edges (CALL {} IN TRANSACTIONS OF 10000 ROWS)"
               printf '%s\n' "${PRUNE_Q}" | ${COMPOSE} exec -T neo4j sh -c \
                 'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain' \
