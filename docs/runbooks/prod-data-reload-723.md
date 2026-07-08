@@ -26,8 +26,9 @@ the verify checks below can false-red even on correct data.
    `promote.yml`; approve the `production` GH Environment gate). See `prod-promote-723.md` and the
    deploy `RUNBOOK.md` "Prod deploy" section.
 2. Confirm prod is healthy: `gh workflow run verify-deploy.yml -f target=prod` → green.
-3. Build the reload from the **same W20/W21 SHAs** (`scripts/load_staging.sh` builds `Dockerfile.load`
-   from the working tree — check out the promoted SHA before running it).
+3. Produce the reload Parquet from the **same W20/W21 SHAs** (§3), and load it via the published
+   loader image at those SHAs — the `<env>-latest` loader image `deploy-data-load.yml` resolves
+   must be built from the promoted SHA (or pass an explicit `image` ref).
 4. THEN run this runbook.
 
 ---
@@ -223,30 +224,83 @@ make validate  # gate: strict data-quality validation → data/reports/validatio
 
 ## 4. Load corrected data to prod  [OWNER-RUN]
 
-Use `scripts/load_staging.sh`, pointed at prod. It builds a self-contained loader image
-(`Dockerfile.load`) and runs it attached to the prod `noorinalabs_backend` docker network; the Neo4j
-password is read from the running prod neo4j container's `NEO4J_AUTH` on the remote host (no secret
-crosses this machine's shell history).
+> **SUPERSEDES `scripts/load_staging.sh`.** The batch load is now behind IaC —
+> the `deploy-data-load.yml` workflow (deploy#546) — instead of the build-host
+> one-off. `load_staging.sh` (rsync Parquet from a workstation + `docker build`
+> the loader on the box) is retired for routine loads: it is an un-repeatable,
+> box-local step and the owner directed repeatable data loads behind GH Actions +
+> IaC. The workflow sources the Parquet from B2 on the VPS (never through the
+> runner), reuses the published loader image via a profile-gated compose service
+> (no on-VPS build), sources the NEO4J password from the VPS `.env` via compose
+> (never on argv/logs), and gates prod behind the `production` Environment.
 
-```bash
-cd <REPO_ROOT>/noorinalabs-data-acquisition   # same checkout as section 3, with data/staging/ populated
+The load is now a two-step flow: **publish the resolved Parquet to B2** (§4a),
+then **dispatch `deploy-data-load.yml`** (§4b).
 
-# Full nodes + edges load to PROD (LOAD_ARGS="load" → not the default nodes-only):
-SSH_HOST=noorinalabs-prod LOAD_ARGS="load" scripts/load_staging.sh
+### 4a. Publish the §3 Parquet set to the pipeline B2 bucket
+
+Upload the curated + staging Parquet produced in §3 to `noorinalabs-pipeline`
+under a **versioned prefix** you will pass as `parquet_ref`. The workflow's
+contract (see its header block) expects this exact layout:
+
+```text
+noorinalabs-pipeline/<parquet_ref>/curated/narrators_canonical.parquet
+noorinalabs-pipeline/<parquet_ref>/curated/narrator_mentions_resolved.parquet
+noorinalabs-pipeline/<parquet_ref>/curated/narrator_mentions_resolved_muhaddithat.parquet
+noorinalabs-pipeline/<parquet_ref>/staging/hadiths_*.parquet
+noorinalabs-pipeline/<parquet_ref>/staging/collections_*.parquet
+noorinalabs-pipeline/<parquet_ref>/staging/narrator_mentions_*.parquet   # full load only
+noorinalabs-pipeline/<parquet_ref>/staging/network_edges_*.parquet       # full load only
+noorinalabs-pipeline/<parquet_ref>/staging/parallel_links.parquet        # full load only
 ```
 
-- `SSH_HOST=noorinalabs-prod` is the prod target (default is `noorinalabs-stg`); `LOAD_ARGS="load"`
-  does the **full** load (nodes + edges incl. `APPEARS_IN`, `STUDIED_UNDER`, `PARALLEL_OF`,
-  `GRADED_BY`) — the default `load --nodes-only` would NOT populate the chains/edges that criteria
-  #2 and #4 depend on, so the explicit `LOAD_ARGS="load"` is required.
-- The loader MERGEs narrator date props (`birth_year_ah`, `death_year_ah`, `generation`) and the
-  segmented narrators/edges. It is idempotent.
-- The script's step `[4/5]` reads back the `source_corpus` distribution (Hadith per corpus) — sanity
-  check it matches the expected corpus set before moving to verify.
-- **Postgres / pgvector:** the loader upserts relational + embedding rows as part of the load; the
-  semantic-search index is rebuilt from this. (If semantic search still 500s in section 5.3 because
-  the pgvector backend was not provisioned for an env, that is an environment-provisioning item, not
-  a data defect — note it but don't block on it.)
+- Choose a reproducible `parquet_ref`, e.g. `staged/narrator-resolve/$(date -u +%Y-%m-%d)-<SHA>`
+  (the W20/W21 SHA from §0), so the load is reproducible and a prior good set is
+  always re-loadable. It is a **bucket-relative prefix** — no bucket name, no
+  leading slash.
+- Publishing is a data-acquisition helper (owner/da item, not this workflow).
+  The credential-safe pattern is rclone native env against the pipeline bucket
+  (mirror `scripts/backup.sh`: `RCLONE_CONFIG_*` env, no CLI-flag secrets) using
+  the pipeline B2 key (`PIPELINE_B2_KEY_ID` / `PIPELINE_B2_KEY`).
+
+### 4b. Dispatch `deploy-data-load.yml`
+
+```bash
+# Dry-run FIRST (default) — verifies the B2 objects exist + prints the load plan,
+# writes NOTHING to the graph:
+gh workflow run deploy-data-load.yml \
+  -f env=prod \
+  -f parquet_ref='staged/narrator-resolve/<YYYY-MM-DD>-<SHA>' \
+  -f load_args='load' \
+  -f dry_run=true
+
+# Review the dry-run summary, then the REAL load (approve the `production`
+# Environment gate when prompted):
+gh workflow run deploy-data-load.yml \
+  -f env=prod \
+  -f parquet_ref='staged/narrator-resolve/<YYYY-MM-DD>-<SHA>' \
+  -f load_args='load' \
+  -f dry_run=false
+```
+
+- `env=prod` maps to the `production` GH Environment → **manual approval gate**;
+  `env=stg` (the validated pre-prod gate) does not. Per stg-gate policy, prod is
+  a promotion of a verified-good stg load — run the stg load + §5 verify first.
+- `load_args='load'` does the **full** load (nodes + edges incl. `APPEARS_IN`,
+  `STUDIED_UNDER`, `PARALLEL_OF`, `GRADED_BY`) — `load --nodes-only` would NOT
+  populate the chains/edges that criteria #2 and #4 depend on, so `load` is
+  required here.
+- The loader MERGEs narrator date props (`birth_year_ah`, `death_year_ah`,
+  `generation`) and the segmented narrators/edges. It is idempotent — an SSH-drop
+  mid-load is recoverable by re-dispatching (MERGE converges).
+- The workflow's post-load step reads back the `source_corpus` distribution
+  (Hadith per corpus) into the job log — sanity-check it matches the expected
+  corpus set before moving to verify.
+- **Postgres / pgvector:** the loader upserts relational + embedding rows as part
+  of the load; the semantic-search index is rebuilt from this. (If semantic
+  search still 500s in section 5.3 because the pgvector backend was not
+  provisioned for an env, that is an environment-provisioning item, not a data
+  defect — note it but don't block on it.)
 
 ---
 
@@ -366,9 +420,11 @@ sudo --preserve-env=B2_KEY_ID,B2_APP_KEY,B2_BUCKET \
 | Purge (dry-run) | `POST /api/v1/admin/data/purge {"source_corpus":C,"dry_run":true}` | isnad-graph API |
 | Purge (real) | `POST .../purge {"source_corpus":C,"dry_run":false,"confirmation":C}` | isnad-graph API |
 | Produce Parquet | `make acquire parse resolve validate` | data-acquisition repo |
-| Load to prod | `SSH_HOST=noorinalabs-prod LOAD_ARGS="load" scripts/load_staging.sh` | data-acquisition repo |
+| Publish Parquet to B2 | rclone upload §3 output to `noorinalabs-pipeline/<parquet_ref>/{curated,staging}/` | data-acquisition repo / VM |
+| Load to prod | `gh workflow run deploy-data-load.yml -f env=prod -f parquet_ref=<ref> -f load_args=load -f dry_run=false` | deploy repo (approve `production` gate) |
 | Verify search | `GET /api/v1/search?q=…`, `/search/semantic?q=…`, `/parallels` | isnad-graph API |
 | Prod smoke | `gh workflow run verify-deploy.yml -f target=prod` | deploy repo |
 
 **Secret NAMES referenced (never inline a value):** `B2_KEY_ID`, `B2_APP_KEY`, `B2_BUCKET`,
-`NEO4J_AUTH` / `NEO4J_PASSWORD`, `SUNNAH_API_KEY`, `KAGGLE_USERNAME`, `KAGGLE_KEY`.
+`PIPELINE_B2_KEY_ID`, `PIPELINE_B2_KEY`, `NEO4J_AUTH` / `NEO4J_PASSWORD`, `SUNNAH_API_KEY`,
+`KAGGLE_USERNAME`, `KAGGLE_KEY`.

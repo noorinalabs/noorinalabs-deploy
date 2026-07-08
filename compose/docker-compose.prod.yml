@@ -431,6 +431,94 @@ services:
     # not loop.
     restart: "no"
 
+  # -------------------------------------------------------------------------
+  # PROFILE-GATED (`graph-load`) — one-shot BATCH node/edge graph load driven
+  # by the data-acquisition loader image (deploy#546). This is the IaC
+  # replacement for the `scripts/load_staging.sh` build-host one-off: it runs
+  # the loader CLI `load` (full nodes+edges) / `load --nodes-only` subcommand
+  # against the live neo4j, reading resolved+staging Parquet from a host bind
+  # mount that `.github/workflows/deploy-data-load.yml` populates via rclone
+  # from the `noorinalabs-pipeline` B2 bucket.
+  #
+  # WHY A SEPARATE SERVICE FROM graph-ops (not a reuse): graph-ops is
+  # Cypher-only (migrate/enrich issue small result sets, 1G limit, NO data
+  # mount). A batch LOAD instead READS large curated + staging Parquet into
+  # PyArrow and MERGEs nodes/edges/parallels — it needs (a) a data volume the
+  # Parquet is mounted through and (b) real memory headroom. Hence its own
+  # profile + a bigger limit. Same published loader image family as graph-ops
+  # (ghcr.io/noorinalabs/noorinalabs-data-acquisition-load), so this is still
+  # "reuse the published image", NOT an on-VPS `docker build`.
+  #
+  # NETWORKS — `backend` (internal) ONLY. The loader issues bolt writes to
+  # neo4j:7687 and needs nothing off-box (the image bakes every dependency at
+  # build time precisely because the target Neo4j is on the internet-isolated
+  # `backend` network). No `egress`.
+  #
+  # DATA MOUNT — `${GRAPH_LOAD_DATA_DIR}` (a host dir the workflow rclone-pulls
+  # the Parquet into) is bind-mounted READ-ONLY at `/app/data`, the path the
+  # loader CLI reads DATA_CURATED_DIR / DATA_STAGING_DIR under. Read-only: the
+  # loader's outputs go to Neo4j over the network, never back to the Parquet
+  # dir, so the mount is inputs-only. The `:-...` default lets `docker compose
+  # config` validate this service without the var set (the workflow always
+  # exports it for a real run).
+  #
+  # CREDENTIALS — reuses the SAME NEO4J_* env the api/graph-ops services read,
+  # interpolated by compose from the VPS .env, so no password ever lands on
+  # argv (CWE-214) and no NEW required secret is added. The B2 read key lives
+  # only on the runner→VPS transport (rclone native env), never here.
+  graph-load:
+    # GRAPH_LOAD_IMAGE default is `prod-latest` — the FAIL-SAFE direction
+    # (deploy#470, same rationale as GRAPH_OPS_IMAGE / EMBED_IMAGE).
+    # deploy-data-load.yml always sets GRAPH_LOAD_IMAGE explicitly per-env
+    # (<env>-latest), so this default is only hit by a manual break-glass
+    # `--profile graph-load` on a box: on PROD it pulls the correct prod loader
+    # image; on STG a prod tag is benign per the deploy-data-load.yml env guard.
+    image: ${GRAPH_LOAD_IMAGE:-ghcr.io/noorinalabs/noorinalabs-data-acquisition-load:prod-latest}
+    profiles: ["graph-load"]
+    # read_only rootfs like graph-ops; the loader writes only to Neo4j + /tmp.
+    # PyArrow may spill to /tmp on large Parquet reads, so give it more room
+    # than graph-ops' Cypher-only 64M.
+    read_only: true
+    tmpfs:
+      - /tmp:size=512M
+    volumes:
+      # Resolved+staging Parquet, rclone-pulled by the workflow. READ-ONLY —
+      # inputs only. Host path is the workflow-exported GRAPH_LOAD_DATA_DIR.
+      - ${GRAPH_LOAD_DATA_DIR:-/opt/noorinalabs-deploy/.graph-load-data/data}:/app/data:ro
+    environment:
+      # Same DB env the api/graph-ops services read (NEO4J_* only — the loader
+      # CLI reads NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD via the NEO4J_ prefix).
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+    # Safe default (break-glass `--profile graph-load up` path): print CLI help
+    # and exit non-destructively. deploy-data-load.yml overrides this with
+    # `load` / `load --nodes-only`. The image ENTRYPOINT is `python -m src.cli`,
+    # so the command below is just args.
+    command: ["--help"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          # A full load reads large curated + staging Parquet into PyArrow and
+          # batches MERGEs — sized like the embed one-shot (4G), well within the
+          # 16G box's headroom for a profile-gated op that never runs on an
+          # ordinary deploy. The heavy work is this container's Parquet read +
+          # MERGE batching (unlike graph-ops, where GDS heap is a neo4j concern).
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 1G
+          cpus: "0.5"
+    logging: *default-logging
+    networks:
+      - backend
+    # One-shot: never restart. A batch load is operator-triggered, not a daemon;
+    # a non-zero exit must surface (the workflow fails the job), not loop.
+    restart: "no"
+
   frontend:
     # GHCR-only — no local-build fallback. The deploy workflow logs into ghcr.io
     # using the auto-provisioned GITHUB_TOKEN (workflow `permissions: packages: read`
