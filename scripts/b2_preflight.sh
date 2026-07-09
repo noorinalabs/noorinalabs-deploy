@@ -134,6 +134,14 @@ preflight_b2() {
     local remote="${RCLONE_REMOTE}"
     local tmp lsd_out lsd_rc bucket_visible write_rc delete_rc verdict canary
 
+    # Every probe below is EXPECTED to fail sometimes -- that is the entire point, and a
+    # probe's non-zero exit is data, not an error. A caller running under `set -e` with
+    # `shopt -s inherit_errexit` would otherwise kill this function at the first failing
+    # `rclone` call, before `lsd_rc=$?` executes, so it would die without ever computing
+    # a verdict. Disable errexit for the probe section explicitly rather than depending on
+    # the caller's shell options. (deploy#563 review)
+    set +e
+
     : "${B2_BUCKET:?B2_BUCKET must be set}"
 
     # Guard the leak vector explicitly rather than trusting the ambient environment.

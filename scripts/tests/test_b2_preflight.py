@@ -17,6 +17,7 @@ These tests drive the real shell function through bash.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -179,7 +180,94 @@ def test_backup_runs_the_preflight_before_dumping() -> None:
 def test_backup_does_not_mask_the_preflight_exit_code_through_a_pipe() -> None:
     """`preflight_b2 | tee` returns tee's status, which is always 0."""
     src = _code_only(BACKUP.read_text())
-    assert "PREFLIGHT_RC=$?" in src, "the preflight rc must be captured directly"
     assert "if ! preflight_b2 2>&1 | tee" not in src, (
         "piping the preflight into tee masks its verdict behind tee's exit status"
     )
+
+
+# --------------------------------------------------------------------------
+# The guard must reach the operator. Behavioural, in production's invocation form.
+# --------------------------------------------------------------------------
+#
+# The previous version of this file asserted that the literal string `PREFLIGHT_RC=$?`
+# appeared in backup.sh. It did appear -- and it was DEAD. backup.sh runs under
+# `set -euo pipefail`, where an assignment whose command substitution exits non-zero is
+# itself a failing simple command: errexit fires at the assignment and every line below
+# it, including the remediation message, is unreachable. A static guard over a line that
+# never executes proves only that the line was typed.
+#
+# The three harnesses that all passed while production was broken:
+#   * `./scripts/b2_preflight.sh` standalone -- its own `set -uo pipefail` has no -e
+#   * `bash -c 'source …; classify_b2_state …'` -- likewise no -e
+#   * a grep over the source                  -- executes nothing
+#
+# None of them was production's. So this test *runs backup.sh*, under `bash`, with the
+# real `set -euo pipefail`, with `rclone` stubbed to fail -- and asserts the diagnosis
+# lands on stdout. It fails against the pre-fix tree.
+
+
+def _run_backup_with_failing_rclone(tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Invoke backup.sh exactly as the systemd unit does, with a failing rclone."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+
+    # `docker compose ps --format json` only needs to succeed for the preflight to be reached.
+    (stub / "docker").write_text("#!/usr/bin/env bash\nexit 0\n")
+    # A failing rclone drives the KEY_INVALID verdict (cannot even list buckets).
+    (stub / "rclone").write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'CRITICAL: you must use bucket(s) [...] with this application key' >&2\n"
+        "exit 1\n"
+    )
+    (stub / "zstd").write_text("#!/usr/bin/env bash\nexit 0\n")
+    for f in stub.iterdir():
+        f.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    env.update(
+        B2_KEY_ID="fake-key-id",
+        B2_APP_KEY="fake-app-key",
+        B2_BUCKET="noorinalabs-backups",
+        BACKUP_DIR=str(tmp_path / "backups"),
+        COMPOSE_FILE="/dev/null",
+    )
+    env.pop("RCLONE_DUMP", None)
+
+    return subprocess.run(
+        ["bash", str(BACKUP)], capture_output=True, text=True, env=env, timeout=120
+    )
+
+
+def test_failing_preflight_reaches_the_operator(tmp_path: Path) -> None:
+    """The whole point of the guard: the operator must SEE the diagnosis.
+
+    Pre-fix, backup.sh emitted exactly one line -- "Backup script exited with code 1",
+    from the EXIT trap -- and nothing else. The verdict, the remediation, and the
+    explicit warning that rclone's "failed to create bucket" names the wrong problem were
+    all computed and then discarded by errexit.
+    """
+    proc = _run_backup_with_failing_rclone(tmp_path)
+    combined = proc.stdout + proc.stderr
+
+    assert proc.returncode != 0, "a failing preflight must fail the backup"
+
+    assert "B2 preflight failed" in combined, (
+        "the remediation message never reached the operator. Under `set -e`, "
+        '`OUT="$(preflight_b2 2>&1)"` fails AT THE ASSIGNMENT and everything below it is '
+        "unreachable. Use `|| PREFLIGHT_RC=$?` so the assignment sits in a condition context."
+    )
+    assert "verdict=" in combined, "the preflight verdict must be printed, not swallowed"
+    assert "KEY_INVALID" in combined, (
+        "a key that cannot list buckets must be diagnosed as KEY_INVALID"
+    )
+
+
+def test_failing_preflight_stops_before_any_dump(tmp_path: Path) -> None:
+    """Refusing to dump is the other half of the contract: no outage for nothing."""
+    proc = _run_backup_with_failing_rclone(tmp_path)
+    combined = proc.stdout + proc.stderr
+
+    assert "refusing to dump databases we cannot upload" in combined
+    # backup.sh logs this immediately before it stops Neo4j.
+    assert "Stopping Neo4j" not in combined, "the preflight must abort before Neo4j is stopped"
