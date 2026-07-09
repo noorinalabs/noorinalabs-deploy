@@ -175,7 +175,7 @@ jobs:
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
           envs: ENV_NAME,PARQUET_REF,LOAD_ARGS,DRY_RUN,IMAGE,PIPELINE_B2_KEY_ID,PIPELINE_B2_KEY,GITHUB_TOKEN,GITHUB_ACTOR
           script: |
-            set -uo pipefail
+            set -euo pipefail
 
             cd /opt/noorinalabs-deploy
 
@@ -184,9 +184,10 @@ jobs:
             # box's /opt/noorinalabs-deploy holds a git checkout that deploys
             # refresh; this op-workflow must too, so `compose` sees the current
             # file (with the profile-gated `graph-load` service added in this PR).
-            # Guarded (this script runs `set -uo pipefail`, NO -e): an unguarded
-            # `git fetch` failure would not abort, and the following
-            # `reset --hard origin/main` would succeed against a STALE
+            # Explicitly guarded even though `set -e` is on: the guard names the
+            # real consequence. An unguarded `git fetch` failure would abort with
+            # git's own message and no hint that the danger is the following
+            # `reset --hard origin/main` succeeding against a STALE
             # remote-tracking ref — leaving the box on an old tree.
             echo "==> Pulling latest deploy config..."
             git fetch origin main \
@@ -222,6 +223,23 @@ jobs:
             #     key never lands on argv; rclone reads RCLONE_CONFIG_PIPELINE_*. ---
             : "${PIPELINE_B2_KEY_ID:?PIPELINE_B2_KEY_ID must be set (env-scoped secret)}"
             : "${PIPELINE_B2_KEY:?PIPELINE_B2_KEY must be set (env-scoped secret)}"
+
+            # Credential hygiene: rclone maps EVERY option to an RCLONE_<OPTION> env var, so an
+            # ambient RCLONE_LOG_LEVEL=DEBUG / RCLONE_VERBOSE=2 makes rclone echo
+            #   DEBUG : Setting key="<application key>" ... from environment variable ...
+            # and RCLONE_DUMP=auth makes it echo an `Authorization: Basic <base64(id:key)>` line.
+            # lsf_or_die below cats rclone's stderr into the Actions log of a PUBLIC repo, and GH
+            # masking is an exact-substring scrub that does NOT match the base64 form. Scrub every
+            # inherited RCLONE_* before setting the three we own. Nothing in this repo sets these,
+            # but sshd with `UsePAM yes` passes /etc/environment into a non-interactive session,
+            # so the pollution is operator-reachable without touching this workflow.
+            # ORDER IS LOAD-BEARING: this loop must run BEFORE the exports below, or it would
+            # unset the very credential it is protecting.
+            # shellcheck disable=SC2013  # env var names are [A-Z0-9_]; word-split is safe here.
+            for _v in $(env | sed -n 's/^\(RCLONE_[A-Z0-9_]*\)=.*/\1/p'); do
+              unset "${_v}"
+            done
+
             export RCLONE_CONFIG_PIPELINE_TYPE="b2"
             export RCLONE_CONFIG_PIPELINE_ACCOUNT="${PIPELINE_B2_KEY_ID}"
             export RCLONE_CONFIG_PIPELINE_KEY="${PIPELINE_B2_KEY}"
@@ -240,19 +258,65 @@ jobs:
             # Parquet; nodes-only needs only hadiths_*/collections_*.
             CURATED_REQUIRED="narrators_canonical.parquet narrator_mentions_resolved.parquet narrator_mentions_resolved_muhaddithat.parquet"
 
+            # lsf_or_die <b2-dir>: list the basenames under a B2 prefix into the
+            # global LSF_OUT. A NON-ZERO rclone rc (401/auth, network, bad remote,
+            # throttling) and an rc=0 EMPTY listing are different facts and must
+            # not be conflated: only the latter says anything about whether
+            # parquet_ref is published. The prior `2>/dev/null || true` collapsed
+            # both into "no objects found — is parquet_ref correct and published?",
+            # and a B2 401 was reported for an hour as an unpublished ref while the
+            # objects were present the whole time (#549).
+            #
+            # On rc != 0 this prints rclone's stderr verbatim and exits WITHOUT
+            # asserting a cause. The rc is captured immediately, in the same
+            # `&& … || …` list as the assignment, before any intervening command
+            # can clobber $?. The exit is taken here, in the caller's shell, and
+            # not inside a `$( )` subshell that would only kill the subshell.
+            #
+            # SURFACING rclone's stderr into a PUBLIC repo's Actions log is safe ONLY
+            # under two preconditions this script establishes, and NOT unconditionally:
+            #   1. the RCLONE_* scrub above has removed any inherited verbosity/dump
+            #      option (RCLONE_LOG_LEVEL=DEBUG and RCLONE_VERBOSE=2 both make rclone
+            #      echo the application key verbatim; RCLONE_DUMP=auth makes it echo an
+            #      `Authorization: Basic <base64(id:key)>` header that GH secret-masking
+            #      does NOT scrub, because masking is an exact-substring match on the
+            #      registered bytes and the base64 is a different byte string), AND
+            #   2. the `--log-level NOTICE` below pins the level explicitly, since an
+            #      explicit flag beats a hostile env — this is what the two `rclone copy`
+            #      calls further down already do with `--log-level INFO`.
+            # At NOTICE, rclone's stderr for a 401 or a connection failure carries only
+            # the remote path and the error string; the credential lives in env, and the
+            # paths are not secrets. If you raise this verbosity to chase a B2 failure —
+            # the most natural next edit to a function that exists to diagnose 401s —
+            # you reintroduce the leak. Don't; the rc and the error string are enough.
+            LSF_OUT=""
+            lsf_or_die() {
+              _lsf_dir="$1"
+              _lsf_err="$(mktemp)"
+              LSF_OUT="$(rclone lsf --log-level NOTICE "${_lsf_dir}/" 2>"${_lsf_err}")" && _lsf_rc=0 || _lsf_rc=$?
+              if [ "${_lsf_rc}" -ne 0 ]; then
+                echo "ERROR: [${ENV_NAME}] rclone failed to list ${_lsf_dir}/ (rc=${_lsf_rc}). This is a hard rclone failure, NOT evidence about whether parquet_ref '${PARQUET_REF}' is published. rclone stderr follows:" >&2
+                cat "${_lsf_err}" >&2
+                rm -f "${_lsf_err}"
+                exit 1
+              fi
+              rm -f "${_lsf_err}"
+            }
+
             # verify_present <b2-dir> <required-basename...>: fail loudly if any
-            # required object is absent under the B2 prefix. rclone lsf lists
-            # basenames; the credential is in env, the paths are not secrets.
+            # required object is absent under the B2 prefix. The empty-listing
+            # branch below is the ONLY one that has established the prefix really
+            # is absent — lsf_or_die has already exited on any rclone error.
             verify_present() {
               _dir="$1"; shift
               echo "    listing ${_dir}/ ..."
-              _listing="$(rclone lsf "${_dir}/" 2>/dev/null || true)"
-              if [ -z "${_listing}" ]; then
-                echo "ERROR: [${ENV_NAME}] no objects found under ${_dir}/ — is parquet_ref '${PARQUET_REF}' correct and published?" >&2
+              lsf_or_die "${_dir}"
+              if [ -z "${LSF_OUT}" ]; then
+                echo "ERROR: [${ENV_NAME}] rclone listed ${_dir}/ successfully but it holds no objects — is parquet_ref '${PARQUET_REF}' correct and published?" >&2
                 exit 1
               fi
               for _want in "$@"; do
-                if ! printf '%s\n' "${_listing}" | grep -qx "${_want}"; then
+                if ! printf '%s\n' "${LSF_OUT}" | grep -qx "${_want}"; then
                   echo "ERROR: [${ENV_NAME}] required object missing in B2: ${_dir}/${_want}" >&2
                   exit 1
                 fi
@@ -261,12 +325,14 @@ jobs:
 
             # glob-present <b2-dir> <shell-glob>: assert at least one object under
             # the prefix matches the glob (for the wildcarded staging shards).
+            # Same rc-vs-empty discipline: lsf_or_die owns the rclone-error exit,
+            # so reaching the no-match branch means the listing really lacks a hit.
             glob_present() {
               _dir="$1"; _glob="$2"
-              _listing="$(rclone lsf "${_dir}/" 2>/dev/null || true)"
-              # shellcheck disable=SC2254  # $_glob is an intentional case pattern.
+              lsf_or_die "${_dir}"
               _hit=0
-              for _f in ${_listing}; do
+              for _f in ${LSF_OUT}; do
+                # shellcheck disable=SC2254  # $_glob is an intentional case pattern.
                 case "${_f}" in
                   ${_glob}) _hit=1; break ;;
                 esac
@@ -304,10 +370,19 @@ jobs:
             # Stable, git-untracked data dir OUTSIDE the /opt checkout (so the
             # git reset above never touches it). rclone-pull the Parquet here,
             # then bind-mount it read-only into the loader container.
+            #
+            # Both the clear and the create are guarded so the FIRST cause is the
+            # one that gets printed. Unguarded, a `mkdir` denied on ${HOME}/.cache
+            # merely warned and the script (then lacking `set -e`) ran on into an
+            # `rclone copy` against a destination that did not exist, whose own
+            # error was the one anyone read — ten lines below the real cause
+            # (#552). `set -e` now aborts here regardless; these guards name why.
             LOAD_DATA_ROOT="${HOME}/.cache/noorinalabs-graph-load"
             LOAD_DATA_DIR="${LOAD_DATA_ROOT}/data"
-            rm -rf "${LOAD_DATA_DIR}"
-            mkdir -p "${LOAD_DATA_DIR}/curated" "${LOAD_DATA_DIR}/staging"
+            rm -rf "${LOAD_DATA_DIR}" \
+              || { echo "ERROR: [${ENV_NAME}] cannot clear the load data dir ${LOAD_DATA_DIR} (is \$HOME=${HOME} writable by 'deploy', and does it own the existing contents?)" >&2; exit 1; }
+            mkdir -p "${LOAD_DATA_DIR}/curated" "${LOAD_DATA_DIR}/staging" \
+              || { echo "ERROR: [${ENV_NAME}] cannot create ${LOAD_DATA_DIR} (is \$HOME=${HOME} writable by 'deploy'?)" >&2; exit 1; }
 
             echo "==> [${ENV_NAME}] rclone pull curated/ -> ${LOAD_DATA_DIR}/curated"
             rclone copy "${B2_BASE}/curated/" "${LOAD_DATA_DIR}/curated/" \
@@ -377,7 +452,10 @@ jobs:
             #     cypher-shell runs INSIDE the live neo4j container and reads the
             #     password from that container's OWN NEO4J_AUTH — never on our
             #     argv, never over the GH transport. Non-fatal: the load already
-            #     succeeded above; this is a sanity echo, not a gate. ---
+            #     succeeded above; this is a sanity echo, not a gate. The trailing
+            #     `|| echo …` keeps it non-fatal under `set -e` too — the exec is
+            #     the left arm of an OR list, which `-e` does not act on, and the
+            #     echo makes the list succeed. Do not drop that arm. ---
             echo "==> [${ENV_NAME}] post-load read-back: Hadith count by source_corpus"
             ${COMPOSE} exec -T neo4j sh -c \
               'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "MATCH (h:Hadith) RETURN h.source_corpus AS source_corpus, count(*) AS hadiths ORDER BY hadiths DESC"' \
