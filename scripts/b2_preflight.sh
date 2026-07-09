@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# =============================================================================
+# B2 credential + bucket preflight for scripts/backup.sh (deploy#559)
+#
+# WHY THIS IS NOT ERROR-STRING PARSING
+#
+# rclone's failure text does not identify the failure. Measured against the live B2
+# account on 2026-07-09 with a bucket-scoped key, these two situations produce a
+# BYTE-IDENTICAL message:
+#
+#   (a) the bucket does not exist
+#   (b) the bucket exists but the key is not scoped to it
+#
+#   CRITICAL: Failed to create file system for destination "isnad:<bucket>/":
+#   you must use bucket(s) [{"3c86..." "noorinalabs-pipeline"}] with this application key
+#
+# B2 refuses at key-scope before it ever looks at the bucket. Separately, a read-only
+# key attempting a write surfaces its 401 as "failed to create bucket" -- a message that
+# names the wrong problem entirely and has already cost this project time
+# (reference_pipeline_b2_publish_key). Any classifier keyed on those strings will
+# misdiagnose the next person exactly the way rclone misdiagnosed us.
+#
+# So we classify by CAPABILITY PROBE, not by message:
+#
+#   1. `rclone lsd` -- can the key enumerate buckets at all, and is the target among
+#      them? A bucket-scoped key lists only its own bucket, so visibility here answers
+#      "is this key scoped to this bucket" definitively.
+#   2. write a canary object     -> proves `writeFiles`
+#   3. delete the canary object  -> proves `deleteFiles`, which backup.sh's retention
+#      prune (`rclone purge`) requires and which a read-only key silently lacks
+#
+# Each probe's outcome is a fact. The error text is used only to enrich the human-facing
+# diagnosis, never to decide it.
+#
+# NEVER set RCLONE_DUMP (or any equivalent). An ambient `RCLONE_DUMP=auth` once leaked
+# base64 credentials past GitHub's log masking in a PUBLIC repo. This script prints no
+# credential material: it reports presence and length only.
+#
+# Usage:
+#   ./scripts/b2_preflight.sh              # requires B2_KEY_ID/B2_APP_KEY/B2_BUCKET
+#   source ./scripts/b2_preflight.sh       # to reuse classify_b2_state()
+# =============================================================================
+set -uo pipefail
+
+RCLONE_REMOTE="${RCLONE_REMOTE:-isnad}"
+
+# ---------------------------------------------------------------------------
+# Pure classifier. No I/O, no network -- takes probe outcomes, returns a verdict code.
+# Kept side-effect free so it can be unit-tested against the real captured outcomes.
+#
+#   $1 lsd_rc          exit status of `rclone lsd <remote>:`
+#   $2 bucket_visible  "yes" | "no"  -- was B2_BUCKET in the lsd listing
+#   $3 write_rc        exit status of the canary write ("skip" if not attempted)
+#   $4 delete_rc       exit status of the canary delete ("skip" if not attempted)
+#
+# Echoes one of:
+#   OK | KEY_INVALID | BUCKET_UNREACHABLE | KEY_READ_ONLY | KEY_CANNOT_DELETE
+# ---------------------------------------------------------------------------
+classify_b2_state() {
+    local lsd_rc="$1" bucket_visible="$2" write_rc="$3" delete_rc="$4"
+
+    # The key cannot even enumerate buckets: it is invalid, revoked, or lacks
+    # listBuckets. Nothing downstream is meaningful.
+    if [[ "$lsd_rc" != "0" ]]; then
+        echo "KEY_INVALID"
+        return
+    fi
+
+    # The target bucket is not among the buckets this key can see. Either it does not
+    # exist, or the key is scoped elsewhere. B2 cannot tell us which, and neither can
+    # rclone -- both render identically. We report the ambiguity rather than guess.
+    if [[ "$bucket_visible" != "yes" ]]; then
+        echo "BUCKET_UNREACHABLE"
+        return
+    fi
+
+    # Bucket is visible, so it EXISTS and the key is scoped to it. A write failure here
+    # therefore cannot be a missing bucket, whatever rclone's message says. It is a
+    # missing writeFiles capability -- a read-only key.
+    if [[ "$write_rc" != "0" ]]; then
+        echo "KEY_READ_ONLY"
+        return
+    fi
+
+    # backup.sh prunes its own retention window with `rclone purge`. A key that can write
+    # but not delete produces backups forever and never prunes: the failure appears
+    # months later as a bill, not as an error.
+    if [[ "$delete_rc" != "0" ]]; then
+        echo "KEY_CANNOT_DELETE"
+        return
+    fi
+
+    echo "OK"
+}
+
+# Human-facing diagnosis for a verdict. Deliberately names the misleading rclone text so
+# the next operator is not sent chasing it.
+explain_b2_state() {
+    case "$1" in
+        OK)
+            echo "B2 credentials verified: bucket reachable, writable, and prunable."
+            ;;
+        KEY_INVALID)
+            echo "B2 key cannot list buckets. It is invalid, revoked, or lacks the listBuckets capability."
+            ;;
+        BUCKET_UNREACHABLE)
+            echo "Bucket '${B2_BUCKET}' is not visible to this key. EITHER the bucket does not exist, OR the key is scoped to a different bucket."
+            echo "B2 refuses at key-scope before evaluating the bucket, so these two cases are indistinguishable from the error text."
+            echo "rclone renders both as: 'you must use bucket(s) [...] with this application key'."
+            echo "Remediation: confirm the bucket exists (terraform/backblaze), then confirm BACKUP_B2_KEY_ID is the key scoped to it."
+            ;;
+        KEY_READ_ONLY)
+            echo "Bucket '${B2_BUCKET}' EXISTS and this key can list it, but the canary write FAILED."
+            echo "This is a read-only key: it lacks the writeFiles capability. It is NOT a missing bucket."
+            echo "rclone reports a read-only key's 401 as 'failed to create bucket'. That message names the wrong problem; ignore it."
+            echo "Remediation: rotate BACKUP_B2_APP_KEY to the write-capable key (writeFiles + deleteFiles), e.g. b2_application_key.backups_rw."
+            ;;
+        KEY_CANNOT_DELETE)
+            echo "Bucket '${B2_BUCKET}' is writable but the canary DELETE failed: the key lacks deleteFiles."
+            echo "backup.sh's retention prune uses 'rclone purge' and will fail silently-late; backups will accumulate without bound."
+            echo "Remediation: the backups key needs deleteFiles as well as writeFiles."
+            ;;
+        *)
+            echo "Unknown B2 preflight verdict: $1"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Live probe. Performs the three capability probes and prints a verdict.
+# Returns 0 only for OK.
+# ---------------------------------------------------------------------------
+preflight_b2() {
+    local remote="${RCLONE_REMOTE}"
+    local tmp lsd_out lsd_rc bucket_visible write_rc delete_rc verdict canary
+
+    : "${B2_BUCKET:?B2_BUCKET must be set}"
+
+    # Guard the leak vector explicitly rather than trusting the ambient environment.
+    if [[ -n "${RCLONE_DUMP:-}" ]]; then
+        echo "[ERROR] RCLONE_DUMP is set (${RCLONE_DUMP:+<redacted>}). It can print credentials into logs. Refusing to run." >&2
+        return 1
+    fi
+
+    tmp="$(mktemp -d)"
+    # shellcheck disable=SC2064  # expand tmp now, on purpose
+    trap "rm -rf '$tmp'" RETURN
+
+    # 1. Can the key enumerate buckets, and is ours among them?
+    lsd_out="${tmp}/lsd.out"
+    rclone lsd "${remote}:" > "$lsd_out" 2>&1
+    lsd_rc=$?
+
+    bucket_visible="no"
+    if [[ "$lsd_rc" -eq 0 ]] && awk '{print $NF}' "$lsd_out" | grep -qx -- "$B2_BUCKET"; then
+        bucket_visible="yes"
+    fi
+
+    # 2/3. Canary write + delete, but only when the bucket is actually reachable --
+    # probing a bucket we cannot see would return the ambiguous message and tell us
+    # nothing we do not already know.
+    write_rc="skip"
+    delete_rc="skip"
+    if [[ "$bucket_visible" == "yes" ]]; then
+        canary=".backup-preflight/canary-$(date -u +%Y%m%d-%H%M%S)-$$"
+        printf 'noorinalabs backup preflight canary\n' > "${tmp}/canary"
+
+        rclone copyto "${tmp}/canary" "${remote}:${B2_BUCKET}/${canary}" > "${tmp}/write.out" 2>&1
+        write_rc=$?
+
+        if [[ "$write_rc" -eq 0 ]]; then
+            rclone deletefile "${remote}:${B2_BUCKET}/${canary}" > "${tmp}/delete.out" 2>&1
+            delete_rc=$?
+        fi
+    fi
+
+    verdict="$(classify_b2_state "$lsd_rc" "$bucket_visible" "$write_rc" "$delete_rc")"
+
+    echo "[preflight] lsd_rc=${lsd_rc} bucket_visible=${bucket_visible} write_rc=${write_rc} delete_rc=${delete_rc}"
+    echo "[preflight] verdict=${verdict}"
+    explain_b2_state "$verdict"
+
+    [[ "$verdict" == "OK" ]]
+}
+
+# Only run when executed, not when sourced.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    : "${B2_KEY_ID:?B2_KEY_ID must be set}"
+    : "${B2_APP_KEY:?B2_APP_KEY must be set}"
+    : "${B2_BUCKET:?B2_BUCKET must be set}"
+
+    # Report shape, never value.
+    printf '[preflight] B2_KEY_ID len=%s  B2_APP_KEY len=%s  B2_BUCKET=%s\n' \
+        "${#B2_KEY_ID}" "${#B2_APP_KEY}" "$B2_BUCKET"
+
+    export RCLONE_CONFIG_ISNAD_TYPE="b2"
+    export RCLONE_CONFIG_ISNAD_ACCOUNT="${B2_KEY_ID}"
+    export RCLONE_CONFIG_ISNAD_KEY="${B2_APP_KEY}"
+
+    preflight_b2
+fi

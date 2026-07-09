@@ -20,3 +20,4 @@ repo imports only its own `.claude/memory/`).
 - [Promote gate stg-verify refresh](project_promote_gate_stg_verify_refresh.md) — promote.yml v2 honors only workflow_run-triggered verify; refresh via deploy-stg. deploy#423.
 - [Streaming E2E prereqs](project_streaming_e2e_prereqs.md) — Kafka pipeline E2E on stg deferred past P4W6 (#601 met via batch); dispatch-needs-main. deploy#443.
 - [Staging Neo4j/frontend unreachable from sandbox](project_staging_unreachable_from_sandbox.md) — bolt/frontend resolve only in-cluster; ssh stg → cypher-shell or -L tunnel. da#73.
+- [B2 preflight discriminator](reference_b2_preflight_discriminator.md) — rclone's text CANNOT tell missing-bucket from wrongly-scoped-key (identical msg); read-only 401 reads as "failed to create bucket". Classify by capability probe (lsd → canary write → canary delete), never by message. Never set RCLONE_DUMP. deploy#559.

@@ -191,6 +191,31 @@ if ! docker compose -f "$COMPOSE_FILE" ps --format json &>/dev/null; then
     exit 1
 fi
 
+# Verify the B2 credential BEFORE stopping Neo4j and dumping gigabytes. Discovering at
+# upload time that the key cannot write means we took an outage for nothing.
+#
+# The preflight classifies by capability probe rather than by rclone's error text,
+# because rclone's text does not identify the failure: a read-only key's 401 surfaces as
+# "failed to create bucket", and a missing bucket is indistinguishable from a
+# wrongly-scoped key. See scripts/b2_preflight.sh. (deploy#559)
+PREFLIGHT="$(dirname "${BASH_SOURCE[0]}")/b2_preflight.sh"
+if [[ -f "$PREFLIGHT" ]]; then
+    # shellcheck source=scripts/b2_preflight.sh
+    source "$PREFLIGHT"
+    # Capture the rc directly. `preflight_b2 | tee` would yield tee's status, and the
+    # whole point of this check is that its verdict is believed.
+    PREFLIGHT_OUT="$(preflight_b2 2>&1)"
+    PREFLIGHT_RC=$?
+    printf '%s\n' "$PREFLIGHT_OUT" | tee -a "$LOG_FILE"
+    if [[ "$PREFLIGHT_RC" -ne 0 ]]; then
+        log "ERROR" "B2 preflight failed — refusing to dump databases we cannot upload"
+        exit 1
+    fi
+else
+    log "ERROR" "Missing ${PREFLIGHT} — cannot verify B2 credentials before dumping"
+    exit 1
+fi
+
 log "INFO" "=== Backup started (${BACKUP_CATEGORY}) ==="
 log "INFO" "Timestamp: ${TIMESTAMP}"
 log "INFO" "Local staging: ${LOCAL_BACKUP_PATH}"
