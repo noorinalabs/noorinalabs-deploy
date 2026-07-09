@@ -202,10 +202,25 @@ PREFLIGHT="$(dirname "${BASH_SOURCE[0]}")/b2_preflight.sh"
 if [[ -f "$PREFLIGHT" ]]; then
     # shellcheck source=scripts/b2_preflight.sh
     source "$PREFLIGHT"
-    # Capture the rc directly. `preflight_b2 | tee` would yield tee's status, and the
-    # whole point of this check is that its verdict is believed.
-    PREFLIGHT_OUT="$(preflight_b2 2>&1)"
-    PREFLIGHT_RC=$?
+
+    # `PREFLIGHT_OUT="$(preflight_b2 2>&1)"` followed by `PREFLIGHT_RC=$?` looks right and
+    # is dead code on every failing path. This script runs under `set -euo pipefail`, and
+    # an assignment whose command substitution exits non-zero IS a failing simple command:
+    # errexit fires AT THE ASSIGNMENT. Nothing below it runs. The operator saw exactly one
+    # line, from the EXIT trap — "Backup script exited with code 1" — and never the verdict
+    # or its remediation. The guard that exists so nobody chases rclone's lying
+    # "failed to create bucket" was, in the only place it runs, silent.
+    #
+    # Measured (bash 5.2.21): failing preflight under `set -e`
+    #   before: exit 1, stdout has no "verdict=" and no "B2 preflight failed"
+    #   after:  exit 1, stdout carries the full verdict + remediation
+    #
+    # `|| PREFLIGHT_RC=$?` puts the assignment in a condition context, which suspends
+    # errexit for it. The inner `set +e` additionally protects the probes: without it, a
+    # caller with `shopt -s inherit_errexit` would kill preflight_b2 at the first failing
+    # `rclone` call, before it could compute a verdict at all.
+    PREFLIGHT_RC=0
+    PREFLIGHT_OUT="$(set +e; preflight_b2 2>&1)" || PREFLIGHT_RC=$?
     printf '%s\n' "$PREFLIGHT_OUT" | tee -a "$LOG_FILE"
     if [[ "$PREFLIGHT_RC" -ne 0 ]]; then
         log "ERROR" "B2 preflight failed — refusing to dump databases we cannot upload"
