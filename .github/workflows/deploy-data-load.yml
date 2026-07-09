@@ -223,6 +223,23 @@ jobs:
             #     key never lands on argv; rclone reads RCLONE_CONFIG_PIPELINE_*. ---
             : "${PIPELINE_B2_KEY_ID:?PIPELINE_B2_KEY_ID must be set (env-scoped secret)}"
             : "${PIPELINE_B2_KEY:?PIPELINE_B2_KEY must be set (env-scoped secret)}"
+
+            # Credential hygiene: rclone maps EVERY option to an RCLONE_<OPTION> env var, so an
+            # ambient RCLONE_LOG_LEVEL=DEBUG / RCLONE_VERBOSE=2 makes rclone echo
+            #   DEBUG : Setting key="<application key>" ... from environment variable ...
+            # and RCLONE_DUMP=auth makes it echo an `Authorization: Basic <base64(id:key)>` line.
+            # lsf_or_die below cats rclone's stderr into the Actions log of a PUBLIC repo, and GH
+            # masking is an exact-substring scrub that does NOT match the base64 form. Scrub every
+            # inherited RCLONE_* before setting the three we own. Nothing in this repo sets these,
+            # but sshd with `UsePAM yes` passes /etc/environment into a non-interactive session,
+            # so the pollution is operator-reachable without touching this workflow.
+            # ORDER IS LOAD-BEARING: this loop must run BEFORE the exports below, or it would
+            # unset the very credential it is protecting.
+            # shellcheck disable=SC2013  # env var names are [A-Z0-9_]; word-split is safe here.
+            for _v in $(env | sed -n 's/^\(RCLONE_[A-Z0-9_]*\)=.*/\1/p'); do
+              unset "${_v}"
+            done
+
             export RCLONE_CONFIG_PIPELINE_TYPE="b2"
             export RCLONE_CONFIG_PIPELINE_ACCOUNT="${PIPELINE_B2_KEY_ID}"
             export RCLONE_CONFIG_PIPELINE_KEY="${PIPELINE_B2_KEY}"
@@ -256,13 +273,27 @@ jobs:
             # can clobber $?. The exit is taken here, in the caller's shell, and
             # not inside a `$( )` subshell that would only kill the subshell.
             #
-            # rclone lsf writes basenames to stdout; the credential is in env, the
-            # paths are not secrets, so the stderr is safe to surface in the log.
+            # SURFACING rclone's stderr into a PUBLIC repo's Actions log is safe ONLY
+            # under two preconditions this script establishes, and NOT unconditionally:
+            #   1. the RCLONE_* scrub above has removed any inherited verbosity/dump
+            #      option (RCLONE_LOG_LEVEL=DEBUG and RCLONE_VERBOSE=2 both make rclone
+            #      echo the application key verbatim; RCLONE_DUMP=auth makes it echo an
+            #      `Authorization: Basic <base64(id:key)>` header that GH secret-masking
+            #      does NOT scrub, because masking is an exact-substring match on the
+            #      registered bytes and the base64 is a different byte string), AND
+            #   2. the `--log-level NOTICE` below pins the level explicitly, since an
+            #      explicit flag beats a hostile env — this is what the two `rclone copy`
+            #      calls further down already do with `--log-level INFO`.
+            # At NOTICE, rclone's stderr for a 401 or a connection failure carries only
+            # the remote path and the error string; the credential lives in env, and the
+            # paths are not secrets. If you raise this verbosity to chase a B2 failure —
+            # the most natural next edit to a function that exists to diagnose 401s —
+            # you reintroduce the leak. Don't; the rc and the error string are enough.
             LSF_OUT=""
             lsf_or_die() {
               _lsf_dir="$1"
               _lsf_err="$(mktemp)"
-              LSF_OUT="$(rclone lsf "${_lsf_dir}/" 2>"${_lsf_err}")" && _lsf_rc=0 || _lsf_rc=$?
+              LSF_OUT="$(rclone lsf --log-level NOTICE "${_lsf_dir}/" 2>"${_lsf_err}")" && _lsf_rc=0 || _lsf_rc=$?
               if [ "${_lsf_rc}" -ne 0 ]; then
                 echo "ERROR: [${ENV_NAME}] rclone failed to list ${_lsf_dir}/ (rc=${_lsf_rc}). This is a hard rclone failure, NOT evidence about whether parquet_ref '${PARQUET_REF}' is published. rclone stderr follows:" >&2
                 cat "${_lsf_err}" >&2
