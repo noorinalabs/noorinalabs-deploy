@@ -242,6 +242,12 @@ fi
 # keys to /root/.ssh/authorized_keys post-provision and want them reachable from
 # the deploy user too. Idempotent append-with-fingerprint-dedup (#287).
 echo "==> [1/5] Merging /root/.ssh/authorized_keys → deploy (idempotent)..."
+# deploy#551: prod's /home/deploy is root:root (a cloned box, not a cloud-init'd one),
+# so the deploy user cannot write its own $HOME and deploy-data-load.yml fails at its
+# first mkdir. Correct the top-level directory only — a recursive chown here would
+# rewrite .ssh/ ownership and modes, which the lines below set deliberately.
+chown "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER"
+
 DEPLOY_AUTH_KEYS="/home/$DEPLOY_USER/.ssh/authorized_keys"
 mkdir -p "/home/$DEPLOY_USER/.ssh"
 touch "$DEPLOY_AUTH_KEYS"
@@ -408,11 +414,14 @@ if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
   install -d -m 0755 /var/lib/node_exporter/textfile_collector
 
   systemctl daemon-reload
-  systemctl enable isnad-backup.timer
-  echo "    Backup timer installed (daily at 03:00 UTC)."
+  # `--now` starts the timer in this boot as well as arming it for the next one.
+  # `enable` alone left it inactive, and the "start it yourself" instruction that used
+  # to be printed below was never followed on either host (deploy#558).
+  systemctl enable --now isnad-backup.timer
+  echo "    Backup timer installed, enabled and STARTED (daily at 03:00 UTC)."
   echo "    Failure marker unit installed (OnFailure= → /var/lib/node_exporter/textfile_collector/*.prom + journal)."
   echo "    Persistent staging dir provisioned: /var/lib/noorinalabs-backups (mode 0700, root)."
-  echo "    Start with: systemctl start isnad-backup.timer"
+  echo "    Verify with: scripts/assert_host_state.sh"
 else
   echo "    Backup systemd files not found, skipping (did the repo refresh in Step 2 succeed?)."
 fi
@@ -510,5 +519,5 @@ echo "       docker compose -f compose/docker-compose.prod.yml --env-file .env u
 echo ""
 echo "  3. Verify: curl http://localhost:8000/health"
 echo ""
-echo "  4. Start the backup timer: systemctl start isnad-backup.timer"
+echo "  4. Assert host state: sudo scripts/assert_host_state.sh"
 echo ""

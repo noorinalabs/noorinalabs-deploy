@@ -187,6 +187,27 @@ jobs:
       # USER_SERVICE_BASE_URL / ISNAD_BASE_URL above; the script sets
       # USER_SERVICE_URL / ISNAD_GRAPH_URL inside the runner container
       # for conftest.py compatibility.
+      # ── Host provisioning + backup-timer assertions (deploy#558 / deploy#551) ──
+      # isnad-backup.timer was never installed on stg or prod and nothing noticed for
+      # months. The units, the tmpfiles.d entry and the cloud-init runcmd that installs
+      # them were all committed and correct; what was missing was anything that CHECKED.
+      # A timer a human installed by hand does not survive a reprovision, and we would
+      # not learn that until we needed a backup. The install is not the deliverable --
+      # this assertion is.
+      #
+      # The script body is a single invocation of a repo script that IS shellchecked in
+      # CI ("shellcheck + bash -n (infra & scripts)"), because ssh-action `script:`
+      # bodies are themselves unlinted (deploy#555). ssh-action fails the step on a
+      # non-zero remote exit, so a missing/disabled/inactive timer fails verify-stg,
+      # which in turn hard-blocks prod-promote (deploy#179/#199).
+      - name: Assert host state (backup timer, staging dir, deploy home)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          script: sudo -n /opt/noorinalabs-deploy/scripts/assert_host_state.sh
+
       - name: Run integration suite (remote mode)
         working-directory: noorinalabs-deploy/integration-tests
         run: ./run-tests.sh
@@ -445,6 +466,17 @@ jobs:
           set -o pipefail
           chmod +x scripts/verify_prod_smoke.sh
           ./scripts/verify_prod_smoke.sh 2>&1 | tee smoke-output.txt
+
+      # Same assertion on prod. Prod is where a missing backup actually costs us:
+      # user-postgres holds accounts, sessions and the audit_log, none of which the
+      # pipeline artifact can rebuild. See deploy#558 / deploy#551.
+      - name: Assert host state (backup timer, staging dir, deploy home)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          script: sudo -n /opt/noorinalabs-deploy/scripts/assert_host_state.sh
 
       - name: Upload smoke output
         if: always()
