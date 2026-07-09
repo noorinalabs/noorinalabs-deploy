@@ -42,6 +42,20 @@ services:
       timeout: 3s
       retries: 30
 
+  user-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: user_service
+      POSTGRES_DB: user_service
+      POSTGRES_PASSWORD: rehearsal_scratch_only
+    volumes:
+      - rehearsal_user_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user_service -d user_service"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   neo4j:
     image: neo4j:5-community
     environment:
@@ -65,4 +79,5 @@ services:
 
 volumes:
   rehearsal_pg_data:
+  rehearsal_user_pg_data:
   rehearsal_neo4j_data:

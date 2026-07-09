@@ -57,3 +57,53 @@ resource "b2_application_key" "pipeline_ro" {
     "readFiles",
   ]
 }
+
+# ---------------------------------------------------------------------------
+# Backups bucket (deploy#559)
+# ---------------------------------------------------------------------------
+# scripts/backup.sh and scripts/restore.sh have referenced a backups bucket since they
+# were written, and no such bucket has ever existed in IaC or in the B2 account. The
+# backup timer has never run (deploy#558), so the absence was never surfaced by a
+# failing upload.
+#
+# Retention here is intentionally NOT the pipeline bucket's version-lifecycle. backup.sh
+# manages its own retention by pruning date-stamped directories (7 daily, 4 weekly), so a
+# bucket-side `days_from_uploading_to_hiding` would race that logic and could hide the
+# only surviving copy. What we do enforce is the abandonment of stuck multipart uploads,
+# which otherwise accumulate cost silently, and the prompt deletion of versions once
+# backup.sh has hidden them by deleting the object.
+resource "b2_bucket" "backups" {
+  bucket_name = var.backups_bucket_name
+  bucket_type = "allPrivate"
+
+  # Once backup.sh's retention prune deletes an object, B2 keeps the hidden version
+  # around. Purge it after a short grace window rather than paying for it forever.
+  lifecycle_rules {
+    file_name_prefix             = ""
+    days_from_hiding_to_deleting = var.backups_days_from_hiding_to_deleting
+  }
+
+  lifecycle_rules {
+    file_name_prefix                                       = ""
+    days_from_starting_to_canceling_unfinished_large_files = var.lifecycle_days_unfinished_uploads
+  }
+}
+
+# Write-capable key scoped to the backups bucket. This is the credential the VPS backup
+# timer uses, delivered as the BACKUP_B2_* GitHub Environment secrets.
+#
+# `deleteFiles` is required: backup.sh prunes its own retention window with `rclone
+# purge`. A read-only key here would 401 on the first upload, and rclone reports that
+# 401 as "failed to create bucket" — a misleading error that has cost this project time
+# before. If you rotate this key, rotate it to a key with these capabilities.
+resource "b2_application_key" "backups_rw" {
+  key_name  = "noorinalabs-backups-rw"
+  bucket_id = b2_bucket.backups.bucket_id
+  capabilities = [
+    "listBuckets",
+    "listFiles",
+    "readFiles",
+    "writeFiles",
+    "deleteFiles",
+  ]
+}
