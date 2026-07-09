@@ -21,7 +21,7 @@ Fourteen named volumes. Three are dumped by `scripts/backup.sh`.
 | `user_pg_data` | `user-postgres` | accounts, roles, `user_roles`, sessions, `oauth_accounts`, `subscriptions`, `totp_secrets`, `verification_tokens`, `audit_log`, `alembic_version` | **yes** (`isnad-userpg-*.dump`) | **Not reconstructible from anything.** The pipeline artifact rebuilds the graph, not the users. Prod holds 9 accounts and 22 `audit_log` rows. Had **no** coverage before deploy#559. |
 | `neo4j_data` | `neo4j` | the isnad graph | yes (`isnad-neo4j-*.dump.zst`) | Can be rebuilt from the published Parquet artifact via `graph-load`, but a rebuild takes hours and the artifact must exist. |
 | `pg_data` | `postgres` | isnad relational metadata + pgvector embeddings | yes (`isnad-pg-*.dump`) | Can be rebuilt from the artifact plus a corpus re-embed, which is expensive. |
-| `grafana_data` | `grafana` | dashboards, alert rules, Grafana users/orgs | **no** — see below | Hand-built and **not** version-controlled. This is the weakest "no" in the table. Tracked separately. |
+| `grafana_data` | `grafana` | Grafana's `grafana.db` — dashboards, users/orgs, API keys, annotations | no | Dashboards **are** code (`infra/grafana/dashboards/*.json`, mounted `:ro`) and alerting lives in Prometheus, not Grafana. Measured on both hosts: 4 dashboards, all 4 provisioned from git, **0 UI-created**, 0 API keys, 0 annotations, 0 Grafana alert rules. Nothing here is unreproducible — but nothing *enforces* that. See deploy#566. |
 | `caddy_data` | `caddy` | ACME account key, issued TLS certificates | no | Re-obtainable from Let's Encrypt. Note the rate limits (50 certs/week/domain, 5 duplicate certs/week) — a rebuild loop during an incident can lock you out of TLS for days. |
 | `caddy_config` | `caddy` | Caddy's autosaved JSON config | no | Regenerated from `caddy/Caddyfile`, which is version-controlled. |
 | `prometheus_data` | `prometheus` | metrics TSDB, 30-day retention | no | Observability history. Losing it costs history, not service. |
@@ -99,9 +99,17 @@ dump, not what exists in a bucket. There is nothing to restore from today.
 
 ## Deliberate gaps worth revisiting
 
-* **`grafana_data`.** Dashboards and alert rules are hand-built and live nowhere else. The
-  right fix is provisioning-as-code (`infra/grafana/provisioning/`) rather than a volume
-  tarball, so this is filed as its own issue rather than bolted onto `backup.sh`.
+* **`grafana_data`.** Disposable as a matter of current *fact*, not of *enforcement*.
+  Provisioning-as-code already exists and every dashboard on both hosts traces back to
+  git. But the mount is `:ro`, so a UI edit lands as a **new** row in `grafana.db` and
+  silently diverges — falsifying this table's row, discovered only when the volume is
+  gone. The fix is a drift guard asserting `ui_created_not_in_git == 0`, **not** a volume
+  tarball. deploy#566.
+
+  > An earlier draft of this document asserted these dashboards were "hand-built and not
+  > version-controlled." That was false, and it pointed at the wrong remedy. The
+  > correction came from querying `grafana.db` on both hosts instead of trusting the
+  > sentence.
 * **`caddy_data`.** Low probability, but the Let's Encrypt rate limits make the recovery
   path slower than operators expect.
 * **B2 `noorinalabs-pipeline`.** Single copy of the artifact the whole graph is rebuilt
