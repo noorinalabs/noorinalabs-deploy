@@ -37,6 +37,40 @@ Fourteen named volumes. Three are dumped by `scripts/backup.sh`.
 workflow or script references that file. It is a local-development convenience and is
 out of scope.
 
+### Orphaned volume twins — back up the wrong one and you get an empty archive
+
+Both hosts carry **two** similarly-named volumes for the user-service stores. Only one of
+each pair is mounted by a running container:
+
+| Live (compose project `noorinalabs`) | Orphan — mounted by nothing |
+|---|---|
+| `noorinalabs_user_pg_data` | `user-postgres-data` |
+| `noorinalabs_user_redis_data` | `user-redis-data` |
+
+Verified 2026-07-09 on stg and prod: `docker ps -a --filter volume=user-postgres-data`
+returns no containers, while `docker inspect noorinalabs-user-postgres-1` shows
+`noorinalabs_user_pg_data:/var/lib/postgresql/data`. prod additionally carries a stale
+`noorinalabs_kafka-data` (hyphen) alongside the live `noorinalabs_kafka_data`
+(underscore).
+
+The orphans are leftovers from an earlier compose project name. They are **not** deleted
+here — that is a destructive operation and needs its own decision — but they are a live
+trap: a backup aimed at `user-postgres-data` would succeed, upload, checksum cleanly, and
+contain nothing. A green pipeline and an empty archive.
+
+**Never resolve a data volume by name.** Resolve it from the running container of the
+compose project you mean:
+
+```bash
+docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' \
+  "$(docker compose -f "$COMPOSE_FILE" ps -aq user-postgres)"
+```
+
+`backup.sh` and `restore.sh` both resolve the Neo4j volume this way as of deploy#559/#560.
+The previous `docker volume ls | grep -E '(neo4j_data|neo4j-data)$' | head -1` matched
+across *every* compose project on the host — combined with `--overwrite-destination`, a
+restore aimed at a scratch stack could have overwritten the production graph.
+
 ## Off-host stores
 
 | Store | Managed by | Contents | Backed up | Rationale |
