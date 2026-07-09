@@ -88,7 +88,9 @@ def test_restore_postgres_does_not_downgrade_failure_to_warning() -> None:
         "restore_postgres() reintroduced the swallow that let a failed pg_restore "
         "report success (deploy#560)"
     )
-    assert re.search(r'log "ERROR" "pg_restore FAILED', body), (
+    # The message is label-prefixed since deploy#559 ("PostgreSQL (user-service): ...").
+    # Match the invariant part, not the exact prefix.
+    assert re.search(r'log "ERROR" ".*pg_restore FAILED', body), (
         "restore_postgres() must log an ERROR when pg_restore exits non-zero"
     )
     assert "return 1" in body, "restore_postgres() must return non-zero when pg_restore fails"
@@ -268,4 +270,91 @@ def test_rehearsal_compose_publishes_no_ports_and_uses_scratch_volumes() -> None
     assert "rehearsal_pg_data" in text and "rehearsal_neo4j_data" in text
     assert "noorinalabs_" not in text, (
         "the rehearsal stack must not reference production volume names"
+    )
+
+
+# --------------------------------------------------------------------------
+# Backup coverage (deploy#559)
+# --------------------------------------------------------------------------
+
+BACKUP = SCRIPTS_DIR / "backup.sh"
+
+
+def _backup_code() -> str:
+    return _code_only(BACKUP.read_text())
+
+
+def test_backup_dumps_user_postgres() -> None:
+    """user-postgres holds the only state no artifact can rebuild.
+
+    Accounts, sessions, RBAC and the ``audit_log`` relocated out of Neo4j. Before
+    deploy#559 ``backup.sh`` dumped only neo4j and the isnad postgres.
+    """
+    code = _backup_code()
+    assert "dump_postgres user-postgres" in code, (
+        "backup.sh must dump the user-postgres service (accounts, sessions, audit_log)"
+    )
+    assert "isnad-userpg-" in code, "the user-service dump needs its own artifact name"
+
+
+def test_backup_userpg_artifact_name_cannot_be_matched_by_the_isnad_glob() -> None:
+    """``isnad-pg-*.dump`` must not also select ``isnad-userpg-*.dump``.
+
+    restore.sh finds each dump by glob. If the user-service dump were named such that the
+    isnad glob matched it, a restore would load the user database into the isnad database
+    silently.
+    """
+    import fnmatch
+
+    assert not fnmatch.fnmatch("isnad-userpg-20260709-120000.dump", "isnad-pg-*.dump")
+    assert fnmatch.fnmatch("isnad-pg-20260709-120000.dump", "isnad-pg-*.dump")
+    assert fnmatch.fnmatch("isnad-userpg-20260709-120000.dump", "isnad-userpg-*.dump")
+
+
+def test_backup_fails_when_user_postgres_dump_fails() -> None:
+    """A partial backup missing the irreplaceable store must not exit 0."""
+    code = _backup_code()
+    assert '"$USER_PG_OK" == "false"' in code, (
+        "backup.sh must account for the user-postgres dump in its exit status"
+    )
+
+
+def test_backup_neo4j_bypasses_the_privilege_dropping_entrypoint() -> None:
+    """BACKUP_DIR is 0700 root:root; the entrypoint's neo4j(7474) cannot write there."""
+    code = _backup_code()
+    assert "--entrypoint neo4j-admin" in code and "--user 0:0" in code, (
+        "backup.sh's neo4j dump must bypass the entrypoint, which drops privileges to "
+        "neo4j(7474) and then fails with AccessDeniedException on /backups"
+    )
+
+
+def test_backup_resolves_neo4j_volume_through_the_compose_project() -> None:
+    code = _backup_code()
+    assert not re.search(r"docker volume ls.*grep", code), (
+        "backup.sh must not select the neo4j data volume by grepping host-global "
+        "`docker volume ls` output"
+    )
+
+
+def test_datastore_inventory_exists_and_covers_every_compose_volume() -> None:
+    """Every named volume in the prod compose file must appear in docs/DATASTORES.md.
+
+    A stateful service added without a row here is exactly the omission deploy#559 exists
+    to prevent: an undocumented gap and a deliberate exclusion are indistinguishable
+    during an incident.
+    """
+    import yaml
+
+    doc = REPO_ROOT / "docs" / "DATASTORES.md"
+    assert doc.exists(), "docs/DATASTORES.md must exist"
+    text = doc.read_text()
+
+    compose = yaml.safe_load((REPO_ROOT / "compose" / "docker-compose.prod.yml").read_text())
+    volumes = list((compose.get("volumes") or {}).keys())
+    assert volumes, "expected named volumes in the prod compose file"
+
+    missing = [v for v in volumes if v not in text]
+    assert not missing, (
+        f"docs/DATASTORES.md does not account for these compose volumes: {missing}. "
+        "Add a row stating whether it is backed up and why."
     )

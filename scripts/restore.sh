@@ -43,6 +43,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 POSTGRES_USER="${POSTGRES_USER:-isnad}"
 POSTGRES_DB="${POSTGRES_DB:-isnad_graph}"
+# Defaults match the live stg/prod values. See backup.sh for the same pair.
+USER_POSTGRES_USER="${USER_POSTGRES_USER:-user_service}"
+USER_POSTGRES_DB="${USER_POSTGRES_DB:-user_service}"
 COMPOSE_FILE="${COMPOSE_FILE:-compose/docker-compose.prod.yml}"
 RESTORE_DIR="${RESTORE_DIR:-/tmp/isnad-restore}"
 RESTORE_LOCAL_DIR="${RESTORE_LOCAL_DIR:-}"
@@ -202,19 +205,21 @@ verify_checksums() {
 }
 
 terminate_pg_connections() {
-    log "INFO" "Terminating active PostgreSQL connections to ${POSTGRES_DB}..."
-    docker compose -f "$COMPOSE_FILE" exec -T postgres \
-        psql -U "$POSTGRES_USER" -d postgres -c \
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${POSTGRES_DB}' AND pid <> pg_backend_pid();" \
+    local service="$1" pg_user="$2" pg_db="$3"
+    log "INFO" "Terminating active PostgreSQL connections to ${pg_db} (service=${service})..."
+    docker compose -f "$COMPOSE_FILE" exec -T "$service" \
+        psql -U "$pg_user" -d postgres -c \
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${pg_db}' AND pid <> pg_backend_pid();" \
         2>/dev/null || true
 }
 
+# restore_postgres <dump-file> <compose-service> <user> <db> <label>
 restore_postgres() {
-    local dump_file="$1"
+    local dump_file="$1" service="$2" pg_user="$3" pg_db="$4" label="$5"
     local rc out
-    log "INFO" "Restoring PostgreSQL from $(basename "$dump_file")..."
+    log "INFO" "Restoring ${label} from $(basename "$dump_file")..."
 
-    terminate_pg_connections
+    terminate_pg_connections "$service" "$pg_user" "$pg_db"
 
     out="$(mktemp)"
 
@@ -232,8 +237,8 @@ restore_postgres() {
     # was unreadable. Verified: restoring a truncated dump printed
     # "could not read from input file: end of file", restored zero rows, and the
     # script reported "PostgreSQL: restored / === Restore complete ===" with exit 0.
-    if docker compose -f "$COMPOSE_FILE" exec -T postgres \
-        pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists \
+    if docker compose -f "$COMPOSE_FILE" exec -T "$service" \
+        pg_restore -U "$pg_user" -d "$pg_db" --clean --if-exists \
         < "$dump_file" > "$out" 2>&1; then
         rc=0
     else
@@ -244,7 +249,7 @@ restore_postgres() {
     sed 's/^/    /' "$out"
 
     if [[ $rc -ne 0 ]]; then
-        log "ERROR" "pg_restore FAILED (exit ${rc}) — the database may be partially restored"
+        log "ERROR" "${label}: pg_restore FAILED (exit ${rc}) — the database may be partially restored"
         rm -f "$out"
         return 1
     fi
@@ -254,13 +259,13 @@ restore_postgres() {
     if grep -qE 'errors ignored on restore: [0-9]+' "$out"; then
         local ignored
         ignored=$(grep -oE 'errors ignored on restore: [0-9]+' "$out" | grep -oE '[0-9]+$' | tail -1)
-        log "ERROR" "pg_restore ignored ${ignored} error(s) — treating as a failed restore"
+        log "ERROR" "${label}: pg_restore ignored ${ignored} error(s) — treating as a failed restore"
         rm -f "$out"
         return 1
     fi
 
     rm -f "$out"
-    log "INFO" "PostgreSQL restore complete"
+    log "INFO" "${label} restore complete"
     return 0
 }
 
@@ -479,24 +484,30 @@ verify_checksums "$RESTORE_DIR"
 # Restore databases
 # ---------------------------------------------------------------------------
 
-# Find dump files
+# Find dump files.
+#
+# `isnad-pg-*` must not also match `isnad-userpg-*`, and it does not: the prefixes
+# diverge at the character after "isnad-". Keep it that way if the names ever change —
+# restoring the user-service dump into the isnad database would be silent and severe.
 PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-pg-*.dump' -type f | head -1)
+USER_PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-userpg-*.dump' -type f | head -1)
 NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name 'isnad-neo4j-*.dump.zst' -o -name 'isnad-neo4j-*.dump' \) -type f | head -1)
 
-# A backup containing neither dump is not a backup. Previously both `find`s coming
-# back empty produced two WARNINGs, "=== Restore complete ===", and exit 0 — an
-# empty directory restored "successfully" (deploy#560).
-if [[ -z "$PG_DUMP" && -z "$NEO4J_DUMP" ]]; then
+# A backup containing no dumps at all is not a backup. Previously the `find`s coming
+# back empty produced warnings, "=== Restore complete ===", and exit 0 — an empty
+# directory restored "successfully" (deploy#560).
+if [[ -z "$PG_DUMP" && -z "$USER_PG_DUMP" && -z "$NEO4J_DUMP" ]]; then
     log "ERROR" "Backup contains no PostgreSQL dump and no Neo4j dump — nothing to restore"
     exit 1
 fi
 
 PG_RESULT="skipped (no dump)"
+USER_PG_RESULT="skipped (no dump)"
 NEO4J_RESULT="skipped (no dump)"
 FAILED=0
 
 if [[ -n "$PG_DUMP" ]]; then
-    if restore_postgres "$PG_DUMP"; then
+    if restore_postgres "$PG_DUMP" postgres "$POSTGRES_USER" "$POSTGRES_DB" "PostgreSQL (isnad)"; then
         PG_RESULT="restored"
     else
         PG_RESULT="FAILED"
@@ -504,6 +515,18 @@ if [[ -n "$PG_DUMP" ]]; then
     fi
 else
     log "WARNING" "No PostgreSQL dump found in backup"
+fi
+
+if [[ -n "$USER_PG_DUMP" ]]; then
+    if restore_postgres "$USER_PG_DUMP" user-postgres "$USER_POSTGRES_USER" "$USER_POSTGRES_DB" "PostgreSQL (user-service)"; then
+        USER_PG_RESULT="restored"
+    else
+        USER_PG_RESULT="FAILED"
+        FAILED=1
+    fi
+else
+    # Loud, because this is the store that cannot be rebuilt from the pipeline artifact.
+    log "WARNING" "No user-service PostgreSQL dump found in backup — accounts, sessions and audit_log will NOT be restored"
 fi
 
 if [[ -n "$NEO4J_DUMP" ]]; then
@@ -526,8 +549,9 @@ else
     log "INFO" "=== Restore complete ==="
 fi
 log "INFO" "Source: $(if [[ -n "$RESTORE_LOCAL_DIR" ]]; then echo "$RESTORE_LOCAL_DIR (local)"; else echo "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PATH}/"; fi)"
-log "INFO" "PostgreSQL: ${PG_RESULT}"
-log "INFO" "Neo4j:      ${NEO4J_RESULT}"
+log "INFO" "PostgreSQL (isnad):        ${PG_RESULT}"
+log "INFO" "PostgreSQL (user-service): ${USER_PG_RESULT}"
+log "INFO" "Neo4j:                     ${NEO4J_RESULT}"
 
 # The exit status is the whole point: a restore that did not restore must not be
 # reported as success. Callers (restore_rehearsal.sh, operators, CI) gate on this.

@@ -49,3 +49,15 @@ variable "cors_allowed_origins" {
   type        = list(string)
   default     = []
 }
+
+variable "backups_bucket_name" {
+  description = "Name of the database-backups bucket written by scripts/backup.sh"
+  type        = string
+  default     = "noorinalabs-backups"
+}
+
+variable "backups_days_from_hiding_to_deleting" {
+  description = "Days after backup.sh deletes (hides) a backup object before B2 purges the hidden version"
+  type        = number
+  default     = 7
+}
