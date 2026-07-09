@@ -456,11 +456,21 @@ services:
   #
   # DATA MOUNT — `${GRAPH_LOAD_DATA_DIR}` (a host dir the workflow rclone-pulls
   # the Parquet into) is bind-mounted READ-ONLY at `/app/data`, the path the
-  # loader CLI reads DATA_CURATED_DIR / DATA_STAGING_DIR under. Read-only: the
-  # loader's outputs go to Neo4j over the network, never back to the Parquet
-  # dir, so the mount is inputs-only. The `:-...` default lets `docker compose
-  # config` validate this service without the var set (the workflow always
-  # exports it for a real run).
+  # loader CLI reads DATA_CURATED_DIR / DATA_STAGING_DIR under. The graph the
+  # loader produces goes to Neo4j over the network — but the loader ALSO writes
+  # two change-detection files back into this dir: `.manifest.json` and
+  # `.last_loaded_manifest.json` (`_cmd_load` in the image's `src/cli.py` calls
+  # `save_manifest` unconditionally). That is the design error, not the mount:
+  # a loader must not write state into its inputs. `:ro` STAYS, and the loader
+  # is being fixed to tolerate it (da#348) — same call as da#335, where
+  # `write_audit_entry` was made best-effort against a read-only fs. Until that
+  # lands, `load` against this service dies on `OSError: [Errno 30]` before any
+  # Neo4j mutation (`_check_neo4j` and `save_manifest` both precede `load_all`),
+  # so the graph is never left partially written. `graph-ops` shares the image
+  # but exercises `enrich`, which never touches the manifest — which is why the
+  # mount survived review. The `:-...` default lets `docker compose config`
+  # validate this service without the var set (the workflow always exports it
+  # for a real run).
   #
   # CREDENTIALS — reuses the SAME NEO4J_* env the api/graph-ops services read,
   # interpolated by compose from the VPS .env, so no password ever lands on
@@ -475,15 +485,19 @@ services:
     # image; on STG a prod tag is benign per the deploy-data-load.yml env guard.
     image: ${GRAPH_LOAD_IMAGE:-ghcr.io/noorinalabs/noorinalabs-data-acquisition-load:prod-latest}
     profiles: ["graph-load"]
-    # read_only rootfs like graph-ops; the loader writes only to Neo4j + /tmp.
-    # PyArrow may spill to /tmp on large Parquet reads, so give it more room
-    # than graph-ops' Cypher-only 64M.
+    # read_only rootfs like graph-ops. The loader's writes go to Neo4j, to /tmp,
+    # and — incorrectly, see the DATA MOUNT note above — to `.manifest.json` in
+    # /app/data, which this `:ro` mount deliberately refuses. PyArrow may spill
+    # to /tmp on large Parquet reads, so give it more room than graph-ops'
+    # Cypher-only 64M.
     read_only: true
     tmpfs:
       - /tmp:size=512M
     volumes:
-      # Resolved+staging Parquet, rclone-pulled by the workflow. READ-ONLY —
-      # inputs only. Host path is the workflow-exported GRAPH_LOAD_DATA_DIR.
+      # Resolved+staging Parquet, rclone-pulled by the workflow. READ-ONLY by
+      # intent — the loader's manifest write-back here is a loader bug (da#348),
+      # not a reason to loosen the mount. Host path is GRAPH_LOAD_DATA_DIR,
+      # exported by the workflow.
       - ${GRAPH_LOAD_DATA_DIR:-/opt/noorinalabs-deploy/.graph-load-data/data}:/app/data:ro
     environment:
       # Same DB env the api/graph-ops services read (NEO4J_* only — the loader
