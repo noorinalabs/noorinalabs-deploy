@@ -1,0 +1,68 @@
+# =============================================================================
+# Restore-rehearsal stack — THROWAWAY, EPHEMERAL, NEVER A DEPLOY TARGET.
+#
+# Purpose (deploy#560): give scripts/restore.sh a real stack to restore INTO so
+# the restore path can be exercised end-to-end without ever pointing restore.sh
+# at a live datastore on stg or prod.
+#
+# Safety properties, each load-bearing:
+#
+#   * Distinct volume names (`rehearsal_*`). They cannot collide with the
+#     production `noorinalabs_*` volumes even if this file is run on a VPS.
+#     restore.sh resolves the neo4j data volume through THIS compose project
+#     (deploy#560), so a rehearsal cannot reach the production graph volume.
+#
+#   * No `ports:` mappings. Nothing is published to the host. The rehearsal
+#     talks to these containers exclusively via `docker compose exec`.
+#
+#   * No bind mounts of any host path that a real service reads or writes.
+#
+#   * Passwords here are scratch literals, deliberately inline. They guard
+#     nothing — the containers are unreachable from outside the compose network
+#     and are destroyed at the end of every run. Do NOT copy this pattern into
+#     compose/docker-compose.prod.yml, which reads its secrets from .env.
+#
+# The rehearsal driver (scripts/restore_rehearsal.sh) refuses to run against any
+# compose file but this one, and `docker compose down -v` tears the volumes down
+# on exit. See .github/workflows/restore-rehearsal.yml for the CI wiring.
+# =============================================================================
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: isnad
+      POSTGRES_DB: isnad_graph
+      POSTGRES_PASSWORD: rehearsal_scratch_only
+    volumes:
+      - rehearsal_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U isnad -d isnad_graph"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/rehearsal_scratch_only
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - rehearsal_neo4j_data:/data
+    healthcheck:
+      # cypher-shell reads NEO4J_USERNAME/NEO4J_PASSWORD from the environment.
+      # Credentials never appear on argv (CWE-214), matching the production
+      # convention even though this password protects nothing.
+      test:
+        [
+          "CMD-SHELL",
+          "NEO4J_USERNAME=neo4j NEO4J_PASSWORD=rehearsal_scratch_only cypher-shell 'RETURN 1' || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  rehearsal_pg_data:
+  rehearsal_neo4j_data:

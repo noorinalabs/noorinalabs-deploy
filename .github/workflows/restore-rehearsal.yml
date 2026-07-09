@@ -1,0 +1,100 @@
+# Restore rehearsal (deploy#560)
+#
+# Runs scripts/restore_rehearsal.sh, which drives the REAL scripts/restore.sh against an
+# ephemeral compose stack and requires it to REJECT four deliberately broken backup
+# artifacts before it is allowed to trust the intact one. See that script's header for
+# the failure modes and why the negatives run first.
+#
+# This job deliberately has:
+#   * no `environment:` — it must never resolve staging/production secrets
+#   * no B2 credentials — the rehearsal restores from a locally-built artifact via
+#     restore.sh's RESTORE_LOCAL_DIR path, so it neither needs nor can reach the bucket
+#   * no SSH access — it never touches a VPS
+#
+# It therefore cannot restore over a live datastore. That property is structural, not a
+# matter of care: there is no live datastore reachable from this runner.
+#
+# `zstd` is preinstalled on ubuntu-latest; the rehearsal hard-fails at its preflight if
+# it is ever absent rather than silently skipping the Neo4j leg.
+
+name: Restore Rehearsal
+
+on:
+  pull_request:
+    paths:
+      - "scripts/restore.sh"
+      - "scripts/backup.sh"
+      - "scripts/restore_rehearsal.sh"
+      - "scripts/tests/test_restore_failure_modes.py"
+      - "compose/docker-compose.rehearsal.yml"
+      - ".github/workflows/restore-rehearsal.yml"
+  schedule:
+    # Weekly, Mondays 04:17 UTC. A restore path rots silently: the images it depends on
+    # (neo4j:5-community, pgvector/pgvector:pg16) move underneath us, and a rehearsal
+    # that only runs when restore.sh changes would not notice. Offset off the hour to
+    # avoid the scheduler's peak.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    name: Rehearse restore against a throwaway stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assert prerequisites are really present
+        run: |
+          set -euo pipefail
+          # A missing tool must fail loudly here rather than let the rehearsal skip a leg.
+          for cmd in docker zstd sha256sum; do
+            command -v "$cmd" >/dev/null || { echo "::error::missing required command: $cmd"; exit 1; }
+          done
+          docker compose version
+          zstd --version
+
+      - name: Run restore rehearsal
+        env:
+          REHEARSAL_WORK: ${{ runner.temp }}/rehearsal
+        run: |
+          set -euo pipefail
+          chmod +x scripts/restore_rehearsal.sh
+          ./scripts/restore_rehearsal.sh 2>&1 | tee "${RUNNER_TEMP}/rehearsal-output.txt"
+
+      - name: Upload rehearsal logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: restore-rehearsal-logs
+          path: |
+            ${{ runner.temp }}/rehearsal-output.txt
+            ${{ runner.temp }}/rehearsal/*.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Restore rehearsal — ${{ job.status }}"
+            echo ""
+            echo "Drove \`scripts/restore.sh\` against an ephemeral compose stack."
+            echo ""
+            echo "Four broken artifacts must each produce a non-zero exit **before** the intact"
+            echo "artifact is trusted, and the intact restore is verified by asserting on restored"
+            echo "content (row counts, sampled records, Neo4j node count) rather than exit status."
+            echo ""
+            if [ -f "${RUNNER_TEMP}/rehearsal-output.txt" ]; then
+              echo "### Verdicts"
+              echo ""
+              echo '```'
+              grep -E '\[PASS\]|\[FAIL\]' "${RUNNER_TEMP}/rehearsal-output.txt" || echo "(no verdicts recorded — the rehearsal did not reach its assertions)"
+              echo '```'
+            else
+              echo "_No rehearsal output captured._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
