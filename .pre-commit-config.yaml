@@ -185,6 +185,39 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      # promtool: validate AND unit-test the Prometheus alert rules. Mirrors the
+      # `promtool check (rules + config)` job in compose-validate.yml, whose
+      # `promtool` kind the sync-drift gate now classifies (deploy#565) — so this
+      # mirror is mandatory, not optional. Until #565 the kind was unclassified,
+      # the gate said nothing, and its silence was read as parity.
+      #
+      # `check rules` alone is NOT sufficient and is why the BackupFailure alert
+      # sat un-fireable for months: it proves the YAML parses, not that any rule
+      # can go red. `test rules` runs the alerts against synthetic series and
+      # asserts both firing and quiet states.
+      #
+      # Pinned to the same prom/prometheus:v3.4.0 image CI uses and compose
+      # deploys, so a local pass means a CI pass. Hard-fails (rather than
+      # skipping) when docker is unavailable: a check that silently no-ops is the
+      # exact failure class these hooks exist to catch.
+      - id: promtool-check-rules
+        name: promtool-check-rules (pre-push)
+        entry: |-
+          bash -c 'command -v docker >/dev/null || { echo "promtool-check-rules: docker not found on PATH; this hook mirrors a required CI gate and will not silently skip"; exit 1; }; docker run --rm --entrypoint promtool -v "$PWD/infra/prometheus:/etc/prometheus:ro" -w /etc/prometheus prom/prometheus:v3.4.0 check rules alerts.yml'
+        language: system
+        pass_filenames: false
+        files: ^infra/prometheus/
+        stages: [pre-push]
+
+      - id: promtool-test-rules
+        name: promtool-test-rules (pre-push)
+        entry: |-
+          bash -c 'command -v docker >/dev/null || { echo "promtool-test-rules: docker not found on PATH; this hook mirrors a required CI gate and will not silently skip"; exit 1; }; docker run --rm --entrypoint promtool -v "$PWD/infra/prometheus:/etc/prometheus:ro" -w /etc/prometheus prom/prometheus:v3.4.0 test rules alerts_test.yml'
+        language: system
+        pass_filenames: false
+        files: ^infra/prometheus/
+        stages: [pre-push]
+
       # Env file completeness check (carried over from the prior config).
       # NOTE: entry is a YAML literal block scalar (`|-`) because the inline
       # `echo "WARNING: ..."` contains a colon-space that a plain scalar would

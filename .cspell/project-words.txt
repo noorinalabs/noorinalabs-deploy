@@ -54,6 +54,7 @@ inlines
 isnad
 itqan
 Jelani
+journalctl
 Kavtaradze
 keypair
 keypairs

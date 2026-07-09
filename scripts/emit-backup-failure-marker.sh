@@ -5,8 +5,11 @@
 # Emits two failure signals:
 #   1. A journal line under SyslogIdentifier=BACKUP_FAILURE that Loki/Alloy
 #      can match for alerting.
-#   2. A node-exporter textfile-collector .prom file under /var/lib/node_exporter
-#      so Prometheus picks up the failure timestamp on its next scrape.
+#   2. A node-exporter textfile-collector .prom file under
+#      /var/lib/node_exporter/textfile_collector so Prometheus picks up the
+#      failure timestamp on its next scrape. (Before deploy#565 this wrote to
+#      the PARENT directory, which node-exporter does not read — the metric was
+#      emitted faithfully and scraped never.)
 #
 # Invoked by isnad-backup-failure-marker.service when isnad-backup.service
 # exits non-zero. The lifted-out helper script is here (rather than inline in
@@ -26,7 +29,12 @@ set -euo pipefail
 FAILED_UNIT="${MONITOR_UNIT:-unknown}"
 NOW_ISO="$(date -u --iso-8601=seconds)"
 NOW_EPOCH="$(date -u +%s)"
-TEXTFILE_DIR="/var/lib/node_exporter"
+# node-exporter is started with
+# `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector` and
+# bind-mounts ONLY that subdirectory (compose/docker-compose.prod.yml). Writing
+# to the parent — as this script did until deploy#565 — produced a .prom file
+# that no collector ever read, so the failure metric never reached Prometheus.
+TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
 TEXTFILE="${TEXTFILE_DIR}/isnad_backup_failure.prom"
 
 # Journal marker — distinct identifier for Loki alert rules.

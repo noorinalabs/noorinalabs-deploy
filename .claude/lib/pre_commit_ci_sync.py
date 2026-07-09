@@ -115,6 +115,16 @@ _KIND_PATTERNS: dict[str, tuple[str, ...]] = {
     # CI job name (`structural-ontology`), and the script both sides invoke
     # (`structural_ontology`).
     "structural-ontology": ("structural_ontology", "structural-ontology"),
+    # `promtool` closes the alert-rule blind spot (deploy#565), by the same
+    # argument that motivated `cspell` (noorinalabs-main#684): compose-validate.yml
+    # has run `promtool check rules` since deploy#212 with NO pre-commit mirror,
+    # and because the kind was unclassified the drift gate reported zero signal —
+    # its silence was mistaken for parity. deploy#565 adds `promtool test rules`
+    # (alert-rule UNIT tests) to the same CI job; classifying the kind makes the
+    # gate DEMAND the local mirror, so the alert-rule tests cannot drift back out
+    # of local runs. Patterns cover the CI job/step names and the pre-commit hook
+    # ids (`promtool-check-rules`, `promtool-test-rules`).
+    "promtool": ("promtool",),
 }
 
 # `ruff-lint` is a substring of nothing problematic, but `ruff format` also
