@@ -250,6 +250,25 @@ jobs:
           smtp_password: ${{ secrets.SMTP_PASSWORD }}
           healthchecks_url: ${{ secrets.HEALTHCHECKS_PING_URL }}
 
+      # ── Converge host provisioning (deploy#558 / deploy#551) ──────────────
+      # cloud-init runs once, on first boot. Both hosts were provisioned before the
+      # runcmd that installs the backup units landed (deploy#329), so fixing the
+      # template fixes zero existing hosts -- which is exactly why isnad-backup.timer
+      # has never existed on stg or prod. This step is the convergence path: idempotent,
+      # additive, version-controlled, and re-applied on every deploy so a reprovision or
+      # a cloned box cannot silently drift back.
+      #
+      # write-deploy-env has already `git reset --hard origin/main`'d the host repo, so
+      # the unit sources this installs are the ones on main. Runs before the assertion
+      # in verify-deploy.yml, which is what actually holds the line.
+      - name: Converge host provisioning (backup units, deploy home)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          script: sudo -n /opt/noorinalabs-deploy/scripts/converge_host.sh
+
       - name: Verify health check
         uses: appleboy/ssh-action@v1
         with:

@@ -184,7 +184,15 @@ runcmd:
   - git clone https://github.com/noorinalabs/noorinalabs-deploy.git /opt/noorinalabs-deploy || true
   - chown -R deploy:deploy /opt/noorinalabs-deploy
 
-  # Set up deploy user home directory
+  # Set up deploy user home directory.
+  #
+  # The top-level chown is deploy#551: prod's /home/deploy is root:root, so the deploy
+  # user cannot write its own $HOME and deploy-data-load.yml fails at mkdir. The cause
+  # was a box cloned from a template rather than cloud-init'd fresh; asserting it here
+  # (and in scripts/assert_host_state.sh) means a future clone cannot reintroduce it
+  # silently. Non-recursive on purpose: a recursive chown would rewrite .ssh/ and
+  # .docker/config.json, whose ownership and modes are already correct and matter.
+  - chown deploy:deploy /home/deploy
   - mkdir -p /home/deploy/.docker
   - chown -R deploy:deploy /home/deploy/.docker
 
@@ -231,7 +239,12 @@ runcmd:
   - install -m 644 /opt/noorinalabs-deploy/systemd/tmpfiles.d/noorinalabs-backups.conf /etc/tmpfiles.d/
   - systemd-tmpfiles --create /etc/tmpfiles.d/noorinalabs-backups.conf
   - systemctl daemon-reload
-  - systemctl enable isnad-backup.timer
+  # `--now` is load-bearing. runcmd executes during boot, AFTER timers.target has
+  # already been reached, so a bare `enable` only creates the want-symlink and the
+  # timer does not start until the NEXT reboot. That is why every provisioned host
+  # ended up with backups armed-but-never-running, and why bootstrap-vps.sh used to
+  # print "start the backup timer" as a manual step nobody performed (deploy#558).
+  - systemctl enable --now isnad-backup.timer
 
   # Allow root to git-operate on the deploy-owned /opt/ repos (#163 followup
   # gap 3/3, deploy#330). git 2.35+ (CVE-2022-24765) refuses to run as root
