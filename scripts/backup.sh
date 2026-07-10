@@ -86,6 +86,55 @@ log() {
 }
 
 # ---------------------------------------------------------------------------
+# node-exporter textfile-collector metrics (deploy#565)
+# ---------------------------------------------------------------------------
+# Until deploy#565 this script emitted no metric at all, so the BackupFailure
+# alert — which keyed off a success gauge nothing wrote — could never fire, and
+# "no backup has ever run" read as healthy for months. The success gauge is the
+# positive signal that makes staleness measurable; its ABSENCE is what
+# BackupNeverSucceeded alerts on (infra/prometheus/alerts.yml § backup).
+#
+# The directory below is the one node-exporter is actually pointed at
+# (`--collector.textfile.directory`, compose/docker-compose.prod.yml) and is the
+# only path bind-mounted into the container.
+TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+SUCCESS_TEXTFILE="${TEXTFILE_DIR}/isnad_backup_success.prom"
+FAILURE_TEXTFILE="${TEXTFILE_DIR}/isnad_backup_failure.prom"
+
+# Emitted ONLY on a fully-successful run (every dump OK + upload OK). A partial
+# backup must not advance the success timestamp: doing so would silence
+# BackupStale while the thing it guards — a complete, restorable backup — did
+# not happen.
+emit_success_metric() {
+    local now_epoch tmp
+    now_epoch="$(date -u +%s)"
+
+    install -d -m 0755 "$TEXTFILE_DIR"
+
+    # Atomic write: temp + rename, so Prometheus never scrapes a half-written
+    # file. The mktemp suffix means the temp name does NOT end in `.prom`, so
+    # the collector ignores it until the rename lands.
+    tmp="$(mktemp "${SUCCESS_TEXTFILE}.XXXXXX")"
+    cat > "$tmp" <<EOF
+# HELP isnad_backup_last_success_timestamp_seconds Unix timestamp of the most recent fully-successful isnad-backup run.
+# TYPE isnad_backup_last_success_timestamp_seconds gauge
+isnad_backup_last_success_timestamp_seconds ${now_epoch}
+EOF
+    # This script runs under `umask 077` (set above), which would leave the file
+    # 0600 and root-owned. node-exporter reads it as an unprivileged uid through
+    # a read-only bind mount, so without an explicit chmod the metric would be
+    # written and never scraped — the same class of silent gap deploy#565 fixes.
+    chmod 644 "$tmp"
+    mv "$tmp" "$SUCCESS_TEXTFILE"
+
+    # A success supersedes any prior failure marker. Removing it lets BackupFailed
+    # resolve on the next scrape instead of lingering for its full 24h window.
+    rm -f "$FAILURE_TEXTFILE"
+
+    log "INFO" "Emitted success metric: ${SUCCESS_TEXTFILE} (ts=${now_epoch})"
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup handler
 # ---------------------------------------------------------------------------
 cleanup() {
@@ -318,6 +367,12 @@ log "INFO" "Category:   ${BACKUP_CATEGORY}"
 log "INFO" "Remote:     ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}/"
 log "INFO" "=== Backup finished ==="
 
+# A partial backup is a failed backup: exit non-zero WITHOUT emitting the
+# success gauge, so isnad-backup.service's `OnFailure=` fires the failure marker
+# and BackupStale keeps counting from the last COMPLETE backup.
 if [[ "$PG_OK" == "false" || "$NEO4J_OK" == "false" ]]; then
+    log "ERROR" "Partial backup — success metric NOT emitted"
     exit 1
 fi
+
+emit_success_metric

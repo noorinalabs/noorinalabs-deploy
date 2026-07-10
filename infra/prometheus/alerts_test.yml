@@ -1,0 +1,267 @@
+# =============================================================================
+# promtool unit tests for the `backup` alert group (deploy#565).
+#
+# Run:
+#   docker run --rm --entrypoint promtool \
+#     -v "$PWD/infra/prometheus:/etc/prometheus:ro" -w /etc/prometheus \
+#     prom/prometheus:v3.4.0 test rules alerts_test.yml
+#
+# WHY THIS FILE EXISTS
+#
+# `promtool check rules` only proves the YAML parses and the PromQL is
+# syntactically valid. The rule this replaces (`BackupFailure`) passed that
+# check for months while being structurally incapable of firing: it keyed off
+# `isnad_backup_last_success_timestamp_seconds > 0`, a metric nothing wrote, so
+# the expression evaluated against an empty vector forever. A never-succeeded
+# backup — the real state of both hosts — read as healthy.
+#
+# A rule nobody has watched go red is a decoration. These tests are the
+# evidence that each rule fires on the state it claims to detect AND goes quiet
+# on the healthy state. Every case asserts BOTH directions: the alerts that
+# should fire, and (with empty `exp_alerts`) the ones that must stay silent.
+#
+# Note on the time base: promtool's synthetic clock starts at epoch 0, so
+# `time()` at `eval_time: 2h` is 7200. Timestamp gauges are therefore expressed
+# as small absolute values ("succeeded at t=600s") rather than realistic Unix
+# epochs, and staleness is exercised by evaluating far enough past them.
+# =============================================================================
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------
+  # 1. THE CURRENT REAL STATE: no backup has ever succeeded.
+  #
+  # This is the exact state deploy#558 uncovered and the state the OLD rule
+  # reported as healthy. node-exporter is up and scraping; the success gauge has
+  # never been written. BackupNeverSucceeded MUST fire.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: never-succeeded — no success metric has ever been written
+    input_series:
+      - series: 'up{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x180"
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: BackupNeverSucceeded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No backup has EVER succeeded on this host"
+              description: >-
+                node-exporter is up and scraping, but
+                `isnad_backup_last_success_timestamp_seconds` has never been
+                written — meaning scripts/backup.sh has never completed a fully
+                successful run on this host. There is no restorable backup. Check
+                `systemctl status isnad-backup.timer` and the last
+                `journalctl -u isnad-backup.service` run.
+              runbook: "docs/runbooks/backup-alerts.md#backupneversucceeded"
+      # The other two must stay silent: there is no success series to be stale,
+      # and no failure has been recorded yet.
+      - eval_time: 2h
+        alertname: BackupStale
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: BackupFailed
+        exp_alerts: []
+      # Below the 1h hold-down the alert is pending, not firing.
+      - eval_time: 30m
+        alertname: BackupNeverSucceeded
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 2. TONIGHT'S 03:01 UTC RUN: stg's timer fires and backup.sh fails at its
+  #    credential preflight (BACKUP_B2_* secrets not yet provisioned).
+  #
+  # The OnFailure= marker writes the failure timestamp; no success has ever been
+  # written. BOTH alerts fire, and both are true: the backup failed, AND no
+  # backup has ever succeeded. This is the live test the fix is aimed at.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: failed run on a host that has never had a successful backup
+    input_series:
+      - series: 'up{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x180"
+      # Failure marker written at t=0 (well inside the 24h recency window).
+      - series: 'isnad_backup_last_failure_timestamp_seconds{job="node-exporter", instance="node-exporter:9100"}'
+        values: "0+0x180"
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: BackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: "node-exporter"
+              instance: "node-exporter:9100"
+            exp_annotations:
+              summary: "Backup FAILED on node-exporter:9100"
+              description: >-
+                isnad-backup.service exited non-zero within the last 24 hours and
+                no successful run has replaced it. The failure marker was written
+                by the unit's `OnFailure=` hook. Inspect with
+                `journalctl -u isnad-backup.service -n 100` and check the
+                BACKUP_FAILURE journal identifier.
+              runbook: "docs/runbooks/backup-alerts.md#backupfailed"
+      - eval_time: 2h
+        alertname: BackupNeverSucceeded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No backup has EVER succeeded on this host"
+              description: >-
+                node-exporter is up and scraping, but
+                `isnad_backup_last_success_timestamp_seconds` has never been
+                written — meaning scripts/backup.sh has never completed a fully
+                successful run on this host. There is no restorable backup. Check
+                `systemctl status isnad-backup.timer` and the last
+                `journalctl -u isnad-backup.service` run.
+              runbook: "docs/runbooks/backup-alerts.md#backupneversucceeded"
+
+  # ---------------------------------------------------------------------------
+  # 3. THE HEALTHY STATE: a fresh success timestamp. Everything must be quiet.
+  #
+  # This is the other half of the proof — a rule that fires on everything is as
+  # useless as one that fires on nothing.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: healthy — a recent successful backup silences every backup alert
+    input_series:
+      - series: 'up{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x180"
+      # Succeeded at t=600s; evaluated at t=7200s → 1h50m old, well inside 24h.
+      - series: 'isnad_backup_last_success_timestamp_seconds{job="node-exporter", instance="node-exporter:9100"}'
+        values: "600+0x180"
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: BackupNeverSucceeded
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: BackupStale
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: BackupFailed
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 4. STALE SUCCESS: a backup succeeded once, then the timer stopped.
+  #
+  # This is what the original rule *intended* to catch. Succeeded at t=1h,
+  # evaluated at t=30h → 29h since the last success, past the 24h threshold.
+  # BackupNeverSucceeded must NOT also fire (the success series exists), so the
+  # two rules partition the space rather than double-paging.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: stale — succeeded once, nothing in over 24h
+    input_series:
+      - series: 'up{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x1900"
+      - series: 'isnad_backup_last_success_timestamp_seconds{job="node-exporter", instance="node-exporter:9100"}'
+        values: "3600+0x1900"
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: BackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: "node-exporter"
+              instance: "node-exporter:9100"
+            exp_annotations:
+              summary: "Backup has not succeeded in over 24 hours"
+              description: >-
+                The last successful backup on node-exporter:9100 completed
+                more than 24 hours ago (1d 5h 0m 0s ago). The daily timer either
+                did not run or did not finish. Any restore now loses more than a
+                day of data.
+              runbook: "docs/runbooks/backup-alerts.md#backupstale"
+      - eval_time: 30h
+        alertname: BackupNeverSucceeded
+        exp_alerts: []
+      # At 20h the success is still inside the 24h window — must be quiet.
+      - eval_time: 20h
+        alertname: BackupStale
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 5. RECOVERY: a success newer than the failure silences BackupFailed.
+  #
+  # backup.sh removes the failure marker on success, so in practice the failure
+  # series disappears. This case proves the `unless` clause independently, for
+  # hosts still running an older marker script where the file lingers.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: recovery — success newer than failure silences BackupFailed
+    input_series:
+      - series: 'up{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x180"
+      - series: 'isnad_backup_last_failure_timestamp_seconds{job="node-exporter", instance="node-exporter:9100"}'
+        values: "0+0x180"
+      # Succeeded at t=600s, AFTER the failure at t=0.
+      - series: 'isnad_backup_last_success_timestamp_seconds{job="node-exporter", instance="node-exporter:9100"}'
+        values: "600+0x180"
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: BackupFailed
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: BackupNeverSucceeded
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: BackupStale
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 6. INSTRUMENT CHECK: node-exporter is DOWN.
+  #
+  # The success metric is absent, but that absence carries no information — the
+  # exporter that would have reported it is not scraping. BackupNeverSucceeded
+  # must stay quiet and let ServiceDown own the page. A zero from an instrument
+  # that can silently receive nothing is not a measurement.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: exporter down — absence of the metric is not evidence of no backup
+    input_series:
+      - series: 'up{job="node-exporter", instance="node-exporter:9100"}'
+        values: "0+0x180"
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: BackupNeverSucceeded
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------
+  # 7. AGED FAILURE, STILL NEVER SUCCEEDED.
+  #
+  # The failure is older than the 24h recency window, so BackupFailed resolves —
+  # but the host still has no backup, so BackupNeverSucceeded keeps firing. The
+  # durable "no restorable backup" fact must not decay just because the last
+  # failure scrolled out of the window.
+  # ---------------------------------------------------------------------------
+  - interval: 1m
+    name: aged failure — BackupFailed resolves, BackupNeverSucceeded persists
+    input_series:
+      - series: 'up{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x1900"
+      - series: 'isnad_backup_last_failure_timestamp_seconds{job="node-exporter", instance="node-exporter:9100"}'
+        values: "0+0x1900"
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: BackupFailed
+        exp_alerts: []
+      - eval_time: 30h
+        alertname: BackupNeverSucceeded
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "No backup has EVER succeeded on this host"
+              description: >-
+                node-exporter is up and scraping, but
+                `isnad_backup_last_success_timestamp_seconds` has never been
+                written — meaning scripts/backup.sh has never completed a fully
+                successful run on this host. There is no restorable backup. Check
+                `systemctl status isnad-backup.timer` and the last
+                `journalctl -u isnad-backup.service` run.
+              runbook: "docs/runbooks/backup-alerts.md#backupneversucceeded"

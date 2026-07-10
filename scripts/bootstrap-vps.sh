@@ -398,16 +398,19 @@ if [ -f "$INSTALL_DIR/systemd/isnad-backup.service" ]; then
   install -m 644 "$INSTALL_DIR/systemd/tmpfiles.d/noorinalabs-backups.conf" /etc/tmpfiles.d/
   systemd-tmpfiles --create /etc/tmpfiles.d/noorinalabs-backups.conf
 
-  # node-exporter textfile-collector PARENT directory for failure-marker
-  # *.prom files. cloud-init creates the textfile_collector SUBDIR
-  # (/var/lib/node_exporter/textfile_collector); `install -d` is idempotent
-  # so this remains safe on fresh cloud-init hosts.
-  install -d -m 0755 /var/lib/node_exporter
+  # node-exporter textfile-collector directory for the backup success/failure
+  # *.prom files. This MUST be the `textfile_collector` subdir: it is the path
+  # node-exporter is pointed at (`--collector.textfile.directory`) and the only
+  # one bind-mounted into the container. Until deploy#565 this created (and the
+  # failure marker wrote to) the PARENT, so the .prom file was never scraped.
+  # cloud-init also creates the subdir; `install -d` is idempotent so this stays
+  # safe on fresh cloud-init hosts.
+  install -d -m 0755 /var/lib/node_exporter/textfile_collector
 
   systemctl daemon-reload
   systemctl enable isnad-backup.timer
   echo "    Backup timer installed (daily at 03:00 UTC)."
-  echo "    Failure marker unit installed (OnFailure= → /var/lib/node_exporter/*.prom + journal)."
+  echo "    Failure marker unit installed (OnFailure= → /var/lib/node_exporter/textfile_collector/*.prom + journal)."
   echo "    Persistent staging dir provisioned: /var/lib/noorinalabs-backups (mode 0700, root)."
   echo "    Start with: systemctl start isnad-backup.timer"
 else

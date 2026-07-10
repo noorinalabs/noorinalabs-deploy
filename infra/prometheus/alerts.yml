@@ -93,21 +93,140 @@ groups:
             Current value: {{ $value | humanizePercentage }}.
           runbook: "docs/deployment/alerting.md#highmemoryusage"
 
+  # Backup observability (deploy#565). The previous single `BackupFailure` rule
+  # was structurally incapable of firing in either direction:
+  #
+  #     isnad_backup_last_success_timestamp_seconds > 0
+  #     and (time() - isnad_backup_last_success_timestamp_seconds) > 86400
+  #
+  # Nothing ever wrote the success metric, so the `> 0` guard evaluated against
+  # an empty vector and the whole expression was empty forever. The guard was
+  # presumably meant to suppress noise before the first backup — but it also
+  # suppressed the alert *permanently* if the first backup never happened, which
+  # is exactly what occurred (deploy#558: the timer was never installed; there
+  # has never been a restorable backup). An absent instrument reading as
+  # "healthy" is not a measurement. Meanwhile the failure metric WAS written
+  # (scripts/emit-backup-failure-marker.sh, via isnad-backup.service's
+  # `OnFailure=`) and no rule referenced it at all.
+  #
+  # Three rules replace it, splitting the states that the single rule conflated:
+  #
+  #   BackupNeverSucceeded — no success metric has ever been written. This is
+  #     the state the old rule reported as healthy. Guarded on `up{job=
+  #     "node-exporter"} == 1` so the absence is a real absence and not an
+  #     artifact of a dead exporter (in which case ServiceDown is the correct
+  #     page, not this one).
+  #
+  #   BackupStale — a backup DID succeed once, but not in the last 24h. This is
+  #     the old rule's stated intent, minus the self-defeating `> 0` guard: when
+  #     the success series is absent the expression is empty, so this rule stays
+  #     quiet and BackupNeverSucceeded owns that state. No double page.
+  #
+  #   BackupFailed — the failure marker is recent. Fires directly off the
+  #     OnFailure= metric rather than waiting 24h to infer a failure from a
+  #     missing success.
+  #
+  # Producer side: scripts/backup.sh writes the success gauge on a fully-
+  # successful run and removes the stale failure marker; both .prom files land
+  # in /var/lib/node_exporter/textfile_collector/ — the directory node-exporter
+  # actually reads (`--collector.textfile.directory`). The failure marker
+  # previously wrote one level up, into the unmounted parent, so even a rule
+  # referencing the failure metric would never have seen it.
+  #
+  # All three are severity: critical -> Alertmanager `critical` receiver. A
+  # system with no restorable backup is not a warning.
   - name: backup
     rules:
-      - alert: BackupFailure
+      - alert: BackupNeverSucceeded
+        # `absent()` returns a synthetic no-label series when the selector
+        # matches nothing, so this fires precisely while no backup has ever
+        # written a success gauge. `and on()` joins against the exporter's own
+        # scrape-health series on the empty label set (absent() carries no
+        # instance/job labels to match on) — set operators permit the resulting
+        # many-to-one match, so this stays valid if a second node-exporter is
+        # ever added.
+        #
+        # `for: 1h` rides out a node-exporter restart (the textfile series goes
+        # briefly absent while the container comes back) and a Prometheus
+        # restart, without meaningfully delaying a page: "no backup has ever
+        # succeeded" is a condition measured in months, not minutes.
         expr: |
-          isnad_backup_last_success_timestamp_seconds > 0
-          and
+          absent(isnad_backup_last_success_timestamp_seconds)
+          and on()
+          (up{job="node-exporter"} == 1)
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "No backup has EVER succeeded on this host"
+          description: >-
+            node-exporter is up and scraping, but
+            `isnad_backup_last_success_timestamp_seconds` has never been
+            written — meaning scripts/backup.sh has never completed a fully
+            successful run on this host. There is no restorable backup. Check
+            `systemctl status isnad-backup.timer` and the last
+            `journalctl -u isnad-backup.service` run.
+          runbook: "docs/runbooks/backup-alerts.md#backupneversucceeded"
+
+      - alert: BackupStale
+        # No `> 0` guard, deliberately. The guard is what made the original rule
+        # unfireable. An absent series already yields an empty vector here, so
+        # the never-succeeded case is naturally excluded and handled by
+        # BackupNeverSucceeded above.
+        #
+        # 86400s = the timer's daily cadence (isnad-backup.timer: OnCalendar=
+        # *-*-* 03:00:00 UTC, RandomizedDelaySec=300). A gap beyond one full day
+        # means a run was missed or silently did not finish.
+        expr: |
           (time() - isnad_backup_last_success_timestamp_seconds) > 86400
         for: 10m
         labels:
-          severity: warning
+          severity: critical
         annotations:
           summary: "Backup has not succeeded in over 24 hours"
           description: >-
-            The last successful backup was more than 24 hours ago.
-          runbook: "docs/deployment/alerting.md#backupfailure"
+            The last successful backup on {{ $labels.instance }} completed
+            more than 24 hours ago ({{ $value | humanizeDuration }} ago). The
+            daily timer either did not run or did not finish. Any restore now
+            loses more than a day of data.
+          runbook: "docs/runbooks/backup-alerts.md#backupstale"
+
+      - alert: BackupFailed
+        # Fires off the OnFailure= marker directly — a failed backup pages on
+        # the next scrape rather than waiting out BackupStale's 24h window.
+        #
+        # backup.sh removes the failure marker on a successful run, so this
+        # normally resolves as soon as a good backup lands. The `unless` clause
+        # is the belt-and-braces case: if a host is still running an older
+        # marker script (or the `rm` was skipped), a success newer than the
+        # failure still silences this rule. When the success series is absent
+        # entirely the right-hand side is empty, `unless` removes nothing, and a
+        # never-succeeded-and-failing host correctly fires BOTH this and
+        # BackupNeverSucceeded — two distinct, both-true facts.
+        #
+        # `< 86400` rather than an equality on a `_success=0`-style gauge: the
+        # marker is a timestamp, so recency IS the signal. Past 24h the next
+        # nightly run has either re-armed it or BackupStale has taken over.
+        expr: |
+          (time() - isnad_backup_last_failure_timestamp_seconds) < 86400
+          unless
+          (
+            isnad_backup_last_success_timestamp_seconds
+            >
+            isnad_backup_last_failure_timestamp_seconds
+          )
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backup FAILED on {{ $labels.instance }}"
+          description: >-
+            isnad-backup.service exited non-zero within the last 24 hours and
+            no successful run has replaced it. The failure marker was written
+            by the unit's `OnFailure=` hook. Inspect with
+            `journalctl -u isnad-backup.service -n 100` and check the
+            BACKUP_FAILURE journal identifier.
+          runbook: "docs/runbooks/backup-alerts.md#backupfailed"
 
   # Alerts for the alembic pre-deploy gate (deploy#161). Two distinct
   # failure modes share the same metric source but warrant separate alerts
