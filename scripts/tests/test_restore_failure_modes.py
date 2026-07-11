@@ -508,3 +508,48 @@ def test_backup_declares_its_own_completeness() -> None:
         "from the artifact, a partial backup would declare itself complete — the same "
         "circularity as a read-back count, and just as invisible."
     )
+
+
+def test_every_negative_fixture_must_name_the_reason_it_fails_for() -> None:
+    """A negative that passes for the WRONG reason is a test that has stopped testing.
+
+    ``expect_fail`` used to assert only a non-zero exit. When restore.sh learned to refuse an
+    incomplete backup, two fixtures that contained only the dump they mutate began being
+    rejected for MISSING STORES — *before* their truncated dump was ever read. They still
+    passed. The truncation path they exist to exercise was no longer tested at all, and
+    nothing said so.
+
+    That is the same defect class as a guard that cannot see what it exists to catch,
+    reappearing inside the suite that guards against it. So every negative names the error it
+    expects, and the rehearsal fails if it gets a different one.
+    """
+    text = REHEARSAL.read_text()
+    assert 'expect_fail() {\n    local name="$1" src="$2" want="$3"' in text, (
+        "expect_fail must take an expected-reason argument"
+    )
+    assert 'elif ! grep -q "$want" "$logfile"; then' in text, (
+        "expect_fail must assert the failure happened for the expected reason"
+    )
+    # And every call site must supply one.
+    calls = [ln for ln in text.splitlines() if ln.strip().startswith("expect_fail ")]
+    assert len(calls) >= 6, f"expected at least 6 negative fixtures, found {len(calls)}"
+    for ln in calls:
+        # name + dir + reason => at least 3 quoted args
+        assert ln.count('"') >= 6, (
+            f"negative fixture does not name its expected reason: {ln.strip()}"
+        )
+
+
+def test_truncation_fixtures_start_from_a_complete_artifact() -> None:
+    """Or the completeness gate rejects them before their truncation is ever exercised."""
+    text = REHEARSAL.read_text()
+    assert "copy_full_artifact() {" in text, (
+        "a helper must build the truncation fixtures from a COMPLETE backup"
+    )
+    for fx in ('local trunc="${WORK}/fx_truncated"', 'local utrunc="${WORK}/fx_user_truncated"'):
+        idx = text.index(fx)
+        window = text[idx : idx + 200]
+        assert "copy_full_artifact" in window, (
+            f"fixture {fx} must start from a complete artifact, or the missing-store gate "
+            "refuses it first and the truncation is never tested"
+        )

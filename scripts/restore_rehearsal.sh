@@ -307,13 +307,29 @@ run_restore() {
     ) > "$logfile" 2>&1
 }
 
+# expect_fail <name> <dir> <expected-reason-substring>
+#
+# The third argument is NOT optional, and it is the whole lesson of the deploy#577 review.
+# This used to assert only a non-zero exit. When restore.sh learned to refuse an INCOMPLETE
+# backup, two fixtures that had contained only the dump they mutate began being rejected for
+# MISSING STORES — before their truncated dump was ever read. They still "passed". The
+# truncation path they exist to exercise was no longer tested at all, and nothing said so.
+#
+# A negative that passes for the wrong reason is a test that has silently stopped testing.
+# It is the same defect class as a guard that cannot see what it exists to catch, living
+# inside the suite that guards against it. So each negative must now name the reason it
+# expects, and get it.
 expect_fail() {
-    local name="$1" src="$2"
+    local name="$1" src="$2" want="$3"
     local logfile="${WORK}/${name}.log" rc=0
-    log "INFO" "--- negative case: ${name} (restore.sh MUST exit non-zero) ---"
+    log "INFO" "--- negative case: ${name} (restore.sh MUST exit non-zero, because: ${want}) ---"
     run_restore "$src" "$logfile" || rc=$?
     if [[ $rc -eq 0 ]]; then
         fail "${name}: restore.sh exited 0 on a broken artifact — the check cannot fail"
+        sed 's/^/        /' "$logfile"
+    elif ! grep -q "$want" "$logfile"; then
+        fail "${name}: restore.sh exited ${rc}, but NOT for the expected reason (${want}). It failed for: $(grep -m1 '\[ERROR\]' "$logfile" | sed 's/.*\[ERROR\] //')"
+        fail "    A negative that fails for the wrong reason is a test that has stopped testing."
         sed 's/^/        /' "$logfile"
     else
         pass "${name}: restore.sh exited ${rc} — $(grep -m1 '\[ERROR\]' "$logfile" | sed 's/.*\[ERROR\] //' || echo 'failed as required')"
@@ -338,6 +354,25 @@ expect_pass() {
 # ---------------------------------------------------------------------------
 # Broken-artifact fixtures
 # ---------------------------------------------------------------------------
+# copy_full_artifact <dir>: every dump + checksum from the intact artifact.
+#
+# The truncation fixtures MUST start from a COMPLETE backup. They used to contain only the
+# dump they mutate — and the moment restore.sh learned to refuse an incomplete backup
+# (deploy#577 review), that made them inert: they were rejected for MISSING STORES before
+# their truncated dump was ever read, so they passed for the wrong reason and the
+# truncation path they exist to exercise was no longer tested at all.
+#
+# A negative fixture must fail for the reason it was built to test. Otherwise the suite is
+# green and the check it names is untested — which is the defect this whole review has been
+# about, reappearing inside the tests that guard against it.
+copy_full_artifact() {
+    local dst="$1"
+    mkdir -p "$dst"
+    cp "${ARTIFACT}/${PG_DUMP_NAME}"          "${ARTIFACT}/${PG_DUMP_NAME}.sha256"          "$dst/"
+    cp "${ARTIFACT}/${USER_PG_DUMP_NAME}"     "${ARTIFACT}/${USER_PG_DUMP_NAME}.sha256"     "$dst/"
+    cp "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst"   "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst.sha256"   "$dst/"
+}
+
 make_fixtures() {
     log "INFO" "Building broken-artifact fixtures..."
 
@@ -346,7 +381,7 @@ make_fixtures() {
     #     restore itself can detect it. This is the fixture that caught the swallowed
     #     pg_restore exit code.
     local trunc="${WORK}/fx_truncated"
-    mkdir -p "$trunc"
+    copy_full_artifact "$trunc"
     local full half
     full=$(stat -c%s "${ARTIFACT}/${PG_DUMP_NAME}")
     half=$(( full / 2 ))
@@ -364,8 +399,7 @@ make_fixtures() {
     #      failing direction of the store added in deploy#559 — a backup leg nobody has
     #      seen fail is a backup leg nobody has tested.
     local utrunc="${WORK}/fx_user_truncated"
-    mkdir -p "$utrunc"
-    cp "${ARTIFACT}/${PG_DUMP_NAME}" "${ARTIFACT}/${PG_DUMP_NAME}.sha256" "$utrunc/"
+    copy_full_artifact "$utrunc"
     local ufull uhalf
     ufull=$(stat -c%s "${ARTIFACT}/${USER_PG_DUMP_NAME}")
     uhalf=$(( ufull / 2 ))
@@ -512,14 +546,15 @@ main() {
     make_fixtures
 
     # Negatives first: prove the check can go red before we trust it green.
-    expect_fail "truncated_dump_matching_checksum"      "${WORK}/fx_truncated"
-    expect_fail "truncated_user_pg_dump"                "${WORK}/fx_user_truncated"
+    # Each negative names the reason it must fail for. See expect_fail().
+    expect_fail "truncated_dump_matching_checksum" "${WORK}/fx_truncated"      "PostgreSQL (isnad): pg_restore"
+    expect_fail "truncated_user_pg_dump"           "${WORK}/fx_user_truncated" "PostgreSQL (user-service): pg_restore"
     # Well-formed by construction: nothing corrupt, everything present is valid, and the
     # user-postgres dump is simply absent. The one the other five could not see.
-    expect_fail "no_user_pg_dump_at_all"                "${WORK}/fx_no_userpg"
-    expect_fail "zero_checksum_files"              "${WORK}/fx_nosums"
-    expect_fail "empty_backup"                     "${WORK}/fx_empty"
-    expect_fail "bitrot_stale_checksum"            "${WORK}/fx_bitrot"
+    expect_fail "no_user_pg_dump_at_all"           "${WORK}/fx_no_userpg"      "Restore REFUSED"
+    expect_fail "zero_checksum_files"              "${WORK}/fx_nosums"         "No checksum files found"
+    expect_fail "empty_backup"                     "${WORK}/fx_empty"          "No checksum files found"
+    expect_fail "bitrot_stale_checksum"            "${WORK}/fx_bitrot"         "Checksum MISMATCH"
 
     # Positive.
     empty_scratch_stores
