@@ -141,6 +141,12 @@ EXIT_OK=0
 EXIT_ALERT=1
 EXIT_INSTRUMENT=2
 
+# The associative-array key for a dump at the ROOT of the scanned scope. It must NOT be the
+# empty string: bash rejects an empty subscript outright (`bad array subscript`), and the
+# empty string is already spoken for as "nothing selected". `/` is what the result line has
+# always PRINTED for the root, so this makes the key and the display agree.
+ROOT_KEY="/"
+
 # The self-test deliberately drives the instrument-error path. Without this, every PASSING
 # run prints an alarming "rclone could not list ..." block from a fixture that is behaving
 # exactly as intended — and a check that cries wolf on success is a check people learn to
@@ -244,8 +250,27 @@ scan() {
             *) continue ;;
         esac
 
+        # ROOT_KEY, not "". **Bash associative arrays cannot take an empty subscript** —
+        # `declare -A a; a[""]=1` is `bad array subscript`, a hard error. So a dump at the
+        # ROOT of the scanned scope killed the scanner outright: no result line, exit 1.
+        #
+        # Two live routes, neither exotic (deploy#584 review, Nurul Hakim):
+        #   * the DOCUMENTED `B2_PREFIX` invocation — every dump sits at the root of the scope;
+        #   * a healthy bucket plus one stray root-level dump, i.e. an operator hand-copying a
+        #     dump during a DR — an entirely ordinary thing to do.
+        #
+        # And note the CLASS. This is not a new category, it is ROW ONE of this script's own
+        # table, still live in its own code: a crash prints NO CLAIM and exits 1, and every
+        # consumer reads a non-zero exit as a verdict about the BACKUPS. The one script whose
+        # founding invariant is "an instrument failure is NOT a claim about your data"
+        # terminated without a claim, with a failing exit code. It is the purest form of the
+        # collapse this whole file exists to prevent.
+        #
+        # The empty string was doing double duty as "the root" AND as "nothing selected" (see
+        # `-z "$chosen"` below) — so even without the crash, a root-level backup would have
+        # reported `no_complete_backup`. One sentinel closes both.
         dir="$(dirname "$path")"
-        [[ "$dir" == "." ]] && dir=""
+        [[ "$dir" == "." ]] && dir="$ROOT_KEY"
 
         # A ZERO-BYTE dump lists non-empty and restores nothing — the same sentence as the
         # checksum-only bucket above, one level in. `pg_dump` failing after the shell has
@@ -287,7 +312,7 @@ scan() {
     local skipped=0 chosen="" chosen_epoch=0
     for dir in "${ordered[@]}"; do
         local mpath="${base}"
-        [[ -n "$dir" ]] && mpath="${base}/${dir}"
+        [[ "$dir" != "$ROOT_KEY" ]] && mpath="${base}/${dir}"
 
         # --- "I COULD NOT READ IT" IS NOT "IT DOES NOT ATTEST". ------------------
         #
@@ -521,6 +546,24 @@ self_test() {
     # CONDITION. The guard and the fixture were blind together.
     _mkbackup "${tmp}/fresh/daily/2026-07-11" true
     _expect fresh "${tmp}/fresh" "" fresh "$EXIT_OK" 1
+
+    # ROOT-LEVEL DUMPS — the DOCUMENTED `B2_PREFIX` invocation, which was never exercised.
+    #
+    # With a prefix, every dump sits at the ROOT of the scanned scope, so `dirname` returns
+    # "." and the directory key was set to the EMPTY STRING — which bash rejects outright as an
+    # associative-array subscript (`bad array subscript`). The scanner DIED: no result line,
+    # exit 1, which every consumer reads as a verdict about the backups. The one script whose
+    # founding invariant is "an instrument failure is NOT a claim about your data" terminated
+    # without a claim, with a failing exit code.
+    #
+    # Same shape via a stray root-level dump beside a healthy bucket — an operator hand-copying
+    # a dump during a DR. Both are covered here because both are ordinary.
+    _mkbackup "${tmp}/prefix/daily/2026-07-11" true
+    _expect fresh-under-prefix "${tmp}/prefix" "daily/2026-07-11" fresh "$EXIT_OK" 1
+
+    _mkbackup "${tmp}/rootdump/daily/2026-07-11" true
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/rootdump/isnad-pg-${RUN_TS}.dump"
+    _expect fresh-beside-a-root-dump "${tmp}/rootdump" "" fresh "$EXIT_OK" 1
 
     # INCOMPLETE — the artifact SAYS it is incomplete, and restore.sh refuses it. This is a
     # backup.sh output by design ("a partial backup beats none"), and it was reported fresh.

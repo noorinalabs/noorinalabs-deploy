@@ -968,3 +968,63 @@ def test_manifest_fixture_is_rendered_from_the_producers_own_printf() -> None:
     line = build_manifest(complete=True).decode()
     assert "complete=true" in line.split()
     assert build_manifest(complete=False).decode().split()[1] == "complete=false"
+
+
+# ---------------------------------------------------------------------------
+# A CRASH IS ROW ONE — the script says NOTHING and exits non-zero
+#
+# `dirname` returns "." for a dump at the root of the scanned scope, and the directory key
+# was then set to the EMPTY STRING — which bash rejects outright as an associative-array
+# subscript (`bad array subscript`). The scanner DIED: **no result line**, exit 1.
+#
+# That is not a fourth category. It is ROW ONE of this script's own table, live in its own
+# code: every consumer reads a non-zero exit as a verdict about the BACKUPS, and the script
+# whose founding invariant is "an instrument failure is NOT a claim about your data"
+# terminated without a claim and with a failing exit code. **The purest form of the collapse
+# it exists to prevent.**
+#
+# So these assert the RESULT LINE EXISTS — the thing that was missing — not merely the status.
+# ---------------------------------------------------------------------------
+def test_documented_b2_prefix_invocation_does_not_crash(tmp_path: Path) -> None:
+    """The invocation in this script's own usage block. It was never exercised.
+
+    With a prefix, EVERY dump sits at the root of the scanned scope — so this is not an edge
+    case of the documented usage, it IS the documented usage.
+    """
+    _backup_dir(tmp_path, complete=True)
+
+    rc, line = _scan(tmp_path, B2_PREFIX="daily/2026-07-11")
+    assert line, "THE SCANNER PRINTED NO RESULT LINE. A crash is not a verdict."
+    assert rc == EXIT_OK, f"a healthy backup read through B2_PREFIX must be fresh: {line}"
+    assert _field(line, "status") == "fresh"
+    assert _field(line, "dumps") == "3"
+
+
+def test_a_stray_root_level_dump_does_not_crash_the_scanner(tmp_path: Path) -> None:
+    """An operator hand-copying a dump into the bucket root during a DR.
+
+    An entirely ordinary thing to do, and it killed the check that is supposed to be watching.
+    """
+    _backup_dir(tmp_path, complete=True)
+    (tmp_path / STORE_FILES["isnad-pg"]).write_bytes(REAL_DUMP)  # stray, at the root
+
+    rc, line = _scan(tmp_path)
+    assert line, "THE SCANNER PRINTED NO RESULT LINE. A crash is not a verdict."
+    assert rc == EXIT_OK, f"the healthy backup must still be found: {line}"
+    assert _field(line, "status") == "fresh"
+    assert _field(line, "newest") == "daily/2026-07-11"
+
+
+def test_scanner_never_exits_without_a_result_line(tmp_path: Path) -> None:
+    """The invariant the crash broke, asserted directly across every class.
+
+    Whatever it concludes, it must SAY so. An exit code with no claim attached is read as a
+    claim — and the only claim a non-zero exit can be read as is "your backups are missing".
+    """
+    _backup_dir(tmp_path, complete=True)
+    (tmp_path / STORE_FILES["isnad-pg"]).write_bytes(REAL_DUMP)
+
+    for env in ({}, {"B2_PREFIX": "daily/2026-07-11"}, {"MAX_AGE_HOURS": "0"}):
+        rc, line = _scan(tmp_path, **env)
+        assert line, f"no result line for env={env} (rc={rc}) — the scanner must never be mute"
+        assert _field(line, "status"), f"result line carries no status: {line}"
