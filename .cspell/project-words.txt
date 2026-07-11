@@ -18,6 +18,7 @@ bitnami
 bitnamilegacy
 Blackbox
 buildx
+chrony
 ciphertext
 consumergroup
 cookieless
@@ -110,11 +111,14 @@ tfstate
 tfvars
 thaqalayn
 thresholding
+timedatectl
+timesyncd
 tlnp
 tmpfs
 tomasz
 Tremblay
 tusi
+userpg
 vhosts
 visualisation
 Volkov

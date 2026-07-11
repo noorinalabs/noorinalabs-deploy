@@ -298,6 +298,44 @@ run_dumps_arrived() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# ...AND WHY THE OTHER EARLY-EXIT PIPELINES IN THIS FILE ARE LEFT ALONE. (deploy#588)
+# ---------------------------------------------------------------------------
+# (This block belongs beside `manifest_attests_complete` and deliberately does NOT sit there:
+# test_restore_sh_completeness_predicate_matches_a_real_manifest slices the shipped text from
+# `manifest_attests_complete() {` to `# Did every store`, and asserts the banned early-exit
+# consumers appear nowhere in it. QUOTING them in a comment inside that window reds the suite.
+# The guard is textual and cannot tell code from prose — that is a fair price for naming the
+# shape that must never come back, so the prose moved instead of the guard being weakened.)
+#
+# The rule above is NOT "no `| head -1` anywhere". This file still runs, deliberately, the
+# early-exit pipelines annotated at their call sites below — a `docker compose ps` wait-loop,
+# a one-service container-id lookup, and the per-run dump `find`s.
+#
+# They are SAFE, and the reason is the PRODUCER, not the consumer — so read this before you
+# copy the shape somewhere the producer is not bounded.
+#
+# SIGPIPE requires a producer STILL WRITING after its consumer has quit. A producer whose
+# entire output fits in the 64 KiB pipe buffer has already written everything and EXITED
+# before the consumer even reads: there is no writer left to signal, and `pipefail` has no
+# 141 to promote. Measured, under `set -euo pipefail`, consumer exiting on the FIRST line:
+#
+#   printf 'a\nb\nc\n' | <early-exit consumer>   -> rc=0     <- bounded: no SIGPIPE
+#   seq 1 5000000      | <early-exit consumer>   -> rc=141   <- unbounded: SIGPIPE, promoted
+#
+# Every producer here is ENVIRONMENT-BOUNDED — a container list, one compose project's service
+# states, a directory listing filtered to a single run's dumps. A few hundred bytes, bounded by
+# the shape of the deployment and not by anything an operator, an attacker, or a corruption can
+# inflate. They cannot reach the 64 KiB threshold.
+#
+# The MANIFEST was the one producer that could: it is ARTIFACT CONTENT, pulled from a bucket,
+# and an operator or a corrupted upload can make it arbitrarily large. That is the whole
+# difference, and it is why the manifest parser — and only the manifest parser — had to lose
+# its pipeline (deploy#591).
+#
+# So the test is not "is there a pipe?" but "CAN ANYTHING MAKE THIS PRODUCER BIG?". If the
+# answer is yes, or you cannot say, do not use an early-exit consumer: use a herestring.
+
 list_backups() {
     log "INFO" "Available backups in ${B2_BUCKET}:"
     local failed=0
@@ -732,7 +770,13 @@ restore_neo4j() {
     log "INFO" "Stopping Neo4j for restore..."
     docker compose -f "$COMPOSE_FILE" stop neo4j
 
-    # Wait for Neo4j to stop
+    # Wait for Neo4j to stop.
+    #
+    # `| grep -q` is an early-exit consumer and this is SAFE: `docker compose ps` over one
+    # project emits a few hundred bytes, which fits the pipe buffer entire, so the producer has
+    # exited before grep quits and there is no SIGPIPE for `pipefail` to promote. The producer
+    # is ENVIRONMENT-BOUNDED, not artifact content — see "WHY THE OTHER EARLY-EXIT PIPELINES IN
+    # THIS FILE ARE LEFT ALONE" above before copying this shape somewhere it is not.
     local max_wait=30 waited=0
     while docker compose -f "$COMPOSE_FILE" ps --format '{{.Service}}:{{.State}}' 2>/dev/null | grep -q "neo4j:running"; do
         if [[ $waited -ge $max_wait ]]; then
@@ -754,6 +798,10 @@ restore_neo4j() {
     # scratch stack — silently overwrites the production graph volume. `--overwrite-
     # destination` makes that unrecoverable. Resolving through COMPOSE_FILE keeps the
     # blast radius inside the stack the caller actually named. (deploy#560)
+    #
+    # `| head -1` is safe here for the same reason as the wait-loop above: a one-service
+    # container-id list is environment-bounded and fits the pipe buffer, so nothing is still
+    # writing when `head` quits.
     local neo4j_cid
     neo4j_cid=$(docker compose -f "$COMPOSE_FILE" ps -aq neo4j 2>/dev/null | head -1)
     if [[ -z "$neo4j_cid" ]]; then
@@ -812,7 +860,8 @@ restore_neo4j() {
     log "INFO" "Restarting Neo4j..."
     docker compose -f "$COMPOSE_FILE" up -d neo4j
 
-    # Wait for healthy
+    # Wait for healthy. Same early-exit pipeline, same environment-bounded producer, safe for
+    # the same reason as the stop-loop above.
     local max_health=120 health_waited=0
     while ! docker compose -f "$COMPOSE_FILE" ps --format '{{.Service}}:{{.Health}}' 2>/dev/null | grep -q "neo4j:healthy"; do
         if [[ $health_waited -ge $max_health ]]; then
@@ -995,6 +1044,13 @@ verify_checksums "$RESTORE_DIR"
 RESTORE_RUN_TS=""
 RESTORE_RUN_TS="$(select_local_run "$RESTORE_DIR")" || RESTORE_RUN_TS=""
 
+#
+# The `find … | head -1` pipelines below are early-exit consumers and are SAFE: `find` over one
+# restore directory, filtered to a single run's dump name, is environment-bounded — a few
+# hundred bytes, inside the pipe buffer, producer exited before `head` quits. The manifest was
+# the only producer here that artifact content could inflate, and it is the only one that lost
+# its pipeline (deploy#591). See "WHY THE OTHER EARLY-EXIT PIPELINES IN THIS FILE ARE LEFT
+# ALONE" (just after `run_dumps_arrived`) before copying the shape.
 if [[ -n "$RESTORE_RUN_TS" ]]; then
     log "INFO" "Manifest attests run ${RESTORE_RUN_TS} — selecting that run's dumps"
     PG_DUMP=$(find "$RESTORE_DIR" -name "isnad-pg-${RESTORE_RUN_TS}.dump" -type f | head -1)

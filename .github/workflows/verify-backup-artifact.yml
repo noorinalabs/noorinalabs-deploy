@@ -55,6 +55,21 @@ jobs:
       fail-fast: false # stg being broken must not hide prod being broken
       matrix:
         env: [stg, prod]
+    # The `runbook:` pointer, carried the way the Prometheus backup alerts carry theirs
+    # (`infra/prometheus/alerts.yml` § backup — every rule there annotates
+    # `runbook: docs/runbooks/backup-alerts.md#<anchor>`). Same convention, same file, same
+    # anchor scheme — deliberately NOT a new one.
+    #
+    # It travels WITH the alert, on every failing path and in the summary, because a runbook
+    # the operator has to go LOOKING for at 3am is a runbook that does not exist. This job
+    # emits ELEVEN distinct (status, reason) outcomes — deploy#588 said ten; the eleventh is
+    # `incomplete reason=undersized_dumps`, which shares its reason STRING with an `absent`
+    # row and is a different fault — and they map nearly one-to-one onto different fixes. The
+    # least guessable of them, `future_timestamp`, is not a backup problem at all: it is a
+    # broken VPS clock (deploy#588).
+    env:
+      RUNBOOK: docs/runbooks/backup-alerts.md#backupartifactcheck
+      RUNBOOK_TORN: docs/runbooks/backup-alerts.md#tornbackup
     steps:
       - uses: actions/checkout@v6
 
@@ -94,18 +109,56 @@ jobs:
           echo "line=${LINE}" >> "$GITHUB_OUTPUT"
           echo "rc=${RC}" >> "$GITHUB_OUTPUT"
 
+          # The REASON, not just the status — it is what selects the fix, and it is the thing
+          # the operator would otherwise have to reverse-engineer. Carried into the annotation
+          # alongside the runbook anchor.
+          REASON="$(printf '%s\n' "${LINE}" | sed -n 's/.*[[:space:]]reason=\([^[:space:]]*\).*/\1/p')"
+          TORN="$(printf '%s\n' "${LINE}" | sed -n 's/.*[[:space:]]torn=\([0-9]*\).*/\1/p')"
+          if [ -z "${TORN}" ]; then TORN=0; fi
+          echo "torn=${TORN}" >> "$GITHUB_OUTPUT"
+
           case "${RC}" in
             0) echo "::notice::${{ matrix.env }}: a fresh restorable backup object exists in B2." ;;
-            1) echo "::error::${{ matrix.env }}: NO fresh restorable backup object in B2. The host-local gauges may be green — they do not look in the bucket." ;;
-            *) echo "::error::${{ matrix.env }}: could not scan B2 (credentials / network / bucket). This is NOT a claim that backups are missing." ;;
+            1) echo "::error::${{ matrix.env }}: NO fresh restorable backup object in B2 (reason=${REASON}). The host-local gauges may be green — they do not look in the bucket. Runbook: ${RUNBOOK}" ;;
+            *) echo "::error::${{ matrix.env }}: could not scan B2 (reason=${REASON}) — credentials / network / bucket / VPS clock. This is NOT a claim that backups are missing. Runbook: ${RUNBOOK}" ;;
           esac
+
+          # --- THE ONE FAULT THAT FIRES ON A GREEN RUN. --------------------------------
+          # A run that attested `complete=true` and did NOT fully arrive. The scanner exits 0
+          # — correctly: an older run IS complete and intact, so a restorable backup exists and
+          # `restore.sh latest` will find it. But it has just watched a run CLAIM completeness
+          # and lie, and that is a defect in backup.sh's attestation path that will recur
+          # tonight.
+          #
+          # So this is keyed on `torn>0` INDEPENDENT OF THE EXIT CODE, deliberately: every other
+          # outcome here is reason->action off a non-zero rc, and this one would otherwise scroll
+          # past in the log of a passing job with nobody paged for it (deploy#591 review, Nino
+          # Kavtaradze; deploy#588).
+          #
+          # It does NOT flip the job red. A usable backup genuinely exists, and failing here
+          # would be the false alarm this whole check was built to avoid.
+          if [ "${TORN}" -gt 0 ]; then
+            echo "::warning::${{ matrix.env }}: torn=${TORN} — a run attested complete=true and did NOT fully arrive. A restorable backup still exists (this job is green), but the PRODUCER is at fault and it will recur. Runbook: ${RUNBOOK_TORN}"
+          fi
+
           exit "${RC}"
 
+      # The reason codes ARE the diagnosis — they map nearly one-to-one onto different fixes.
+      # Rendering only the status threw that away and left the operator to reverse-engineer,
+      # at 3am, both what `reason=missing_stores,isnad-userpg` means and what to do about it.
+      # A taxonomy an operator cannot act on is a taxonomy that gets ignored, and an ignored
+      # backup signal is how deploy#559 happened. (deploy#588)
+      #
+      # Every row below was traced to the line in scripts/verify_b2_backup_artifact.sh that
+      # emits it. The canonical, fuller version lives in the runbook — this table is the
+      # 3am-legible subset, and it carries the link.
       - name: Summary
         if: always()
         env:
           LINE: ${{ steps.verify.outputs.line }}
           RC: ${{ steps.verify.outputs.rc }}
+          TORN: ${{ steps.verify.outputs.torn }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           {
             echo "## Backup artifact in B2 — ${{ matrix.env }}: ${{ job.status }}"
@@ -121,15 +174,48 @@ jobs:
               echo "about the bucket's contents. Do NOT read this as \"backups are fine\"."
             fi
             echo ""
+            echo "**Runbook: [\`${RUNBOOK}\`](${REPO_URL}/blob/main/${RUNBOOK})**"
+            echo ""
             echo "This is the **only** check that looks inside the bucket. Every other backup"
             echo "alert reads a host-local gauge — those report that \`backup.sh\` RAN and that"
             echo "\`rclone\` returned 0. They cannot see an empty bucket."
             echo ""
-            echo "- \`fresh\` — a restorable dump exists and is newer than the age bound."
-            echo "- \`absent\` — the bucket holds no dump at all. **An empty listing exits 0; it is an ALERT, not an OK.**"
-            echo "- \`stale\` — the newest dump is older than the bound."
-            echo "- \`instrument_error\` — we could not look. **This is not a statement about backups.**"
+
+            # The torn banner goes FIRST, and it goes up even when this job is GREEN — that is
+            # the entire point of the field. See the verify step for why it does not fail the job.
+            if [ "${TORN:-0}" != "0" ] && [ -n "${TORN:-}" ]; then
+              echo "> ### :rotating_light: \`torn=${TORN}\` — a producer fault, on a run that PASSED"
+              echo ">"
+              echo "> A run attested \`complete=true\` and its dumps did **not** all arrive. The"
+              echo "> producer's word and the bucket **disagree** — and only the disagreement is a"
+              echo "> fault. (An honest \`complete=false\` partial is \`skipped\`, not \`torn\`;"
+              echo "> \`backup.sh\` emits those by design.)"
+              echo ">"
+              echo "> This job is green because an **older** run is complete and intact, so a"
+              echo "> restorable backup does exist. But \`backup.sh\` claimed completeness and lied,"
+              echo "> and it will do it again tonight. **Fix the producer, not the bucket.**"
+              echo ">"
+              echo "> Triage: [\`${RUNBOOK_TORN}\`](${REPO_URL}/blob/main/${RUNBOOK_TORN})"
+              echo ""
+            fi
+
+            echo "### What the reason code means, and what to do"
             echo ""
-            echo "If \`absent\` and \`bucket_objects > 0\`, the bucket has contents but no dump under"
-            echo "the scanned prefix — check the prefix before concluding the backups are gone."
+            echo "| status | reason | rc | Meaning | Action |"
+            echo "|---|---|---|---|---|"
+            echo "| \`fresh\` | — | 0 | Newest attested run is complete, all stores arrived, within the age bound. | Nothing — **unless \`torn>0\`** (above). |"
+            echo "| \`stale\` | \`too_old\` | 1 | A complete run exists but is older than \`MAX_AGE_HOURS\` (30). | The nightly stopped landing. Check \`isnad-backup.timer\` + \`journalctl -u isnad-backup.service\`. |"
+            echo "| \`absent\` | \`no_dumps\` | 1 | Bucket reachable, **no dumps at all**. | **Check \`bucket_objects\` first** — if \`> 0\`, the bucket has contents but not under the scanned prefix (wrong bucket/prefix). If \`0\`, backups have never landed. |"
+            echo "| \`absent\` | \`undersized_dumps\` | 1 | Dumps exist but **every** one is under the 1 KiB floor. | \`pg_dump\` is failing **after** creating the file — the dump leg, not the upload. Check the journal + disk. |"
+            echo "| \`incomplete\` | \`no_complete_backup\` | 1 | Dumps exist; **not one run attests** \`complete=true\`. | A leg fails every night. \`backup.sh\` marks its partials honestly — find the failing store in the journal. |"
+            echo "| \`incomplete\` | \`missing_stores,…\` | 1 | An attested run's dumps did **not** all arrive, **and nothing older qualified**. | The upload was interrupted after the manifest landed. **Nothing is restorable — this is the emergency.** The named stores are what to chase. |"
+            echo "| \`incomplete\` | \`undersized_dumps\` | 1 | An attested run carries a dump under the floor — attested **and** corrupt. | **Not the \`absent\` row above**, despite the same reason string: there, nothing is restorable anywhere; here the *attested* run is corrupt. Fix the producer. |"
+            echo "| \`incomplete\` | \`manifest_ts_mismatch\` | 1 | The manifest's \`timestamp=\` disagrees with the run id it is filed under (or is absent), so it is refused. | Producer bug in \`backup.sh\`'s manifest write. **Do not hand-edit the manifest** — that binding is what prevents a torn restore. |"
+            echo "| \`instrument_error\` | \`unreachable\` | 2 | \`rclone lsf\` failed. **Nothing is known about the backups.** | Not a backup alert. Credentials / network / bucket name. \`rclone\`'s stderr is in the log above. |"
+            echo "| \`instrument_error\` | \`manifest_unreadable\` | 2 | The manifest could not be **read** (401, throttle, blip). \"Could not read\" ≠ \"does not attest\". | Re-run; check credentials. The dumps may be perfectly fine. |"
+            echo "| \`instrument_error\` | \`future_timestamp\` | 2 | **THE VPS CLOCK IS WRONG — NOT A BACKUP PROBLEM.** \`rclone\` preserves the source mtime, so the object's timestamp *is* the VPS clock at dump time. | **Fix NTP on the box** (\`timedatectl status\`). Left alone this **latches**: one future-dated object masks an entire stale bucket. |"
+            echo ""
+            echo "\`instrument_error\` (rc=2) is never a claim about your backups — it means the"
+            echo "scan could not look. An empty \`rclone\` listing exits 0 and prints nothing, so"
+            echo "\"no backups\" and \"I cannot see the bucket\" must never collapse into each other."
           } >> "$GITHUB_STEP_SUMMARY"
