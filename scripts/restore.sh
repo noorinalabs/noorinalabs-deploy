@@ -126,10 +126,32 @@ list_backups() {
 # manifest is NOT complete: every pre-#559 backup predates user-postgres coverage entirely,
 # so treating "no manifest" as "probably fine" would hand `latest` the exact artifact class
 # this change exists to stop.
+#
+# THREE outcomes, not two:
+#   0 = attests complete
+#   1 = read it, and it does NOT attest (or there is no manifest)
+#   2 = COULD NOT READ IT  <- not a value of the predicate. A separate answer.
+#
+# This read was `rclone cat … 2>/dev/null || true`, with the rc DISCARDED, so a transient
+# 401 / throttle / network blip collapsed into "does not attest" — and `resolve_latest` then
+# told an operator mid-incident "No COMPLETE backup found in B2 bucket" over a bucket full of
+# good ones. That is the SAME user-visible lie the unmatched regex produced, reached by a
+# different route; fixing the regex and leaving this would have been half a fix to the
+# identical symptom (deploy#584 review, Nino Kavtaradze).
+#
+# rc separates them, measured on both backends — which DISAGREE:
+#   cat existing    -> rc=0 (B2)  rc=0 (local)
+#   cat nonexistent -> rc=0 EMPTY (B2)  rc=3 (local)   <- absent. Not an error.
+#   cat, bad key    -> rc=1 (B2)  rc=1 (local)         <- CANNOT EVALUATE
 backup_is_complete() {
     local path="$1"
-    local manifest
-    manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest.txt" 2>/dev/null || true)"
+    local manifest rc=0
+    manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest.txt" 2>/dev/null)" || rc=$?
+    if [[ "$rc" -ne 0 && "$rc" -ne 3 ]]; then
+        log "ERROR" "Could not READ the manifest at ${path} (rclone rc=${rc})."
+        log "ERROR" "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look."
+        return 2
+    fi
     [[ -n "$manifest" ]] || return 1
     # WHOLE-TOKEN match. The predicate this replaces was:
     #
@@ -152,8 +174,13 @@ backup_is_complete() {
     #
     # Splitting on spaces and matching an exact `complete=true` token is order-independent
     # and cannot be defeated by a key that ends in another key's name.
+    #
+    # `head -n1`: attest on the FIRST manifest line only. Unioning tokens across every line
+    # lets a corrupt artifact carrying both a `complete=false` and a `complete=true` line
+    # match — it fails OPEN, and reading line 1 costs nothing.
     printf '%s\n' "$manifest" \
         | grep '^BACKUP_MANIFEST ' \
+        | head -n1 \
         | tr ' ' '\n' \
         | grep -qx 'complete=true'
 }
@@ -180,12 +207,31 @@ resolve_latest() {
             [[ -z "$dir" ]] && continue
             dir="${dir%/}"
             if [[ "$dir" > "$latest_date" ]]; then
-                if backup_is_complete "${category}/${dir}"; then
-                    latest_date="$dir"
-                    latest="${category}/${dir}"
-                else
-                    skipped+=("${category}/${dir}")
-                fi
+                local brc=0
+                backup_is_complete "${category}/${dir}" || brc=$?
+                case "$brc" in
+                    0)
+                        latest_date="$dir"
+                        latest="${category}/${dir}"
+                        ;;
+                    1)
+                        skipped+=("${category}/${dir}")
+                        ;;
+                    *)
+                        # COULD NOT READ the manifest. We must NOT quietly skip: that would
+                        # demote a possibly-good backup to "incomplete" on a transient 401 or
+                        # network blip, and then — if it was the only one — report "No
+                        # COMPLETE backup found" over a bucket full of good backups, to an
+                        # operator who is already mid-incident. Refuse to resolve, and say
+                        # why. An operator who knows the instrument failed can retry, fix
+                        # credentials, or name a directory explicitly; one who is told the
+                        # backups are incomplete cannot.
+                        log "ERROR" "Cannot resolve 'latest': the manifest for ${category}/${dir} is UNREADABLE." >&2
+                        log "ERROR" "  This is an INSTRUMENT failure, not a verdict on the backup." >&2
+                        log "ERROR" "  Check credentials/connectivity and retry, or name a backup explicitly." >&2
+                        exit 1
+                        ;;
+                esac
             fi
         done <<< "$dirs"
     done

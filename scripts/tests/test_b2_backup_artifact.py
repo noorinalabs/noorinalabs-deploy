@@ -745,3 +745,134 @@ def test_restore_selection_survives_an_artifact_with_no_manifest(tmp_path: Path)
     assert got["PG"] == STORE_FILES["isnad-pg"]
     assert got["USER_PG"] == STORE_FILES["isnad-userpg"]
     assert got["NEO4J"] == STORE_FILES["isnad-neo4j"]
+
+
+# ---------------------------------------------------------------------------
+# LEVEL 4 — what does the guard do when it CANNOT EVALUATE?
+#
+# Levels 1-3 ask: does the guard exist, is it called, does it return the right answer.
+# None of them can see this, because it is not a question about the predicate at all.
+#
+#   "I could not read the input" is NOT a value of the predicate. It is a THIRD OUTCOME,
+#   and collapsing it into either branch produces a confident lie.
+#
+# Both manifest reads were `rclone cat ... 2>/dev/null || true` — rc DISCARDED. A transient
+# 401 / throttle / network blip on a GOOD, COMPLETE, FRESH backup then produced
+# `status=incomplete reason=no_complete_backup`, and in restore.sh told an operator
+# mid-incident "No COMPLETE backup found in B2 bucket" over a bucket full of good ones —
+# the SAME user-visible lie the unmatched regex produced, by a different route.
+#
+# rc separates them, and the BACKENDS DISAGREE — in exactly the shape of the `lsf` finding:
+#   cat existing    -> rc=0 (B2)   rc=0 (local)
+#   cat nonexistent -> rc=0 EMPTY (B2)   rc=3 (local)   <- absent, NOT an error
+#   cat, bad key    -> rc=1 (B2)   rc=1 (local)         <- CANNOT EVALUATE
+# Verified against real rclone on the local backend before this was written.
+# ---------------------------------------------------------------------------
+def _backup_is_complete(root: Path, path: str) -> int:
+    """Execute restore.sh's SHIPPED `backup_is_complete`, through real rclone.
+
+    `:local:` is rclone's local backend, so `${RCLONE_REMOTE}:${B2_BUCKET}/...` resolves to a
+    real path and the function's rc handling is exercised for real — not against a stub whose
+    rcs I chose to believe.
+    """
+    body = RESTORE_SH.read_text()
+    fn = body[body.index("backup_is_complete() {") : body.index("\nresolve_latest()")]
+    script = (
+        "set -uo pipefail\n"
+        "log() { :; }\n"
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{root}"\n' + fn + "\n"
+        'backup_is_complete "$1"\n'
+    )
+    return subprocess.run(  # noqa: S603
+        ["bash", "-c", script, "_", path],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    ).returncode
+
+
+ATTESTS, DOES_NOT_ATTEST, CANNOT_READ = 0, 1, 2
+
+
+def test_backup_is_complete_separates_all_three_outcomes(tmp_path: Path) -> None:
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+
+    # (1) reads it, and it attests
+    (d / "_backup_manifest.txt").write_bytes(_manifest(True))
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == ATTESTS
+
+    # (2) reads it, and it does NOT attest
+    (d / "_backup_manifest.txt").write_bytes(_manifest(False))
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST
+
+    # (3) NO manifest — rclone rc=3 on local, rc=0/empty on B2. ABSENT, not an error.
+    (d / "_backup_manifest.txt").unlink()
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST, (
+        "a missing manifest is 'does not attest', NOT an instrument failure — rc=3 on the "
+        "local backend must not be mistaken for the bad-key rc=1"
+    )
+
+
+def test_unreadable_manifest_is_not_reported_as_incomplete(tmp_path: Path) -> None:
+    """THE BLOCK. A good backup whose manifest merely could not be READ.
+
+    The dumps are there. The backup is restorable. Saying "incomplete" is a confident lie,
+    and in `resolve_latest` it becomes "No COMPLETE backup found in B2 bucket" — told to an
+    operator who is mid-incident and holding a bucket full of good backups.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    m = d / "_backup_manifest.txt"
+    m.write_bytes(_manifest(True))
+    m.chmod(0o000)  # rclone rc=1 — the same class as a 401/bad key
+    try:
+        rc = _backup_is_complete(tmp_path, "daily/2026-07-11")
+    finally:
+        m.chmod(0o644)
+
+    assert rc == CANNOT_READ, (
+        f"an unreadable manifest must be CANNOT_READ ({CANNOT_READ}), not "
+        f"DOES_NOT_ATTEST ({DOES_NOT_ATTEST}); got {rc}. 'I could not read the input' is not "
+        "a value of the predicate."
+    )
+
+
+def test_scanner_reports_unreadable_manifest_as_instrument_error(tmp_path: Path) -> None:
+    """Same defect, scanner side — and it violated this script's own founding invariant.
+
+    `instrument_error` is NOT a claim about backups. Step 1's bucket probe honours that
+    meticulously (`|| rc=$?`, citing deploy#563). Step 4's manifest read discarded the rc,
+    INSIDE the change built to enforce the invariant.
+    """
+    d = _backup_dir(tmp_path, complete=True)  # a GOOD, COMPLETE, FRESH backup
+    m = d / "_backup_manifest.txt"
+
+    rc, line = _scan(tmp_path)  # control: the manifest is readable
+    assert rc == EXIT_OK and _field(line, "status") == "fresh", f"control must be fresh: {line}"
+
+    m.chmod(0o000)
+    try:
+        rc, line = _scan(tmp_path)
+    finally:
+        m.chmod(0o644)
+
+    assert rc == EXIT_INSTRUMENT, (
+        f"a GOOD backup whose manifest could not be READ must be instrument_error, not a "
+        f"verdict on the backup: {line}"
+    )
+    assert _field(line, "status") == "instrument_error"
+    assert _field(line, "reason") == "manifest_unreadable"
+
+
+def test_manifest_with_a_true_line_after_a_false_one_does_not_attest(tmp_path: Path) -> None:
+    """Attest on the FIRST manifest line. Unioning tokens across all lines FAILS OPEN.
+
+    `backup.sh` writes with `>`, so this needs a corrupt artifact — but the failure direction
+    is the wrong one, and `head -n1` costs nothing.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    (d / "_backup_manifest.txt").write_bytes(_manifest(False) + _manifest(True))
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST

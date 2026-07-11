@@ -289,17 +289,60 @@ scan() {
         local mpath="${base}"
         [[ -n "$dir" ]] && mpath="${base}/${dir}"
 
-        # The attestation the producer wrote about ITSELF. Same predicate restore.sh uses.
-        local manifest
-        manifest="$(rclone cat --log-level NOTICE "${mpath}/_backup_manifest.txt" 2>/dev/null || true)"
+        # --- "I COULD NOT READ IT" IS NOT "IT DOES NOT ATTEST". ------------------
+        #
+        # This read was `rclone cat … 2>/dev/null || true` — the rc DISCARDED. A transient
+        # 401, a throttle, a network blip on the manifest object then produced
+        # `status=incomplete reason=no_complete_backup` over a GOOD, COMPLETE, FRESH backup:
+        # the dumps are there, the backup is restorable, and the scanner says there is no
+        # complete backup. That is the same confident lie the unmatched regex produced,
+        # reached by a different route (deploy#584 review, Nino Kavtaradze).
+        #
+        # And it broke this script's OWN founding invariant — `instrument_error` is NOT a
+        # claim about backups — INSIDE the change built to enforce it. Step 1's bucket probe
+        # honours it (`|| rc=$?`); this read did not. "I could not read the input" is a THIRD
+        # OUTCOME, not a value of the predicate, and collapsing it into either branch is a lie
+        # either way.
+        #
+        # rc SEPARATES them, measured on both backends (and the backends DISAGREE, in exactly
+        # the same shape as the `lsf` finding above — so calibrating this on local fixtures
+        # alone would repeat that mistake):
+        #
+        #   cat existing      -> rc=0 (B2)   rc=0 (local)
+        #   cat NONEXISTENT   -> rc=0, EMPTY (B2)   rc=3 (local)      <- absent, not an error
+        #   cat, bad key      -> rc=1 (B2)   rc=1 (local)             <- CANNOT EVALUATE
+        #
+        # So: 0 => read it (empty on B2 means absent); 3 => local not-found, absent;
+        # anything else => we could not look, and we must say so.
+        local manifest mrc=0 merr
+        merr="$(mktemp)"
+        manifest="$(rclone cat --log-level NOTICE "${mpath}/_backup_manifest.txt" 2>"$merr")" || mrc=$?
+        if [[ "$mrc" -ne 0 && "$mrc" -ne 3 ]]; then
+            if [[ "$QUIET_ERRORS" != "true" ]]; then
+                log ERROR "rclone could not READ the manifest at ${mpath} (rc=${mrc}). Its stderr follows:"
+                sed 's/^/    /' "$merr" >&2
+                log ERROR "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look."
+            fi
+            rm -f "$merr"
+            result instrument_error manifest_unreadable "${dir_dumps["$dir"]}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
+            return $EXIT_INSTRUMENT
+        fi
+        rm -f "$merr"
+
         # Whole-TOKEN match, and NOT the anchored-prefix regex restore.sh shipped with —
         # that one could never match, because `complete=` is the first token after
         # `BACKUP_MANIFEST ` and the anchor's literal space consumes the only space present.
         # Fixed in restore.sh in this same change; the bug is the reason this fixture exists.
-        if ! printf '%s\n' "$manifest" | grep '^BACKUP_MANIFEST ' | tr ' ' '\n' | grep -qx 'complete=true'; then
-            # No manifest, or it says complete=false. A directory that does not attest its
-            # own completeness is not one we can promise a restore from — and every
-            # pre-deploy#559 backup predates user-postgres coverage entirely.
+        #
+        # `head -n1`: attest on the FIRST manifest line only. Unioning tokens across every
+        # line lets a corrupt artifact carrying both a `complete=false` and a `complete=true`
+        # line match — it FAILS OPEN, and a line-1 read costs nothing.
+        if ! printf '%s\n' "$manifest" | grep '^BACKUP_MANIFEST ' | head -n1 \
+                | tr ' ' '\n' | grep -qx 'complete=true'; then
+            # A manifest we READ, which does not attest. (Or none at all: every
+            # pre-deploy#559 backup predates user-postgres coverage entirely.) Distinct from
+            # the branch above — that one is "I could not read it", this one is "I read it,
+            # and it does not say complete".
             skipped=$((skipped + 1))
             continue
         fi

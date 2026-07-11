@@ -32,6 +32,8 @@ specific defects is reintroduced textually.
 from __future__ import annotations
 
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
@@ -302,6 +304,29 @@ def test_backup_dumps_user_postgres() -> None:
 TIMESTAMP = "20260709-120000"
 
 
+def _resolve_latest(root: Path) -> str:
+    """Execute restore.sh's SHIPPED `resolve_latest` against a real bucket.
+
+    `:local:` is rclone's local backend, so `${RCLONE_REMOTE}:${B2_BUCKET}/...` resolves to a
+    real directory tree and both `rclone lsf` and `backup_is_complete` run for real.
+    """
+    body = _restore_text()
+    fns = body[body.index("backup_is_complete() {") : body.index("\nverify_checksums()")]
+    script = (
+        "set -uo pipefail\n"
+        "log() { :; }\n"
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return r.stdout.strip()
+
+
 def _backup_dump_filenames() -> dict[str, str]:
     """Concrete filenames ``backup.sh`` actually writes, read out of the script.
 
@@ -494,20 +519,38 @@ def test_resolve_latest_selects_a_complete_backup() -> None:
     assert "_backup_manifest.txt" in code, (
         "completeness is a property of the artifact and the artifact must declare it"
     )
-    # Assert the CALL, not merely the definition. A first version of this test checked only
-    # that `backup_is_complete` appeared somewhere in the file — which it still does when
-    # the call site is replaced by `if true`, leaving the function defined, unused, and the
-    # newest-by-name bug fully restored. A guard is not pinned by the existence of the
-    # function that implements it; it is pinned by the branch that calls it.
+
+    # This test used to assert the LITERAL call line —
+    #   `if backup_is_complete "${category}/${dir}"; then`
+    # — which pinned the guard's SYNTAX rather than its BEHAVIOUR, and went red the moment the
+    # call site legitimately grew a third outcome (deploy#584: "could not read the manifest" is
+    # not a value of the predicate). A textual assertion is the same instrument that let the
+    # `backup_is_complete` regex ship broken through a green suite: it can prove a line was
+    # typed and never that it does anything. So RUN it.
     body = code.split("resolve_latest() {", 1)[1].split("\n}", 1)[0]
-    assert 'if backup_is_complete "${category}/${dir}"; then' in body, (
-        "resolve_latest must actually CALL backup_is_complete when selecting; otherwise "
-        "'latest' is still the newest directory NAME and will pick a partial backup"
-    )
     assert "skipped" in body, (
         "an operator told nothing about why the newest backup was passed over will assume "
         "the tool is broken and reach for the one it refused"
     )
+    assert "backup_is_complete" in body, "resolve_latest must consult the attestation"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # The NEWEST directory is INCOMPLETE; the older one is complete. Selecting by name
+        # picks 07-11 — the artifact missing the store nothing can rebuild.
+        for date, complete in (("2026-07-10", True), ("2026-07-11", False)):
+            d = root / "daily" / date
+            d.mkdir(parents=True)
+            (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
+            (d / "_backup_manifest.txt").write_text(
+                f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
+                f"stores=postgres,user-postgres,neo4j timestamp={TIMESTAMP} category=daily\n"
+            )
+        (root / "weekly").mkdir()
+
+        assert _resolve_latest(root) == "daily/2026-07-10", (
+            "'latest' must select the newest COMPLETE backup, not the newest directory NAME"
+        )
 
 
 def test_backup_declares_its_own_completeness() -> None:
