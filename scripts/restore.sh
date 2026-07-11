@@ -122,15 +122,41 @@ done
 # and an operator reads that as "I have no backups." The instrument failed; the bucket may be
 # full. A listing that cannot distinguish an empty bucket from a failed listing is not a
 # listing, it is a guess (deploy#584 review, Nino Kavtaradze — the pattern, not the incident).
+#
+# ---------------------------------------------------------------------------
+# THE TWO STREAMS EXIST BECAUSE ONE IS DATA AND ONE IS COMMENTARY
+# ---------------------------------------------------------------------------
+# The FIRST fix for the above used `2>&1`, and that is a NEW bug, not a fix:
+#
+#   2>/dev/null, || true    DISCARDS the diagnostic          <- the original bug
+#   2>&1 into a variable    PROMOTES the diagnostic to DATA  <- the over-correction
+#   2>"$err", read on rc    CAPTURES it                      <- correct
+#
+# `restore.sh` configures rclone through `RCLONE_CONFIG_ISNAD_*` and ships no `rclone.conf`,
+# so rclone writes this to stderr on every SUCCESSFUL call:
+#
+#   NOTICE: Config file ".../rclone.conf" not found - using defaults
+#
+# `2>&1` folded that line into `$dirs`, and the code then read it as a backup DIRECTORY NAME.
+# Against a healthy bucket holding one good backup, `resolve_latest` reported two INCOMPLETE
+# backups that do not exist, and `--list` printed a log line to the operator as a backup name.
+#
+# Note the direction of the regression: the ORIGINAL bug fired only on FAILURE. This one fires
+# on SUCCESS — because a tool writing to stderr when nothing is wrong is completely ordinary
+# (warnings, deprecations, progress, config notices). `2>&1` corrupts the NORMAL path, which
+# is the path nobody tests as hard. Found by both reviewers independently.
 list_category() {
-    local category="$1" out rc=0
-    out="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>&1)" || rc=$?
+    local category="$1" out rc=0 err
+    err="$(mktemp)"
+    out="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$err")" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         log "ERROR" "Could not LIST ${category} (rclone rc=${rc}):"
-        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        sed 's/^/    /' "$err" >&2
         log "ERROR" "  This is an INSTRUMENT failure — NOT a claim that you have no backups."
+        rm -f "$err"
         return 1
     fi
+    rm -f "$err"
     if [[ -z "$out" ]]; then
         echo "  (none)"
     else
@@ -264,15 +290,18 @@ resolve_latest() {
     # a measurement — the same sentence as the `lsf` silent zero the scanner is built around,
     # which is why the scanner's step-1 probe captures this rc and this one did not.
     for category in daily weekly; do
-        local dirs lrc=0
-        dirs="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>&1)" || lrc=$?
+        local dirs lrc=0 lerr
+        lerr="$(mktemp)"
+        dirs="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$lerr")" || lrc=$?
         if [[ "$lrc" -ne 0 ]]; then
             log "ERROR" "Cannot resolve 'latest': could not LIST ${category} (rclone rc=${lrc}):" >&2
-            printf '%s\n' "$dirs" | sed 's/^/    /' >&2
+            sed 's/^/    /' "$lerr" >&2
             log "ERROR" "  This is an INSTRUMENT failure, NOT a verdict on your backups." >&2
             log "ERROR" "  Check credentials/connectivity and retry, or name a backup explicitly." >&2
+            rm -f "$lerr"
             exit 1
         fi
+        rm -f "$lerr"
         while IFS= read -r dir; do
             [[ -z "$dir" ]] && continue
             dir="${dir%/}"

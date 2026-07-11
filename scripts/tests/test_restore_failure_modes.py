@@ -31,10 +31,13 @@ specific defects is reintroduced textually.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import tempfile
 from pathlib import Path
+
+from manifest_fixture import build_manifest
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -712,3 +715,101 @@ def test_list_backups_does_not_report_a_failed_listing_as_none() -> None:
         f"backups', asserted from an instrument failure: {out}"
     )
     assert "INSTRUMENT failure" in out, f"it must say it could not look: {out}"
+
+
+# --------------------------------------------------------------------------
+# The two streams exist because one is DATA and one is COMMENTARY
+# --------------------------------------------------------------------------
+
+
+def _rclone_notice_env() -> dict[str, str]:
+    """Force rclone's config NOTICE onto stderr, exactly as production emits it.
+
+    ``restore.sh`` configures rclone through ``RCLONE_CONFIG_ISNAD_*`` and ships no
+    ``rclone.conf``, so on the VPS rclone writes
+
+        NOTICE: Config file ".../rclone.conf" not found - using defaults
+
+    to stderr on every **successful** call. Pointing ``RCLONE_CONFIG`` at a path that does not
+    exist reproduces that condition deterministically here, rather than depending on whether
+    this machine happens to have a config file.
+    """
+    return {**os.environ, "RCLONE_CONFIG": "/nonexistent/rclone.conf"}
+
+
+def test_resolve_latest_does_not_read_rclone_stderr_as_a_backup_directory(tmp_path: Path) -> None:
+    """`2>&1` does not CAPTURE the diagnostic — it PROMOTES it to data.
+
+    And note the direction of this regression against the bug it replaced: the original
+    swallow (`2>/dev/null || true`) fired only on FAILURE. This one fires on **SUCCESS**,
+    because a tool writing to stderr when nothing is wrong is completely ordinary. It corrupts
+    the NORMAL path — the one nobody tests as hard.
+
+    Against a HEALTHY bucket holding one good complete backup, folding stderr into the listing
+    made `resolve_latest` report two INCOMPLETE backups that do not exist:
+
+        [WARNING] Skipped 2 INCOMPLETE backup(s) when resolving 'latest':
+        [WARNING]     incomplete: daily/2026/07/11 05:13:53 NOTICE: Config file … not found
+
+    and it corrupts the warning block added precisely so an operator is not left guessing —
+    telling them a lie instead of nothing.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
+    (d / "_backup_manifest.txt").write_bytes(build_manifest(complete=True, run_ts=TIMESTAMP))
+    (tmp_path / "weekly").mkdir()
+
+    body = _restore_text()
+    fns = body[body.index("list_runs() {") : body.index("\nverify_checksums()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{tmp_path}"\n' + fns + "\nresolve_latest\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_rclone_notice_env(),
+    )
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 0, f"the HEALTHY bucket must resolve: {out}"
+    assert "NOTICE" not in out, (
+        "rclone's stderr was folded into the listing and is being reported as backup "
+        f"directories. The diagnostic is COMMENTARY, not DATA:\n{out}"
+    )
+    assert "INCOMPLETE" not in out.upper() or "Skipped 0" in out, (
+        f"a healthy bucket with one good backup must not invent incomplete ones:\n{out}"
+    )
+    assert r.stdout.strip().splitlines()[-1] == "daily/2026-07-11"
+
+
+def test_list_backups_does_not_print_rclone_stderr_as_a_backup_name(tmp_path: Path) -> None:
+    """`--list` printed a LOG LINE to the operator as a backup name."""
+    (tmp_path / "daily" / "2026-07-11").mkdir(parents=True)
+    (tmp_path / "weekly").mkdir()
+
+    body = _restore_text()
+    fns = body[body.index("list_category() {") : body.index("\nbackup_is_complete()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{tmp_path}"\n' + fns + "\nlist_backups\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_rclone_notice_env(),
+    )
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 0, f"a healthy bucket must list cleanly: {out}"
+    assert "NOTICE" not in out, f"rclone's stderr is being printed as a backup name:\n{out}"
+    assert "2026-07-11/" in r.stdout, f"the real backup must still be listed:\n{out}"
