@@ -111,14 +111,107 @@ done
 # Functions
 # ---------------------------------------------------------------------------
 
+# rclone lsf a category, separating "empty" from "I could not look".
+#
+# `|| echo "  (none)"` — what this used to be — is the SAME LIE this whole change exists to
+# stop, by a third route: with a bad key or an unreachable bucket, `restore.sh --list` printed
+#
+#     === Daily ===
+#       (none)
+#
+# and an operator reads that as "I have no backups." The instrument failed; the bucket may be
+# full. A listing that cannot distinguish an empty bucket from a failed listing is not a
+# listing, it is a guess (deploy#584 review, Nino Kavtaradze — the pattern, not the incident).
+#
+# ---------------------------------------------------------------------------
+# THE TWO STREAMS EXIST BECAUSE ONE IS DATA AND ONE IS COMMENTARY
+# ---------------------------------------------------------------------------
+# The FIRST fix for the above used `2>&1`, and that is a NEW bug, not a fix:
+#
+#   2>/dev/null, || true    DISCARDS the diagnostic          <- the original bug
+#   2>&1 into a variable    PROMOTES the diagnostic to DATA  <- the over-correction
+#   2>"$err", read on rc    CAPTURES it                      <- correct
+#
+# `restore.sh` configures rclone through `RCLONE_CONFIG_ISNAD_*` and ships no `rclone.conf`,
+# so rclone writes this to stderr on every SUCCESSFUL call:
+#
+#   NOTICE: Config file ".../rclone.conf" not found - using defaults
+#
+# `2>&1` folded that line into `$dirs`, and the code then read it as a backup DIRECTORY NAME.
+# Against a healthy bucket holding one good backup, `resolve_latest` reported two INCOMPLETE
+# backups that do not exist, and `--list` printed a log line to the operator as a backup name.
+#
+# Note the direction of the regression: the ORIGINAL bug fired only on FAILURE. This one fires
+# on SUCCESS — because a tool writing to stderr when nothing is wrong is completely ordinary
+# (warnings, deprecations, progress, config notices). `2>&1` corrupts the NORMAL path, which
+# is the path nobody tests as hard. Found by both reviewers independently.
+list_category() {
+    local category="$1" out rc=0 err
+    err="$(mktemp)"
+    out="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$err")" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        log "ERROR" "Could not LIST ${category} (rclone rc=${rc}):"
+        sed 's/^/    /' "$err" >&2
+        log "ERROR" "  This is an INSTRUMENT failure — NOT a claim that you have no backups."
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+    if [[ -z "$out" ]]; then
+        echo "  (none)"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+# The DISTINCT run timestamps present among a directory's dumps.
+#
+# `backup.sh` names every dump `isnad-<store>-<TIMESTAMP>.dump[.zst]` with a single
+# `%Y%m%d-%H%M%S` run id, so the filenames themselves carry which run each dump belongs to.
+# A B2 day-directory accumulates runs (`rclone copy` adds and never deletes), so "how many
+# runs are in here?" is a question the artifact can answer without a manifest.
+#
+# ---------------------------------------------------------------------------
+# ANCHOR ON THE RUN ID. DO NOT PARSE THE STORE NAME. (deploy#589)
+# ---------------------------------------------------------------------------
+# This matched the store segment as `[a-z0-9]\{1,\}` — which CANNOT CONTAIN A HYPHEN. Rename
+# `userpg` to `user-pg` in backup.sh and every dump of that store becomes INVISIBLE here:
+#
+#   isnad-user-pg-20260711-030100.dump   ->   (no match)
+#
+# A producer-side rename does not BREAK this parser — it QUIETLY NARROWS it. And what it
+# stops seeing is exactly what the guard downstream needs to count: with a run rendered
+# invisible, `count_runs` falls to 1, the refuse-on-ambiguity gate stops refusing, and THE
+# TORN RESTORE COMES BACK — with nothing red anywhere. A paraphrase in the PRODUCT is worse
+# than one in a test: the test paraphrases too, so it stays green.
+#
+# So do not parse the part that can change. The RUN ID is what we want and its format is
+# strict and self-delimiting (`%Y%m%d-%H%M%S`), so anchor on THAT and let the store segment be
+# anything at all. Sidecars still fall out for free: `.sha256` does not end in `.dump[.zst]`.
+list_runs() {
+    find "$1" \( -name 'isnad-*.dump' -o -name 'isnad-*.dump.zst' \) -type f -printf '%f\n' 2>/dev/null \
+        | sed -n 's/^isnad-.*-\([0-9]\{8\}-[0-9]\{6\}\)\.dump\(\.zst\)\{0,1\}$/\1/p' \
+        | sort -u
+}
+
+count_runs() {
+    local n
+    n="$(list_runs "$1" | grep -c . || true)"
+    printf '%s\n' "${n:-0}"
+}
+
 list_backups() {
     log "INFO" "Available backups in ${B2_BUCKET}:"
+    local failed=0
     echo ""
     echo "=== Daily ==="
-    rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/daily/" --dirs-only 2>/dev/null || echo "  (none)"
+    list_category daily || failed=1
     echo ""
     echo "=== Weekly ==="
-    rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/weekly/" --dirs-only 2>/dev/null || echo "  (none)"
+    list_category weekly || failed=1
+    # Exit non-zero on an instrument failure. `--list` that cannot see the bucket must not
+    # exit 0 with a confident-looking empty report.
+    return "$failed"
 }
 
 # Does the backup directory at <category>/<date> declare itself COMPLETE?
@@ -126,13 +219,63 @@ list_backups() {
 # manifest is NOT complete: every pre-#559 backup predates user-postgres coverage entirely,
 # so treating "no manifest" as "probably fine" would hand `latest` the exact artifact class
 # this change exists to stop.
+#
+# THREE outcomes, not two:
+#   0 = attests complete
+#   1 = read it, and it does NOT attest (or there is no manifest)
+#   2 = COULD NOT READ IT  <- not a value of the predicate. A separate answer.
+#
+# This read was `rclone cat … 2>/dev/null || true`, with the rc DISCARDED, so a transient
+# 401 / throttle / network blip collapsed into "does not attest" — and `resolve_latest` then
+# told an operator mid-incident "No COMPLETE backup found in B2 bucket" over a bucket full of
+# good ones. That is the SAME user-visible lie the unmatched regex produced, reached by a
+# different route; fixing the regex and leaving this would have been half a fix to the
+# identical symptom (deploy#584 review, Nino Kavtaradze).
+#
+# rc separates them, measured on both backends — which DISAGREE:
+#   cat existing    -> rc=0 (B2)  rc=0 (local)
+#   cat nonexistent -> rc=0 EMPTY (B2)  rc=3 (local)   <- absent. Not an error.
+#   cat, bad key    -> rc=1 (B2)  rc=1 (local)         <- CANNOT EVALUATE
 backup_is_complete() {
     local path="$1"
-    local manifest
-    manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest.txt" 2>/dev/null || true)"
+    local manifest rc=0
+    manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest.txt" 2>/dev/null)" || rc=$?
+    if [[ "$rc" -ne 0 && "$rc" -ne 3 ]]; then
+        log "ERROR" "Could not READ the manifest at ${path} (rclone rc=${rc})."
+        log "ERROR" "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look."
+        return 2
+    fi
     [[ -n "$manifest" ]] || return 1
+    # WHOLE-TOKEN match. The predicate this replaces was:
+    #
+    #   grep -q '^BACKUP_MANIFEST .*[[:space:]]complete=true\([[:space:]]\|$\)'
+    #
+    # and it COULD NEVER MATCH. `complete=` is the FIRST token backup.sh writes after
+    # `BACKUP_MANIFEST `, so the literal space in the anchor consumes the only space there
+    # is, and `.*[[:space:]]complete=true` then demands a SECOND one that never exists.
+    #
+    # So `backup_is_complete` returned false for EVERY backup, `resolve_latest` skipped all
+    # of them, and `restore.sh latest` could not select an artifact at all — it would have
+    # reported "No COMPLETE backup found in B2 bucket" over a bucket full of good backups.
+    # It failed CLOSED, so nothing was ever at risk; but the recovery path was inert, and it
+    # shipped in deploy#577 with a green suite.
+    #
+    # It survived because #577's tests are TEXTUAL: they assert this function is CALLED
+    # (correctly — that was the deploy#577 review's own lesson) and never once run its
+    # predicate against a manifest `backup.sh` actually produces. Found by deploy#584, whose
+    # fixture was a real manifest.
+    #
+    # Splitting on spaces and matching an exact `complete=true` token is order-independent
+    # and cannot be defeated by a key that ends in another key's name.
+    #
+    # `head -n1`: attest on the FIRST manifest line only. Unioning tokens across every line
+    # lets a corrupt artifact carrying both a `complete=false` and a `complete=true` line
+    # match — it fails OPEN, and reading line 1 costs nothing.
     printf '%s\n' "$manifest" \
-        | grep -q '^BACKUP_MANIFEST .*[[:space:]]complete=true\([[:space:]]\|$\)'
+        | grep '^BACKUP_MANIFEST ' \
+        | head -n1 \
+        | tr ' ' '\n' \
+        | grep -qx 'complete=true'
 }
 
 resolve_latest() {
@@ -150,19 +293,62 @@ resolve_latest() {
     local latest="" latest_date="0000-00-00"
     local skipped=()
 
+    # --- THE LISTING MUST NOT FAIL OPEN. -----------------------------------------
+    #
+    # This was `dirs=$(rclone lsf … 2>/dev/null || true)`. A bad key, a wrong bucket, or a
+    # network fault made `dirs` EMPTY — so the loop body never ran, `backup_is_complete` was
+    # NEVER CALLED, and control fell straight through to "No COMPLETE backup found in B2
+    # bucket." The three-outcome guard below could not fire on the single most likely
+    # instrument failure, because a bad credential dies at the FIRST rclone call, upstream of
+    # it (deploy#584 review, Nino Kavtaradze):
+    #
+    #   FIXING A GUARD DOES NOT HELP IF THE CALL THAT FEEDS IT FAILS OPEN.
+    #
+    # An empty listing and a failed listing are the same empty string, and only one of them is
+    # a measurement — the same sentence as the `lsf` silent zero the scanner is built around,
+    # which is why the scanner's step-1 probe captures this rc and this one did not.
     for category in daily weekly; do
-        local dirs
-        dirs=$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>/dev/null || true)
+        local dirs lrc=0 lerr
+        lerr="$(mktemp)"
+        dirs="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$lerr")" || lrc=$?
+        if [[ "$lrc" -ne 0 ]]; then
+            log "ERROR" "Cannot resolve 'latest': could not LIST ${category} (rclone rc=${lrc}):" >&2
+            sed 's/^/    /' "$lerr" >&2
+            log "ERROR" "  This is an INSTRUMENT failure, NOT a verdict on your backups." >&2
+            log "ERROR" "  Check credentials/connectivity and retry, or name a backup explicitly." >&2
+            rm -f "$lerr"
+            exit 1
+        fi
+        rm -f "$lerr"
         while IFS= read -r dir; do
             [[ -z "$dir" ]] && continue
             dir="${dir%/}"
             if [[ "$dir" > "$latest_date" ]]; then
-                if backup_is_complete "${category}/${dir}"; then
-                    latest_date="$dir"
-                    latest="${category}/${dir}"
-                else
-                    skipped+=("${category}/${dir}")
-                fi
+                local brc=0
+                backup_is_complete "${category}/${dir}" || brc=$?
+                case "$brc" in
+                    0)
+                        latest_date="$dir"
+                        latest="${category}/${dir}"
+                        ;;
+                    1)
+                        skipped+=("${category}/${dir}")
+                        ;;
+                    *)
+                        # COULD NOT READ the manifest. We must NOT quietly skip: that would
+                        # demote a possibly-good backup to "incomplete" on a transient 401 or
+                        # network blip, and then — if it was the only one — report "No
+                        # COMPLETE backup found" over a bucket full of good backups, to an
+                        # operator who is already mid-incident. Refuse to resolve, and say
+                        # why. An operator who knows the instrument failed can retry, fix
+                        # credentials, or name a directory explicitly; one who is told the
+                        # backups are incomplete cannot.
+                        log "ERROR" "Cannot resolve 'latest': the manifest for ${category}/${dir} is UNREADABLE." >&2
+                        log "ERROR" "  This is an INSTRUMENT failure, not a verdict on the backup." >&2
+                        log "ERROR" "  Check credentials/connectivity and retry, or name a backup explicitly." >&2
+                        exit 1
+                        ;;
+                esac
             fi
         done <<< "$dirs"
     done
@@ -541,9 +727,84 @@ verify_checksums "$RESTORE_DIR"
 # `isnad-pg-*` must not also match `isnad-userpg-*`, and it does not: the prefixes
 # diverge at the character after "isnad-". Keep it that way if the names ever change —
 # restoring the user-service dump into the isnad database would be silent and severe.
-PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-pg-*.dump' -type f | head -1)
-USER_PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-userpg-*.dump' -type f | head -1)
-NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name 'isnad-neo4j-*.dump.zst' -o -name 'isnad-neo4j-*.dump' \) -type f | head -1)
+#
+# ---------------------------------------------------------------------------
+# SELECT THE ATTESTED RUN — not "whatever `find` hands back first"
+# ---------------------------------------------------------------------------
+# These three were `find ... | head -1`. `find` emits READDIR order, which is neither
+# chronological nor stable — and a backup directory can legitimately hold dumps from MORE
+# THAN ONE RUN. B2's day-directory accumulates: the path is `<category>/<DATE>` (a day),
+# the dumps inside it are `isnad-<store>-<TIMESTAMP>` (a run), `rclone copy` ADDS and never
+# deletes, and the fixed-name `_backup_manifest.txt` is overwritten by whichever run
+# uploaded last. backup.sh deliberately uploads partials ("a partial backup beats none"),
+# so a failed 02:00 run and a good 14:00 run land side by side — routinely, by design.
+#
+# Measured over 48 two-run day-directories, `find | head -1` selected the OLDER dump in
+# 14 of them. And because each store was selected by an INDEPENDENT `find`, the three could
+# come from DIFFERENT RUNS: isnad Postgres from the failed 02:00 attempt, Neo4j from the
+# good 14:00 one — a TORN RESTORE across datastores, referentially inconsistent, with the
+# required-store gate satisfied (all three present), `verify_checksums` green (a checksum
+# binds a file to ITSELF; it cannot see that the file is from the wrong run) and
+# `complete=true` on the manifest. Every gate we have would have passed it.
+#
+# The manifest already carries the run id — `timestamp=<TS>` — and every dump of that run
+# is named `isnad-<store>-<TS>.*`. So bind the selection to it: the producer names the run,
+# the consumer restores THAT RUN or none of it. A store missing from the attested run then
+# falls through to the required-store gate below, which is exactly where it belongs.
+# The trailing `|| true` is LOAD-BEARING, and its absence was caught by the restore rehearsal
+# rather than by any unit test. This script runs under `set -euo pipefail`. An artifact with
+# no manifest — every pre-deploy#559 backup, and the rehearsal's own fixtures — makes `grep`
+# match nothing, which under `pipefail` fails the WHOLE pipeline, which makes this bare
+# assignment a FAILING SIMPLE COMMAND, at which point errexit kills restore.sh outright. The
+# recovery path would have died on exactly the artifacts the fallback below exists to serve.
+# Same shape as deploy#563's `OUT="$(fn)"; RC=$?`, which is dead on every failing path.
+RESTORE_RUN_TS="$(grep '^BACKUP_MANIFEST ' "${RESTORE_DIR}/_backup_manifest.txt" 2>/dev/null \
+    | tr ' ' '\n' | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1 || true)"
+
+if [[ -n "$RESTORE_RUN_TS" ]]; then
+    log "INFO" "Manifest attests run ${RESTORE_RUN_TS} — selecting that run's dumps"
+    PG_DUMP=$(find "$RESTORE_DIR" -name "isnad-pg-${RESTORE_RUN_TS}.dump" -type f | head -1)
+    USER_PG_DUMP=$(find "$RESTORE_DIR" -name "isnad-userpg-${RESTORE_RUN_TS}.dump" -type f | head -1)
+    NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name "isnad-neo4j-${RESTORE_RUN_TS}.dump.zst" \
+        -o -name "isnad-neo4j-${RESTORE_RUN_TS}.dump" \) -type f | head -1)
+elif [[ "$(count_runs "$RESTORE_DIR")" -gt 1 ]]; then
+    # --- SORTING MADE THE SELECTION REPRODUCIBLE. IT DID NOT MAKE IT COHERENT. ---
+    #
+    # The fallback below is three INDEPENDENT `sort -r | head -1`s, and with no manifest
+    # timestamp to bind them there is nothing making the three agree on a RUN. Against a
+    # directory holding a complete 03:01 run plus a failed 08:00 rerun that left a stray pg
+    # dump, it selected:
+    #
+    #   pg=…-080000   userpg=…-030100   neo4j=…-030100      <- TORN
+    #
+    # Postgres from the failed rerun, Neo4j from the attested run. That is the SAME defect as
+    # the original `find | head -1` — it merely tears the same way every time now. And every
+    # guard still passes it: required-store sees all three present, and each checksum verifies
+    # the file against ITSELF (deploy#584 review, Nino Kavtaradze).
+    #
+    # Determinism is not coherence. With more than one run in the directory and no manifest to
+    # say which one is real, there is no honest answer — so REFUSE and let the operator name
+    # it. Guessing is what produced the tear.
+    log "ERROR" "This backup directory holds dumps from MORE THAN ONE RUN, and has no manifest"
+    log "ERROR" "  timestamp to say which run is the real one:"
+    list_runs "$RESTORE_DIR" | sed 's/^/      /'
+    log "ERROR" "  Selecting per-store would mix runs — an isnad Postgres from one run beside a"
+    log "ERROR" "  Neo4j from another restores a referentially INCONSISTENT stack, and every"
+    log "ERROR" "  checksum still passes (a hash binds a file to ITSELF; it cannot see the file"
+    log "ERROR" "  is from the wrong run)."
+    log "ERROR" "  Remove the dumps from the runs you do not want, and re-run."
+    exit 1
+else
+    # No manifest (a pre-deploy#559 artifact, or a hand-assembled directory under
+    # --allow-partial), and exactly ONE run present — so per-store selection cannot mix runs.
+    # We cannot bind to a run, so at least be DETERMINISTIC: the timestamp
+    # is `%Y%m%d-%H%M%S`, which sorts chronologically as text, so `sort -r | head -1` is the
+    # NEWEST — never an arbitrary one. Strictly better than readdir order in every case.
+    log "WARNING" "No manifest timestamp — falling back to newest-by-name (cannot bind to a run)"
+    PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-pg-*.dump' -type f | sort -r | head -1)
+    USER_PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-userpg-*.dump' -type f | sort -r | head -1)
+    NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name 'isnad-neo4j-*.dump.zst' -o -name 'isnad-neo4j-*.dump' \) -type f | sort -r | head -1)
+fi
 
 # A backup containing no dumps at all is not a backup. Previously the `find`s coming
 # back empty produced warnings, "=== Restore complete ===", and exit 0 — an empty

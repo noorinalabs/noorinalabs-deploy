@@ -361,6 +361,16 @@ jobs:
         # setup-python tool-cache interpreter has no PyYAML preinstalled (unlike
         # the system python the compose-config job's gate step runs on).
         run: pip install pytest pyyaml
+      - name: Install rclone
+        # test_b2_backup_artifact.py EXECUTES scripts/verify_b2_backup_artifact.sh
+        # against local fixtures (rclone treats a filesystem path as a remote), so the
+        # binary is a real test dependency (deploy#583).
+        #
+        # The alternative — skipping those tests when rclone is absent — would be a
+        # silent skip on the one check that stands between us and an empty backup
+        # bucket, and a suite that quietly tests nothing is the exact defect class this
+        # scanner exists to close. Install it instead.
+        run: sudo apt-get update && sudo apt-get install -y rclone
       - name: Run scripts unit tests
         run: python3 -m pytest scripts/tests -q
 

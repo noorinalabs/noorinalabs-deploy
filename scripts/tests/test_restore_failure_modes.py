@@ -31,8 +31,13 @@ specific defects is reintroduced textually.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
+
+from manifest_fixture import build_manifest
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -297,6 +302,34 @@ def test_backup_dumps_user_postgres() -> None:
     assert "isnad-userpg-" in code, "the user-service dump needs its own artifact name"
 
 
+# One concrete run id, substituted into BOTH the producer's `${TIMESTAMP}` and the consumer's
+# `${RESTORE_RUN_TS}`, so the two sides are compared against the same run.
+TIMESTAMP = "20260709-120000"
+
+
+def _resolve_latest(root: Path) -> str:
+    """Execute restore.sh's SHIPPED `resolve_latest` against a real bucket.
+
+    `:local:` is rclone's local backend, so `${RCLONE_REMOTE}:${B2_BUCKET}/...` resolves to a
+    real directory tree and both `rclone lsf` and `backup_is_complete` run for real.
+    """
+    body = _restore_text()
+    fns = body[body.index("backup_is_complete() {") : body.index("\nverify_checksums()")]
+    script = (
+        "set -uo pipefail\n"
+        "log() { :; }\n"
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return r.stdout.strip()
+
+
 def _backup_dump_filenames() -> dict[str, str]:
     """Concrete filenames ``backup.sh`` actually writes, read out of the script.
 
@@ -309,7 +342,7 @@ def _backup_dump_filenames() -> dict[str, str]:
         re.M,
     )
     found = {
-        m.group("var"): m.group("name").replace("${TIMESTAMP}", "20260709-120000")
+        m.group("var"): m.group("name").replace("${TIMESTAMP}", TIMESTAMP)
         for m in pattern.finditer(_backup_code())
     }
     assert found, "could not parse any *_DUMP_FILE assignment out of backup.sh"
@@ -317,12 +350,24 @@ def _backup_dump_filenames() -> dict[str, str]:
 
 
 def _restore_globs() -> dict[str, list[str]]:
-    """The ``find -name '<glob>'`` patterns ``restore.sh`` actually selects each dump by."""
-    globs = {}
+    """The ``find -name <glob>`` patterns ``restore.sh`` actually selects each dump by.
+
+    Selection is now bound to the run the manifest attests (deploy#584): the primary branch
+    globs ``isnad-<store>-${RESTORE_RUN_TS}.dump`` and a fallback branch keeps the old
+    ``isnad-<store>-*.dump`` for artifacts with no manifest. So this ACCUMULATES the patterns
+    from both branches — each one has to satisfy the no-cross-match invariant, not just
+    whichever happens to be parsed last. ``${RESTORE_RUN_TS}`` is substituted with the same
+    concrete timestamp the producer parser uses, so the two sides are compared like for like.
+    """
+    globs: dict[str, list[str]] = {}
     for line in _code_only(_restore_text()).splitlines():
-        m = re.match(r"^(?P<var>[A-Z0-9_]+)_DUMP=\$\(find ", line)
-        if m:
-            globs[m.group("var")] = re.findall(r"-name '([^']+)'", line)
+        m = re.match(r"^\s*(?P<var>[A-Z0-9_]+)_DUMP=\$\(find ", line)
+        if not m:
+            continue
+        # -name 'single' or -name "double"
+        found = re.findall(r"""-name ['"]([^'"]+)['"]""", line)
+        pats = [p.replace("${RESTORE_RUN_TS}", TIMESTAMP) for p in found]
+        globs.setdefault(m.group("var"), []).extend(pats)
     assert globs, "could not parse any *_DUMP=$(find ...) glob out of restore.sh"
     return globs
 
@@ -477,20 +522,38 @@ def test_resolve_latest_selects_a_complete_backup() -> None:
     assert "_backup_manifest.txt" in code, (
         "completeness is a property of the artifact and the artifact must declare it"
     )
-    # Assert the CALL, not merely the definition. A first version of this test checked only
-    # that `backup_is_complete` appeared somewhere in the file — which it still does when
-    # the call site is replaced by `if true`, leaving the function defined, unused, and the
-    # newest-by-name bug fully restored. A guard is not pinned by the existence of the
-    # function that implements it; it is pinned by the branch that calls it.
+
+    # This test used to assert the LITERAL call line —
+    #   `if backup_is_complete "${category}/${dir}"; then`
+    # — which pinned the guard's SYNTAX rather than its BEHAVIOUR, and went red the moment the
+    # call site legitimately grew a third outcome (deploy#584: "could not read the manifest" is
+    # not a value of the predicate). A textual assertion is the same instrument that let the
+    # `backup_is_complete` regex ship broken through a green suite: it can prove a line was
+    # typed and never that it does anything. So RUN it.
     body = code.split("resolve_latest() {", 1)[1].split("\n}", 1)[0]
-    assert 'if backup_is_complete "${category}/${dir}"; then' in body, (
-        "resolve_latest must actually CALL backup_is_complete when selecting; otherwise "
-        "'latest' is still the newest directory NAME and will pick a partial backup"
-    )
     assert "skipped" in body, (
         "an operator told nothing about why the newest backup was passed over will assume "
         "the tool is broken and reach for the one it refused"
     )
+    assert "backup_is_complete" in body, "resolve_latest must consult the attestation"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # The NEWEST directory is INCOMPLETE; the older one is complete. Selecting by name
+        # picks 07-11 — the artifact missing the store nothing can rebuild.
+        for date, complete in (("2026-07-10", True), ("2026-07-11", False)):
+            d = root / "daily" / date
+            d.mkdir(parents=True)
+            (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
+            (d / "_backup_manifest.txt").write_text(
+                f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
+                f"stores=postgres,user-postgres,neo4j timestamp={TIMESTAMP} category=daily\n"
+            )
+        (root / "weekly").mkdir()
+
+        assert _resolve_latest(root) == "daily/2026-07-10", (
+            "'latest' must select the newest COMPLETE backup, not the newest directory NAME"
+        )
 
 
 def test_backup_declares_its_own_completeness() -> None:
@@ -553,3 +616,284 @@ def test_truncation_fixtures_start_from_a_complete_artifact() -> None:
             f"fixture {fx} must start from a complete artifact, or the missing-store gate "
             "refuses it first and the truncation is never tested"
         )
+
+
+def _resolve_latest_rc(root: str) -> tuple[int, str]:
+    """Run the SHIPPED `resolve_latest` and return (rc, combined output).
+
+    `root` is passed through as-is, so a nonexistent path exercises a FAILED LISTING — which
+    is what a bad key / wrong bucket / network fault looks like at the first rclone call.
+    """
+    body = _restore_text()
+    fns = body[body.index("list_runs() {") : body.index("\nverify_checksums()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_resolve_latest_does_not_report_a_failed_listing_as_no_backups() -> None:
+    """FIXING A GUARD DOES NOT HELP IF THE CALL THAT FEEDS IT FAILS OPEN.
+
+    `resolve_latest` listed the categories with `rclone lsf … 2>/dev/null || true`. A bad key,
+    a wrong bucket, or a network fault made `dirs` EMPTY — so the loop body never ran,
+    `backup_is_complete` was **never called**, and control fell straight through to
+    *"No COMPLETE backup found in B2 bucket."*
+
+    So on the single most likely instrument failure — and the one most likely to bite
+    mid-incident — the three-outcome guard could not fire **at all**, because a bad credential
+    dies at the FIRST rclone call, upstream of it. An empty listing and a failed listing are
+    the same empty string, and only one of them is a measurement.
+    """
+    rc, out = _resolve_latest_rc("/nonexistent/bucket/path")
+
+    assert rc != 0, "a failed listing must not resolve successfully"
+    assert "No COMPLETE backup found" not in out, (
+        "a failed LISTING must never be reported as 'no complete backup' — that tells an "
+        f"operator mid-incident that their backups are gone when the instrument failed: {out}"
+    )
+    assert "INSTRUMENT failure" in out, f"it must say it could not look: {out}"
+
+
+def test_resolve_latest_still_resolves_when_the_listing_works(tmp_path: Path) -> None:
+    """The POSITIVE control. A guard that refuses everything is not a guard."""
+    for date, complete in (("2026-07-10", True), ("2026-07-11", False)):
+        d = tmp_path / "daily" / date
+        d.mkdir(parents=True)
+        (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
+        (d / "_backup_manifest.txt").write_text(
+            f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
+            f"stores=postgres,user-postgres,neo4j timestamp={TIMESTAMP} category=daily\n"
+        )
+    (tmp_path / "weekly").mkdir()
+
+    rc, out = _resolve_latest_rc(str(tmp_path))
+    assert rc == 0, f"the good control must resolve: {out}"
+    assert "daily/2026-07-10" in out
+
+
+def test_list_backups_does_not_report_a_failed_listing_as_none() -> None:
+    """The SAME lie, by a third route — and nobody had named this one.
+
+    `list_backups` used `|| echo "  (none)"`. With a bad key, `restore.sh --list` printed
+
+        === Daily ===
+          (none)
+
+    and an operator reads that as "I have no backups." The instrument failed; the bucket may
+    be full. Found by walking every rclone call in the file rather than only the one that was
+    reported — the pattern, not the incident.
+    """
+    body = _restore_text()
+    fns = body[body.index("list_category() {") : body.index("\nbackup_is_complete()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        'B2_BUCKET="/nonexistent/bucket/path"\n' + fns + "\nlist_backups\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    out = r.stdout + r.stderr
+
+    assert r.returncode != 0, "--list over an unreadable bucket must not exit 0"
+    assert "(none)" not in out, (
+        f"a failed listing must never be rendered as '(none)' — that is 'you have no "
+        f"backups', asserted from an instrument failure: {out}"
+    )
+    assert "INSTRUMENT failure" in out, f"it must say it could not look: {out}"
+
+
+# --------------------------------------------------------------------------
+# The two streams exist because one is DATA and one is COMMENTARY
+# --------------------------------------------------------------------------
+
+
+def _rclone_notice_env() -> dict[str, str]:
+    """Force rclone's config NOTICE onto stderr, exactly as production emits it.
+
+    ``restore.sh`` configures rclone through ``RCLONE_CONFIG_ISNAD_*`` and ships no
+    ``rclone.conf``, so on the VPS rclone writes
+
+        NOTICE: Config file ".../rclone.conf" not found - using defaults
+
+    to stderr on every **successful** call. Pointing ``RCLONE_CONFIG`` at a path that does not
+    exist reproduces that condition deterministically here, rather than depending on whether
+    this machine happens to have a config file.
+    """
+    return {**os.environ, "RCLONE_CONFIG": "/nonexistent/rclone.conf"}
+
+
+def test_resolve_latest_does_not_read_rclone_stderr_as_a_backup_directory(tmp_path: Path) -> None:
+    """`2>&1` does not CAPTURE the diagnostic — it PROMOTES it to data.
+
+    And note the direction of this regression against the bug it replaced: the original
+    swallow (`2>/dev/null || true`) fired only on FAILURE. This one fires on **SUCCESS**,
+    because a tool writing to stderr when nothing is wrong is completely ordinary. It corrupts
+    the NORMAL path — the one nobody tests as hard.
+
+    Against a HEALTHY bucket holding one good complete backup, folding stderr into the listing
+    made `resolve_latest` report two INCOMPLETE backups that do not exist:
+
+        [WARNING] Skipped 2 INCOMPLETE backup(s) when resolving 'latest':
+        [WARNING]     incomplete: daily/2026/07/11 05:13:53 NOTICE: Config file … not found
+
+    and it corrupts the warning block added precisely so an operator is not left guessing —
+    telling them a lie instead of nothing.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
+    (d / "_backup_manifest.txt").write_bytes(build_manifest(complete=True, run_ts=TIMESTAMP))
+    (tmp_path / "weekly").mkdir()
+
+    body = _restore_text()
+    fns = body[body.index("list_runs() {") : body.index("\nverify_checksums()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{tmp_path}"\n' + fns + "\nresolve_latest\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_rclone_notice_env(),
+    )
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 0, f"the HEALTHY bucket must resolve: {out}"
+    assert "NOTICE" not in out, (
+        "rclone's stderr was folded into the listing and is being reported as backup "
+        f"directories. The diagnostic is COMMENTARY, not DATA:\n{out}"
+    )
+    assert "INCOMPLETE" not in out.upper() or "Skipped 0" in out, (
+        f"a healthy bucket with one good backup must not invent incomplete ones:\n{out}"
+    )
+    assert r.stdout.strip().splitlines()[-1] == "daily/2026-07-11"
+
+
+def test_list_backups_does_not_print_rclone_stderr_as_a_backup_name(tmp_path: Path) -> None:
+    """`--list` printed a LOG LINE to the operator as a backup name."""
+    (tmp_path / "daily" / "2026-07-11").mkdir(parents=True)
+    (tmp_path / "weekly").mkdir()
+
+    body = _restore_text()
+    fns = body[body.index("list_category() {") : body.index("\nbackup_is_complete()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{tmp_path}"\n' + fns + "\nlist_backups\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_rclone_notice_env(),
+    )
+    out = r.stdout + r.stderr
+
+    assert r.returncode == 0, f"a healthy bucket must list cleanly: {out}"
+    assert "NOTICE" not in out, f"rclone's stderr is being printed as a backup name:\n{out}"
+    assert "2026-07-11/" in r.stdout, f"the real backup must still be listed:\n{out}"
+
+
+# --------------------------------------------------------------------------
+# deploy#589 — the paraphrase in the PRODUCT
+# --------------------------------------------------------------------------
+
+
+def _list_runs(directory: Path) -> list[str]:
+    """Execute restore.sh's SHIPPED `list_runs` against a real directory."""
+    body = _restore_text()
+    fn = body[body.index("list_runs() {") : body.index("\ncount_runs()")]
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", fn + '\nlist_runs "$1"\n', "_", str(directory)],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return r.stdout.split()
+
+
+def test_list_runs_sees_every_dump_the_producer_actually_writes(tmp_path: Path) -> None:
+    """The run-counter is bound to `backup.sh`'s REAL filenames, not to names I typed.
+
+    `count_runs` feeds the refuse-on-ambiguity gate, so a dump this parser cannot see is a run
+    that does not exist as far as the gate is concerned.
+    """
+    names = _backup_dump_filenames()  # parsed out of backup.sh
+    assert names, "no *_DUMP_FILE names parsed from backup.sh"
+    for name in names.values():
+        # backup.sh compresses the Neo4j dump after writing it.
+        for fname in (name, f"{name}.zst"):
+            (tmp_path / fname).write_bytes(b"P" * 4096)
+        (tmp_path / f"{name}.sha256").write_bytes(b"x")  # sidecar — must be ignored
+
+    assert _list_runs(tmp_path) == [TIMESTAMP], (
+        f"every dump backup.sh writes belongs to run {TIMESTAMP}; list_runs saw "
+        f"{_list_runs(tmp_path)}. A dump this parser cannot see is a run the "
+        "refuse-on-ambiguity gate cannot count."
+    )
+
+
+def test_a_store_rename_cannot_make_a_run_invisible(tmp_path: Path) -> None:
+    """deploy#589. The store segment was `[a-z0-9]+` — which CANNOT CONTAIN A HYPHEN.
+
+    Rename `userpg` -> `user-pg` in the producer and every dump of that store becomes invisible
+    to `list_runs`. That does not BREAK the parser, it QUIETLY NARROWS it — and what it stops
+    seeing is exactly what the guard downstream needs to count:
+
+        run rendered invisible -> count_runs falls to 1 -> the refuse-on-ambiguity gate
+        stops refusing -> THE TORN RESTORE COMES BACK -> and nothing goes red.
+
+    **A paraphrase in the product is worse than one in a test, because the test paraphrases
+    too, so it stays green.** So the parser must anchor on the RUN ID — whose format is strict
+    and self-delimiting — and must not care what the store is called.
+    """
+    # Two runs. The 08:00 leftover is written under a HYPHENATED store name.
+    for name in ("isnad-pg", "isnad-userpg", "isnad-neo4j"):
+        (tmp_path / f"{name}-20260711-030100.dump").write_bytes(b"P" * 4096)
+    (tmp_path / "isnad-user-pg-20260711-080000.dump").write_bytes(b"S" * 4096)
+
+    runs = _list_runs(tmp_path)
+    assert runs == ["20260711-030100", "20260711-080000"], (
+        f"a hyphenated store name made an entire run INVISIBLE: saw {runs}. count_runs would "
+        "fall to 1, the refuse-on-ambiguity gate would stand down, and the torn restore "
+        "would come back with nothing red."
+    )
+
+
+def test_list_runs_does_not_constrain_the_store_charset() -> None:
+    """Pin the SHAPE, not the instance — the store segment must not be enumerated.
+
+    A charset for the store name is a paraphrase of the producer's naming, and it is the
+    paraphrase that silently narrows. The run id is the only thing worth parsing.
+    """
+    fn = _code_only(_restore_text())
+    fn = fn[fn.index("list_runs() {") : fn.index("count_runs()")]
+    assert "[a-z0-9]" not in fn, (
+        "list_runs is matching the store name against a character class again. A producer-side "
+        "rename would not break it — it would silently narrow it, and the refuse-on-ambiguity "
+        "gate downstream would stop refusing. Anchor on the run id instead (deploy#589)."
+    )
+    assert "[0-9]\\{8\\}-[0-9]\\{6\\}" in fn, (
+        "list_runs must anchor on the run id's strict %Y%m%d-%H%M%S shape"
+    )

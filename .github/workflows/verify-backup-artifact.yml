@@ -1,0 +1,135 @@
+# Verify a restorable backup object exists IN B2 (deploy#583)
+#
+# Every other backup signal we have reads a HOST-LOCAL textfile gauge. The single point of
+# trust that an object ever landed in the bucket is `rclone copy; echo $?` — the uploader's
+# own opinion of its upload. The whole alerting stack can be green while the bucket is empty.
+#
+# This job is the only thing that looks IN THE BUCKET, and it deliberately runs on a GitHub
+# runner rather than on the VPS:
+#
+#   * A host that is down cannot report that its own backup is missing.
+#   * A Prometheus gauge would have to be SCRAPED from that same host — so a metric could
+#     not carry this signal either. That is why the alert here is a FAILING JOB, and why it
+#     is a different layer from `BackupNeverSucceeded` / `BackupStale` / `BackupFailed`,
+#     which all read `isnad_backup_last_success_timestamp_seconds` off the box.
+#
+# It needs no SSH and never touches the VPS. It needs only the read-scoped B2 credential.
+name: Verify backup artifact (B2)
+
+on:
+  schedule:
+    # 05:30 UTC — comfortably after the 03:01 nightly backup window, and offset off the
+    # hour to avoid the scheduler's peak.
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "scripts/verify_b2_backup_artifact.sh"
+      - "scripts/tests/test_b2_backup_artifact.py"
+      - ".github/workflows/verify-backup-artifact.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # On a PR we cannot reach B2 (no env secrets), and we should not want to: what a PR must
+  # prove is that the SCANNER still separates the classes. That is exactly the self-test.
+  self-test:
+    name: Scanner self-test (no B2 access)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install rclone
+        run: sudo apt-get update && sudo apt-get install -y rclone
+      - name: The scanner must separate fresh / absent / stale / instrument-error
+        run: bash scripts/verify_b2_backup_artifact.sh --self-test
+
+  verify:
+    # Not on PRs: the environment secrets do not resolve there, and a job that cannot see
+    # the bucket must not report on it.
+    if: github.event_name != 'pull_request'
+    name: ${{ matrix.env }} — is there a restorable object in B2?
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.env == 'prod' && 'production' || 'staging' }}
+    strategy:
+      fail-fast: false # stg being broken must not hide prod being broken
+      matrix:
+        env: [stg, prod]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install rclone
+        run: sudo apt-get update && sudo apt-get install -y rclone
+
+      - name: Verify a restorable backup object exists
+        id: verify
+        env:
+          # Env-scoped secrets. Read-only key; this job never writes to the bucket.
+          # rclone native env — the credential never appears on argv, so it cannot surface
+          # in a process listing or in the run log (deploy#556).
+          RCLONE_CONFIG_ISNAD_TYPE: b2
+          RCLONE_CONFIG_ISNAD_ACCOUNT: ${{ secrets.BACKUP_B2_KEY_ID }}
+          RCLONE_CONFIG_ISNAD_KEY: ${{ secrets.BACKUP_B2_APP_KEY }}
+          B2_BUCKET: ${{ secrets.BACKUP_B2_BUCKET }}
+          MAX_AGE_HOURS: "30"
+        run: |
+          set -uo pipefail
+          if [ -z "${RCLONE_CONFIG_ISNAD_ACCOUNT}" ] || [ -z "${B2_BUCKET}" ]; then
+            echo "::error::BACKUP_B2_* secrets are not set for ${{ matrix.env }}."
+            echo "  This job cannot see the bucket, so it will NOT report on it. An absent"
+            echo "  credential is an INSTRUMENT failure, not evidence that backups are fine."
+            exit 1
+          fi
+
+          # The script self-tests before it reads, and refuses to report a verdict from an
+          # uncalibrated scanner. Its exit codes: 0 fresh, 1 alert, 2 instrument error.
+          set +e
+          OUT="$(B2_ROOT="isnad:${B2_BUCKET}" bash scripts/verify_b2_backup_artifact.sh 2>&1)"
+          RC=$?
+          set -e
+          printf '%s\n' "${OUT}"
+
+          # The one machine-readable line, for the summary.
+          LINE="$(printf '%s\n' "${OUT}" | grep -o 'B2_BACKUP_ARTIFACT .*' | head -n1)"
+          echo "line=${LINE}" >> "$GITHUB_OUTPUT"
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+
+          case "${RC}" in
+            0) echo "::notice::${{ matrix.env }}: a fresh restorable backup object exists in B2." ;;
+            1) echo "::error::${{ matrix.env }}: NO fresh restorable backup object in B2. The host-local gauges may be green — they do not look in the bucket." ;;
+            *) echo "::error::${{ matrix.env }}: could not scan B2 (credentials / network / bucket). This is NOT a claim that backups are missing." ;;
+          esac
+          exit "${RC}"
+
+      - name: Summary
+        if: always()
+        env:
+          LINE: ${{ steps.verify.outputs.line }}
+          RC: ${{ steps.verify.outputs.rc }}
+        run: |
+          {
+            echo "## Backup artifact in B2 — ${{ matrix.env }}: ${{ job.status }}"
+            echo ""
+            if [ -n "${LINE:-}" ]; then
+              echo '```'
+              echo "${LINE}"
+              echo '```'
+            else
+              # No result line: the step did not reach a verdict. Say that, rather than
+              # render a healthy-looking blank.
+              echo "**No verdict was produced.** The scan did not complete, so nothing is known"
+              echo "about the bucket's contents. Do NOT read this as \"backups are fine\"."
+            fi
+            echo ""
+            echo "This is the **only** check that looks inside the bucket. Every other backup"
+            echo "alert reads a host-local gauge — those report that \`backup.sh\` RAN and that"
+            echo "\`rclone\` returned 0. They cannot see an empty bucket."
+            echo ""
+            echo "- \`fresh\` — a restorable dump exists and is newer than the age bound."
+            echo "- \`absent\` — the bucket holds no dump at all. **An empty listing exits 0; it is an ALERT, not an OK.**"
+            echo "- \`stale\` — the newest dump is older than the bound."
+            echo "- \`instrument_error\` — we could not look. **This is not a statement about backups.**"
+            echo ""
+            echo "If \`absent\` and \`bucket_objects > 0\`, the bucket has contents but no dump under"
+            echo "the scanned prefix — check the prefix before concluding the backups are gone."
+          } >> "$GITHUB_STEP_SUMMARY"
