@@ -1,6 +1,6 @@
 ---
 name: feedback_errexit_kills_assignment_guard
-description: Under `set -e`, `OUT="$(fn)"` followed by `RC=$?` is DEAD CODE on every failing path — errexit fires at the assignment. Guards written this way never print their diagnosis. Use `RC=0; OUT="$(set +e; fn)" || RC=$?`. And a static grep for the line proves only that it was typed.
+description: Under `set -e`, `OUT="$(fn)"` followed by `RC=$?` is DEAD CODE on every failing path — errexit fires at the assignment. Guards written this way never print their diagnosis. Use `RC=0; OUT="$(set +e; fn)" || RC=$?`. And a static grep for the line proves only that it was typed. CORRECTED 2026-07-11: the no-match rule holds for `grep` ONLY — `sed`/`find` exit 0 on no-match; look up the command's actual contract. Third mechanism: `pipefail` promotes an early-exit consumer's SIGPIPE (141) over a SUCCEEDING final stage.
 metadata:
   type: feedback
 ---
@@ -89,11 +89,68 @@ earlier.** Knowing the rule did not help, because the *shape* looked different: 
 parsing a string). **There is no rc in sight, so the rule doesn't pattern-match.** The
 generalisation to hold instead:
 
-> **Under `set -e` + `pipefail`, ANY `VAR="$(…)"` whose command substitution can legitimately
-> produce NO OUTPUT is a crash, not an empty string.** `grep`, `sed -n`, `find … | head`,
-> `jq -e` — a no-match is a *normal, expected* outcome and a *non-zero* exit. Every such
-> assignment needs `|| true` (or a condition context). Ask of each one: **"what is the exit
-> status when this legitimately finds nothing?"**
+> **Under `set -e` + `pipefail`, ANY `VAR="$(grep …)"` whose command substitution can
+> legitimately produce NO OUTPUT is a crash, not an empty string.** A no-match is a *normal,
+> expected* outcome and a *non-zero* exit. Such an assignment needs `|| true` (or a condition
+> context). Ask of each one: **"what is the exit status when this legitimately finds nothing?"**
+
+### ⛔ CORRECTION 2026-07-11 (Nino Kavtaradze, deploy#591) — the restatement above was ITSELF over-generalised
+
+It originally read `$(grep/sed/find …)`. **That lumps three commands with three different
+no-match contracts, and it is wrong for two of them.** Measured, not reasoned:
+
+| command | exit on **no match** | under `set -e` |
+|---|---|---|
+| `grep` | **1** | **CRASHES** — the rule holds |
+| `sed -n '/x/p'` | **0** | survives — **the rule is FALSE** |
+| `find` | **0** | survives — **the rule is FALSE** |
+| `find` over an **unreadable** dir | **1** | **CRASHES — but on an ERROR, never a no-match** |
+
+**The over-generalised rule fails in BOTH directions.** It produces guards against crashes that
+cannot happen (`sed`, `find`), *and* it points at the wrong trigger for `find` — so anyone who
+removes a `find` guard on learning "find doesn't crash on empty" is then bitten by the
+permission case. A rule wrong in both directions is worse than no rule.
+
+> **The correct instruction is not a list of commands. It is: LOOK UP THE COMMAND'S ACTUAL
+> NO-MATCH EXIT CODE.** Do not generalise across commands that merely *feel* similar. `grep`'s
+> "no match is exit 1" is a deliberate and unusual contract, not a Unix convention — most
+> filters exit 0 on empty output.
+
+**And errexit does not reach into `$( )` at all by default.** `shopt inherit_errexit` is unset,
+so a failing command *inside* a command substitution does not kill the subshell — regardless of
+whether the call site is a condition context. It is a **global shell option**: setting it arms
+every `$( )` in the file at once. What *does* fire is the **assignment's own rc** — a command
+substitution's exit status is the exit status of the assignment reading it, so a *top-level*
+`VAR="$(fn_returning_1)"` crashes under `set -e` no matter what is inside the function.
+
+## PIPEFAIL PROMOTES SIGPIPE — an early-exit consumer poisons a SUCCEEDING pipeline (deploy#591)
+
+Same family, third mechanism, found by Nurul Hakim in the deploy#591 review:
+
+```bash
+set -euo pipefail
+grep '^BACKUP_MANIFEST ' | head -n1 | tr ' ' '\n' | grep -qx 'complete=true'
+```
+
+When a **consumer exits early** (`head -n1`, `grep -q`), its producer takes **SIGPIPE and dies
+141** — and **`pipefail` promotes that 141 to the rc of the whole pipeline even though the final
+stage SUCCEEDED.** A complete, attesting backup manifest read as *"does not attest"*.
+
+There were **two** early-exit consumers, so the obvious one-token fix does **not** close it:
+
+```
+first line attests complete=true:
+  grep | head -n1 | tr | grep -qx     100k lines -> 141    huge first line -> 141
+  grep -m1 | tr | grep -qx            100k lines -> 141    huge first line -> 141
+                                      ^ `grep -qx` exits on the match and SIGPIPEs `tr`.
+```
+
+> **Do not swap the early-exit consumer — REMOVE THE PIPELINE.** A herestring is a file
+> descriptor, not a pipe: `grep -m1 pattern <<< "$text"` may stop reading early and nothing
+> dies. Then do the token test in plain bash. The shape is deleted rather than guarded.
+
+Latent (needs a manifest ~700x what the producer writes) and it fails closed — but **a guard
+with a known path that silently disarms it is not a correct guard, it is an incomplete one.**
 
 ### The harness table, again — and it is the same three rows
 

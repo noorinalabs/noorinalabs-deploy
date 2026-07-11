@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -161,6 +162,17 @@ def _age(d: Path, epoch: float) -> None:
 
 
 def _scan(root: Path | str, **env: str) -> tuple[int, str]:
+    """Run the scanner. Returns (rc, RESULT LINE).
+
+    **The result line is the contract, and it is the only thing a caller can see.**
+    ``verify-backup-artifact.yml``'s summary step renders *only* this line, so anything the scan
+    knows and does not put here is, operationally, not known at all. That is why ``torn`` is a
+    field and not a ``log WARNING``: this helper discards stderr — deliberately, because stderr
+    is commentary — and so **no test could ever have seen a warning.** Deleting every torn
+    WARNING from the scanner left the suite 55/55 green (deploy#591 review, Nino Kavtaradze).
+
+    Use ``_scan_stderr`` when the diagnostic itself is what's under test.
+    """
     r = subprocess.run(  # noqa: S603
         ["bash", str(SCANNER)],  # noqa: S607
         env={**os.environ, "B2_ROOT": str(root), **env},
@@ -614,21 +626,21 @@ def test_restore_sh_completeness_predicate_matches_a_real_manifest() -> None:
     # `backup_is_complete` and `select_local_run` both call (deploy#587 gave them a second
     # caller, so it stopped being inline). RUN THE SHIPPED TEXT — do not retype the pipeline
     # here, or this test would assert against its own paraphrase.
-    fn = body[body.index("manifest_attests_complete() {") : body.index("\n# Did every store")]
-    assert "grep -qx 'complete=true'" in fn, (
-        "the completeness predicate must match `complete=true` as a WHOLE TOKEN; the "
-        "anchored-prefix regex it shipped with can never match a real manifest"
-    )
+    fn = _shipped_predicate()
+    assert "complete=true" in fn, "the predicate must test for `complete=true` as a WHOLE TOKEN"
     assert "manifest_attests_complete" in body[body.index("backup_is_complete() {") :], (
         "backup_is_complete must consult the shipped predicate, not its own copy of it"
     )
-
-    def _predicate(manifest: bytes) -> int:
-        script = fn + '\nprintf "%s\\n" "$1" | manifest_attests_complete\n'
-        return subprocess.run(  # noqa: S603
-            ["bash", "-c", script, "_", manifest.decode().strip()],  # noqa: S607
-            check=False,
-        ).returncode
+    # NO EARLY-EXIT CONSUMER. `head -n1` and `grep -q` SIGPIPE their producer, and `pipefail`
+    # promotes the resulting 141 over a SUCCEEDING final stage — a complete, attesting manifest
+    # then reads as "does not attest" (deploy#591). This is the one textual assertion worth
+    # keeping: it names the shape that must never come back.
+    for banned in ("head -n1", "grep -q"):
+        assert banned not in fn, (
+            f"`{banned}` is an EARLY-EXIT CONSUMER: it SIGPIPEs its producer, and `pipefail` "
+            f"promotes the 141 over a succeeding final stage. Do not swap the consumer — remove "
+            f"the pipeline (a herestring is a file descriptor, not a pipe)."
+        )
 
     assert _predicate(_manifest(True)) == 0, "a complete manifest must MATCH"
     assert _predicate(_manifest(False)) != 0, "an incomplete manifest must NOT match"
@@ -698,6 +710,37 @@ def test_stale_dump_from_an_earlier_run_does_not_satisfy_the_attested_run(tmp_pa
 # precisely how the `backup_is_complete` bug survived a green suite and two approvals.
 # ---------------------------------------------------------------------------
 RESTORE_SH = SCRIPTS_DIR / "restore.sh"
+
+
+def _shipped_predicate() -> str:
+    """The SHIPPED text of `manifest_attests_complete` — never a retyped copy of it."""
+    body = RESTORE_SH.read_text()
+    return body[body.index("manifest_attests_complete() {") : body.index("\n# Did every store")]
+
+
+def _predicate(manifest: bytes) -> int:
+    """Run the shipped predicate against `manifest`, under restore.sh's own shell mode.
+
+    The manifest arrives via a FILE and is read into a shell VARIABLE — exactly as production
+    does it (`manifest="$(rclone cat ...)"`, then passed to the function). Passing it as argv
+    instead raises `OSError: [Errno 7] Argument list too long` at ~2MB (execve's ARG_MAX), and
+    production never hits that: a bash function call is not an exec, so its arguments have no
+    such limit. A harness that cannot carry the fixture would report an error indistinguishable
+    from a failure, over a defect that is not there.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".txt") as f:
+        f.write(manifest)
+        f.flush()
+        script = (
+            "set -euo pipefail\n"
+            + _shipped_predicate()
+            + '\nmanifest="$(cat "$1")"\nmanifest_attests_complete "$manifest"\n'
+        )
+        return subprocess.run(  # noqa: S603
+            ["bash", "-c", script, "_", f.name],  # noqa: S607
+            check=False,
+            capture_output=True,
+        ).returncode
 
 
 def _shipped_region(start: str, end: str) -> str:
@@ -1499,3 +1542,258 @@ def test_a_manifest_filed_under_the_wrong_run_id_is_not_trusted(tmp_path: Path) 
     assert _field(line, "reason") == "manifest_ts_mismatch", (
         f"and it must say WHY, not merely refuse: {line}"
     )
+
+
+# ===========================================================================================
+# deploy#591 review — WHAT THE SCAN KNOWS, THE RESULT LINE SAYS.
+#
+# A torn run (attests `complete=true`, dumps did NOT all arrive) is SKIPPED rather than alerted
+# on, because an older intact run may still be restorable. That softening is defensible. But it
+# was reported only as a `log WARNING` to STDERR — and:
+#
+#   * the result line is the ONLY thing verify-backup-artifact.yml's summary renders;
+#   * `_scan()` returns (rc, result-line) and discards stderr, so NO TEST COULD SEE IT.
+#
+# Nino deleted every torn WARNING from the scanner, confirmed the mutation applied, and ran the
+# full file: 55/55 passed. So for a producer that tears its upload nightly, the alert had not
+# been softened — IT HAD BEEN DELETED. It is the identical defect to the `undersized` value that
+# was computed and thrown away, committed one field over, inside the change that created it.
+# ===========================================================================================
+
+
+def _scan_stderr(root: Path | str, **env: str) -> tuple[int, str, str]:
+    """(rc, result line, STDERR) — for when the diagnostic itself is under test."""
+    r = subprocess.run(  # noqa: S603
+        ["bash", str(SCANNER)],  # noqa: S607
+        env={**os.environ, "B2_ROOT": str(root), **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    line = ""
+    for ln in r.stdout.splitlines():
+        if ln.startswith("B2_BACKUP_ARTIFACT "):
+            line = ln
+    return r.returncode, line, r.stderr
+
+
+def test_a_torn_run_is_counted_on_the_result_line_even_when_the_verdict_is_fresh(
+    tmp_path: Path,
+) -> None:
+    """GREEN-WITH-TORN MUST NOT BE BYTE-IDENTICAL TO A HEALTHY BUCKET.
+
+    Today's 03:01 run landed its `complete=true` manifest and then tore its upload — only pg
+    arrived. Yesterday's run is complete and intact, so a restorable backup DOES exist and the
+    verdict is honestly `fresh`. But the tear is real, it will recur nightly, and the result
+    line is the only channel anyone reads.
+    """
+    _write_run(tmp_path / "daily" / "2026-07-10", run_ts="20260710-030100", complete=True)
+    _write_run(  # today: attests all three, only pg arrived
+        tmp_path / "daily" / "2026-07-11", run_ts=RUN_TS, complete=True, stores=("isnad-pg",)
+    )
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK, f"an older intact run is restorable, so this is honestly fresh: {line}"
+    assert _field(line, "status") == "fresh"
+    assert _field(line, "newest") == "daily/2026-07-10"
+    assert _field(line, "torn") == "1", (
+        f"THE TEAR MUST BE ON THE RESULT LINE. A `log WARNING` goes to stderr, which the CI "
+        f"summary does not render and no test can read — a softened alert that nothing can "
+        f"observe is a DELETED alert: {line}"
+    )
+
+
+def test_a_healthy_bucket_reports_torn_zero(tmp_path: Path) -> None:
+    """The POSITIVE CONTROL for the field above.
+
+    A field that is always `1` distinguishes nothing. `torn` must SEPARATE a torn bucket from a
+    healthy one, or asserting on it proves only that the token was printed.
+    """
+    _write_run(tmp_path / "daily" / "2026-07-11", complete=True)
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK and _field(line, "status") == "fresh", line
+    assert _field(line, "torn") == "0", f"a healthy bucket has torn=0: {line}"
+
+
+def test_a_partial_run_is_skipped_not_torn(tmp_path: Path) -> None:
+    """`skipped` and `torn` are DIFFERENT FAULTS and must not be conflated.
+
+    A run attesting `complete=false` is the producer honestly reporting a partial backup — it is
+    SKIPPED, and it is not a tear. A tear is a run that attests `complete=true` and then fails to
+    deliver: the producer's word and the bucket's contents DISAGREE. Reporting the ordinary
+    nightly partial as `torn` would make the field meaningless within a week.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)
+    _partial_run(d, run_ts=LATE_TS)  # attests complete=false — honest, not torn
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK and _field(line, "status") == "fresh", line
+    assert _field(line, "torn") == "0", (
+        f"an honestly-declared partial run is SKIPPED, not TORN — the producer's word and the "
+        f"bucket agree: {line}"
+    )
+
+
+def test_torn_is_reported_on_the_alert_path_too(tmp_path: Path) -> None:
+    """No older run to fall back on: the torn run is the whole bucket. Alert AND count it."""
+    _write_run(
+        tmp_path / "daily" / "2026-07-11", run_ts=RUN_TS, complete=True, stores=("isnad-pg",)
+    )
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, f"nothing restorable here: {line}"
+    assert _field(line, "status") == "incomplete"
+    assert "isnad-userpg" in _field(line, "reason")
+    assert _field(line, "torn") == "1", f"the tear is named on the alert path as well: {line}"
+
+
+def test_the_torn_warning_still_reaches_stderr(tmp_path: Path) -> None:
+    """The result line is the SIGNAL; the WARNING is the EXPLANATION. Keep both.
+
+    Putting `torn=N` on the result line is not a reason to drop the human-readable diagnostic —
+    an operator reading a CI log needs to know WHICH run tore and WHY it was not an alert.
+    """
+    _write_run(tmp_path / "daily" / "2026-07-10", run_ts="20260710-030100", complete=True)
+    _write_run(
+        tmp_path / "daily" / "2026-07-11", run_ts=RUN_TS, complete=True, stores=("isnad-pg",)
+    )
+
+    rc, line, err = _scan_stderr(tmp_path)
+    assert rc == EXIT_OK and _field(line, "torn") == "1", line
+
+    # The PER-RUN diagnostic: which run, and what it failed to deliver.
+    assert RUN_TS in err, f"the WARNING must name the run that tore: {err}"
+    assert "isnad-userpg" in err, f"and what it failed to deliver: {err}"
+
+    # And the SUMMARY block — a DISTINCT log site, which the per-run assertions above cannot
+    # see. Deleting it left the first two assertions passing, so they were pinning the wrong
+    # line: the test agreed with itself while the thing under test was gone. (Caught by
+    # mutation N1 — the very mutation Nino used to prove the warning was unobservable.)
+    assert "not an ALERT" in err and "torn upload is REAL" in err, (
+        "the summary must explain WHY a torn upload did not raise an alert — an operator who "
+        f"sees torn=1 on a green run needs to be told an older run covered for it: {err}"
+    )
+
+
+# ===========================================================================================
+# deploy#591 review — PIPEFAIL PROMOTES SIGPIPE OVER A SUCCEEDING FINAL STAGE.
+# ===========================================================================================
+
+
+def test_a_huge_manifest_does_not_read_as_does_not_attest(tmp_path: Path) -> None:
+    """THE #587 CONFIDENT LIE, BY A FOURTH ROUTE — in the parser that fixes it.
+
+    The predicate was::
+
+        grep '^BACKUP_MANIFEST ' | head -n1 | tr ' ' '\\n' | grep -qx 'complete=true'
+
+    Under ``set -euo pipefail``, a consumer that exits early (``head -n1``, ``grep -q``) SIGPIPEs
+    its producer, which dies **141** — and **pipefail promotes that 141 to the rc of the whole
+    pipeline even though the final ``grep -qx`` SUCCEEDED.** A complete, intact, attesting run
+    then reads as *does not attest*, and the scanner prints ``no_complete_backup`` over a bucket
+    holding a complete backup.
+
+    There were TWO early-exit consumers, so swapping ``head -n1`` for ``grep -m1`` does NOT close
+    it — ``grep -qx`` still SIGPIPEs ``tr``. Both measured at 141. The fix removes the pipeline
+    entirely: a herestring is a file descriptor, not a pipe.
+
+    Latent — it needs a manifest far larger than the producer writes — and it fails closed. But a
+    guard with a known path that silently disarms it is not a correct guard, it is an incomplete
+    one, and here the shape can simply be deleted. (Found by Nurul Hakim.)
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, complete=True)
+
+    # The run is COMPLETE and INTACT. Its manifest is merely enormous: the real attesting line
+    # first, then 100k more. Every dump is present and correctly sized.
+    m = d / manifest_filename(RUN_TS)
+    m.write_bytes(_manifest(True) + _manifest(True) * 100_000)
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK, (
+        f"a COMPLETE, INTACT, ATTESTING run must not read as 'does not attest' because its "
+        f"manifest outran a pipe buffer: {line}"
+    )
+    assert _field(line, "status") == "fresh"
+    assert _field(line, "reason") == "-"
+
+
+def test_the_shipped_predicate_survives_sigpipe_pressure() -> None:
+    """Drive the SHIPPED predicate directly, under restore.sh's own shell mode.
+
+    The scanner test above is end-to-end; this one isolates the parser and proves the mechanism,
+    so a regression names itself instead of surfacing as a mysterious `no_complete_backup`.
+    """
+    one = _manifest(True)
+    huge = _manifest(True) + _manifest(True) * 100_000
+    # A single enormous FIRST LINE — the second early-exit consumer (`grep -qx` SIGPIPEs `tr`),
+    # which a `grep -m1`-only fix leaves wide open.
+    long_line = (
+        b"BACKUP_MANIFEST complete=true stores=postgres timestamp=" + RUN_TS.encode() + b" "
+    ) + b" ".join(b"pad%d=x" % i for i in range(200_000))
+
+    assert _predicate(one) == 0, "the control: a normal manifest attests"
+    assert _predicate(huge) == 0, (
+        "a 100k-line manifest must still ATTEST — rc=141 from a SIGPIPEd producer, promoted by "
+        "pipefail over a SUCCEEDING final grep, is not a verdict about the backup"
+    )
+    assert _predicate(long_line) == 0, (
+        "and a single enormous LINE must still attest — this is the consumer a `grep -m1`-only "
+        "fix leaves in place"
+    )
+    assert _predicate(_manifest(False)) == 1, (
+        "the negative control: it must still be able to say NO. A predicate that always returns "
+        "0 would pass every assertion above and prove nothing."
+    )
+
+
+def _backup_is_complete_err(root: Path, path: str) -> tuple[int, str]:
+    """(rc, STDERR) from restore.sh's shipped `backup_is_complete`.
+
+    `restore.sh` has no result line — its stdout IS the chosen run id — so its torn diagnostic
+    genuinely does live on stderr. That is fine; what was NOT fine is that nothing read it. Same
+    treatment as the scanner's `torn=` field: the signal must be observable, so it gets a test.
+    """
+    body = RESTORE_SH.read_text()
+    helpers = body[body.index("manifest_runs() {") : body.index("\nlist_backups()")]
+    fn = body[body.index("backup_is_complete() {") : body.index("\nresolve_latest()")]
+    script = (
+        "set -euo pipefail\n"
+        'log() { shift; echo "$*" >&2; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{root}"\n' + helpers + "\n" + fn + "\n"
+        'backup_is_complete "$1"\n'
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script, "_", path],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return r.returncode, r.stderr
+
+
+def test_restore_names_the_torn_run_it_passed_over(tmp_path: Path) -> None:
+    """A run that attests `complete=true` and did not deliver is a real fault in restore.sh too.
+
+    It selects the older intact run — correctly — but an operator who is never told that today's
+    backup tore will not know the tear is happening. It recurs nightly and nothing says so.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=EARLY_TS, complete=True)  # 02:00 — complete and intact
+    _write_run(  # 08:00 — attests all three, only pg arrived: TORN
+        d, run_ts=LATE_TS, complete=True, stores=("isnad-pg",)
+    )
+
+    rc, err = _backup_is_complete_err(tmp_path, "daily/2026-07-11")
+    assert rc == ATTESTS, "the older 02:00 run IS restorable, so the day resolves"
+    assert LATE_TS in err, f"but the torn 08:00 run must be NAMED, not silently passed over: {err}"
+    assert "did NOT all arrive" in err, f"and the fault must be described: {err}"
+
+
+def test_restore_says_nothing_about_tears_when_there_are_none(tmp_path: Path) -> None:
+    """The positive control for the warning above — it must SEPARATE, not always fire."""
+    _write_run(tmp_path / "daily" / "2026-07-11", complete=True)
+    rc, err = _backup_is_complete_err(tmp_path, "daily/2026-07-11")
+    assert rc == ATTESTS
+    assert "did NOT all arrive" not in err, f"a healthy day must not cry wolf: {err}"

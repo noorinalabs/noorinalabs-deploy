@@ -225,7 +225,7 @@ manifest_runs() {
     sed -n 's/^_backup_manifest-\([0-9]\{8\}-[0-9]\{6\}\)\.txt$/\1/p' | sort -ru
 }
 
-# Does the manifest text on stdin ATTEST `complete=true`?
+# Does <manifest-text> ATTEST `complete=true`?
 #
 # WHOLE-TOKEN match on the FIRST `BACKUP_MANIFEST ` line. Both halves are load-bearing and both
 # were bugs (deploy#584):
@@ -233,10 +233,48 @@ manifest_runs() {
 #   * `grep '^BACKUP_MANIFEST .*[[:space:]]complete=true'` COULD NEVER MATCH — `complete=` is
 #     the FIRST token after `BACKUP_MANIFEST `, so the anchor's literal space consumes the only
 #     space there is and `.*[[:space:]]` then demands a second one that never exists.
-#   * `head -n1` — unioning tokens across every line lets a corrupt artifact carrying BOTH a
+#   * FIRST LINE ONLY — unioning tokens across every line lets a corrupt artifact carrying BOTH a
 #     `complete=false` and a `complete=true` line match. It fails OPEN, and a line-1 read is free.
+#
+# ---------------------------------------------------------------------------
+# NO EARLY-EXIT PIPELINE. `pipefail` TURNS SIGPIPE INTO "DOES NOT ATTEST". (deploy#591 review)
+# ---------------------------------------------------------------------------
+# This was:
+#
+#   grep '^BACKUP_MANIFEST ' | head -n1 | tr ' ' '\n' | grep -qx 'complete=true'
+#
+# and under `set -euo pipefail` it can report a COMPLETE, INTACT, ATTESTING run as NOT
+# ATTESTING. When the producer of a pipe stage outruns a consumer that exits early, the
+# producer takes SIGPIPE and dies 141 — and **`pipefail` promotes that 141 to the rc of the
+# whole pipeline even though the final `grep -qx` SUCCEEDED.** The scanner then prints
+# `no_complete_backup` over a bucket holding a complete backup: THE #587 CONFIDENT LIE, by a
+# fourth route, in the parser this very change ships. Found by Nurul Hakim.
+#
+# There were TWO early-exit consumers, not one, and fixing only the first leaves the shape:
+#
+#   measured, `set -euo pipefail`, first line attests complete=true:
+#     grep | head -n1 | tr | grep -qx      100k lines -> rc=141   huge first line -> rc=141
+#     grep -m1 | tr | grep -qx             100k lines -> rc=141   huge first line -> rc=141
+#                                          ^ `grep -qx` exits on the match and SIGPIPEs `tr`.
+#
+# So the fix is not to swap `head` for `-m1`; it is to have NO PIPELINE. A herestring is a file
+# descriptor, not a pipe: `grep -m1` may stop reading it early and nothing dies. The token test
+# is then plain bash. Latent today (it needs a manifest ~700x what the producer writes) and it
+# fails closed — but a guard with a known path that silently disarms it is not a correct guard,
+# it is an incomplete one, and here the shape can simply be DELETED rather than guarded.
 manifest_attests_complete() {
-    grep '^BACKUP_MANIFEST ' | head -n1 | tr ' ' '\n' | grep -qx 'complete=true'
+    local first="" tok
+    local IFS=$' \t\n'
+    first="$(grep -m1 '^BACKUP_MANIFEST ' <<< "$1")" || return 1
+    # Deliberate word-splitting: the manifest's fields are space-separated, and an exact token
+    # match cannot be defeated by a key that ends in another key's name (`xcomplete=true`).
+    # shellcheck disable=SC2086
+    for tok in $first; do
+        if [[ "$tok" == "complete=true" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Did every store REQUIRED for run <ts> actually ARRIVE in <listing>?
@@ -328,10 +366,35 @@ backup_is_complete() {
     rm -f "$lerr"
 
     # A directory with NO run manifests is an ordinary artifact — every pre-deploy#559 backup
-    # predates the manifest entirely. `|| runs=""` keeps that from being a CRASH: enumerating
-    # manifests is exactly the operation that can LEGITIMATELY MATCH NOTHING, and under
-    # `set -euo pipefail` a matching-nothing pipeline in a bare assignment kills the script
-    # outright (deploy#584 — the shape, not the story).
+    # predates the manifest entirely.
+    #
+    # ---------------------------------------------------------------------------
+    # WHAT ACTUALLY PROTECTS THIS — and it is NOT what the first version of this comment said.
+    # ---------------------------------------------------------------------------
+    # I wrote that a matching-nothing pipeline here "kills the script outright". That is FALSE,
+    # twice over, and Nino Kavtaradze measured both (deploy#591 review):
+    #
+    #   1. THE NO-MATCH CONTRACT IS PER-COMMAND, NOT A UNIX CONVENTION. `manifest_runs` is
+    #      `sed -n …p | sort -ru`, and BOTH EXIT 0 on no match — so this pipeline cannot fail
+    #      on an empty result at all. Only `grep` has the "no match is exit 1" contract:
+    #
+    #        grep                        no-match -> 1  -> would crash
+    #        sed -n '/x/p'               no-match -> 0  -> cannot
+    #        find                        no-match -> 0  -> cannot
+    #        find, unreadable directory           -> 1  -> crashes ON AN ERROR, never a no-match
+    #
+    #   2. ERREXIT DOES NOT REACH IN HERE ANYWAY. `shopt inherit_errexit` is UNSET, and this
+    #      function is invoked inside a command substitution (`run_ts="$(backup_is_complete …)"`),
+    #      so errexit is not inherited by the subshell — REGARDLESS of the call site's context.
+    #      That is a GLOBAL SHELL OPTION, not a property of the caller: anyone who adds
+    #      `shopt -s inherit_errexit` arms every `$( )` in this file at once.
+    #
+    # So `|| runs=""` is DEFENCE IN DEPTH, not the load-bearing guard: it keeps this correct if
+    # someone sets `inherit_errexit`, or edits `manifest_runs` to use `grep`. The guard that IS
+    # load-bearing is the TOP-LEVEL `RESTORE_RUN_TS="$(select_local_run …)" || RESTORE_RUN_TS=""`
+    # — there the substitution's non-zero rc IS the assignment's rc, at top level, under
+    # errexit, and removing the `||` kills restore.sh on every artifact with no manifest. That
+    # is the deploy#584 shape, and it is the one the tests pin.
     local runs=""
     runs="$(printf '%s\n' "$listing" | manifest_runs)" || runs=""
     [[ -n "$runs" ]] || return 1
@@ -363,7 +426,7 @@ backup_is_complete() {
         fi
         [[ -n "$manifest" ]] || continue
 
-        printf '%s\n' "$manifest" | manifest_attests_complete || continue
+        manifest_attests_complete "$manifest" || continue
 
         if ! run_dumps_arrived "$ts" "$have"; then
             torn+=("$ts")
@@ -416,7 +479,7 @@ select_local_run() {
         # The newest run we could READ is the fallback, whatever it attests.
         [[ -n "$fallback" ]] || fallback="$ts"
 
-        printf '%s\n' "$manifest" | manifest_attests_complete || continue
+        manifest_attests_complete "$manifest" || continue
         run_dumps_arrived "$ts" "$have" || continue
 
         printf '%s\n' "$ts"
@@ -917,13 +980,18 @@ verify_checksums "$RESTORE_DIR"
 # partial one it bound to whichever uploaded LAST — and under `--allow-partial` it would
 # restore only the partial run's pg dump while the good run's three dumps sat beside it.
 #
-# `|| RESTORE_RUN_TS=""` is LOAD-BEARING. This script runs under `set -euo pipefail`, and an
-# artifact with NO manifest — every pre-deploy#559 backup, and the rehearsal's own fixtures —
-# makes the enumeration legitimately match nothing. A bare assignment from a matching-nothing
-# pipeline is a FAILING SIMPLE COMMAND, at which point errexit kills restore.sh outright: the
-# recovery path would die on exactly the artifacts the fallback below exists to serve. The
-# absence of this was caught by the restore rehearsal and by NO unit test (deploy#584); it is
-# tested directly now.
+# `|| RESTORE_RUN_TS=""` is THE LOAD-BEARING GUARD — this one, and not the `|| runs=""` inside
+# the functions (see `backup_is_complete` for why those are only defence in depth).
+#
+# The mechanism is the ASSIGNMENT'S OWN rc, not anything about pipefail or no-match contracts:
+# `select_local_run` RETURNS 1 when the directory has no manifest — every pre-deploy#559 backup,
+# and the rehearsal's own fixtures — and a command substitution's exit status IS the exit status
+# of the assignment that reads it. At TOP LEVEL, under `set -e`, that is a failing simple command
+# and errexit kills restore.sh outright. The recovery path would die on exactly the artifacts the
+# fallback below exists to serve.
+#
+# Removing the `||` here is the deploy#584 crash, reproduced: it was caught then by the restore
+# rehearsal and by NO unit test. It is pinned by a unit test now, and by a mutation.
 RESTORE_RUN_TS=""
 RESTORE_RUN_TS="$(select_local_run "$RESTORE_DIR")" || RESTORE_RUN_TS=""
 

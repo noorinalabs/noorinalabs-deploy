@@ -162,9 +162,70 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$1] ${*:2}" >&2; }
 # reported `fresh` and said nothing at all. The value was computed and then thrown away:
 # the identical defect to the `-719` age that was computed and never checked. If the scan
 # knows something, the result line says it.
+#
+# `torn` is on this line for the same reason `undersized` is (deploy#591 review, Nino
+# Kavtaradze). A run that attests `complete=true` but did not fully arrive is SKIPPED rather
+# than alerted on, because an older intact run may still be restorable — but the skip was
+# reported only as a `log WARNING` to STDERR, and:
+#
+#   * the result line is the ONLY thing verify-backup-artifact.yml's summary renders;
+#   * `_scan()` in the tests returns (rc, result-line) and DISCARDS stderr, so no test could
+#     see it — deleting every torn WARNING left the suite 55/55 green.
+#
+# So for a producer tearing its upload nightly, the alert had not been softened, it had been
+# DELETED. That is the identical defect to the `undersized` value this very function was fixed
+# to report — computed, then thrown away — committed one field over, inside the change that
+# created the field. IF THE SCAN KNOWS SOMETHING, THE RESULT LINE SAYS IT.
 result() {
-    printf 'B2_BACKUP_ARTIFACT status=%s reason=%s dumps=%s newest_age_hours=%s bucket_objects=%s undersized=%s newest=%s\n' \
-        "$1" "${2:--}" "$3" "$4" "$5" "${6:-0}" "${7:--}"
+    printf 'B2_BACKUP_ARTIFACT status=%s reason=%s dumps=%s newest_age_hours=%s bucket_objects=%s undersized=%s torn=%s newest=%s\n' \
+        "$1" "${2:--}" "$3" "$4" "$5" "${6:-0}" "${7:-0}" "${8:--}"
+}
+
+# ---------------------------------------------------------------------------
+# THE MANIFEST PARSERS — NO EARLY-EXIT PIPELINE ANYWHERE. (deploy#591 review)
+# ---------------------------------------------------------------------------
+# Under `set -euo pipefail`, a pipeline whose CONSUMER exits early (`head -n1`, `grep -q`)
+# SIGPIPEs its producer, which dies 141 — and **`pipefail` promotes that 141 to the rc of the
+# whole pipeline even when the final stage SUCCEEDED**. A complete, intact, attesting run then
+# reads as "does not attest", and this scanner prints `no_complete_backup` over a bucket that
+# holds a complete backup: the deploy#587 confident lie, by a fourth route, in the parser that
+# fixes it. Found by Nurul Hakim.
+#
+# There were TWO early-exit consumers, so swapping `head -n1` for `grep -m1` does NOT close it:
+#
+#   measured, `set -euo pipefail`, first line attests complete=true:
+#     grep | head -n1 | tr | grep -qx     100k lines -> 141    huge first line -> 141
+#     grep -m1 | tr | grep -qx            100k lines -> 141    huge first line -> 141
+#
+# A herestring is a FILE DESCRIPTOR, not a pipe: `grep -m1` may stop reading it early and
+# nothing dies. Everything after it is plain bash. The shape is deleted, not guarded.
+manifest_attests_complete() { # <manifest-text>
+    local first="" tok
+    local IFS=$' \t\n'
+    first="$(grep -m1 '^BACKUP_MANIFEST ' <<< "$1")" || return 1
+    # Deliberate word-splitting on the manifest's spaces. An EXACT token match cannot be
+    # defeated by a key that ends in another key's name (`xcomplete=true`).
+    # shellcheck disable=SC2086
+    for tok in $first; do
+        if [[ "$tok" == "complete=true" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The `timestamp=` the manifest declares, from its FIRST BACKUP_MANIFEST line. Empty if absent.
+manifest_timestamp() { # <manifest-text>
+    local first="" tok
+    local IFS=$' \t\n'
+    first="$(grep -m1 '^BACKUP_MANIFEST ' <<< "$1")" || return 0
+    # shellcheck disable=SC2086
+    for tok in $first; do
+        if [[ "$tok" == timestamp=* ]]; then
+            printf '%s\n' "${tok#timestamp=}"
+            return 0
+        fi
+    done
 }
 
 # scan <bucket-root> <prefix> -> result line; 0 fresh / 1 alert / 2 instrument error.
@@ -192,7 +253,7 @@ scan() {
             sed 's/^/    /' "$err" >&2
         fi
         rm -f "$err"
-        result instrument_error unreachable 0 -1 -1 0 -
+        result instrument_error unreachable 0 -1 -1 0 0 -
         return $EXIT_INSTRUMENT
     fi
     rm -f "$err"
@@ -212,7 +273,7 @@ scan() {
             sed 's/^/    /' "$err" >&2
         fi
         rm -f "$err"
-        result instrument_error unreachable 0 -1 "$bucket_objects" 0 -
+        result instrument_error unreachable 0 -1 "$bucket_objects" 0 0 -
         return $EXIT_INSTRUMENT
     fi
     rm -f "$err"
@@ -341,9 +402,9 @@ scan() {
     # Nothing restorable anywhere.
     if [[ "$sized_total" -eq 0 ]]; then
         if [[ "$undersized_total" -gt 0 ]]; then
-            result absent undersized_dumps 0 -1 "$bucket_objects" "$undersized_total" -
+            result absent undersized_dumps 0 -1 "$bucket_objects" "$undersized_total" 0 -
         else
-            result absent no_dumps 0 -1 "$bucket_objects" "$undersized_total" -
+            result absent no_dumps 0 -1 "$bucket_objects" "$undersized_total" 0 -
         fi
         return $EXIT_ALERT
     fi
@@ -423,21 +484,16 @@ scan() {
                 log ERROR "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look."
             fi
             rm -f "$merr"
-            result instrument_error manifest_unreadable "${run_dumps["$key"]:-0}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
+            result instrument_error manifest_unreadable "${run_dumps["$key"]:-0}" -1 "$bucket_objects" "$undersized_total" "$torn_count" "${dir:-/}"
             return $EXIT_INSTRUMENT
         fi
         rm -f "$merr"
 
-        # Whole-TOKEN match, and NOT the anchored-prefix regex restore.sh shipped with —
-        # that one could never match, because `complete=` is the first token after
-        # `BACKUP_MANIFEST ` and the anchor's literal space consumes the only space present.
-        # Fixed in restore.sh in this same change; the bug is the reason this fixture exists.
-        #
-        # `head -n1`: attest on the FIRST manifest line only. Unioning tokens across every
-        # line lets a corrupt artifact carrying both a `complete=false` and a `complete=true`
-        # line match — it FAILS OPEN, and a line-1 read costs nothing.
-        if ! printf '%s\n' "$manifest" | grep '^BACKUP_MANIFEST ' | head -n1 \
-                | tr ' ' '\n' | grep -qx 'complete=true'; then
+        # Whole-TOKEN match on the FIRST manifest line, with NO EARLY-EXIT PIPELINE — see
+        # `manifest_attests_complete` above for why the pipeline form could report a COMPLETE,
+        # ATTESTING run as "does not attest" (SIGPIPE -> 141, promoted by `pipefail` over a
+        # SUCCEEDING final grep). Same predicate as restore.sh's, deliberately.
+        if ! manifest_attests_complete "$manifest"; then
             # A manifest we READ, which does not attest. (Or none at all: every
             # pre-deploy#559 backup predates user-postgres coverage entirely.) Distinct from
             # the branch above — that one is "I could not read it", this one is "I read it,
@@ -453,8 +509,7 @@ scan() {
         # dumps of run X to an attestation about run Y is exactly the mis-binding this change
         # exists to prevent — so refuse to use it. Cheap to check, and it fails closed.
         local run_ts
-        run_ts="$(printf '%s\n' "$manifest" | grep '^BACKUP_MANIFEST ' | tr ' ' '\n' \
-            | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1)"
+        run_ts="$(manifest_timestamp "$manifest")"
         if [[ "$run_ts" != "$rts" ]]; then
             log WARNING "manifest _backup_manifest-${rts}.txt declares timestamp=${run_ts:-<none>} — it does not attest the run it is named for."
             torn_count=$((torn_count + 1))
@@ -531,20 +586,26 @@ scan() {
         # outranks the generic verdict. This is the deploy#584 diagnosis, preserved: the
         # operator is told WHICH store is missing, not merely that nothing qualified.
         if [[ "$torn_count" -gt 0 ]]; then
-            result incomplete "$torn_reason" "$torn_dumps" -1 "$bucket_objects" "$undersized_total" "${torn_dir:-/}"
+            result incomplete "$torn_reason" "$torn_dumps" -1 "$bucket_objects" "$undersized_total" "$torn_count" "${torn_dir:-/}"
             return $EXIT_ALERT
         fi
         # Dumps exist, but not one RUN attests completeness.
-        result incomplete no_complete_backup 0 -1 "$bucket_objects" "$undersized_total" -
+        result incomplete no_complete_backup 0 -1 "$bucket_objects" "$undersized_total" "$torn_count" -
         return $EXIT_ALERT
     fi
 
     # We found a restorable run — but a torn one existed too, and that is still a fault. It is
     # NOT an alert (an older run is restorable, and restore.sh will find it), but it must not be
-    # silent: an upload that landed its attestation and not its dumps will keep happening.
+    # SILENT: an upload that lands its attestation and not its dumps will keep happening.
+    #
+    # `torn` is on the RESULT LINE (see `result`, above), not merely in this WARNING. A WARNING
+    # goes to stderr, which the CI summary does not render and no test could read — so a
+    # green-with-torn bucket was byte-identical to a healthy one, and for a producer tearing its
+    # upload nightly the alert had not been softened, it had been DELETED (deploy#591 review).
     if [[ "$torn_count" -gt 0 ]]; then
         log WARNING "${torn_count} run(s) attest complete=true but did NOT fully arrive (see above)."
-        log WARNING "  An older run IS restorable, so this is not an ALERT — but the torn upload is real."
+        log WARNING "  An older run IS restorable, so this is not an ALERT — but the torn upload is REAL,"
+        log WARNING "  and it is on the result line as torn=${torn_count}."
     fi
     if [[ "$skipped" -gt 0 ]]; then
         log WARNING "skipped ${skipped} run(s) that do not attest complete=true"
@@ -557,18 +618,18 @@ scan() {
 
     # --- 4. A FUTURE timestamp is a broken clock, not a fresh backup. -------
     if [[ "$delta" -lt $(( -FUTURE_TOLERANCE_SECONDS )) ]]; then
-        result instrument_error future_timestamp "$chosen_dumps" $(( delta / 3600 )) "$bucket_objects" "$undersized_total" "${chosen:-/}"
+        result instrument_error future_timestamp "$chosen_dumps" $(( delta / 3600 )) "$bucket_objects" "$undersized_total" "$torn_count" "${chosen:-/}"
         return $EXIT_INSTRUMENT
     fi
 
     age_h=$(( delta / 3600 ))
 
     if [[ "$age_h" -gt "$MAX_AGE_HOURS" ]]; then
-        result stale too_old "$chosen_dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
+        result stale too_old "$chosen_dumps" "$age_h" "$bucket_objects" "$undersized_total" "$torn_count" "${chosen:-/}"
         return $EXIT_ALERT
     fi
 
-    result fresh - "$chosen_dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
+    result fresh - "$chosen_dumps" "$age_h" "$bucket_objects" "$undersized_total" "$torn_count" "${chosen:-/}"
     return $EXIT_OK
 }
 
@@ -582,13 +643,29 @@ self_test() {
     # shellcheck disable=SC2064  # expand $tmp now, deliberately
     trap "rm -rf '$tmp'" RETURN
 
-    _expect() { # <label> <root> <prefix> <want-status> <want-rc> [max-age-hours-reported]
+    _expect() { # <label> <root> <prefix> <want-status> <want-rc> [max-age-hours] [want-torn]
         local label="$1" root="$2" prefix="$3" want="$4" want_rc="$5" want_age="${6:-}"
+        local want_torn="${7:-}"
         rc=0
         out="$(scan "$root" "$prefix")" || rc=$?
         status="$(printf '%s' "$out" | sed -n 's/.*status=\([a-z_]*\).*/\1/p')"
         local ok=1
         [[ "$status" == "$want" && "$rc" -eq "$want_rc" ]] || ok=0
+
+        # `torn` — a run that attested complete=true and did NOT deliver. It is reported on the
+        # RESULT LINE, not merely as a WARNING, because stderr is a channel nothing reads: the
+        # CI summary renders only this line. A softened alert that nothing can observe is a
+        # DELETED alert (deploy#591 review). Calibrated here on BOTH sides — a field that is
+        # always 1 separates nothing.
+        if [[ -n "$want_torn" && "$ok" -eq 1 ]]; then
+            local got_torn
+            got_torn="$(printf '%s' "$out" | sed -n 's/.*[[:space:]]torn=\([0-9]*\).*/\1/p')"
+            if [[ "$got_torn" != "$want_torn" ]]; then
+                log FAIL "self-test ${label}: torn=${got_torn:-<absent>}, want ${want_torn}. A tear the result line does not carry is a tear nobody sees."
+                fails=$((fails + 1))
+                return
+            fi
+        fi
 
         # The AGE, not just the class — and BOTH SIDES of it.
         #
@@ -713,7 +790,26 @@ self_test() {
     # here so that fixing the first cannot regress the second.
     _mkbackup "${tmp}/good_then_partial/daily/2026-07-11" true
     _mkpartial "${tmp}/good_then_partial/daily/2026-07-11"
-    _expect good-run-then-partial-run "${tmp}/good_then_partial" "" fresh "$EXIT_OK" 1
+    # torn=0: a run that HONESTLY declares `complete=false` is SKIPPED, not TORN. The producer's
+    # word and the bucket's contents AGREE. Conflating the two would make `torn` fire on every
+    # ordinary nightly partial and be worthless inside a week.
+    _expect good-run-then-partial-run "${tmp}/good_then_partial" "" fresh "$EXIT_OK" 1 0
+
+    # A TORN run — attests `complete=true` and then does NOT deliver. The producer's word and the
+    # bucket DISAGREE, which is a different and worse fault than an honest partial.
+    #
+    # The verdict is `fresh` (yesterday's run is complete and intact, so a restorable backup DOES
+    # exist and `restore.sh latest` will find it) — but the tear is real and will recur nightly.
+    # It was reported ONLY as a `log WARNING` to stderr, which the CI summary does not render and
+    # no test could read: green-with-torn was byte-identical to a healthy bucket. Deleting every
+    # torn WARNING left the suite green. So it is a FIELD (deploy#591 review, Nino Kavtaradze).
+    _mkbackup "${tmp}/torn/daily/2026-07-10" true "" 20260710-030100
+    mkdir -p "${tmp}/torn/daily/2026-07-11"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero \
+        > "${tmp}/torn/daily/2026-07-11/isnad-pg-${RUN_TS}.dump"
+    printf 'BACKUP_MANIFEST complete=true stores=postgres,user-postgres,neo4j timestamp=%s category=daily\n' \
+        "$RUN_TS" > "${tmp}/torn/daily/2026-07-11/_backup_manifest-${RUN_TS}.txt"
+    _expect fresh-but-a-later-run-tore "${tmp}/torn" "" fresh "$EXIT_OK" 1 1
 
     _mkpartial "${tmp}/partial_then_good/daily/2026-07-11" 20260711-020000
     _mkbackup "${tmp}/partial_then_good/daily/2026-07-11" true
