@@ -99,6 +99,28 @@ export TZ=UTC
 MAX_AGE_HOURS="${MAX_AGE_HOURS:-30}"
 B2_PREFIX="${B2_PREFIX:-}"
 
+# A dump smaller than this is not restorable. `pg_dump --format=custom` of even an empty
+# database is several KB; a 0-byte file is what you get when pg_dump FAILS and the shell
+# redirection has already created the target. That file then uploads cleanly, rclone
+# returns 0, the host gauge goes green — and, before this floor existed, THIS check said
+# `fresh` too. The whole chain of trust this script exists to break was still broken one
+# layer out. A plausible floor beats `> 0`: it also catches a truncated upload.
+MIN_DUMP_BYTES="${MIN_DUMP_BYTES:-1024}"
+
+# A timestamp in the future is NOT a fresh backup. It is a broken clock.
+#
+# rclone PRESERVES the source file's mtime, so an object's timestamp is the VPS CLOCK AT
+# DUMP TIME. This script already pins TZ on the READER side; the WRITER side has the
+# identical exposure and no guard at all. A skewed or NTP-failed VPS uploads future-dated
+# dumps — and a one-sided `age > MAX` bound then reports them `fresh` FOREVER. It does not
+# degrade, it LATCHES: because `newest` is selected by max epoch, a single bad-clock object
+# masks an entire stale bucket, and this job becomes a permanent green light on the one
+# signal we built it to trust.
+#
+# A few minutes of jitter between two machines is normal; a future timestamp beyond that is
+# a fault, and the only honest verdict is "I cannot trust this reading".
+FUTURE_TOLERANCE_SECONDS="${FUTURE_TOLERANCE_SECONDS:-300}"
+
 EXIT_OK=0
 EXIT_ALERT=1
 EXIT_INSTRUMENT=2
@@ -108,8 +130,8 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$1] ${*:2}" >&2; }
 # One machine-readable line. `status` is set explicitly on every path — it is never
 # inferred from an absence of output, which is the whole point of this script.
 result() {
-    printf 'B2_BACKUP_ARTIFACT status=%s dumps=%s newest_age_hours=%s bucket_objects=%s newest=%s\n' \
-        "$1" "$2" "$3" "$4" "${5:--}"
+    printf 'B2_BACKUP_ARTIFACT status=%s reason=%s dumps=%s newest_age_hours=%s bucket_objects=%s newest=%s\n' \
+        "$1" "${2:--}" "$3" "$4" "$5" "${6:--}"
 }
 
 # scan <bucket-root> <prefix> -> result line; 0 fresh / 1 alert / 2 instrument error.
@@ -124,27 +146,31 @@ scan() {
     # error would never be told apart from an absence. (Learned in deploy#563.)
     bucket_listing="$(rclone lsf --recursive "$root" 2>/dev/null)" || rc=$?
     if [[ $rc -ne 0 ]]; then
-        result instrument_error 0 -1 -1 -
+        result instrument_error unreachable 0 -1 -1 -
         return $EXIT_INSTRUMENT
     fi
     bucket_objects="$(printf '%s' "$bucket_listing" | grep -c . || true)"
 
     # --- 2. Scan the prefix we actually care about. -------------------------
+    # `tsp` = modtime; size; path. The SIZE is not decoration: a 0-byte dump lists
+    # non-empty and restores nothing.
     local base="$root"
     [[ -n "$prefix" ]] && base="${root}/${prefix}"
     rc=0
-    listing="$(rclone lsf --recursive --format tp --separator ';' "$base" 2>/dev/null)" || rc=$?
+    listing="$(rclone lsf --recursive --format tsp --separator ';' "$base" 2>/dev/null)" || rc=$?
     if [[ $rc -ne 0 ]]; then
-        result instrument_error 0 -1 "$bucket_objects" -
+        result instrument_error unreachable 0 -1 "$bucket_objects" -
         return $EXIT_INSTRUMENT
     fi
 
     # --- 3. Classify. An empty listing is an ALERT, never an OK. ------------
-    local newest_epoch=0 newest_path="-" dumps=0
-    local line ts path epoch
+    local newest_epoch=0 newest_path="-" dumps=0 undersized=0
+    local line ts size path epoch
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         ts="${line%%;*}"
+        line="${line#*;}"
+        size="${line%%;*}"
         path="${line#*;}"
         # A checksum or a manifest is not a restorable backup. A bucket holding only
         # `.sha256` and `_backup_manifest.txt` lists NON-empty and restores NOTHING — so
@@ -153,6 +179,13 @@ scan() {
             *.dump | *.dump.zst) ;;
             *) continue ;;
         esac
+        # ...and a ZERO-BYTE dump also lists non-empty and restores nothing. Same sentence,
+        # one level in. `pg_dump` failing after the shell has created the target leaves
+        # exactly this, and it uploads cleanly.
+        if [[ "${size:-0}" -lt "$MIN_DUMP_BYTES" ]]; then
+            undersized=$((undersized + 1))
+            continue
+        fi
         dumps=$((dumps + 1))
         epoch="$(date -u -d "$ts" +%s 2>/dev/null || echo 0)"
         if [[ "$epoch" -gt "$newest_epoch" ]]; then
@@ -162,20 +195,38 @@ scan() {
     done <<< "$listing"
 
     if [[ "$dumps" -eq 0 ]]; then
-        result absent 0 -1 "$bucket_objects" -
+        if [[ "$undersized" -gt 0 ]]; then
+            # Present, listed, checksummed — and unrestorable. The most dangerous shape of
+            # "absent" there is, because every other signal in the stack says it is there.
+            result absent undersized_dumps 0 -1 "$bucket_objects" -
+        else
+            result absent no_dumps 0 -1 "$bucket_objects" -
+        fi
         return $EXIT_ALERT
     fi
 
-    local now age_h
+    local now delta age_h
     now="$(date -u +%s)"
-    age_h=$(( (now - newest_epoch) / 3600 ))
+    delta=$(( now - newest_epoch ))
+
+    # --- 4. A FUTURE timestamp is a broken clock, not a fresh backup. -------
+    # Checked BEFORE the freshness bound, and it returns INSTRUMENT_ERROR rather than an
+    # alert: we are not saying the backups are bad, we are saying we cannot trust the
+    # reading. Reporting `fresh` here would latch the job green forever — `newest` is the
+    # max epoch, so one bad-clock object masks an entire stale bucket.
+    if [[ "$delta" -lt $(( -FUTURE_TOLERANCE_SECONDS )) ]]; then
+        result instrument_error future_timestamp "$dumps" $(( delta / 3600 )) "$bucket_objects" "$newest_path"
+        return $EXIT_INSTRUMENT
+    fi
+
+    age_h=$(( delta / 3600 ))
 
     if [[ "$age_h" -gt "$MAX_AGE_HOURS" ]]; then
-        result stale "$dumps" "$age_h" "$bucket_objects" "$newest_path"
+        result stale too_old "$dumps" "$age_h" "$bucket_objects" "$newest_path"
         return $EXIT_ALERT
     fi
 
-    result fresh "$dumps" "$age_h" "$bucket_objects" "$newest_path"
+    result fresh - "$dumps" "$age_h" "$bucket_objects" "$newest_path"
     return $EXIT_OK
 }
 
@@ -196,15 +247,27 @@ self_test() {
         local ok=1
         [[ "$status" == "$want" && "$rc" -eq "$want_rc" ]] || ok=0
 
-        # The AGE, not just the class. A systematic clock/TZ error does not move a fresh
-        # fixture out of the fresh class — the classes are far apart, so the class check
-        # alone is blind to it. Asserting the value is what makes the calibration able to
-        # see a skew at all.
+        # The AGE, not just the class — and BOTH SIDES of it.
+        #
+        # This assertion was `-gt` only. That catches INFLATION (a fresh backup reading
+        # stale — a false alarm, the annoying direction) and is STRUCTURALLY BLIND to
+        # DEFLATION (a stale backup reading fresh — the missed alarm, the dangerous
+        # direction, and the one this guard was written for). Proved by removing the TZ
+        # pin the guard exists to protect: at UTC-4 the self-test FAILED; at UTC+4 it
+        # PASSED and the scanner then reported `newest_age_hours=-3` as `fresh`.
+        #
+        # A one-sided assertion on a two-sided error is half a control. If the gate
+        # consumes a value, the control must bound the value — on both sides.
         if [[ -n "$want_age" && "$ok" -eq 1 ]]; then
             local got_age
             got_age="$(printf '%s' "$out" | sed -n 's/.*newest_age_hours=\(-\?[0-9]*\).*/\1/p')"
+            if [[ "$got_age" -lt 0 ]]; then
+                log FAIL "self-test ${label}: reported a NEGATIVE age (${got_age}h) for an object created NOW. The clock disagrees with rclone's ModTime in the DEFLATING direction — a stale backup would read fresh."
+                fails=$((fails + 1))
+                return
+            fi
             if [[ "$got_age" -gt "$want_age" ]]; then
-                log FAIL "self-test ${label}: reported age ${got_age}h for an object created NOW (max ${want_age}h). Clock/TZ skew — a stale backup could read fresh."
+                log FAIL "self-test ${label}: reported age ${got_age}h for an object created NOW (max ${want_age}h). Clock/TZ skew — a fresh backup would read stale."
                 fails=$((fails + 1))
                 return
             fi
@@ -218,12 +281,39 @@ self_test() {
         fi
     }
 
-    # FRESH — the POSITIVE control. Without a fixture the scanner can pass, every
-    # refusal below is vacuous: a scanner that only ever says ALERT proves every bucket
-    # is empty.
+    # FRESH — the POSITIVE control. Without a fixture the scanner can pass, every refusal
+    # below is vacuous: a scanner that only ever says ALERT proves every bucket is empty.
+    #
+    # It must be a REAL-SIZED dump. The previous version of this fixture was `: > file` —
+    # a ZERO-BYTE file — so the scanner had never been shown to tell a restorable dump
+    # from an empty one, BECAUSE NO FIXTURE COULD PRODUCE THE BAD CONDITION. The guard and
+    # the fixture were blind together.
     mkdir -p "${tmp}/fresh"
-    : > "${tmp}/fresh/isnad-pg-now.dump"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/fresh/isnad-pg-now.dump"
     _expect fresh "${tmp}/fresh" "" fresh "$EXIT_OK" 1
+
+    # ZERO-BYTE DUMP — lists non-empty, restores nothing. This is what `pg_dump` failing
+    # leaves behind after the shell has already created the target, and it uploads cleanly.
+    mkdir -p "${tmp}/zerobyte"
+    : > "${tmp}/zerobyte/isnad-pg-now.dump"
+    _expect absent-zero-byte-dump "${tmp}/zerobyte" "" absent "$EXIT_ALERT"
+
+    # FUTURE TIMESTAMP — a broken clock, NOT a fresh backup. Must be instrument_error, and
+    # must never latch the job green. rclone preserves the source mtime, so this is the VPS
+    # clock at dump time; the writer side has no TZ pin and no guard.
+    mkdir -p "${tmp}/future"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/future/isnad-pg-future.dump"
+    touch -d "+30 days" "${tmp}/future/isnad-pg-future.dump"
+    _expect instrument-error-future "${tmp}/future" "" instrument_error "$EXIT_INSTRUMENT"
+
+    # ...and it must not MASK a stale bucket. `newest` is the max epoch, so one bad-clock
+    # object beside a genuinely ancient backup previously reported `fresh`.
+    mkdir -p "${tmp}/future_masks"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/future_masks/isnad-pg-old.dump"
+    touch -d "40 days ago" "${tmp}/future_masks/isnad-pg-old.dump"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/future_masks/isnad-pg-future.dump"
+    touch -d "+30 days" "${tmp}/future_masks/isnad-pg-future.dump"
+    _expect instrument-error-future-masking "${tmp}/future_masks" "" instrument_error "$EXIT_INSTRUMENT"
 
     # ABSENT — the silent zero itself: rclone exits 0 and prints nothing.
     mkdir -p "${tmp}/empty"
@@ -237,7 +327,7 @@ self_test() {
 
     # STALE — a real dump, far too old.
     mkdir -p "${tmp}/stale"
-    : > "${tmp}/stale/isnad-pg-old.dump"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/stale/isnad-pg-old.dump"
     touch -d "$(( MAX_AGE_HOURS + 24 )) hours ago" "${tmp}/stale/isnad-pg-old.dump"
     _expect stale "${tmp}/stale" "" stale "$EXIT_ALERT"
 

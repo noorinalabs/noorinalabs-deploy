@@ -47,6 +47,12 @@ EXIT_OK = 0
 EXIT_ALERT = 1
 EXIT_INSTRUMENT = 2
 
+# Must clear the scanner's MIN_DUMP_BYTES floor. The first version of these tests wrote
+# b"x" — a 1-byte "dump" — and the scanner's own positive fixture was a ZERO-byte file, so
+# neither could produce the bad condition they were meant to exclude. A fixture that cannot
+# express the defect cannot test for it.
+REAL_DUMP = b"P" * 4096
+
 
 def _scan(root: Path | str, **env: str) -> tuple[int, str]:
     r = subprocess.run(  # noqa: S603
@@ -76,7 +82,7 @@ def _field(line: str, key: str) -> str:
 # that only ever says ALERT proves every bucket is empty.
 # ---------------------------------------------------------------------------
 def test_fresh_dump_is_accepted(tmp_path: Path) -> None:
-    (tmp_path / "isnad-pg-now.dump").write_bytes(b"x")
+    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
     rc, line = _scan(tmp_path)
     assert rc == EXIT_OK, f"a fresh dump must pass: {line}"
     assert _field(line, "status") == "fresh"
@@ -90,7 +96,7 @@ def test_fresh_dump_age_is_not_skewed(tmp_path: Path) -> None:
     4 hours old on this box. A skew in the other direction makes a stale backup read fresh.
     A class-level assertion cannot see this: 4h is still comfortably 'fresh'.
     """
-    (tmp_path / "isnad-pg-now.dump").write_bytes(b"x")
+    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
     rc, line = _scan(tmp_path)
     assert rc == EXIT_OK
     age = int(_field(line, "newest_age_hours"))
@@ -131,7 +137,7 @@ def test_bucket_with_no_dumps_is_absent(tmp_path: Path) -> None:
 
 def test_stale_dump_is_an_alert(tmp_path: Path) -> None:
     p = tmp_path / "isnad-pg-old.dump"
-    p.write_bytes(b"x")
+    p.write_bytes(REAL_DUMP)
     old = time.time() - (60 * 3600)
     os.utime(p, (old, old))
     rc, line = _scan(tmp_path, MAX_AGE_HOURS="30")
@@ -177,7 +183,7 @@ def test_scan_refuses_when_self_test_fails(tmp_path: Path) -> None:
     fixture reports hours old, the self-test fails, and the scanner must refuse to give a
     verdict on the real bucket rather than hand back a reading it cannot vouch for.
     """
-    (tmp_path / "isnad-pg-now.dump").write_bytes(b"x")
+    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
     r = subprocess.run(  # noqa: S603
         ["bash", str(SCANNER)],  # noqa: S607
         env={**os.environ, "B2_ROOT": str(tmp_path), "TZ": "Asia/Tokyo"},
@@ -191,4 +197,99 @@ def test_scan_refuses_when_self_test_fails(tmp_path: Path) -> None:
     assert r.returncode == EXIT_OK, (
         "the scanner must pin TZ itself and not inherit the caller's — otherwise a runner "
         f"in a non-UTC zone silently mis-ages every backup.\n{r.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A zero-byte dump restores NOTHING (deploy#584 review — Nino Kavtaradze)
+# ---------------------------------------------------------------------------
+def test_zero_byte_dump_is_not_restorable(tmp_path: Path) -> None:
+    """The PR is titled *assert a RESTORABLE object exists*. A 0-byte dump is not one.
+
+    This is the same argument the scanner already made one level out — *"a bucket holding
+    only .sha256 and _backup_manifest.txt lists NON-empty and restores NOTHING"* — and it
+    stopped one level short. A bucket holding only zero-byte `.dump` files also lists
+    non-empty and restores nothing.
+
+    It is exactly what `pg_dump` failing leaves behind, after the shell redirection has
+    already created the target: the file uploads cleanly, rclone returns 0, the host gauge
+    goes green — and, before the size floor, THIS check said `fresh` too. The chain of trust
+    this scanner exists to break was still broken, one layer out.
+    """
+    (tmp_path / "isnad-pg-now.dump").write_bytes(b"")
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, f"a zero-byte dump is not restorable: {line}"
+    assert _field(line, "status") == "absent"
+    assert _field(line, "reason") == "undersized_dumps"
+
+
+# ---------------------------------------------------------------------------
+# A future timestamp is a BROKEN CLOCK, not a fresh backup (both reviewers)
+# ---------------------------------------------------------------------------
+def test_future_timestamp_is_an_instrument_error_not_fresh(tmp_path: Path) -> None:
+    """`age > MAX` is a ONE-SIDED bound, and the unbounded side reads `fresh` forever.
+
+    rclone PRESERVES the source mtime, so an object's timestamp is the VPS clock at dump
+    time. This script pins TZ on the READER side; the WRITER has the identical exposure and
+    no guard. A skewed or NTP-failed VPS uploads future-dated dumps — and a one-sided bound
+    then reports them fresh.
+    """
+    p = tmp_path / "isnad-pg-future.dump"
+    p.write_bytes(REAL_DUMP)
+    future = time.time() + (30 * 24 * 3600)
+    os.utime(p, (future, future))
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_INSTRUMENT, f"a future timestamp is a broken clock, not a backup: {line}"
+    assert _field(line, "status") == "instrument_error"
+    assert _field(line, "reason") == "future_timestamp"
+
+
+def test_one_future_object_cannot_mask_a_stale_bucket(tmp_path: Path) -> None:
+    """It does not degrade — it LATCHES.
+
+    `newest` is selected by max epoch, so a single bad-clock object masks an entire stale
+    bucket: a genuinely 40-day-old backup beside one future-dated object reported
+    `status=fresh`, rc=0. One bad-clock upload converts this job into a permanent green
+    light on the exact signal it was built to provide.
+    """
+    old = tmp_path / "isnad-pg-old.dump"
+    old.write_bytes(REAL_DUMP)
+    t_old = time.time() - (40 * 24 * 3600)
+    os.utime(old, (t_old, t_old))
+
+    fut = tmp_path / "isnad-pg-future.dump"
+    fut.write_bytes(REAL_DUMP)
+    t_fut = time.time() + (30 * 24 * 3600)
+    os.utime(fut, (t_fut, t_fut))
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_INSTRUMENT, (
+        f"one future-dated object must not mask a 40-day-old bucket: {line}"
+    )
+    assert _field(line, "status") != "fresh"
+
+
+# ---------------------------------------------------------------------------
+# The production calibration gate must be TWO-SIDED
+# ---------------------------------------------------------------------------
+def test_self_test_catches_clock_skew_in_BOTH_directions() -> None:
+    """A one-sided assertion on a two-sided error is half a control.
+
+    The shell `self_test` — the gate that runs in production before every real reading, on
+    the machine where a skew would actually occur — asserted `got_age > want` only. That
+    catches INFLATION (a fresh backup reading stale: a false alarm, the annoying direction)
+    and is structurally blind to DEFLATION (a stale backup reading fresh: the missed alarm,
+    and the direction the guard was written for).
+
+    Proved by removing the TZ pin the guard exists to protect: at UTC-4 the self-test
+    failed; at UTC+4 it PASSED, and the scanner then reported `newest_age_hours=-3` as
+    `fresh`. The self-test declared the scanner calibrated and the scanner then lied.
+    """
+    src = SCANNER.read_text()
+    assert 'if [[ "$got_age" -lt 0 ]]; then' in src, (
+        "the calibration gate must reject a NEGATIVE age — the deflating direction, which "
+        "turns a stale backup into a fresh one"
+    )
+    assert 'if [[ "$got_age" -gt "$want_age" ]]; then' in src, (
+        "and it must still reject an inflated age"
     )
