@@ -284,6 +284,27 @@ def test_self_test_catches_clock_skew_in_BOTH_directions() -> None:
     Proved by removing the TZ pin the guard exists to protect: at UTC-4 the self-test
     failed; at UTC+4 it PASSED, and the scanner then reported `newest_age_hours=-3` as
     `fresh`. The self-test declared the scanner calibrated and the scanner then lied.
+
+    THIS ASSERTION IS TEXTUAL, DELIBERATELY, AND THAT IS WORTH SAYING OUT LOUD.
+
+    The lower bound is DORMANT defence-in-depth today: `status=fresh` now requires
+    `delta >= -FUTURE_TOLERANCE_SECONDS`, and integer division truncates `[-300s, 0)` to age
+    `0` — so a negative age carrying `status=fresh` is UNREACHABLE while the future-timestamp
+    guard (F1) stands. Deleting this bound therefore changes no observable behaviour, and a
+    behavioural test for it would be inert. Nino Kavtaradze nearly wrote up "the F3 fix is
+    decorative" on exactly that basis, and caught himself: an inert mutation is not evidence
+    of a gap.
+
+    Isolated properly — remove F1's future guard AND the TZ pin, run at UTC+4 — the bound is
+    load-bearing: with it, the self-test reports `[FAIL] reported a NEGATIVE age (-4h)`;
+    without it, that failure disappears.
+
+    So: **F1's future guard is what actually kills the clock-skew attack today. This bound is
+    the layer behind it, and it becomes load-bearing the instant F1 is relaxed.** Knowing
+    which guard carries the weight is the point — if anyone ever loosens one, it matters
+    enormously which. A source-text assertion is the honest instrument for a property that is
+    correct, ordered, and currently unreachable; pretending it is behavioural would be the
+    vacuous-assertion defect in a new costume.
     """
     src = SCANNER.read_text()
     assert 'if [[ "$got_age" -lt 0 ]]; then' in src, (
