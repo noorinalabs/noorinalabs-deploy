@@ -379,6 +379,28 @@ make_fixtures() {
     fi
     log "INFO" "  user-pg truncated fixture: ${ufull}B -> ${utsize}B, checksum recomputed to match"
 
+    # (a3) EVERY dump valid, checksums correct — but the user-postgres dump is simply NOT
+    #      THERE. This is the fixture that was missing, and the hole it exercises was live:
+    #      restore.sh set FAILED=1 only when a dump was PRESENT and failed. An ABSENT dump
+    #      logged a WARNING and never touched FAILED, so the script printed
+    #      "=== Restore complete ===" and exited 0 on a backup with no accounts, no
+    #      sessions and no audit_log in it.
+    #
+    #      It is reachable by an artifact backup.sh itself produces: a partial upload lands
+    #      in B2 date-stamped, checksums cleanly, and `latest` selected it by directory name.
+    #      Nothing here is corrupt. Everything present is valid. That is the point — this
+    #      fixture is well-formed by construction, which is exactly why the other five
+    #      negatives could not catch it.
+    local nouserpg="${WORK}/fx_no_userpg"
+    mkdir -p "$nouserpg"
+    cp "${ARTIFACT}/${PG_DUMP_NAME}"    "${ARTIFACT}/${PG_DUMP_NAME}.sha256"    "$nouserpg/"
+    cp "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst" "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst.sha256" "$nouserpg/"
+    if [[ -e "${nouserpg}/${USER_PG_DUMP_NAME}" ]]; then
+        log "ERROR" "no-userpg fixture is inert — the user-pg dump is present in it"
+        exit 1
+    fi
+    log "INFO" "  no-userpg fixture: valid isnad-pg + neo4j + correct checksums, user-pg ABSENT"
+
     # (b) Dump present, zero checksum files. Verification of nothing must not pass.
     local nosums="${WORK}/fx_nosums"
     mkdir -p "$nosums"
@@ -492,6 +514,9 @@ main() {
     # Negatives first: prove the check can go red before we trust it green.
     expect_fail "truncated_dump_matching_checksum"      "${WORK}/fx_truncated"
     expect_fail "truncated_user_pg_dump"                "${WORK}/fx_user_truncated"
+    # Well-formed by construction: nothing corrupt, everything present is valid, and the
+    # user-postgres dump is simply absent. The one the other five could not see.
+    expect_fail "no_user_pg_dump_at_all"                "${WORK}/fx_no_userpg"
     expect_fail "zero_checksum_files"              "${WORK}/fx_nosums"
     expect_fail "empty_backup"                     "${WORK}/fx_empty"
     expect_fail "bitrot_stale_checksum"            "${WORK}/fx_bitrot"

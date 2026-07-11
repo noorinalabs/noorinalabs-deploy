@@ -418,3 +418,93 @@ def test_datastore_inventory_exists_and_covers_every_compose_volume() -> None:
         f"docs/DATASTORES.md does not account for these compose volumes: {missing}. "
         "Add a row stating whether it is backed up and why."
     )
+
+
+# --------------------------------------------------------------------------
+# The required-store gate (deploy#559 review — Nurul Hakim, Lucas Ferreira)
+# --------------------------------------------------------------------------
+def test_absent_dump_is_as_fatal_as_a_failed_one() -> None:
+    """A MISSING store must fail the restore, not warn about it.
+
+    restore.sh set ``FAILED=1`` only when a dump was PRESENT and its restore failed. A dump
+    that was absent entirely logged a WARNING, recorded ``skipped (no dump)``, and never
+    touched ``FAILED`` — so the script printed ``=== Restore complete ===`` and exited **0**
+    on a backup with no accounts, no sessions and no ``audit_log`` in it. The all-empty case
+    was caught and the one-store-missing case was not: a guard on each side of the hole and
+    none in it.
+
+    Reachable by an artifact backup.sh itself produces: a partial upload lands in B2
+    date-stamped, checksums cleanly, and ``latest`` selected it by directory NAME.
+
+    backup.sh already refuses to call a partial backup a success (``USER_PG_OK`` is inside
+    its non-zero-exit condition). The identical argument applies to the consumer, and had
+    not been carried across.
+    """
+    code = _code_only(_restore_text())
+    assert "MISSING_STORES" in code, "restore.sh must compute the set of expected-but-absent stores"
+    assert "if [[ ${#MISSING_STORES[@]} -gt 0 ]]; then" in code, (
+        "an absent expected store must be tested for, not merely warned about"
+    )
+    assert "ALLOW_PARTIAL" in code, (
+        "the DR escape hatch must be an explicit opt-in, so the default is refuse"
+    )
+    # Default-deny: the refusal branch must exit non-zero.
+    refuse = code.split("if [[ ${#MISSING_STORES[@]} -gt 0 ]]; then", 1)[1].split("fi", 1)[0]
+    assert "exit 1" in refuse, (
+        "without --allow-partial an incomplete backup must EXIT NON-ZERO. Documentation is "
+        "not enforcement: during an incident nobody reads the header comment, they read the "
+        "exit code and the last line."
+    )
+
+
+def test_allow_partial_is_opt_in_not_default() -> None:
+    code = _code_only(_restore_text())
+    assert "ALLOW_PARTIAL=false" in code, (
+        "--allow-partial must default to false; a restore that silently tolerates a missing "
+        "store is the defect this gate exists to close"
+    )
+
+
+def test_resolve_latest_selects_a_complete_backup() -> None:
+    """`latest` must not mean "newest directory name".
+
+    A partial backup is date-stamped and checksums cleanly; at rest it is indistinguishable
+    from a complete one. Selecting by name means that the night the user-postgres dump
+    fails, `latest` picks precisely the artifact missing the only store no pipeline artifact
+    can rebuild — while the previous night's good backup sits there unselected.
+    """
+    code = _code_only(_restore_text())
+    assert "_backup_manifest.txt" in code, (
+        "completeness is a property of the artifact and the artifact must declare it"
+    )
+    # Assert the CALL, not merely the definition. A first version of this test checked only
+    # that `backup_is_complete` appeared somewhere in the file — which it still does when
+    # the call site is replaced by `if true`, leaving the function defined, unused, and the
+    # newest-by-name bug fully restored. A guard is not pinned by the existence of the
+    # function that implements it; it is pinned by the branch that calls it.
+    body = code.split("resolve_latest() {", 1)[1].split("\n}", 1)[0]
+    assert 'if backup_is_complete "${category}/${dir}"; then' in body, (
+        "resolve_latest must actually CALL backup_is_complete when selecting; otherwise "
+        "'latest' is still the newest directory NAME and will pick a partial backup"
+    )
+    assert "skipped" in body, (
+        "an operator told nothing about why the newest backup was passed over will assume "
+        "the tool is broken and reach for the one it refused"
+    )
+
+
+def test_backup_declares_its_own_completeness() -> None:
+    """The producer attests to what it actually wrote — it is the only party that knows."""
+    code = _backup_code()
+    assert "_backup_manifest.txt" in code, "backup.sh must write a completeness manifest"
+    assert "BACKUP_MANIFEST complete=" in code, (
+        "the manifest must declare whether this backup is complete"
+    )
+    # And the manifest must NOT be the source of the expected set — that would let a
+    # partial backup declare itself complete-for-what-it-happens-to-hold.
+    rcode = _code_only(_restore_text())
+    assert "REQUIRED_STORES" in rcode, (
+        "restore.sh must carry its OWN list of required stores. If the expected set came "
+        "from the artifact, a partial backup would declare itself complete — the same "
+        "circularity as a read-back count, and just as invisible."
+    )

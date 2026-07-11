@@ -402,6 +402,42 @@ for f in "$LOCAL_BACKUP_PATH"/isnad-*; do
 done
 
 # ---------------------------------------------------------------------------
+# 3b. Declare what this backup actually contains (deploy#559 review)
+# ---------------------------------------------------------------------------
+# A partial backup is uploaded deliberately ("a partial backup beats none"), and once it
+# lands in B2 it is date-stamped, checksums cleanly, and is INDISTINGUISHABLE AT REST from
+# a complete one. `restore.sh latest` picks the newest directory NAME. So the night the
+# user-postgres dump fails, the artifact `latest` selects is precisely the one missing the
+# only store that cannot be rebuilt from the pipeline artifact.
+#
+# Completeness is a property of the artifact, so the artifact must declare it. This is the
+# same shape as `_resolve_run.txt` in da#428: the PRODUCER attests to what it actually
+# wrote, because it is the only party that knows, and the consumer refuses anything that
+# does not attest completeness.
+#
+# Note what this manifest is NOT: it is not the source of the EXPECTED set. restore.sh
+# carries its own list of required stores. If the expected set came from the artifact, a
+# partial backup would declare itself complete-for-what-it-happens-to-hold — the same
+# circularity that a read-back count has, and it would be just as invisible.
+MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_backup_manifest.txt"
+BACKUP_STORES=""
+$PG_OK && BACKUP_STORES="${BACKUP_STORES}postgres,"
+$USER_PG_OK && BACKUP_STORES="${BACKUP_STORES}user-postgres,"
+$NEO4J_OK && BACKUP_STORES="${BACKUP_STORES}neo4j,"
+BACKUP_STORES="${BACKUP_STORES%,}"
+
+if $PG_OK && $USER_PG_OK && $NEO4J_OK; then
+    BACKUP_COMPLETE=true
+else
+    BACKUP_COMPLETE=false
+fi
+
+printf 'BACKUP_MANIFEST complete=%s stores=%s timestamp=%s category=%s\n' \
+    "$BACKUP_COMPLETE" "$BACKUP_STORES" "$TIMESTAMP" "$BACKUP_CATEGORY" > "$MANIFEST_FILE"
+sha256sum "$MANIFEST_FILE" | sed "s|${LOCAL_BACKUP_PATH}/||" > "${MANIFEST_FILE}.sha256"
+log "INFO" "Manifest: complete=${BACKUP_COMPLETE} stores=${BACKUP_STORES}"
+
+# ---------------------------------------------------------------------------
 # 4. Upload to Backblaze B2
 # ---------------------------------------------------------------------------
 if [[ "$PG_OK" == "false" && "$USER_PG_OK" == "false" && "$NEO4J_OK" == "false" ]]; then

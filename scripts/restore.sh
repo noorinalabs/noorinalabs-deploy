@@ -66,6 +66,11 @@ if [[ -z "$RESTORE_LOCAL_DIR" ]]; then
 fi
 
 FORCE=false
+# A DR escape hatch, not a convenience. Default-deny: an incomplete backup is REFUSED
+# unless the operator explicitly says they know and accept it. Safety direction over UX
+# friction (PR#494) — during an incident nobody reads the header comment; they read the
+# exit code and the last line, and the last line used to say the restore was complete.
+ALLOW_PARTIAL=false
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -116,10 +121,34 @@ list_backups() {
     rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/weekly/" --dirs-only 2>/dev/null || echo "  (none)"
 }
 
+# Does the backup directory at <category>/<date> declare itself COMPLETE?
+# Reads `_backup_manifest.txt` (written by backup.sh, deploy#559). A directory with no
+# manifest is NOT complete: every pre-#559 backup predates user-postgres coverage entirely,
+# so treating "no manifest" as "probably fine" would hand `latest` the exact artifact class
+# this change exists to stop.
+backup_is_complete() {
+    local path="$1"
+    local manifest
+    manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest.txt" 2>/dev/null || true)"
+    [[ -n "$manifest" ]] || return 1
+    printf '%s\n' "$manifest" \
+        | grep -q '^BACKUP_MANIFEST .*[[:space:]]complete=true\([[:space:]]\|$\)'
+}
+
 resolve_latest() {
-    # Find the most recent backup across daily and weekly
-    local latest=""
-    local latest_date="0000-00-00"
+    # The most recent COMPLETE backup — not merely the newest directory NAME.
+    #
+    # A partial backup lands in B2 date-stamped and checksums cleanly; at rest it is
+    # indistinguishable from a complete one. Selecting by name alone means that the night
+    # the user-postgres dump fails, `latest` picks precisely the artifact missing the only
+    # store no pipeline artifact can rebuild — and the previous night's good backup is
+    # sitting right there, unselected.
+    #
+    # Skipped directories are named, loudly. An operator who is told nothing about why the
+    # newest backup was passed over will assume the tool is broken and reach for the one it
+    # refused.
+    local latest="" latest_date="0000-00-00"
+    local skipped=()
 
     for category in daily weekly; do
         local dirs
@@ -128,14 +157,27 @@ resolve_latest() {
             [[ -z "$dir" ]] && continue
             dir="${dir%/}"
             if [[ "$dir" > "$latest_date" ]]; then
-                latest_date="$dir"
-                latest="${category}/${dir}"
+                if backup_is_complete "${category}/${dir}"; then
+                    latest_date="$dir"
+                    latest="${category}/${dir}"
+                else
+                    skipped+=("${category}/${dir}")
+                fi
             fi
         done <<< "$dirs"
     done
 
+    if [[ ${#skipped[@]} -gt 0 ]]; then
+        log "WARNING" "Skipped ${#skipped[@]} INCOMPLETE backup(s) when resolving 'latest':" >&2
+        for _s in "${skipped[@]}"; do
+            log "WARNING" "    incomplete: ${_s}" >&2
+        done
+        log "WARNING" "To restore one of these anyway, name it explicitly and pass --allow-partial." >&2
+    fi
+
     if [[ -z "$latest" ]]; then
-        log "ERROR" "No backups found in B2 bucket"
+        log "ERROR" "No COMPLETE backup found in B2 bucket." >&2
+        log "ERROR" "If only incomplete backups exist, name one explicitly and pass --allow-partial." >&2
         exit 1
     fi
 
@@ -390,16 +432,26 @@ while [[ $# -gt 0 ]]; do
             FORCE=true
             shift
             ;;
+        --allow-partial)
+            ALLOW_PARTIAL=true
+            shift
+            ;;
         --list)
             list_backups
             exit 0
             ;;
         --help|-h)
-            echo "Usage: $0 [--force] [--list] <backup-path|latest>"
+            echo "Usage: $0 [--force] [--allow-partial] [--list] <backup-path|latest>"
             echo ""
-            echo "  latest              Restore the most recent backup"
+            echo "  latest              Restore the most recent COMPLETE backup"
             echo "  daily/2026-03-25    Restore a specific backup"
             echo "  --force             Skip confirmation prompt"
+            echo "  --allow-partial     Restore a backup that is MISSING one or more stores."
+            echo "                      Without this, an incomplete backup is REFUSED: restoring"
+            echo "                      some stores and not others reports success while silently"
+            echo "                      leaving the rest at their pre-restore contents, and"
+            echo "                      user-postgres (accounts, sessions, audit_log) cannot be"
+            echo "                      rebuilt from any artifact. DR use only."
             echo "  --list              List available backups"
             exit 0
             ;;
@@ -411,7 +463,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$BACKUP_PATH" ]]; then
-    echo "Usage: $0 [--force] [--list] <backup-path|latest>"
+    echo "Usage: $0 [--force] [--allow-partial] [--list] <backup-path|latest>"
     echo "Run '$0 --list' to see available backups."
     exit 1
 fi
@@ -506,6 +558,68 @@ USER_PG_RESULT="skipped (no dump)"
 NEO4J_RESULT="skipped (no dump)"
 FAILED=0
 
+# ---------------------------------------------------------------------------
+# REQUIRED-STORE GATE — an ABSENT dump is as fatal as a FAILED one
+# ---------------------------------------------------------------------------
+# This script used to set FAILED=1 only when a dump was PRESENT and its restore failed. A
+# dump that was absent entirely logged a WARNING, recorded "skipped (no dump)", and never
+# touched FAILED — so the script printed "=== Restore complete ===" and exited 0 on a
+# backup that was missing user-postgres. The all-empty case was caught, and the
+# one-store-missing case was not: a guard on each side of the hole and none in it.
+#
+# It was reachable in production, by an artifact THIS CHANGE creates: backup.sh
+# deliberately uploads a partial when a leg fails ("a partial backup beats none"), that
+# directory lands in B2 date-stamped and checksums cleanly, and `latest` picks the newest
+# directory NAME. So the night the user-postgres dump fails, `restore.sh latest` selects
+# exactly the artifact missing the one store no pipeline artifact can rebuild — and says
+# "Restore complete".
+#
+# The scenario is the one this PR exists to prevent: the dump fails, BackupFailed fires
+# CORRECTLY, nobody restores because nothing is broken yet, the next night succeeds. Weeks
+# later a prune eats the graph, someone restores `latest`, gets the graph and the isnad DB
+# back, is told the restore is complete — and has silently lost every account, session and
+# audit record. The alerting cannot help: it watched the backup, and the backup honestly
+# said it failed. THE RESTORE IS THE THING THAT LIED.
+#
+# backup.sh already refuses to call a partial backup a success — USER_PG_OK is INSIDE its
+# non-zero-exit condition, for exactly this reason. The identical argument applies to the
+# consumer and had not been carried across: the producer refused to call a partial backup a
+# success while the consumer called a partial RESTORE one. And this script's own summary
+# comment says "a restore that did not restore must not be reported as success" — the
+# comment was right and the code disagreed with it.
+#
+# THE EXPECTED SET IS THIS SCRIPT'S OWN, and is deliberately NOT read from the artifact.
+# If it were, a partial backup would declare itself complete-for-what-it-happens-to-hold —
+# the same circularity as a read-back count, and just as invisible. The backup's manifest
+# is a SECOND signal (checked above), never the definition of what is required.
+REQUIRED_STORES=("isnad-pg:PostgreSQL (isnad)" "isnad-userpg:PostgreSQL (user-service)" "isnad-neo4j:Neo4j")
+MISSING_STORES=()
+[[ -z "$PG_DUMP" ]]      && MISSING_STORES+=("PostgreSQL (isnad)")
+[[ -z "$USER_PG_DUMP" ]] && MISSING_STORES+=("PostgreSQL (user-service) — accounts, sessions, audit_log")
+[[ -z "$NEO4J_DUMP" ]]   && MISSING_STORES+=("Neo4j")
+
+if [[ ${#MISSING_STORES[@]} -gt 0 ]]; then
+    if [[ "$ALLOW_PARTIAL" == "true" ]]; then
+        log "WARNING" "--allow-partial: proceeding with ${#MISSING_STORES[@]} store(s) MISSING from this backup:"
+        for _m in "${MISSING_STORES[@]}"; do
+            log "WARNING" "    MISSING: ${_m}"
+        done
+        log "WARNING" "The stores above will NOT be restored. Their current contents are left as they are."
+    else
+        log "ERROR" "=== Restore REFUSED — this backup is incomplete ==="
+        for _m in "${MISSING_STORES[@]}"; do
+            log "ERROR" "    MISSING: ${_m}"
+        done
+        log "ERROR" "A complete backup contains all ${#REQUIRED_STORES[@]} dumped stores (see docs/DATASTORES.md)."
+        log "ERROR" "Restoring only some of them would report success while silently leaving the others"
+        log "ERROR" "at their pre-restore contents — and user-postgres cannot be rebuilt from any artifact."
+        log "ERROR" ""
+        log "ERROR" "If you are in a DR scenario and this really is the only backup you have, re-run with"
+        log "ERROR" "--allow-partial to restore what is present. NOTHING has been restored."
+        exit 1
+    fi
+fi
+
 if [[ -n "$PG_DUMP" ]]; then
     if restore_postgres "$PG_DUMP" postgres "$POSTGRES_USER" "$POSTGRES_DB" "PostgreSQL (isnad)"; then
         PG_RESULT="restored"
@@ -513,8 +627,6 @@ if [[ -n "$PG_DUMP" ]]; then
         PG_RESULT="FAILED"
         FAILED=1
     fi
-else
-    log "WARNING" "No PostgreSQL dump found in backup"
 fi
 
 if [[ -n "$USER_PG_DUMP" ]]; then
@@ -524,9 +636,6 @@ if [[ -n "$USER_PG_DUMP" ]]; then
         USER_PG_RESULT="FAILED"
         FAILED=1
     fi
-else
-    # Loud, because this is the store that cannot be rebuilt from the pipeline artifact.
-    log "WARNING" "No user-service PostgreSQL dump found in backup — accounts, sessions and audit_log will NOT be restored"
 fi
 
 if [[ -n "$NEO4J_DUMP" ]]; then
@@ -536,8 +645,6 @@ if [[ -n "$NEO4J_DUMP" ]]; then
         NEO4J_RESULT="FAILED"
         FAILED=1
     fi
-else
-    log "WARNING" "No Neo4j dump found in backup"
 fi
 
 # ---------------------------------------------------------------------------

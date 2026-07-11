@@ -128,12 +128,41 @@ dump, not what exists in a bucket. There is nothing to restore from today.
 
 ## Verifying a restore
 
-`scripts/restore.sh` exits non-zero if any dump present in the artifact fails to restore,
-and refuses artifacts it cannot verify. Do not read a zero exit as "the data is back" —
-`pg_restore --clean` can warn and succeed while restoring nothing. Assert on content.
+`scripts/restore.sh` **refuses an incomplete backup by default.** A store that is expected
+but **absent** is now as fatal as one whose restore fails — pass `--allow-partial` to
+restore anyway, which is a DR escape hatch and not a convenience.
+
+That gate exists because the previous behaviour was the defect this document warns about,
+committed in code. An absent dump logged a `WARNING`, recorded `skipped (no dump)`, and
+never set `FAILED` — so the script printed `=== Restore complete ===` and exited **0** on a
+backup with no accounts, no sessions and no `audit_log` in it. The all-empty case was
+caught and the one-store-missing case was not: a guard on each side of the hole and none in
+it. Two reviewers found it independently (deploy#577).
+
+It was reachable by an artifact *this repo produces*: `backup.sh` deliberately uploads a
+partial when a leg fails ("a partial backup beats none"), that directory lands in B2
+date-stamped and checksums cleanly, and `latest` selected it by directory **name**. So the
+night the `user-postgres` dump fails, `restore.sh latest` picked precisely the artifact
+missing the one store nothing can rebuild — and said the restore was complete. The alerting
+could not help: it watches the *backup*, and the backup correctly reported that it failed.
+**The restore was the thing that lied.**
+
+So **completeness is a property of the artifact, and the artifact declares it**:
+`backup.sh` writes `_backup_manifest.txt` (`BACKUP_MANIFEST complete=<bool> stores=<csv>`),
+and `resolve_latest` selects the newest backup that declares itself **complete**, naming any
+it skipped. A directory with no manifest is not complete — every pre-deploy#559 backup
+predates `user-postgres` coverage entirely.
+
+The manifest is **not** the source of the expected set. `restore.sh` carries its own list of
+required stores; if the expected set came from the artifact, a partial backup would declare
+itself complete-for-whatever-it-happens-to-hold — the same circularity as a read-back count,
+and just as invisible.
+
+Do not read a zero exit as "the data is back" — `pg_restore --clean` can warn and succeed
+while restoring nothing. Assert on content.
 
 `scripts/restore_rehearsal.sh` does exactly that against a throwaway stack: it requires
-`restore.sh` to **reject** five broken artifacts before it trusts an intact one, then
+`restore.sh` to **reject** six broken artifacts before it trusts an intact one, then
 asserts row counts, sampled records, and the Neo4j node count. It runs in CI
 (`.github/workflows/restore-rehearsal.yml`) on changes to the backup/restore path and
 weekly. See deploy#560.
