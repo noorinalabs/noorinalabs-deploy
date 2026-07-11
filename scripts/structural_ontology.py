@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
-"""Generate / staleness-check noorinalabs-deploy's structural ontology index (#493).
+"""Generate noorinalabs-deploy's structural ontology index (#493, deploy#571).
 
 This is noorinalabs-deploy's consumer side of the C×T2 distributed structural
 ontology (noorinalabs-main#820, generator noorinalabs-main#855; wiring deploy#493).
+
+The structural index is a **gitignored build product** (main#939 / deploy#571), not a
+committed artifact. Per the ratified C×T2 principle (#857) the structural layer is
+*always-current-by-regeneration*: if it is always regenerable, a committed copy is
+redundant -- and committing it made every concurrent PR conflict on a whole-file
+generated artifact that carries no source-level information (the union merge-driver
+that tried to paper over it is a per-clone ``git config`` that GitHub's server-side
+merge never runs). So this script's only job is ``emit``: (re)build the index on
+demand. There is no longer a staleness ``check`` (a gitignored build product has
+nothing to gate) nor a merge-driver to register (nothing to merge once uncommitted).
 
 **Hybrid index -- stub mode for HCL (deploy-specific).**
 HCL/Terraform is NOT cleanly AST-derivable by the current ``ontology_gen`` generator
@@ -18,15 +28,14 @@ a HYBRID committed index:
   ``lang: yaml``, embedded in ``_HCL_STUB_NODES`` / ``_HCL_STUB_EDGES`` below.
   These are documented as a STUB: they capture structure, not symbol-level detail.
 
-``emit`` merges both halves and writes the committed artifacts deterministically.
-``check`` regenerates the same merge in a temp dir and fails if it differs from what is
-committed. Because the HCL stub is a constant in this script, the merge is deterministic
--- a Python source change OR an update to the stub constants produces detectable drift.
+``emit`` merges both halves and writes the artifacts deterministically. Because the
+HCL stub is a constant in this script, the merge is deterministic -- a Python source
+change OR an update to the stub constants regenerates a byte-identical index.
 
 When an HCL backend is added to ``ontology_gen`` (noorinalabs-main#820 Task 1
 follow-on), replace ``_HCL_STUB_NODES`` / ``_HCL_STUB_EDGES`` / ``_HCL_STUB_LLMS``
 with a standard ``generate()`` call and remove the merge step. The rest of this script
-(subcommands, locate_generator, CI wiring) stays identical to the isnad-graph pattern.
+(the ``emit`` wrapper, locate_generator) stays identical to the isnad-graph pattern.
 
 Why a sibling generator instead of a vendored copy
 ==================================================
@@ -40,15 +49,12 @@ on the standard org layout (this repo cloned beneath ``noorinalabs-main/``).
 
 Subcommands
 ===========
-* ``emit``  -- (re)generate + merge, write committed index in place.
-* ``check`` -- regenerate + merge into temp dir; fail (exit 1) if it differs.
-* ``register-merge-driver`` -- register the union merge-driver in git config.
+* ``emit`` -- (re)generate + merge, write the (gitignored) index in place.
 """
 
 from __future__ import annotations
 
 import argparse
-import difflib
 import json
 import os
 import sys
@@ -533,84 +539,6 @@ def cmd_emit(gen_lib: Path, repo_root: Path) -> int:
     return 0
 
 
-def cmd_check(gen_lib: Path | None, repo_root: Path, require_generator: bool) -> int:
-    committed_dir = repo_root / OUT_REL
-    missing = [a for a in ARTIFACTS if not (committed_dir / a).is_file()]
-    if missing:
-        sys.stderr.write(
-            f"error: committed structural index missing: {missing}\n"
-            "  Generate it with: python3 scripts/structural_ontology.py emit\n"
-        )
-        return 1
-
-    if gen_lib is None:
-        if require_generator:
-            sys.stderr.write("error: " + _not_found_message())
-            return 2
-        sys.stderr.write(
-            "warning: " + _not_found_message() + "  Skipping local staleness check "
-            "(CI enforces it authoritatively).\n"
-        )
-        return 0
-
-    drifted = False
-    with tempfile.TemporaryDirectory() as tmp:
-        fresh_dir = Path(tmp)
-        _build_into(gen_lib, repo_root, fresh_dir)
-        for artifact in ARTIFACTS:
-            committed = (committed_dir / artifact).read_text(encoding="utf-8")
-            fresh = (fresh_dir / artifact).read_text(encoding="utf-8")
-            if committed == fresh:
-                continue
-            drifted = True
-            sys.stderr.write(f"\nDRIFT: ontology/structural/{artifact} is stale vs source.\n")
-            diff = difflib.unified_diff(
-                committed.splitlines(keepends=True),
-                fresh.splitlines(keepends=True),
-                fromfile=f"committed/{artifact}",
-                tofile=f"regenerated/{artifact}",
-                n=1,
-            )
-            shown = 0
-            for line in diff:
-                sys.stderr.write(line if line.endswith("\n") else line + "\n")
-                shown += 1
-                if shown >= 60:
-                    sys.stderr.write("  ... (diff truncated)\n")
-                    break
-
-    if drifted:
-        sys.stderr.write(
-            "\nThe committed structural ontology index is out of date.\n"
-            "Regenerate and commit it:\n"
-            "  python3 scripts/structural_ontology.py emit\n"
-            "  git add ontology/structural/\n"
-        )
-        return 1
-    print("OK: structural ontology index is current with source.")
-    return 0
-
-
-def cmd_register_merge_driver(gen_lib: Path, repo_root: Path) -> int:
-    import subprocess  # noqa: PLC0415
-
-    # Module form is required: merge_driver.py uses a relative import, so a bare
-    # ``python3 .../merge_driver.py`` raises ImportError.
-    driver = f"PYTHONPATH={gen_lib} python3 -m ontology_gen.merge_driver %O %A %B %P"
-    subprocess.run(
-        ["git", "config", "merge.ontology-codegraph.driver", driver],
-        cwd=repo_root,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "merge.ontology-codegraph.name", "union merge for code-graph.json"],
-        cwd=repo_root,
-        check=True,
-    )
-    print(f"registered merge driver 'ontology-codegraph': {driver}")
-    return 0
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -620,8 +548,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("emit", "check", "register-merge-driver"),
-        help="emit: write the index; check: fail if stale; register-merge-driver: git config.",
+        choices=("emit",),
+        help="emit: (re)generate the gitignored structural index in place.",
     )
     parser.add_argument(
         "--gen-lib",
@@ -636,28 +564,15 @@ def main(argv: list[str] | None = None) -> int:
         default=str(REPO_ROOT),
         help="Repo root to index (default: this repo).",
     )
-    parser.add_argument(
-        "--require-generator",
-        action="store_true",
-        help=(
-            "Treat a missing generator as a hard error (exit 2) instead of a "
-            "graceful local skip. CI passes this so a check never false-passes."
-        ),
-    )
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve()
     gen_lib = locate_generator(repo_root, args.gen_lib)
 
-    if args.command == "check":
-        return cmd_check(gen_lib, repo_root, args.require_generator)
-
     if gen_lib is None:
         sys.stderr.write("error: " + _not_found_message())
         return 2
-    if args.command == "emit":
-        return cmd_emit(gen_lib, repo_root)
-    return cmd_register_merge_driver(gen_lib, repo_root)
+    return cmd_emit(gen_lib, repo_root)
 
 
 if __name__ == "__main__":

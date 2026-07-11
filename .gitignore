@@ -42,3 +42,18 @@ Thumbs.db
 
 .claude/.consulted/
 .claude/.librarian-consulted/
+
+# Generated structural ontology index (main#939 child rollout deploy#571, #820 C×T2).
+# The structural layer is "always-current-by-regeneration" (#857) — regenerated
+# wholesale from source by the owned generator (ontology_gen in noorinalabs-main,
+# via `python3 scripts/structural_ontology.py emit`, which merges the auto-derived
+# Python graph with this repo's hand-curated HCL/YAML stub). Committing it made
+# EVERY concurrent PR that touched any source file conflict on a whole-file
+# generated artifact that carries no information (the only correct resolution is
+# "discard both, regenerate"), and GitHub's server-side merge cannot run the
+# per-clone union merge-driver that tried to paper over it. So it is no longer
+# committed: it is a build product, produced on demand and read locally.
+# noorinalabs-main's cross-repo aggregator (ontology_gen.aggregate) regenerates
+# this repo's index locally before rolling up, so nothing depends on a committed
+# copy. See issue deploy#571 / main#939.
+ontology/structural/
