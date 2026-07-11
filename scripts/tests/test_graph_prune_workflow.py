@@ -20,15 +20,22 @@ full re-mint prune deletes 55.4% — the legitimate and catastrophic bands overl
 So the only thing that can separate them is provenance: the keep-set must match a count
 declared *independently of the artifact*.
 
-**And the declared count this workflow can obtain today is only a partial floor.** The
-number a resolve run reports is a **read-back** of the parquet it just wrote
-(``src/resolve/__init__.py:344`` — the sole writer of ``canonical_narrator_count``), so it
-agrees with a short file. That catches a truncated *upload* and a wrong ``parquet_ref``
-whose count differs; it does **not** catch a partial write or a resolve stopped early,
-which are da#426's actual cases. The real fix is da#428: a count threaded from the
-producer's **in-memory tally before the write**, plus a run-completion assertion for
-"stopped early", which no count equality of any kind can see. These tests pin the guard
-that exists — they do not certify that the door is closed.
+**No human-supplied count can be that declaration.** The only count the pipeline produces
+is a **read-back** of the parquet being pruned against (``src/resolve/__init__.py:344`` —
+the sole writer of ``canonical_narrator_count``), so it agrees with a short file. An
+operator copying it copies the short file's own count. Told instead to supply "the count
+you expect from the corpus", they are stuck the other way: a legitimate re-run *changes*
+the count, so a mismatch is expected and a match proves nothing. A required input with no
+correct value is not a gate — it is a foot-gun wearing the costume of one.
+
+So ``curated/_manifest.txt`` is **REQUIRED**, and its absence is a hard refusal. That makes
+this workflow **inert until da#428 publishes one** — which is the point: it cannot do the
+dangerous thing at all, so it carries no residual.
+
+da#428 must write the count from the producer's **in-memory tally before the write**, and
+must also carry a **run-completion assertion**: "resolve stopped early" is invisible to any
+count equality, because a run that halts after writing a coherent partial file is
+internally consistent by construction.
 
 These are cheap textual assertions running in the ``pytest (scripts)`` CI job. They are
 the only automated gate on this workflow's shell: actionlint does not shellcheck an
@@ -68,49 +75,82 @@ def _code_only(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 
-def test_completeness_binding_asserts_equality_against_a_declared_count() -> None:
+def test_completeness_binding_asserts_equality_against_the_manifest() -> None:
     """The keep-set must equal what its producing run declared, or the prune must refuse.
 
     Without this the workflow deletes 83.9% of the graph on a short-but-valid parquet and
-    prints a passing verification (da#426). Note this is EQUALITY against a declaration,
-    not a floor: a `--min-canonical-ids` threshold is still magnitude, only approached
+    prints a passing verification (da#426). EQUALITY against a producer-signed declaration
+    — not a floor: a `--min-canonical-ids` threshold is still magnitude, only approached
     from below, and would accept a larger parquet from the wrong generation.
     """
     code = _code_only(_ssh_script())
-    assert 'CANON_N}" -ne "${EXPECTED_CANONICAL_IDS}' in code, (
+    assert 'CANON_N}" -ne "${MF_CANON_IDS}' in code, (
         "the completeness binding must assert the canonical ids READ from the parquet "
-        "EQUAL the count the producing run DECLARED; without that equality a truncated "
-        "parquet is indistinguishable from a complete one"
+        "EQUAL the count the manifest declares; without that equality a truncated parquet "
+        "is indistinguishable from a complete one"
     )
     # A floor would be a magnitude threshold wearing a provenance costume.
-    for floor in ('-lt "${EXPECTED_CANONICAL_IDS}"', '-ge "${EXPECTED_CANONICAL_IDS}"'):
+    for floor in ('-lt "${MF_CANON_IDS}"', '-ge "${MF_CANON_IDS}"'):
         assert floor not in code, (
             f"the binding must be equality, not a floor ({floor}) — a floor accepts any "
             "parquet at-or-above it, including a larger one from the wrong generation"
         )
 
 
-def test_declared_count_is_required_and_has_no_break_glass() -> None:
-    """`expected_canonical_ids` is a REQUIRED input, and nothing can wave it through.
+def test_manifest_is_required_so_the_workflow_is_inert_without_provenance() -> None:
+    """No manifest, no prune — which is what lets #574 merge ahead of da#428.
 
-    An override on an irreversible op with no provenance is the flag that gets set at
-    03:00 by someone who just wants the job green.
+    An earlier revision made `expected_canonical_ids` a REQUIRED input and the manifest
+    optional. That was not merely weaker; the input was UN-SOURCEABLE. The only count the
+    pipeline produces is a read-back of the parquet being pruned against
+    (``src/resolve/__init__.py:344``), so an operator copying it copies the short file's
+    own count and the check passes on exactly the artifact it exists to reject. Told
+    instead to supply "the count you expect from the corpus", they are stuck the other
+    way: a legitimate re-run changes the count, so a mismatch is expected and a match
+    proves nothing.
+
+    A required input with no correct value is not a gate; it is a foot-gun wearing the
+    costume of one. The manifest is the only declarer that can work, because it is written
+    from the producer's in-memory tally BEFORE the write.
     """
+    code = _code_only(_ssh_script())
+    assert (
+        'verify_present "${B2_BASE}/curated" "narrators_canonical.parquet" "_manifest.txt"' in code
+    ), "the manifest must be in the REQUIRED B2 presence list, not pulled opportunistically"
+    assert '[ ! -s "${MANIFEST}" ]' in code, "an absent/empty manifest must be a hard refusal"
+
+
+def test_operator_count_is_optional_and_cross_checked_when_supplied() -> None:
+    """Corroboration, not the gate — and it may not become required again.
+
+    It catches one thing the manifest cannot: an operator who meant run A and typed run
+    B's parquet_ref. B's manifest and B's parquet agree with each other perfectly, so every
+    other check passes. Supplied, it must equal the manifest. Blank, it is skipped.
+    """
+    doc = yaml.safe_load(WORKFLOW.read_text())
+    trigger = doc.get("on", doc.get(True))
+    inputs = trigger["workflow_dispatch"]["inputs"]
+
+    assert inputs["expected_canonical_ids"].get("required") is False, (
+        "expected_canonical_ids must NOT be required — there is no correct value an "
+        "operator can source for it (the pipeline's only count is a read-back of the "
+        "parquet being pruned against)"
+    )
+    code = _code_only(_ssh_script())
+    assert 'if [ -n "${EXPECTED_CANONICAL_IDS}" ]; then' in code, (
+        "the operator count must be skipped when left blank"
+    )
+    assert 'MF_CANON_IDS}" -ne "${EXPECTED_CANONICAL_IDS}' in code, (
+        "when supplied, the operator count must be cross-checked against the manifest"
+    )
+
+
+def test_no_break_glass_input() -> None:
+    """Nothing may wave the provenance check through."""
     doc = yaml.safe_load(WORKFLOW.read_text())
     # `on` is parsed by PyYAML as the boolean True (YAML 1.1) — look it up either way.
     trigger = doc.get("on", doc.get(True))
     inputs = trigger["workflow_dispatch"]["inputs"]
-
-    assert "expected_canonical_ids" in inputs, (
-        "the workflow must require the operator to declare the producing run's canonical "
-        "count — it is the only signal not derived from the keep-set being validated"
-    )
-    assert inputs["expected_canonical_ids"].get("required") is True, (
-        "expected_canonical_ids must be REQUIRED; an optional provenance check is not one"
-    )
-    assert "default" not in inputs["expected_canonical_ids"], (
-        "a default would let the operator skip the declaration without noticing"
-    )
 
     # ALLOW-list, not a deny-list. The previous version of this test matched input names
     # against ("force", "override", "skip", "allow", "ignore") — and Nino Kavtaradze
@@ -137,22 +177,18 @@ def test_declared_count_is_required_and_has_no_break_glass() -> None:
     )
 
 
-def test_manifest_when_present_must_agree_with_the_operator() -> None:
-    """The manifest (da#428) is machine provenance; it does not merely decorate.
+def test_manifest_md5_verifies_the_bytes_we_pulled() -> None:
+    """Byte integrity is a SEPARATE property from completeness. Both are needed.
 
-    It is not required — nothing publishes it yet — but a manifest that CONTRADICTS the
-    operator means one of them describes a different run, and on a destructive op that is
-    a stop, not a coin-toss.
+    The md5 catches a corrupt or truncated *transfer*. It does NOT catch a short *write* —
+    a short parquet has a perfectly good md5 of itself — which is what the count equality
+    is for. Neither substitutes for the other, and dropping either leaves a real door open.
     """
     code = _code_only(_ssh_script())
-    assert "_manifest.txt" in code, "the prune must pull curated/_manifest.txt when present"
-    assert 'MF_CANON_IDS}" -ne "${EXPECTED_CANONICAL_IDS}' in code, (
-        "a present manifest must be cross-checked against the operator's declaration"
-    )
     assert 'GOT_MD5}" != "${MF_MD5}' in code, (
-        "a present manifest must be used to verify the bytes we pulled are the bytes "
-        "that were published"
+        "the manifest md5 must be checked against the bytes actually pulled from B2"
     )
+    assert "md5sum" in code, "the pulled parquet's md5 must actually be computed"
 
 
 def test_dry_run_fails_safe() -> None:
