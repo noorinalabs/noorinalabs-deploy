@@ -39,10 +39,14 @@ Two things this suite refuses to do, both learned the hard way in deploy#591:
 
 from __future__ import annotations
 
+import contextlib
+import itertools
 import os
 import re
 import shutil
 import subprocess
+import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -153,6 +157,86 @@ def _field(line: str, key: str) -> str:
         if k == key:
             return v
     return ""
+
+
+# ---------------------------------------------------------------------------
+# A LOCAL HTTP REFERENCE — so the PRODUCTION path is what gets tested.
+#
+# Everything above drives the reference through `CLOCK_REF_EPOCH_CMD`, which is the *injection
+# seam*. That tests the classifier honestly, but it never once exercised the path a real host
+# takes: `curl -I` → `Date:` header → `http_date_epoch` → offset. A guard tested only through its
+# test seam is a guard whose production path is unproven — which is uncomfortably close to the
+# defect this whole issue is about.
+#
+# `http.server` emits an RFC-7231 `Date:` header from the machine's real clock, so pointing
+# CLOCK_REF_URLS at 127.0.0.1 exercises the real curl path with a genuine external-shaped
+# reference — and needs no network, so CI cannot flake on reaching cloudflare.com.
+# ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _local_reference(fail_first: int = 0) -> Iterator[str]:
+    """`fail_first` drops that many connections before answering — a transient egress blip.
+
+    It closes the socket without writing a response, so curl reports an empty reply and exits
+    non-zero. A 500 would NOT do: curl treats a served error page as a successful fetch, and the
+    response still carries a `Date:` header, so the read would succeed and the retry would never
+    be exercised. A fixture that cannot produce the failure cannot test the recovery.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen = itertools.count(1)
+
+    class Handler(BaseHTTPRequestHandler):
+        def handle_one_request(self) -> None:
+            if next(seen) <= fail_first:
+                self.close_connection = True
+                return  # no response at all — curl: "Empty reply from server"
+            super().handle_one_request()
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            self.send_response(200)  # send_response emits the `Date:` header for us
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            pass  # do not spray the pytest output
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_port}"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _probe_via_http(
+    tmp_path: Path, *, skew: int = 0, urls: str | None = None, max_offset: str = "60"
+) -> tuple[int, str]:
+    """Drive `probe_clock` through the REAL `curl` reference path — no injection seam."""
+    script = f"{_shipped_set_line()}\n" + _shipped_clock_code() + '\nprobe_clock "$1" "$2"\n'
+    with _local_reference() as url:
+        env = {
+            **os.environ,
+            "PATH": f"{_skew_shim(tmp_path)}:{os.environ['PATH']}",
+            "CLOCK_TEST_SKEW": str(skew),
+            "CLOCK_REF_URLS": urls if urls is not None else url,
+            "CLOCK_MAX_OFFSET_SECONDS": max_offset,
+            "CLOCK_REF_TIMEOUT": "5",
+            "CLOCK_REF_RETRY_DELAY": "0",
+        }
+        env.pop("CLOCK_REF_EPOCH_CMD", None)
+        r = subprocess.run(  # noqa: S603
+            ["bash", "-c", script, "_", "yes", "systemd-timesyncd.service"],  # noqa: S607
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    line = ""
+    for ln in r.stdout.splitlines():
+        if ln.startswith("HOST_CLOCK "):
+            line = ln
+    return r.returncode, line
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +702,183 @@ def test_calibration_FAILS_if_unmeasurable_is_collapsed_into_a_verdict(tmp_path:
     assert "self-test unmeasurable: FAILED" in r.stderr
 
 
+# ---------------------------------------------------------------------------
+# THE PRODUCTION PATH — real curl, real Date: header, no injection seam.
+#
+# Every skew test above reaches the classifier through `CLOCK_REF_EPOCH_CMD`. These reach it the
+# way the VPS does.
+# ---------------------------------------------------------------------------
+def test_the_real_curl_path_detects_a_forward_skew(tmp_path: Path) -> None:
+    rc, line = _probe_via_http(tmp_path, skew=3600)
+    assert rc == CLOCK_BAD, f"the PRODUCTION reference path must catch a clock 1h ahead: {line}"
+    assert _field(line, "status") == "skewed"
+    assert _field(line, "reason") == "ahead"
+    assert int(_field(line, "offset_seconds")) == pytest.approx(3600, abs=3)
+
+
+def test_the_real_curl_path_detects_a_backward_skew(tmp_path: Path) -> None:
+    rc, line = _probe_via_http(tmp_path, skew=-3600)
+    assert rc == CLOCK_BAD, f"the PRODUCTION reference path must catch a clock 1h behind: {line}"
+    assert _field(line, "status") == "skewed"
+    assert _field(line, "reason") == "behind"
+    assert int(_field(line, "offset_seconds")) == pytest.approx(-3600, abs=3)
+
+
+def test_the_real_curl_path_passes_a_sane_clock(tmp_path: Path) -> None:
+    """The positive control for the production path — without it the two above are vacuous."""
+    rc, line = _probe_via_http(tmp_path, skew=0)
+    assert rc == CLOCK_SANE, f"an unskewed clock must pass through the real path: {line}"
+    assert _field(line, "status") == "sane"
+    assert abs(int(_field(line, "offset_seconds"))) <= 2
+
+
+def test_a_dead_reference_does_not_sink_a_live_one(tmp_path: Path) -> None:
+    """URL FALLBACK — note this is NOT the retry, and calling it one would leave the retry untested.
+
+    A dead URL ahead of a live one is handled by the inner URL loop on the FIRST attempt; the
+    attempts loop never runs. `test_a_transient_failure_is_retried` is the one that exercises the
+    retry, and it needs a reference that fails and then recovers.
+    """
+    with _local_reference() as good:
+        rc, line = _probe_via_http(tmp_path, skew=0, urls=f"http://127.0.0.1:1 {good}")
+    assert rc == CLOCK_SANE, f"a dead reference must not sink a read a live one can serve: {line}"
+    assert _field(line, "status") == "sane"
+
+
+def test_a_transient_failure_is_retried(tmp_path: Path) -> None:
+    """THE RETRY. Failing closed on an unreachable reference is right; on one blip it is brittle.
+
+    An egress hiccup would otherwise fail closed and block a promote over a dropped packet (Nino
+    Kavtaradze, deploy#585 review). The reference here drops the first connection outright — curl
+    gets an empty reply — and answers the second. Only the attempts loop can recover that.
+    """
+    with _local_reference(fail_first=1) as url:
+        rc, line = _probe_via_http(tmp_path, skew=0, urls=url)
+    assert rc == CLOCK_SANE, (
+        f"a reference that blipped once and then answered must be RETRIED, not written off: {line}"
+    )
+    assert _field(line, "status") == "sane"
+
+
+def test_an_entirely_unreachable_reference_still_fails_CLOSED(tmp_path: Path) -> None:
+    """The retry must not become a way to eventually shrug and pass."""
+    rc, line = _probe_via_http(tmp_path, skew=0, urls="http://127.0.0.1:1 http://127.0.0.1:2")
+    assert rc == CLOCK_UNMEASURABLE, f"no reference at all must be `unknown`, not `sane`: {line}"
+    assert _field(line, "status") == "unknown"
+    assert _field(line, "reason") == "reference_unreachable"
+
+
+# ---------------------------------------------------------------------------
+# REVIEW FINDING (Aisha Idrissi): the production read rode the calibration's own seam.
+#
+# `reference_epoch` honoured `CLOCK_REF_EPOCH_CMD` UNCONDITIONALLY, and production went through
+# the same function. So `CLOCK_REF_EPOCH_CMD='date -u +%s'` compared the clock TO ITSELF — a host
+# 99,999s out reported `offset_seconds=0 status=sane` and a green PASS.
+#
+# It is the same shape as a `date` shim that skews parsing as well as `now` — the reference and
+# the subject moving together, offset pinned at 0 — which `_skew_shim` is explicitly written to
+# avoid. The guard against it survived one layer down, in the seam the guard itself rides on.
+# ---------------------------------------------------------------------------
+def _full_script(tmp_path: Path, *, skew: int = 0, source: str | None = None, **env_over: str):
+    target = ASSERT_SH
+    if source is not None:
+        target = tmp_path / "assert_host_state.sh"
+        target.write_text(source)
+    with _local_reference() as url:
+        env = {
+            **os.environ,
+            "PATH": f"{_skew_shim(tmp_path)}:{os.environ['PATH']}",
+            "CLOCK_TEST_SKEW": str(skew),
+            "CLOCK_REF_URLS": url,
+            "CLOCK_REF_TIMEOUT": "5",
+            "CLOCK_REF_RETRY_DELAY": "0",
+        }
+        env.pop("CLOCK_REF_EPOCH_CMD", None)
+        env.update(env_over)
+        return subprocess.run(  # noqa: S603
+            ["bash", str(target)],  # noqa: S607
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def test_production_read_REFUSES_an_injected_reference(tmp_path: Path) -> None:
+    """The regression test for the seam. It must REFUSE — loudly — not silently unset.
+
+    If this variable is set on a real host, something is wrong that an operator needs to be told
+    about. Quietly unsetting it would fix the offset and hide the fact that someone was in a
+    position to inject a reference at all.
+    """
+    r = _full_script(tmp_path, skew=99999, CLOCK_REF_EPOCH_CMD="date -u +%s")
+
+    assert "CLOCK_REF_EPOCH_CMD is set" in r.stdout, (
+        f"an injected reference must be refused, loudly: {r.stdout}"
+    )
+    assert not any(ln.strip().startswith("HOST_CLOCK") for ln in r.stdout.splitlines()), (
+        "the script emitted a clock VERDICT while its reference was caller-supplied"
+    )
+    assert r.returncode != 0
+
+
+def test_an_injected_reference_can_no_longer_certify_a_wildly_skewed_clock(tmp_path: Path) -> None:
+    """THE EXACT REPRO, pinned. A clock 99,999s out once reported `sane` with `offset_seconds=0`.
+
+    Note what makes this so quiet: the offset is not merely *wrong*, it is *0* — the most
+    reassuring number the field can hold — because the subject was measured against itself.
+    """
+    r = _full_script(tmp_path, skew=99999, CLOCK_REF_EPOCH_CMD="date -u +%s")
+    assert "status=sane" not in r.stdout, (
+        f"a clock 99,999s out was certified sane by comparing it to itself: {r.stdout}"
+    )
+    assert "[PASS] host clock is sane" not in r.stdout
+
+
+def test_the_self_test_may_still_inject_its_own_reference() -> None:
+    """The gate must not break the legitimate injection point it is protecting.
+
+    A fix that closed the seam by removing `CLOCK_REF_EPOCH_CMD` outright would take the
+    calibration down with it — and the calibration is the thing that makes this guard trustworthy.
+    Gate the PRODUCTION call; leave the self-test's use of it alone.
+    """
+    r = _run_self_test()
+    assert r.returncode == 0, f"the gate broke the calibration's own injection: {r.stderr}"
+    for case in ("sane", "skew-ahead", "skew-behind", "unmeasurable"):
+        assert f"self-test {case}: OK" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# REVIEW FINDING (Aisha Idrissi): CLOCK_MAX_OFFSET_SECONDS was not regex-guarded.
+#
+# `CLOCK_MAX_OFFSET_SECONDS=60s` — an easy fat-finger — ERRORS both `(( ))` comparisons, which
+# short-circuits both skew branches FALSE and drops through to the terminal `else`: `status=sane
+# rc=0` on a clock an hour out. The calibration already caught it (its own `skew` arithmetic breaks
+# the same way, so the control fails and the script refuses) — this makes the diagnosis precise
+# rather than incidental.
+# ---------------------------------------------------------------------------
+def test_a_nonnumeric_threshold_is_REFUSED_not_read_as_sane(tmp_path: Path) -> None:
+    rc, line = _probe(tmp_path, skew=3600, max_offset="60s")
+    assert rc != CLOCK_SANE, f"a clock 1h out passed because the THRESHOLD was unreadable: {line}"
+    assert _field(line, "status") == "unknown"
+    assert _field(line, "reason") == "invalid_threshold"
+
+
+def test_a_nonnumeric_threshold_fails_the_calibration_too(tmp_path: Path) -> None:
+    """Defence in depth, and it must stay in depth: BOTH layers refuse."""
+    r = _full_script(tmp_path, skew=3600, CLOCK_MAX_OFFSET_SECONDS="60s")
+    assert "status=sane" not in r.stdout
+    assert "[PASS] host clock is sane" not in r.stdout
+    assert r.returncode != 0
+
+
+def test_a_valid_threshold_is_still_honoured(tmp_path: Path) -> None:
+    """The positive control for the threshold guard — it must not refuse every threshold."""
+    rc, line = _probe(tmp_path, skew=120, max_offset="300")
+    assert rc == CLOCK_SANE, f"120s of skew is inside a 300s bound: {line}"
+    assert _field(line, "status") == "sane"
+
+
 def test_a_passing_calibration_does_not_cry_wolf(tmp_path: Path) -> None:
     """The calibration drives the instrument-error path ON PURPOSE (case 4).
 
@@ -625,13 +886,7 @@ def test_a_passing_calibration_does_not_cry_wolf(tmp_path: Path) -> None:
     past the clock section — and it only matters on the day someone actually reads it (deploy#591's
     `test_passing_self_test_does_not_cry_wolf`, same trap, one script over).
     """
-    r = subprocess.run(  # noqa: S603
-        ["bash", str(ASSERT_SH)],  # noqa: S607
-        env={**os.environ, "CLOCK_REF_EPOCH_CMD": TRUE_TIME},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    r = _full_script(tmp_path, skew=0)
     clock = [ln for ln in r.stdout.splitlines() if "HOST_CLOCK" in ln or "clock" in ln.lower()]
     assert any("[PASS] clock check calibrated" in ln for ln in clock), (
         f"the clock section did not run: {r.stdout}"
@@ -651,16 +906,7 @@ def test_the_script_refuses_a_verdict_when_its_calibration_fails(tmp_path: Path)
     unproven guard in front of a proven one is worse than no guard, because it is believed.
     """
     mutated = _mutate('status="skewed"; reason="behind"', 'status="sane"; reason="ok"')
-    target = tmp_path / "assert_host_state.sh"
-    target.write_text(mutated)
-
-    r = subprocess.run(  # noqa: S603
-        ["bash", str(target)],  # noqa: S607
-        env={**os.environ, "CLOCK_REF_EPOCH_CMD": TRUE_TIME},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    r = _full_script(tmp_path, skew=0, source=mutated)
     assert "FAILED ITS OWN CALIBRATION" in r.stdout, (
         f"the script reported on the real clock from an uncalibrated instrument: {r.stdout}"
     )

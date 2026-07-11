@@ -60,6 +60,10 @@ CLOCK_MAX_OFFSET_SECONDS="${CLOCK_MAX_OFFSET_SECONDS:-60}"
 # — so it fails safe, just with a less precise diagnosis than it could give.
 CLOCK_REF_URLS="${CLOCK_REF_URLS:-https://www.cloudflare.com https://www.google.com}"
 CLOCK_REF_TIMEOUT="${CLOCK_REF_TIMEOUT:-10}"
+# Every reference is tried, then all of them again. Failing closed on an unreachable reference is
+# correct; failing closed on one dropped packet would block a promote for no reason.
+CLOCK_REF_ATTEMPTS="${CLOCK_REF_ATTEMPTS:-2}"
+CLOCK_REF_RETRY_DELAY="${CLOCK_REF_RETRY_DELAY:-2}"
 
 PASS=0
 FAIL=0
@@ -103,14 +107,25 @@ reference_epoch() {
         eval "$CLOCK_REF_EPOCH_CMD"
         return
     fi
-    local url hdrs epoch
+    local url hdrs epoch attempt
     local -a urls
     read -r -a urls <<<"$CLOCK_REF_URLS"
-    for url in "${urls[@]}"; do
-        hdrs=$(curl -sS -I --max-time "$CLOCK_REF_TIMEOUT" "$url" 2>&1) || continue
-        epoch=$(http_date_epoch "$hdrs") || continue
-        printf '%s\n' "$epoch"
-        return 0
+    # Failing closed on an unreachable reference is RIGHT — an unverifiable clock is not a
+    # verified one — but failing closed on a single egress blip would block a promote over a
+    # dropped packet. So: try every reference, then try them all again. Right AND not brittle
+    # (Nino Kavtaradze, deploy#585 review).
+    for (( attempt = 1; attempt <= CLOCK_REF_ATTEMPTS; attempt++ )); do
+        for url in "${urls[@]}"; do
+            hdrs=$(curl -sS -I --max-time "$CLOCK_REF_TIMEOUT" "$url" 2>&1) || continue
+            epoch=$(http_date_epoch "$hdrs") || continue
+            printf '%s\n' "$epoch"
+            return 0
+        done
+        # Not `[[ … ]] && sleep`: as the last statement in the loop body that returns 1 on the
+        # final pass, which is a live landmine for whoever adds `set -e` to this script.
+        if (( attempt < CLOCK_REF_ATTEMPTS )); then
+            sleep "$CLOCK_REF_RETRY_DELAY"
+        fi
     done
     return 1
 }
@@ -156,7 +171,16 @@ classify_clock() {
     local ntp_sync="$1" sync_service="$2" offset="$3" max="$4"
     local status reason
 
-    if [[ "$offset" =~ ^-?[0-9]+$ ]] && (( offset > max )); then
+    if [[ ! "$max" =~ ^[0-9]+$ ]]; then
+        # `CLOCK_MAX_OFFSET_SECONDS=60s` is an easy operator fat-finger, and it is not inert:
+        # a non-numeric `max` ERRORS both `(( ))` comparisons below, which makes both skew
+        # branches short-circuit FALSE and drops through to the terminal `else` — reporting
+        # `status=sane rc=0` on a clock an hour out. The calibration catches it too (its own
+        # `skew` arithmetic breaks the same way, so the control fails and the script refuses),
+        # but a threshold this check cannot read is a thing it must SAY, not something to be
+        # caught two layers out by accident. Found by Aisha Idrissi, deploy#585 review.
+        status="unknown"; reason="invalid_threshold"
+    elif [[ "$offset" =~ ^-?[0-9]+$ ]] && (( offset > max )); then
         # AHEAD: dumps stamped in the FUTURE. Pre-deploy#584 this did not degrade, it
         # LATCHED — one bad-clock upload turned the bucket check into a permanent green light.
         status="skewed"; reason="ahead"
@@ -210,6 +234,15 @@ probe_clock() {
 # "skewed" would pass (2) and (3) and prove exactly nothing.
 self_test_clock() {
     local skew failed=0 out rc
+
+    # Refuse BEFORE the arithmetic rather than crashing inside it: `$(( "60s" * 10 ))` is an
+    # error, `skew` is then empty, and every case below reports something confusing about a
+    # problem that is neither the clock's nor the classifier's.
+    if [[ ! "$CLOCK_MAX_OFFSET_SECONDS" =~ ^[0-9]+$ ]]; then
+        printf 'self-test: CLOCK_MAX_OFFSET_SECONDS=%s is not a whole number of seconds — the clock check cannot be calibrated against a threshold it cannot read\n' \
+            "$CLOCK_MAX_OFFSET_SECONDS" >&2
+        return 1
+    fi
     skew=$(( CLOCK_MAX_OFFSET_SECONDS * 10 ))
 
     _expect() {
@@ -409,7 +442,25 @@ printf '\n-- clock sanity (deploy#585) --\n'
 # On FAILURE the diagnostic is the whole point, so it is held and then shown, never discarded.
 selftest_rc=0
 selftest_out=$(self_test_clock 2>&1) || selftest_rc=$?
-if [[ "$selftest_rc" -eq 0 ]]; then
+if [[ -n "${CLOCK_REF_EPOCH_CMD:-}" ]]; then
+    # THE SEAM THE CALIBRATION RIDES ON. `CLOCK_REF_EPOCH_CMD` is the injection point the
+    # self-test needs — and `reference_epoch` honoured it unconditionally, so the PRODUCTION read
+    # went through it too. `CLOCK_REF_EPOCH_CMD='date -u +%s'` therefore compared the clock TO
+    # ITSELF: a host 99,999s out reported `offset_seconds=0 status=sane` and a green PASS.
+    #
+    # That is the exact defect this file exists to prevent — the reference and the subject moving
+    # together, offset pinned at 0 — and it is the same shape as a `date` shim that skews parsing
+    # as well as `now`, which is guarded against one layer up. It survived one layer down, in the
+    # seam the guard itself rides on. Found by Aisha Idrissi in review (deploy#585).
+    #
+    # REFUSE, don't unset. Unsetting is silent, and this variable being set on a real deploy means
+    # something is wrong that an operator needs to told about. It is not reachable through the
+    # shipped path today (`sudo -n` with `env_reset` and no `envs:` on the ssh step, so it cannot
+    # cross) — but a guard whose bypass depends on a sudoers default staying put is one sudoers
+    # edit from being decorative, and this file's claim is that the state is impossible, not
+    # merely improbable.
+    fail "CLOCK_REF_EPOCH_CMD is set (${CLOCK_REF_EPOCH_CMD}) — refusing to report a clock verdict. That variable replaces the EXTERNAL reference with a command of the caller's choosing, so the clock would be compared to something other than an independent time source (and, with \`date\`, to ITSELF — reporting offset=0 on any skew). It is the self-test's injection point and has no legitimate use on a real host."
+elif [[ "$selftest_rc" -eq 0 ]]; then
     pass "clock check calibrated — goes RED on both forward and backward skew"
 
     ntp_sync=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "unreadable")
