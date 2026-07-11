@@ -131,8 +131,31 @@ backup_is_complete() {
     local manifest
     manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest.txt" 2>/dev/null || true)"
     [[ -n "$manifest" ]] || return 1
+    # WHOLE-TOKEN match. The predicate this replaces was:
+    #
+    #   grep -q '^BACKUP_MANIFEST .*[[:space:]]complete=true\([[:space:]]\|$\)'
+    #
+    # and it COULD NEVER MATCH. `complete=` is the FIRST token backup.sh writes after
+    # `BACKUP_MANIFEST `, so the literal space in the anchor consumes the only space there
+    # is, and `.*[[:space:]]complete=true` then demands a SECOND one that never exists.
+    #
+    # So `backup_is_complete` returned false for EVERY backup, `resolve_latest` skipped all
+    # of them, and `restore.sh latest` could not select an artifact at all — it would have
+    # reported "No COMPLETE backup found in B2 bucket" over a bucket full of good backups.
+    # It failed CLOSED, so nothing was ever at risk; but the recovery path was inert, and it
+    # shipped in deploy#577 with a green suite.
+    #
+    # It survived because #577's tests are TEXTUAL: they assert this function is CALLED
+    # (correctly — that was the deploy#577 review's own lesson) and never once run its
+    # predicate against a manifest `backup.sh` actually produces. Found by deploy#584, whose
+    # fixture was a real manifest.
+    #
+    # Splitting on spaces and matching an exact `complete=true` token is order-independent
+    # and cannot be defeated by a key that ends in another key's name.
     printf '%s\n' "$manifest" \
-        | grep -q '^BACKUP_MANIFEST .*[[:space:]]complete=true\([[:space:]]\|$\)'
+        | grep '^BACKUP_MANIFEST ' \
+        | tr ' ' '\n' \
+        | grep -qx 'complete=true'
 }
 
 resolve_latest() {

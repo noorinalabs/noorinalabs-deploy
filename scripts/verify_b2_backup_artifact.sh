@@ -151,9 +151,14 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$1] ${*:2}" >&2; }
 
 # One machine-readable line. `status` is set explicitly on every path — it is never
 # inferred from an absence of output, which is the whole point of this script.
+# `undersized` is reported UNCONDITIONALLY. It used to be consulted only when `dumps == 0`,
+# so a user-postgres dump that uploaded as ZERO BYTES — beside a healthy pg and neo4j —
+# reported `fresh` and said nothing at all. The value was computed and then thrown away:
+# the identical defect to the `-719` age that was computed and never checked. If the scan
+# knows something, the result line says it.
 result() {
-    printf 'B2_BACKUP_ARTIFACT status=%s reason=%s dumps=%s newest_age_hours=%s bucket_objects=%s newest=%s\n' \
-        "$1" "${2:--}" "$3" "$4" "$5" "${6:--}"
+    printf 'B2_BACKUP_ARTIFACT status=%s reason=%s dumps=%s newest_age_hours=%s bucket_objects=%s undersized=%s newest=%s\n' \
+        "$1" "${2:--}" "$3" "$4" "$5" "${6:-0}" "${7:--}"
 }
 
 # scan <bucket-root> <prefix> -> result line; 0 fresh / 1 alert / 2 instrument error.
@@ -181,7 +186,7 @@ scan() {
             sed 's/^/    /' "$err" >&2
         fi
         rm -f "$err"
-        result instrument_error unreachable 0 -1 -1 -
+        result instrument_error unreachable 0 -1 -1 0 -
         return $EXIT_INSTRUMENT
     fi
     rm -f "$err"
@@ -201,75 +206,141 @@ scan() {
             sed 's/^/    /' "$err" >&2
         fi
         rm -f "$err"
-        result instrument_error unreachable 0 -1 "$bucket_objects" -
+        result instrument_error unreachable 0 -1 "$bucket_objects" 0 -
         return $EXIT_INSTRUMENT
     fi
     rm -f "$err"
 
-    # --- 3. Classify. An empty listing is an ALERT, never an OK. ------------
-    local newest_epoch=0 newest_path="-" dumps=0 undersized=0
-    local line ts size path epoch
+    # --- 3. Group by BACKUP DIRECTORY, and ask each one whether it is complete.
+    #
+    # "At least one dump, over the floor, recent" is NOT what this PR claims to assert. It
+    # is "a RESTORABLE object exists". Those came apart badly (deploy#584 review, Nurul
+    # Hakim): a bucket holding only `isnad-pg` — no user-postgres, no Neo4j — WITH a
+    # `_backup_manifest.txt` explicitly saying `complete=false` was reported `fresh`.
+    #
+    # `restore.sh`'s required-store gate REFUSES that artifact outright. So the one check
+    # that looks inside the bucket was certifying a backup our own restore path declines to
+    # restore — and the attestation was sitting right there, in the bucket, saying so.
+    #
+    # And backup.sh MANUFACTURES these by design: it deliberately uploads a partial when a
+    # leg fails ("a partial backup beats none"). This is not a hypothetical artifact.
+    #
+    # So this now mirrors restore.sh's resolve_latest(): walk the backup directories
+    # newest-first and take the first one that ATTESTS its own completeness. Same
+    # `_backup_manifest.txt`, same `complete=true` predicate. If the consumer would refuse
+    # it, this must not call it fresh.
+    local -A dir_newest=() dir_dumps=() dir_undersized=()
+    local line ts size path epoch dir
+    local undersized_total=0
+
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         ts="${line%%;*}"
         line="${line#*;}"
         size="${line%%;*}"
         path="${line#*;}"
-        # A checksum or a manifest is not a restorable backup. A bucket holding only
-        # `.sha256` and `_backup_manifest.txt` lists NON-empty and restores NOTHING — so
-        # "is anything there?" is the wrong question. Count only dumps.
         case "$path" in
             *.dump | *.dump.zst) ;;
             *) continue ;;
         esac
-        # ...and a ZERO-BYTE dump also lists non-empty and restores nothing. Same sentence,
-        # one level in. `pg_dump` failing after the shell has created the target leaves
-        # exactly this, and it uploads cleanly.
+
+        dir="$(dirname "$path")"
+        [[ "$dir" == "." ]] && dir=""
+
+        # A ZERO-BYTE dump lists non-empty and restores nothing — the same sentence as the
+        # checksum-only bucket above, one level in. `pg_dump` failing after the shell has
+        # created the target leaves exactly this, and it uploads cleanly.
         if [[ "${size:-0}" -lt "$MIN_DUMP_BYTES" ]]; then
-            undersized=$((undersized + 1))
+            undersized_total=$((undersized_total + 1))
+            dir_undersized["$dir"]=$(( ${dir_undersized["$dir"]:-0} + 1 ))
             continue
         fi
-        dumps=$((dumps + 1))
+
+        dir_dumps["$dir"]=$(( ${dir_dumps["$dir"]:-0} + 1 ))
         epoch="$(date -u -d "$ts" +%s 2>/dev/null || echo 0)"
-        if [[ "$epoch" -gt "$newest_epoch" ]]; then
-            newest_epoch="$epoch"
-            newest_path="$path"
+        if [[ "$epoch" -gt "${dir_newest["$dir"]:-0}" ]]; then
+            dir_newest["$dir"]="$epoch"
         fi
     done <<< "$listing"
 
-    if [[ "$dumps" -eq 0 ]]; then
-        if [[ "$undersized" -gt 0 ]]; then
-            # Present, listed, checksummed — and unrestorable. The most dangerous shape of
-            # "absent" there is, because every other signal in the stack says it is there.
-            result absent undersized_dumps 0 -1 "$bucket_objects" -
+    # Nothing restorable anywhere.
+    if [[ ${#dir_newest[@]} -eq 0 ]]; then
+        if [[ "$undersized_total" -gt 0 ]]; then
+            result absent undersized_dumps 0 -1 "$bucket_objects" "$undersized_total" -
         else
-            result absent no_dumps 0 -1 "$bucket_objects" -
+            result absent no_dumps 0 -1 "$bucket_objects" "$undersized_total" -
         fi
         return $EXIT_ALERT
     fi
 
-    local now delta age_h
+    # Newest-first, exactly as resolve_latest walks them.
+    local -a ordered=()
+    while IFS= read -r dir; do ordered+=("$dir"); done < <(
+        for dir in "${!dir_newest[@]}"; do
+            printf '%s\t%s\n' "${dir_newest["$dir"]}" "$dir"
+        done | sort -rn | cut -f2-
+    )
+
+    local skipped=0 chosen="" chosen_epoch=0
+    for dir in "${ordered[@]}"; do
+        local mpath="${base}"
+        [[ -n "$dir" ]] && mpath="${base}/${dir}"
+
+        # The attestation the producer wrote about ITSELF. Same predicate restore.sh uses.
+        local manifest
+        manifest="$(rclone cat --log-level NOTICE "${mpath}/_backup_manifest.txt" 2>/dev/null || true)"
+        # Whole-TOKEN match, and NOT the anchored-prefix regex restore.sh shipped with —
+        # that one could never match, because `complete=` is the first token after
+        # `BACKUP_MANIFEST ` and the anchor's literal space consumes the only space present.
+        # Fixed in restore.sh in this same change; the bug is the reason this fixture exists.
+        if ! printf '%s\n' "$manifest" | grep '^BACKUP_MANIFEST ' | tr ' ' '\n' | grep -qx 'complete=true'; then
+            # No manifest, or it says complete=false. A directory that does not attest its
+            # own completeness is not one we can promise a restore from — and every
+            # pre-deploy#559 backup predates user-postgres coverage entirely.
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # It attests complete — but attestation is the PRODUCER's word about what it wrote,
+        # not about what survived. A complete-attested directory holding a zero-byte dump is
+        # corrupt, and `complete=true` cannot see that. Both checks are needed.
+        if [[ "${dir_undersized["$dir"]:-0}" -gt 0 ]]; then
+            result incomplete undersized_dumps "${dir_dumps["$dir"]}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
+            return $EXIT_ALERT
+        fi
+
+        chosen="$dir"
+        chosen_epoch="${dir_newest["$dir"]}"
+        break
+    done
+
+    if [[ -z "$chosen" && "$chosen_epoch" -eq 0 ]]; then
+        # Dumps exist, but not one backup directory attests completeness.
+        result incomplete no_complete_backup 0 -1 "$bucket_objects" "$undersized_total" -
+        return $EXIT_ALERT
+    fi
+
+    [[ "$skipped" -gt 0 ]] && log WARNING "skipped ${skipped} backup director(ies) that do not attest complete=true"
+
+    local now delta age_h dumps
+    dumps="${dir_dumps["$chosen"]}"
     now="$(date -u +%s)"
-    delta=$(( now - newest_epoch ))
+    delta=$(( now - chosen_epoch ))
 
     # --- 4. A FUTURE timestamp is a broken clock, not a fresh backup. -------
-    # Checked BEFORE the freshness bound, and it returns INSTRUMENT_ERROR rather than an
-    # alert: we are not saying the backups are bad, we are saying we cannot trust the
-    # reading. Reporting `fresh` here would latch the job green forever — `newest` is the
-    # max epoch, so one bad-clock object masks an entire stale bucket.
     if [[ "$delta" -lt $(( -FUTURE_TOLERANCE_SECONDS )) ]]; then
-        result instrument_error future_timestamp "$dumps" $(( delta / 3600 )) "$bucket_objects" "$newest_path"
+        result instrument_error future_timestamp "$dumps" $(( delta / 3600 )) "$bucket_objects" "$undersized_total" "${chosen:-/}"
         return $EXIT_INSTRUMENT
     fi
 
     age_h=$(( delta / 3600 ))
 
     if [[ "$age_h" -gt "$MAX_AGE_HOURS" ]]; then
-        result stale too_old "$dumps" "$age_h" "$bucket_objects" "$newest_path"
+        result stale too_old "$dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
         return $EXIT_ALERT
     fi
 
-    result fresh - "$dumps" "$age_h" "$bucket_objects" "$newest_path"
+    result fresh - "$dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
     return $EXIT_OK
 }
 
@@ -325,38 +396,60 @@ self_test() {
         fi
     }
 
+    # A helper, because every fixture below now needs the producer's attestation — the same
+    # `_backup_manifest.txt` backup.sh writes and restore.sh reads.
+    _mkbackup() { # <dir> <complete> [dump-bytes]
+        mkdir -p "$1"
+        head -c "${3:-$(( MIN_DUMP_BYTES * 2 ))}" /dev/zero > "$1/isnad-pg-a.dump"
+        printf 'BACKUP_MANIFEST complete=%s stores=postgres,user-postgres,neo4j timestamp=t category=daily\n' \
+            "$2" > "$1/_backup_manifest.txt"
+    }
+
     # FRESH — the POSITIVE control. Without a fixture the scanner can pass, every refusal
     # below is vacuous: a scanner that only ever says ALERT proves every bucket is empty.
     #
-    # It must be a REAL-SIZED dump. The previous version of this fixture was `: > file` —
-    # a ZERO-BYTE file — so the scanner had never been shown to tell a restorable dump
-    # from an empty one, BECAUSE NO FIXTURE COULD PRODUCE THE BAD CONDITION. The guard and
-    # the fixture were blind together.
-    mkdir -p "${tmp}/fresh"
-    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/fresh/isnad-pg-now.dump"
+    # It must be a REAL-SIZED dump AND attest completeness. The first version of this fixture
+    # was `: > file` — zero bytes, no manifest — so the scanner had never been shown to tell
+    # a restorable backup from an unrestorable one, BECAUSE NO FIXTURE COULD PRODUCE THE BAD
+    # CONDITION. The guard and the fixture were blind together.
+    _mkbackup "${tmp}/fresh/daily/2026-07-11" true
     _expect fresh "${tmp}/fresh" "" fresh "$EXIT_OK" 1
 
-    # ZERO-BYTE DUMP — lists non-empty, restores nothing. This is what `pg_dump` failing
-    # leaves behind after the shell has already created the target, and it uploads cleanly.
-    mkdir -p "${tmp}/zerobyte"
-    : > "${tmp}/zerobyte/isnad-pg-now.dump"
+    # INCOMPLETE — the artifact SAYS it is incomplete, and restore.sh refuses it. This is a
+    # backup.sh output by design ("a partial backup beats none"), and it was reported fresh.
+    _mkbackup "${tmp}/incomplete/daily/2026-07-11" false
+    _expect incomplete-manifest "${tmp}/incomplete" "" incomplete "$EXIT_ALERT"
+
+    # NO MANIFEST AT ALL — every pre-deploy#559 backup predates user-postgres coverage.
+    # A directory that does not attest its own completeness is not one we can promise a
+    # restore from.
+    mkdir -p "${tmp}/nomanifest/daily/2026-07-11"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/nomanifest/daily/2026-07-11/isnad-pg-a.dump"
+    _expect no-manifest "${tmp}/nomanifest" "" incomplete "$EXIT_ALERT"
+
+    # COMPLETE-ATTESTED, BUT CORRUPT — the producer's word about what it WROTE is not a claim
+    # about what SURVIVED. A zero-byte user-postgres dump inside a complete-attested directory
+    # reported `fresh` and said nothing: `undersized` was computed and thrown away.
+    _mkbackup "${tmp}/corrupt/daily/2026-07-11" true
+    : > "${tmp}/corrupt/daily/2026-07-11/isnad-userpg-a.dump"
+    _expect complete-but-undersized "${tmp}/corrupt" "" incomplete "$EXIT_ALERT"
+
+    # ZERO-BYTE DUMP — lists non-empty, restores nothing.
+    mkdir -p "${tmp}/zerobyte/daily/2026-07-11"
+    : > "${tmp}/zerobyte/daily/2026-07-11/isnad-pg-a.dump"
     _expect absent-zero-byte-dump "${tmp}/zerobyte" "" absent "$EXIT_ALERT"
 
-    # FUTURE TIMESTAMP — a broken clock, NOT a fresh backup. Must be instrument_error, and
-    # must never latch the job green. rclone preserves the source mtime, so this is the VPS
-    # clock at dump time; the writer side has no TZ pin and no guard.
-    mkdir -p "${tmp}/future"
-    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/future/isnad-pg-future.dump"
-    touch -d "+30 days" "${tmp}/future/isnad-pg-future.dump"
+    # FUTURE TIMESTAMP — a broken clock, NOT a fresh backup. rclone preserves the source
+    # mtime, so this is the VPS clock at dump time; the writer side has no pin and no guard.
+    _mkbackup "${tmp}/future/daily/2026-07-11" true
+    touch -d "+30 days" "${tmp}/future/daily/2026-07-11/isnad-pg-a.dump"
     _expect instrument-error-future "${tmp}/future" "" instrument_error "$EXIT_INSTRUMENT"
 
-    # ...and it must not MASK a stale bucket. `newest` is the max epoch, so one bad-clock
-    # object beside a genuinely ancient backup previously reported `fresh`.
-    mkdir -p "${tmp}/future_masks"
-    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/future_masks/isnad-pg-old.dump"
-    touch -d "40 days ago" "${tmp}/future_masks/isnad-pg-old.dump"
-    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/future_masks/isnad-pg-future.dump"
-    touch -d "+30 days" "${tmp}/future_masks/isnad-pg-future.dump"
+    # ...and it must not MASK a stale bucket.
+    _mkbackup "${tmp}/future_masks/daily/2026-06-01" true
+    touch -d "40 days ago" "${tmp}/future_masks/daily/2026-06-01/isnad-pg-a.dump"
+    _mkbackup "${tmp}/future_masks/daily/2026-08-10" true
+    touch -d "+30 days" "${tmp}/future_masks/daily/2026-08-10/isnad-pg-a.dump"
     _expect instrument-error-future-masking "${tmp}/future_masks" "" instrument_error "$EXIT_INSTRUMENT"
 
     # ABSENT — the silent zero itself: rclone exits 0 and prints nothing.
@@ -369,16 +462,12 @@ self_test() {
     : > "${tmp}/nodumps/_backup_manifest.txt"
     _expect absent-no-dumps "${tmp}/nodumps" "" absent "$EXIT_ALERT"
 
-    # STALE — a real dump, far too old.
-    mkdir -p "${tmp}/stale"
-    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${tmp}/stale/isnad-pg-old.dump"
-    touch -d "$(( MAX_AGE_HOURS + 24 )) hours ago" "${tmp}/stale/isnad-pg-old.dump"
+    # STALE — a real, COMPLETE backup, far too old.
+    _mkbackup "${tmp}/stale/daily/2026-06-01" true
+    touch -d "$(( MAX_AGE_HOURS + 24 )) hours ago" "${tmp}/stale/daily/2026-06-01/isnad-pg-a.dump"
     _expect stale "${tmp}/stale" "" stale "$EXIT_ALERT"
 
     # INSTRUMENT ERROR — an unreachable bucket must NOT be reported as "absent".
-    # This is the one the B2/local divergence forced onto the BUCKET probe: on B2 a
-    # nonexistent PREFIX returns rc=0 and empty, so only a bucket-level failure can carry
-    # this signal on the backend we actually run against.
     _expect instrument-error "${tmp}/no-such-bucket" "" instrument_error "$EXIT_INSTRUMENT"
 
     QUIET_ERRORS=false

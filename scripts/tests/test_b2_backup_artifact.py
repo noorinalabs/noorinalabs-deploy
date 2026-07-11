@@ -54,6 +54,25 @@ EXIT_INSTRUMENT = 2
 REAL_DUMP = b"P" * 4096
 
 
+# EXACTLY the line backup.sh writes (scripts/backup.sh, the `printf 'BACKUP_MANIFEST ...'`).
+# Not a paraphrase: the bug this fixture exposed was that a predicate could never match the
+# real thing, and a fixture that restates the format in the test's own words could not have
+# revealed it.
+def _manifest(complete: bool) -> bytes:
+    return (
+        f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
+        "stores=postgres,user-postgres,neo4j timestamp=20260711-030100 category=daily\n"
+    ).encode()
+
+
+def _backup_dir(root: Path, *, complete: bool = True, dump: bytes = REAL_DUMP) -> Path:
+    d = root / "daily" / "2026-07-11"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "isnad-pg-a.dump").write_bytes(dump)
+    (d / "_backup_manifest.txt").write_bytes(_manifest(complete))
+    return d
+
+
 def _scan(root: Path | str, **env: str) -> tuple[int, str]:
     r = subprocess.run(  # noqa: S603
         ["bash", str(SCANNER)],  # noqa: S607
@@ -82,7 +101,7 @@ def _field(line: str, key: str) -> str:
 # that only ever says ALERT proves every bucket is empty.
 # ---------------------------------------------------------------------------
 def test_fresh_dump_is_accepted(tmp_path: Path) -> None:
-    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
+    _backup_dir(tmp_path, complete=True)
     rc, line = _scan(tmp_path)
     assert rc == EXIT_OK, f"a fresh dump must pass: {line}"
     assert _field(line, "status") == "fresh"
@@ -96,7 +115,7 @@ def test_fresh_dump_age_is_not_skewed(tmp_path: Path) -> None:
     4 hours old on this box. A skew in the other direction makes a stale backup read fresh.
     A class-level assertion cannot see this: 4h is still comfortably 'fresh'.
     """
-    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
+    _backup_dir(tmp_path, complete=True)
     rc, line = _scan(tmp_path)
     assert rc == EXIT_OK
     age = int(_field(line, "newest_age_hours"))
@@ -136,10 +155,9 @@ def test_bucket_with_no_dumps_is_absent(tmp_path: Path) -> None:
 
 
 def test_stale_dump_is_an_alert(tmp_path: Path) -> None:
-    p = tmp_path / "isnad-pg-old.dump"
-    p.write_bytes(REAL_DUMP)
+    d = _backup_dir(tmp_path, complete=True)
     old = time.time() - (60 * 3600)
-    os.utime(p, (old, old))
+    os.utime(d / "isnad-pg-a.dump", (old, old))
     rc, line = _scan(tmp_path, MAX_AGE_HOURS="30")
     assert rc == EXIT_ALERT
     assert _field(line, "status") == "stale"
@@ -183,7 +201,7 @@ def test_scan_refuses_when_self_test_fails(tmp_path: Path) -> None:
     fixture reports hours old, the self-test fails, and the scanner must refuse to give a
     verdict on the real bucket rather than hand back a reading it cannot vouch for.
     """
-    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
+    _backup_dir(tmp_path, complete=True)
     r = subprocess.run(  # noqa: S603
         ["bash", str(SCANNER)],  # noqa: S607
         env={**os.environ, "B2_ROOT": str(tmp_path), "TZ": "Asia/Tokyo"},
@@ -216,7 +234,10 @@ def test_zero_byte_dump_is_not_restorable(tmp_path: Path) -> None:
     goes green — and, before the size floor, THIS check said `fresh` too. The chain of trust
     this scanner exists to break was still broken, one layer out.
     """
-    (tmp_path / "isnad-pg-now.dump").write_bytes(b"")
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    (d / "isnad-pg-a.dump").write_bytes(b"")
+    (d / "_backup_manifest.txt").write_bytes(_manifest(True))
     rc, line = _scan(tmp_path)
     assert rc == EXIT_ALERT, f"a zero-byte dump is not restorable: {line}"
     assert _field(line, "status") == "absent"
@@ -234,10 +255,9 @@ def test_future_timestamp_is_an_instrument_error_not_fresh(tmp_path: Path) -> No
     no guard. A skewed or NTP-failed VPS uploads future-dated dumps — and a one-sided bound
     then reports them fresh.
     """
-    p = tmp_path / "isnad-pg-future.dump"
-    p.write_bytes(REAL_DUMP)
+    d = _backup_dir(tmp_path, complete=True)
     future = time.time() + (30 * 24 * 3600)
-    os.utime(p, (future, future))
+    os.utime(d / "isnad-pg-a.dump", (future, future))
     rc, line = _scan(tmp_path)
     assert rc == EXIT_INSTRUMENT, f"a future timestamp is a broken clock, not a backup: {line}"
     assert _field(line, "status") == "instrument_error"
@@ -252,15 +272,19 @@ def test_one_future_object_cannot_mask_a_stale_bucket(tmp_path: Path) -> None:
     `status=fresh`, rc=0. One bad-clock upload converts this job into a permanent green
     light on the exact signal it was built to provide.
     """
-    old = tmp_path / "isnad-pg-old.dump"
-    old.write_bytes(REAL_DUMP)
+    d_old = tmp_path / "daily" / "2026-06-01"
+    d_old.mkdir(parents=True)
+    (d_old / "isnad-pg-a.dump").write_bytes(REAL_DUMP)
+    (d_old / "_backup_manifest.txt").write_bytes(_manifest(True))
     t_old = time.time() - (40 * 24 * 3600)
-    os.utime(old, (t_old, t_old))
+    os.utime(d_old / "isnad-pg-a.dump", (t_old, t_old))
 
-    fut = tmp_path / "isnad-pg-future.dump"
-    fut.write_bytes(REAL_DUMP)
+    d_fut = tmp_path / "daily" / "2026-08-10"
+    d_fut.mkdir(parents=True)
+    (d_fut / "isnad-pg-a.dump").write_bytes(REAL_DUMP)
+    (d_fut / "_backup_manifest.txt").write_bytes(_manifest(True))
     t_fut = time.time() + (30 * 24 * 3600)
-    os.utime(fut, (t_fut, t_fut))
+    os.utime(d_fut / "isnad-pg-a.dump", (t_fut, t_fut))
 
     rc, line = _scan(tmp_path)
     assert rc == EXIT_INSTRUMENT, (
@@ -350,7 +374,7 @@ def test_passing_self_test_does_not_cry_wolf(tmp_path: Path) -> None:
     a check people learn to scroll past — and this one only matters on the day someone
     actually reads it.
     """
-    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
+    _backup_dir(tmp_path, complete=True)
     r = subprocess.run(  # noqa: S603
         ["bash", str(SCANNER)],  # noqa: S607
         env={**os.environ, "B2_ROOT": str(tmp_path)},
@@ -372,7 +396,7 @@ def test_refuses_to_run_under_rclone_dump(tmp_path: Path) -> None:
     catch. Refuse rather than redact: a leak is not recoverable, and there is no reason to
     run this under a debug dump.
     """
-    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
+    _backup_dir(tmp_path, complete=True)
     r = subprocess.run(  # noqa: S603
         ["bash", str(SCANNER)],  # noqa: S607
         env={**os.environ, "B2_ROOT": str(tmp_path), "RCLONE_DUMP": "auth"},
@@ -382,3 +406,118 @@ def test_refuses_to_run_under_rclone_dump(tmp_path: Path) -> None:
     )
     assert r.returncode == EXIT_INSTRUMENT, "RCLONE_DUMP must be refused, not honoured"
     assert "RCLONE_DUMP" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# The scanner must not certify a backup our own restore path REFUSES (deploy#584 — Nurul)
+# ---------------------------------------------------------------------------
+def test_incomplete_backup_is_not_fresh(tmp_path: Path) -> None:
+    """`_backup_manifest.txt` says `complete=false`. `restore.sh` refuses it. So must we.
+
+    The scanner's definition of restorable was "at least one dump, over the floor, recent".
+    It never asked WHICH stores were present and never read the completeness attestation
+    sitting in the bucket beside the dumps — so a bucket holding only `isnad-pg`, with a
+    manifest explicitly declaring itself incomplete, came back `fresh`.
+
+    And `backup.sh` MANUFACTURES these by design: it deliberately uploads a partial when a
+    leg fails ("a partial backup beats none"). This is not a hypothetical artifact.
+    """
+    _backup_dir(tmp_path, complete=False)
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, f"a backup restore.sh refuses must not be certified fresh: {line}"
+    assert _field(line, "status") == "incomplete"
+
+
+def test_backup_with_no_manifest_is_not_fresh(tmp_path: Path) -> None:
+    """Every pre-deploy#559 backup predates user-postgres coverage entirely."""
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    (d / "isnad-pg-a.dump").write_bytes(REAL_DUMP)
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT
+    assert _field(line, "status") == "incomplete"
+
+
+def test_complete_attested_but_undersized_dump_is_not_fresh(tmp_path: Path) -> None:
+    """The producer's word about what it WROTE is not a claim about what SURVIVED.
+
+    A user-postgres dump that uploaded as zero bytes, beside a healthy pg and neo4j, inside a
+    directory whose manifest says `complete=true`. The attestation cannot see this; the size
+    floor can. Both are needed.
+    """
+    d = _backup_dir(tmp_path, complete=True)
+    (d / "isnad-userpg-a.dump").write_bytes(b"")
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, f"a complete-attested backup with a 0-byte dump is not fresh: {line}"
+    assert _field(line, "reason") == "undersized_dumps"
+
+
+def test_undersized_is_reported_unconditionally(tmp_path: Path) -> None:
+    """It was computed and then thrown away unless `dumps == 0`.
+
+    The identical defect to the `-719` age that was computed and never checked: if the scan
+    knows something, the result line must say it.
+    """
+    _backup_dir(tmp_path, complete=True)
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK
+    assert _field(line, "undersized") == "0", "the result line must always carry `undersized`"
+
+
+def test_healthy_complete_backup_is_fresh(tmp_path: Path) -> None:
+    """The POSITIVE control for the completeness gate.
+
+    Without it, every refusal above could be passing because the gate rejects everything —
+    and a scanner that only ever says ALERT proves every bucket is empty.
+    """
+    _backup_dir(tmp_path, complete=True)
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK, f"a genuinely complete, healthy backup must be fresh: {line}"
+    assert _field(line, "status") == "fresh"
+
+
+# ---------------------------------------------------------------------------
+# restore.sh's completeness predicate — BEHAVIOURAL, against a REAL manifest
+# ---------------------------------------------------------------------------
+def test_restore_sh_completeness_predicate_matches_a_real_manifest() -> None:
+    """A LIVE BUG in merged code (deploy#577), found because this fixture is a real manifest.
+
+    `backup_is_complete()` shipped as::
+
+        grep -q '^BACKUP_MANIFEST .*[[:space:]]complete=true\\([[:space:]]\\|$\\)'
+
+    and it COULD NEVER MATCH. `complete=` is the FIRST token backup.sh writes after
+    `BACKUP_MANIFEST `, so the anchor's literal space consumes the only space there is, and
+    `.*[[:space:]]complete=true` then demands a second one that never exists.
+
+    So `backup_is_complete` returned false for EVERY backup, `resolve_latest` skipped all of
+    them, and `restore.sh latest` could not select an artifact at all — it would report "No
+    COMPLETE backup found in B2 bucket" over a bucket full of good ones. It fails CLOSED, so
+    nothing was at risk; but the recovery path was inert, and it shipped with a green suite.
+
+    It survived because deploy#577's tests are TEXTUAL — they assert the function is CALLED
+    (correctly; that was that review's own lesson) and never once run its predicate against a
+    manifest `backup.sh` actually produces. **Asserting the call site is not the same as
+    asserting the callee works.** This test runs the predicate.
+    """
+    restore = SCRIPTS_DIR / "restore.sh"
+    body = restore.read_text()
+    fn = body[body.index("backup_is_complete()") : body.index("\nresolve_latest()")]
+
+    def _predicate(manifest: bytes) -> int:
+        # Run the shipped predicate's own pipeline against the manifest.
+        script = (
+            "printf '%s\\n' \"$1\" | grep '^BACKUP_MANIFEST ' | tr ' ' '\\n' "
+            "| grep -qx 'complete=true'"
+        )
+        return subprocess.run(  # noqa: S603
+            ["bash", "-c", script, "_", manifest.decode().strip()],  # noqa: S607
+            check=False,
+        ).returncode
+
+    assert "grep -qx 'complete=true'" in fn, (
+        "backup_is_complete must match `complete=true` as a WHOLE TOKEN; the anchored-prefix "
+        "regex it shipped with can never match a real manifest"
+    )
+    assert _predicate(_manifest(True)) == 0, "a complete manifest must MATCH"
+    assert _predicate(_manifest(False)) != 0, "an incomplete manifest must NOT match"
