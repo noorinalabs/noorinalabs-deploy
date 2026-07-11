@@ -40,6 +40,9 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+from manifest_fixture import build_manifest, manifest_format
+
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 SCANNER = SCRIPTS_DIR / "verify_b2_backup_artifact.sh"
 
@@ -66,15 +69,16 @@ STORE_FILES = {
 }
 
 
-# EXACTLY the line backup.sh writes (scripts/backup.sh, the `printf 'BACKUP_MANIFEST ...'`).
-# Not a paraphrase: the bug this fixture exposed was that a predicate could never match the
-# real thing, and a fixture that restates the format in the test's own words could not have
-# revealed it.
+# Rendered from BACKUP.SH'S OWN printf — format string and argument order both parsed out of
+# the producer. Not a paraphrase.
+#
+# This used to be an f-string in the test's own words. It was FAITHFUL — and that is the
+# point: it was faithful *today*, by inspection, and nothing pinned it. The manifest line is
+# the exact place `backup_is_complete`'s never-matching regex lived, and a fixture that
+# restates the producer's format is written by the same mind that wrote the parser, so it
+# encodes the same misreading and cannot falsify it. See manifest_fixture.py.
 def _manifest(complete: bool, run_ts: str = RUN_TS) -> bytes:
-    return (
-        f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
-        f"stores=postgres,user-postgres,neo4j timestamp={run_ts} category=daily\n"
-    ).encode()
+    return build_manifest(complete=complete, run_ts=run_ts)
 
 
 def _backup_dir(
@@ -634,10 +638,16 @@ def _select(restore_dir: Path) -> dict[str, str]:
     is not running production code.
     """
     region = _shipped_region("# Find dump files.", "# A backup containing no dumps at all")
+    # The selection block calls these, so the harness must carry the SHIPPED ones — a
+    # re-typed `count_runs` here would be exactly the paraphrase this suite exists to refuse.
+    helpers = _shipped_region("list_runs() {", "\nlist_backups()")
     script = (
         "set -euo pipefail\n"
-        "log() { :; }\n"
-        'RESTORE_DIR="$1"\n' + region + "\n"
+        # To STDERR — so the selection's own output stays parseable, but the script's messages
+        # are NOT discarded. A `log() { :; }` stub would hide the refusal text this suite
+        # asserts on, which is the same "the fixture cannot express the condition" trap one
+        # level out: an assertion on a message a stub swallowed can never fail.
+        'log() { shift; echo "$*" >&2; }\n' + helpers + "\n" + 'RESTORE_DIR="$1"\n' + region + "\n"
         'printf "PG=%s\\n" "$(basename "${PG_DUMP:-}")"\n'
         'printf "USER_PG=%s\\n" "$(basename "${USER_PG_DUMP:-}")"\n'
         'printf "NEO4J=%s\\n" "$(basename "${NEO4J_DUMP:-}")"\n'
@@ -705,20 +715,26 @@ def test_restore_selection_is_deterministic_across_many_two_run_directories(tmp_
         )
 
 
-def test_restore_selection_without_a_manifest_is_newest_not_arbitrary(tmp_path: Path) -> None:
-    """Pre-deploy#559 artifacts carry no manifest, so no run can be bound.
+def test_restore_selection_without_a_manifest_refuses_rather_than_guessing(tmp_path: Path) -> None:
+    """This test used to assert "pick the NEWEST run" — and that answer was WRONG.
 
-    We cannot be CORRECT there, but we can be DETERMINISTIC: the timestamp is `%Y%m%d-%H%M%S`,
-    which sorts chronologically as text, so newest-by-name beats readdir order in every case.
+    The earlier fallback was deterministic newest-by-name, and I wrote this test to pin that.
+    But newest-by-name is *per store*, and with no manifest binding the three selections there
+    is nothing making them agree on a run: `pg` from the newest run beside `neo4j` from an
+    older one is a TORN restore, and every guard passes it.
+
+    **Sorting made the selection reproducible. It did not make it coherent.** So the honest
+    answer with several runs and nothing to say which is real is to REFUSE, and the assertion
+    that used to demand a guess now demands the refusal.
     """
     d = tmp_path / "daily" / "2026-07-11"
     d.mkdir(parents=True)
-    # Twelve candidates, for the same reason as above: with two, readdir order returns the
-    # newest by luck about half the time, and the assertion proves nothing.
     for hh in range(1, 13):
         (d / f"isnad-pg-20260711-{hh:02d}0000.dump").write_bytes(REAL_DUMP)
 
-    assert _select(d)["PG"] == "isnad-pg-20260711-120000.dump", "must pick the NEWEST run"
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        _select(d)
+    assert "MORE THAN ONE RUN" in e.value.stderr
 
 
 def test_restore_selection_survives_an_artifact_with_no_manifest(tmp_path: Path) -> None:
@@ -876,3 +892,79 @@ def test_manifest_with_a_true_line_after_a_false_one_does_not_attest(tmp_path: P
     d.mkdir(parents=True)
     (d / "_backup_manifest.txt").write_bytes(_manifest(False) + _manifest(True))
     assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST
+
+
+def test_fallback_refuses_a_directory_holding_more_than_one_run(tmp_path: Path) -> None:
+    """SORTING MADE THE SELECTION REPRODUCIBLE. IT DID NOT MAKE IT COHERENT.
+
+    The no-manifest fallback is three INDEPENDENT `sort -r | head -1`s. With no manifest
+    timestamp binding them, nothing makes the three agree on a RUN — so against a directory
+    holding a complete 03:01 run plus a failed 08:00 rerun that left a stray pg dump, it
+    selected `pg=…-080000` beside `neo4j=…-030100`: **Postgres from the failed rerun, Neo4j
+    from the good one.** The same defect as the original `find | head -1`; it merely tears the
+    same way every time now.
+
+    And every guard still passes it — required-store sees all three present, and each checksum
+    verifies the file against ITSELF. Determinism is not coherence. With more than one run and
+    no manifest to say which is real, there is no honest answer: REFUSE.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    for f in STORE_FILES.values():  # the complete 03:01 run
+        (d / f).write_bytes(REAL_DUMP)
+    (d / "isnad-pg-20260711-080000.dump").write_bytes(b"S" * 4096)  # the failed 08:00 rerun
+    assert not (d / "_backup_manifest.txt").exists()  # nothing to bind to
+
+    with pytest.raises(subprocess.CalledProcessError) as e:
+        _select(d)
+    assert e.value.returncode == 1
+    assert "MORE THAN ONE RUN" in e.value.stderr, (
+        f"must refuse and say why, not silently pick a torn set: {e.value.stderr}"
+    )
+
+
+def test_fallback_still_works_when_exactly_one_run_is_present(tmp_path: Path) -> None:
+    """The POSITIVE control for the refusal above.
+
+    A guard that refuses everything is not a guard. Pre-deploy#559 artifacts carry no manifest
+    and hold exactly one run — those must still restore.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    for f in STORE_FILES.values():
+        (d / f).write_bytes(REAL_DUMP)
+
+    got = _select(d)
+    assert got["PG"] == STORE_FILES["isnad-pg"]
+    assert got["USER_PG"] == STORE_FILES["isnad-userpg"]
+    assert got["NEO4J"] == STORE_FILES["isnad-neo4j"]
+
+
+def test_manifest_fixture_is_rendered_from_the_producers_own_printf() -> None:
+    """The fixture must not be able to drift away from `backup.sh`.
+
+    Every other test in this file trusts `_manifest()`. If that rendering is the test's own
+    words, then the whole suite is testing the consumer against the test's idea of the
+    producer — which is exactly how a predicate that could NEVER match a real manifest passed
+    39 tests, two reviewers, and shipped.
+
+    So: the format string and the argument order both come out of `backup.sh`, and this pins
+    that they do. Change the producer's printf and the fixtures follow; rename one of its
+    variables and this raises rather than fabricating a plausible line.
+    """
+    fmt, args = manifest_format()
+    assert fmt.startswith("BACKUP_MANIFEST "), fmt
+    assert args == ["BACKUP_COMPLETE", "BACKUP_STORES", "TIMESTAMP", "BACKUP_CATEGORY"], (
+        f"backup.sh's manifest printf changed its arguments: {args}. The fixture must be "
+        "taught the new shape, not left to fill the old slots."
+    )
+    # `complete=` must remain the FIRST token after `BACKUP_MANIFEST ` — the whole reason the
+    # shipped anchored-prefix regex could never match.
+    assert fmt.split()[1].startswith("complete="), (
+        "`complete=` is no longer the first field. Any predicate anchored on `BACKUP_MANIFEST `"
+        " plus a leading space will now behave differently — re-check both parsers."
+    )
+
+    line = build_manifest(complete=True).decode()
+    assert "complete=true" in line.split()
+    assert build_manifest(complete=False).decode().split()[1] == "complete=false"

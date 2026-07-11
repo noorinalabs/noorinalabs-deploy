@@ -111,14 +111,63 @@ done
 # Functions
 # ---------------------------------------------------------------------------
 
+# rclone lsf a category, separating "empty" from "I could not look".
+#
+# `|| echo "  (none)"` — what this used to be — is the SAME LIE this whole change exists to
+# stop, by a third route: with a bad key or an unreachable bucket, `restore.sh --list` printed
+#
+#     === Daily ===
+#       (none)
+#
+# and an operator reads that as "I have no backups." The instrument failed; the bucket may be
+# full. A listing that cannot distinguish an empty bucket from a failed listing is not a
+# listing, it is a guess (deploy#584 review, Nino Kavtaradze — the pattern, not the incident).
+list_category() {
+    local category="$1" out rc=0
+    out="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        log "ERROR" "Could not LIST ${category} (rclone rc=${rc}):"
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        log "ERROR" "  This is an INSTRUMENT failure — NOT a claim that you have no backups."
+        return 1
+    fi
+    if [[ -z "$out" ]]; then
+        echo "  (none)"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+# The DISTINCT run timestamps present among a directory's dumps.
+#
+# `backup.sh` names every dump `isnad-<store>-<TIMESTAMP>.dump[.zst]` with a single
+# `%Y%m%d-%H%M%S` run id, so the filenames themselves carry which run each dump belongs to.
+# A B2 day-directory accumulates runs (`rclone copy` adds and never deletes), so "how many
+# runs are in here?" is a question the artifact can answer without a manifest.
+list_runs() {
+    find "$1" \( -name 'isnad-*.dump' -o -name 'isnad-*.dump.zst' \) -type f -printf '%f\n' 2>/dev/null \
+        | sed -n 's/^isnad-[a-z0-9]\{1,\}-\([0-9]\{8\}-[0-9]\{6\}\)\.dump\(\.zst\)\{0,1\}$/\1/p' \
+        | sort -u
+}
+
+count_runs() {
+    local n
+    n="$(list_runs "$1" | grep -c . || true)"
+    printf '%s\n' "${n:-0}"
+}
+
 list_backups() {
     log "INFO" "Available backups in ${B2_BUCKET}:"
+    local failed=0
     echo ""
     echo "=== Daily ==="
-    rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/daily/" --dirs-only 2>/dev/null || echo "  (none)"
+    list_category daily || failed=1
     echo ""
     echo "=== Weekly ==="
-    rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/weekly/" --dirs-only 2>/dev/null || echo "  (none)"
+    list_category weekly || failed=1
+    # Exit non-zero on an instrument failure. `--list` that cannot see the bucket must not
+    # exit 0 with a confident-looking empty report.
+    return "$failed"
 }
 
 # Does the backup directory at <category>/<date> declare itself COMPLETE?
@@ -200,9 +249,30 @@ resolve_latest() {
     local latest="" latest_date="0000-00-00"
     local skipped=()
 
+    # --- THE LISTING MUST NOT FAIL OPEN. -----------------------------------------
+    #
+    # This was `dirs=$(rclone lsf … 2>/dev/null || true)`. A bad key, a wrong bucket, or a
+    # network fault made `dirs` EMPTY — so the loop body never ran, `backup_is_complete` was
+    # NEVER CALLED, and control fell straight through to "No COMPLETE backup found in B2
+    # bucket." The three-outcome guard below could not fire on the single most likely
+    # instrument failure, because a bad credential dies at the FIRST rclone call, upstream of
+    # it (deploy#584 review, Nino Kavtaradze):
+    #
+    #   FIXING A GUARD DOES NOT HELP IF THE CALL THAT FEEDS IT FAILS OPEN.
+    #
+    # An empty listing and a failed listing are the same empty string, and only one of them is
+    # a measurement — the same sentence as the `lsf` silent zero the scanner is built around,
+    # which is why the scanner's step-1 probe captures this rc and this one did not.
     for category in daily weekly; do
-        local dirs
-        dirs=$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>/dev/null || true)
+        local dirs lrc=0
+        dirs="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>&1)" || lrc=$?
+        if [[ "$lrc" -ne 0 ]]; then
+            log "ERROR" "Cannot resolve 'latest': could not LIST ${category} (rclone rc=${lrc}):" >&2
+            printf '%s\n' "$dirs" | sed 's/^/    /' >&2
+            log "ERROR" "  This is an INSTRUMENT failure, NOT a verdict on your backups." >&2
+            log "ERROR" "  Check credentials/connectivity and retry, or name a backup explicitly." >&2
+            exit 1
+        fi
         while IFS= read -r dir; do
             [[ -z "$dir" ]] && continue
             dir="${dir%/}"
@@ -650,9 +720,37 @@ if [[ -n "$RESTORE_RUN_TS" ]]; then
     USER_PG_DUMP=$(find "$RESTORE_DIR" -name "isnad-userpg-${RESTORE_RUN_TS}.dump" -type f | head -1)
     NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name "isnad-neo4j-${RESTORE_RUN_TS}.dump.zst" \
         -o -name "isnad-neo4j-${RESTORE_RUN_TS}.dump" \) -type f | head -1)
+elif [[ "$(count_runs "$RESTORE_DIR")" -gt 1 ]]; then
+    # --- SORTING MADE THE SELECTION REPRODUCIBLE. IT DID NOT MAKE IT COHERENT. ---
+    #
+    # The fallback below is three INDEPENDENT `sort -r | head -1`s, and with no manifest
+    # timestamp to bind them there is nothing making the three agree on a RUN. Against a
+    # directory holding a complete 03:01 run plus a failed 08:00 rerun that left a stray pg
+    # dump, it selected:
+    #
+    #   pg=…-080000   userpg=…-030100   neo4j=…-030100      <- TORN
+    #
+    # Postgres from the failed rerun, Neo4j from the attested run. That is the SAME defect as
+    # the original `find | head -1` — it merely tears the same way every time now. And every
+    # guard still passes it: required-store sees all three present, and each checksum verifies
+    # the file against ITSELF (deploy#584 review, Nino Kavtaradze).
+    #
+    # Determinism is not coherence. With more than one run in the directory and no manifest to
+    # say which one is real, there is no honest answer — so REFUSE and let the operator name
+    # it. Guessing is what produced the tear.
+    log "ERROR" "This backup directory holds dumps from MORE THAN ONE RUN, and has no manifest"
+    log "ERROR" "  timestamp to say which run is the real one:"
+    list_runs "$RESTORE_DIR" | sed 's/^/      /'
+    log "ERROR" "  Selecting per-store would mix runs — an isnad Postgres from one run beside a"
+    log "ERROR" "  Neo4j from another restores a referentially INCONSISTENT stack, and every"
+    log "ERROR" "  checksum still passes (a hash binds a file to ITSELF; it cannot see the file"
+    log "ERROR" "  is from the wrong run)."
+    log "ERROR" "  Remove the dumps from the runs you do not want, and re-run."
+    exit 1
 else
     # No manifest (a pre-deploy#559 artifact, or a hand-assembled directory under
-    # --allow-partial). We cannot bind to a run, so at least be DETERMINISTIC: the timestamp
+    # --allow-partial), and exactly ONE run present — so per-store selection cannot mix runs.
+    # We cannot bind to a run, so at least be DETERMINISTIC: the timestamp
     # is `%Y%m%d-%H%M%S`, which sorts chronologically as text, so `sort -r | head -1` is the
     # NEWEST — never an arbitrary one. Strictly better than readdir order in every case.
     log "WARNING" "No manifest timestamp — falling back to newest-by-name (cannot bind to a run)"

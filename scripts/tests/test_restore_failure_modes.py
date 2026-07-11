@@ -613,3 +613,102 @@ def test_truncation_fixtures_start_from_a_complete_artifact() -> None:
             f"fixture {fx} must start from a complete artifact, or the missing-store gate "
             "refuses it first and the truncation is never tested"
         )
+
+
+def _resolve_latest_rc(root: str) -> tuple[int, str]:
+    """Run the SHIPPED `resolve_latest` and return (rc, combined output).
+
+    `root` is passed through as-is, so a nonexistent path exercises a FAILED LISTING — which
+    is what a bad key / wrong bucket / network fault looks like at the first rclone call.
+    """
+    body = _restore_text()
+    fns = body[body.index("list_runs() {") : body.index("\nverify_checksums()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_resolve_latest_does_not_report_a_failed_listing_as_no_backups() -> None:
+    """FIXING A GUARD DOES NOT HELP IF THE CALL THAT FEEDS IT FAILS OPEN.
+
+    `resolve_latest` listed the categories with `rclone lsf … 2>/dev/null || true`. A bad key,
+    a wrong bucket, or a network fault made `dirs` EMPTY — so the loop body never ran,
+    `backup_is_complete` was **never called**, and control fell straight through to
+    *"No COMPLETE backup found in B2 bucket."*
+
+    So on the single most likely instrument failure — and the one most likely to bite
+    mid-incident — the three-outcome guard could not fire **at all**, because a bad credential
+    dies at the FIRST rclone call, upstream of it. An empty listing and a failed listing are
+    the same empty string, and only one of them is a measurement.
+    """
+    rc, out = _resolve_latest_rc("/nonexistent/bucket/path")
+
+    assert rc != 0, "a failed listing must not resolve successfully"
+    assert "No COMPLETE backup found" not in out, (
+        "a failed LISTING must never be reported as 'no complete backup' — that tells an "
+        f"operator mid-incident that their backups are gone when the instrument failed: {out}"
+    )
+    assert "INSTRUMENT failure" in out, f"it must say it could not look: {out}"
+
+
+def test_resolve_latest_still_resolves_when_the_listing_works(tmp_path: Path) -> None:
+    """The POSITIVE control. A guard that refuses everything is not a guard."""
+    for date, complete in (("2026-07-10", True), ("2026-07-11", False)):
+        d = tmp_path / "daily" / date
+        d.mkdir(parents=True)
+        (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
+        (d / "_backup_manifest.txt").write_text(
+            f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
+            f"stores=postgres,user-postgres,neo4j timestamp={TIMESTAMP} category=daily\n"
+        )
+    (tmp_path / "weekly").mkdir()
+
+    rc, out = _resolve_latest_rc(str(tmp_path))
+    assert rc == 0, f"the good control must resolve: {out}"
+    assert "daily/2026-07-10" in out
+
+
+def test_list_backups_does_not_report_a_failed_listing_as_none() -> None:
+    """The SAME lie, by a third route — and nobody had named this one.
+
+    `list_backups` used `|| echo "  (none)"`. With a bad key, `restore.sh --list` printed
+
+        === Daily ===
+          (none)
+
+    and an operator reads that as "I have no backups." The instrument failed; the bucket may
+    be full. Found by walking every rclone call in the file rather than only the one that was
+    reported — the pattern, not the incident.
+    """
+    body = _restore_text()
+    fns = body[body.index("list_category() {") : body.index("\nbackup_is_complete()")]
+    script = (
+        "set -uo pipefail\n"
+        'log() { shift; echo "$*"; }\n'
+        'RCLONE_REMOTE=":local"\n'
+        'B2_BUCKET="/nonexistent/bucket/path"\n' + fns + "\nlist_backups\n"
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    out = r.stdout + r.stderr
+
+    assert r.returncode != 0, "--list over an unreadable bucket must not exit 0"
+    assert "(none)" not in out, (
+        f"a failed listing must never be rendered as '(none)' — that is 'you have no "
+        f"backups', asserted from an instrument failure: {out}"
+    )
+    assert "INSTRUMENT failure" in out, f"it must say it could not look: {out}"
