@@ -293,3 +293,71 @@ def test_self_test_catches_clock_skew_in_BOTH_directions() -> None:
     assert 'if [[ "$got_age" -gt "$want_age" ]]; then' in src, (
         "and it must still reject an inflated age"
     )
+
+
+# ---------------------------------------------------------------------------
+# instrument_error must say WHY (deploy#584 review — Nino Kavtaradze)
+# ---------------------------------------------------------------------------
+def test_instrument_error_carries_a_diagnostic(tmp_path: Path) -> None:
+    """`rc` alone cannot separate a 401 from a typo'd bucket from a network fault.
+
+    Both probes previously discarded rclone's stderr (`2>/dev/null`). An error state that
+    cannot say *why* it could not look is a diminished version of the third state this whole
+    script is built around — the operator is told "I could not see" and given nothing to act
+    on. Verified on real B2: a bad key yields `401 bad_auth_token`, a missing bucket yields
+    `directory not found` — two different faults that share an exit code.
+    """
+    r = subprocess.run(  # noqa: S603
+        ["bash", str(SCANNER)],  # noqa: S607
+        env={**os.environ, "B2_ROOT": str(tmp_path / "no-such-bucket")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == EXIT_INSTRUMENT
+    assert "rclone could not list" in r.stderr, (
+        "instrument_error must surface rclone's own stderr, or the operator cannot tell a "
+        "credential failure from a wrong path"
+    )
+
+
+def test_passing_self_test_does_not_cry_wolf(tmp_path: Path) -> None:
+    """The self-test drives the instrument-error path ON PURPOSE.
+
+    Without suppression, every *passing* run printed an alarming "rclone could not list"
+    block from a fixture behaving exactly as intended. A check that cries wolf on success is
+    a check people learn to scroll past — and this one only matters on the day someone
+    actually reads it.
+    """
+    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
+    r = subprocess.run(  # noqa: S603
+        ["bash", str(SCANNER)],  # noqa: S607
+        env={**os.environ, "B2_ROOT": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == EXIT_OK
+    assert "rclone could not list" not in r.stderr, (
+        "a PASSING run must not print an error block from the self-test's own fixtures"
+    )
+
+
+def test_refuses_to_run_under_rclone_dump(tmp_path: Path) -> None:
+    """This script PRINTS rclone's stderr, and its output goes to a public CI log.
+
+    `RCLONE_DUMP=auth` makes rclone echo the `Authorization: Basic <base64(keyID:key)>`
+    header, which GitHub's masking — an exact-substring match on the raw secret — does NOT
+    catch. Refuse rather than redact: a leak is not recoverable, and there is no reason to
+    run this under a debug dump.
+    """
+    (tmp_path / "isnad-pg-now.dump").write_bytes(REAL_DUMP)
+    r = subprocess.run(  # noqa: S603
+        ["bash", str(SCANNER)],  # noqa: S607
+        env={**os.environ, "B2_ROOT": str(tmp_path), "RCLONE_DUMP": "auth"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r.returncode == EXIT_INSTRUMENT, "RCLONE_DUMP must be refused, not honoured"
+    assert "RCLONE_DUMP" in r.stderr

@@ -34,20 +34,25 @@
 # WHY THE REACHABILITY PROBE IS ON THE BUCKET AND NOT THE PREFIX
 # ---------------------------------------------------------------------------
 # Because the B2 backend and the local backend DISAGREE, and calibrating on the wrong one
-# would have shipped a scanner that cannot tell "no backups" from "wrong path". Measured
-# against real B2, 2026-07-11:
+# would have shipped a scanner that cannot tell "no backups" from "wrong path".
 #
-#                                  local backend      B2 backend
-#   lsf on a NONEXISTENT prefix    rc=3 (error)       rc=0, empty output   <-- !!
-#   lsd on a NONEXISTENT bucket    rc=3 (error)       rc=1 (error)
-#   lsd on a bucket, BAD key       n/a                rc=1 (error)
+# What matters is the SCOPE of the probe, not the subcommand. Measured against real B2 with
+# `lsf --recursive` — the call this script actually makes (an earlier version of this
+# comment described `lsd`, a probe that was measured during design and never shipped; the
+# code was right and the comment was describing something else, which is its own small
+# lesson about documenting the thing you ran):
 #
-# So on B2 there is NO error for a nonexistent prefix: a typo in the path is
+#                                             local backend      B2 backend
+#   lsf -R on a NONEXISTENT PREFIX            rc=3 (error)       rc=0, empty output  <-- !!
+#   lsf -R on a NONEXISTENT BUCKET            rc=3 (error)       rc=1 (error)
+#   lsf -R on a bucket with a BAD KEY         n/a                rc=1 (error)
+#
+# So on B2 there is NO error for a nonexistent PREFIX: a typo in the path is
 # indistinguishable, by exit code, from an empty bucket. A prefix-level probe therefore
 # cannot be the instrument-liveness control on the backend we actually run against — it
 # would have been calibrated on a behaviour that does not exist in production.
 #
-# The BUCKET-level `lsd` does separate, on both backends, so that is the control. After it
+# The BUCKET-level probe DOES separate, on both backends, so that is the control. After it
 # passes, a zero under the prefix is a real zero: we know the credentials work, the bucket
 # exists, and the scanner can see.
 #
@@ -96,6 +101,17 @@ set -euo pipefail
 # calibration.
 export TZ=UTC
 
+# This script CAPTURES AND PRINTS rclone's stderr (see instrument_error, below), and its
+# output goes to a PUBLIC CI log. `RCLONE_DUMP=auth` makes rclone echo the `Authorization:
+# Basic <base64(keyID:key)>` header — which GitHub's secret masking, an exact-substring
+# match on the raw secret, does NOT catch. Refuse rather than redact: a leak is not
+# recoverable, and there is no reason to run this under a debug dump.
+if [[ -n "${RCLONE_DUMP:-}" ]]; then
+    echo "ERROR: refusing to run with RCLONE_DUMP set (value redacted). rclone would echo the" >&2
+    echo "  Authorization header, and GitHub's masking does not catch the base64 form." >&2
+    exit 2
+fi
+
 MAX_AGE_HOURS="${MAX_AGE_HOURS:-30}"
 B2_PREFIX="${B2_PREFIX:-}"
 
@@ -125,6 +141,12 @@ EXIT_OK=0
 EXIT_ALERT=1
 EXIT_INSTRUMENT=2
 
+# The self-test deliberately drives the instrument-error path. Without this, every PASSING
+# run prints an alarming "rclone could not list ..." block from a fixture that is behaving
+# exactly as intended — and a check that cries wolf on success is a check people learn to
+# scroll past. The diagnostic is suppressed for the fixtures, never for a real scan.
+QUIET_ERRORS=false
+
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$1] ${*:2}" >&2; }
 
 # One machine-readable line. `status` is set explicitly on every path — it is never
@@ -144,11 +166,25 @@ scan() {
     # substitution fails IS a failing simple command and errexit fires AT THE ASSIGNMENT,
     # so the rc check below would be dead code on every failing path and an instrument
     # error would never be told apart from an absence. (Learned in deploy#563.)
-    bucket_listing="$(rclone lsf --recursive "$root" 2>/dev/null)" || rc=$?
+    # `--log-level NOTICE` is pinned, not incidental: it keeps rclone's verbosity at a
+    # level that carries the failure reason and nothing else. Without a diagnostic, rc alone
+    # cannot separate a 401 from a typo'd bucket from a network fault — and an error state
+    # that cannot say WHY it could not look is a diminished version of the third state this
+    # whole script is built around. The credential cannot reach this output: it travels via
+    # RCLONE_CONFIG_* env, never argv, and RCLONE_DUMP is refused above.
+    local err
+    err="$(mktemp)"
+    bucket_listing="$(rclone lsf --recursive --log-level NOTICE "$root" 2>"$err")" || rc=$?
     if [[ $rc -ne 0 ]]; then
+        if [[ "$QUIET_ERRORS" != "true" ]]; then
+            log ERROR "rclone could not list ${root} (rc=${rc}). Its stderr follows:"
+            sed 's/^/    /' "$err" >&2
+        fi
+        rm -f "$err"
         result instrument_error unreachable 0 -1 -1 -
         return $EXIT_INSTRUMENT
     fi
+    rm -f "$err"
     bucket_objects="$(printf '%s' "$bucket_listing" | grep -c . || true)"
 
     # --- 2. Scan the prefix we actually care about. -------------------------
@@ -157,11 +193,18 @@ scan() {
     local base="$root"
     [[ -n "$prefix" ]] && base="${root}/${prefix}"
     rc=0
-    listing="$(rclone lsf --recursive --format tsp --separator ';' "$base" 2>/dev/null)" || rc=$?
+    err="$(mktemp)"
+    listing="$(rclone lsf --recursive --format tsp --separator ';' --log-level NOTICE "$base" 2>"$err")" || rc=$?
     if [[ $rc -ne 0 ]]; then
+        if [[ "$QUIET_ERRORS" != "true" ]]; then
+            log ERROR "rclone could not list ${base} (rc=${rc}). Its stderr follows:"
+            sed 's/^/    /' "$err" >&2
+        fi
+        rm -f "$err"
         result instrument_error unreachable 0 -1 "$bucket_objects" -
         return $EXIT_INSTRUMENT
     fi
+    rm -f "$err"
 
     # --- 3. Classify. An empty listing is an ALERT, never an OK. ------------
     local newest_epoch=0 newest_path="-" dumps=0 undersized=0
@@ -235,6 +278,7 @@ scan() {
 # --------------------------------------------------------------------------
 self_test() {
     local tmp fails=0 out status rc
+    QUIET_ERRORS=true
     tmp="$(mktemp -d)"
     # shellcheck disable=SC2064  # expand $tmp now, deliberately
     trap "rm -rf '$tmp'" RETURN
@@ -337,6 +381,7 @@ self_test() {
     # this signal on the backend we actually run against.
     _expect instrument-error "${tmp}/no-such-bucket" "" instrument_error "$EXIT_INSTRUMENT"
 
+    QUIET_ERRORS=false
     if [[ "$fails" -ne 0 ]]; then
         log ERROR "self-test FAILED (${fails} case(s)). The scanner does not separate the"
         log ERROR "classes, so its verdict on the real bucket would mean nothing. Refusing"
