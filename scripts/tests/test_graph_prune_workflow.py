@@ -75,7 +75,7 @@ def _code_only(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 
-def test_completeness_binding_asserts_equality_against_the_manifest() -> None:
+def test_completeness_binding_asserts_equality_against_the_producer_tally() -> None:
     """The keep-set must equal what its producing run declared, or the prune must refuse.
 
     Without this the workflow deletes 83.9% of the graph on a short-but-valid parquet and
@@ -84,13 +84,13 @@ def test_completeness_binding_asserts_equality_against_the_manifest() -> None:
     from below, and would accept a larger parquet from the wrong generation.
     """
     code = _code_only(_ssh_script())
-    assert 'CANON_N}" -ne "${MF_CANON_IDS}' in code, (
+    assert 'CANON_N}" -ne "${PROV_CANON_IDS}' in code, (
         "the completeness binding must assert the canonical ids READ from the parquet "
-        "EQUAL the count the manifest declares; without that equality a truncated parquet "
+        "EQUAL the count RESOLVE declared in curated/_resolve_run.txt; without that "
         "is indistinguishable from a complete one"
     )
     # A floor would be a magnitude threshold wearing a provenance costume.
-    for floor in ('-lt "${MF_CANON_IDS}"', '-ge "${MF_CANON_IDS}"'):
+    for floor in ('-lt "${PROV_CANON_IDS}"', '-ge "${PROV_CANON_IDS}"'):
         assert floor not in code, (
             f"the binding must be equality, not a floor ({floor}) — a floor accepts any "
             "parquet at-or-above it, including a larger one from the wrong generation"
@@ -115,9 +115,17 @@ def test_manifest_is_required_so_the_workflow_is_inert_without_provenance() -> N
     """
     code = _code_only(_ssh_script())
     assert (
-        'verify_present "${B2_BASE}/curated" "narrators_canonical.parquet" "_manifest.txt"' in code
-    ), "the manifest must be in the REQUIRED B2 presence list, not pulled opportunistically"
-    assert '[ ! -s "${MANIFEST}" ]' in code, "an absent/empty manifest must be a hard refusal"
+        'verify_present "${B2_BASE}/curated" "narrators_canonical.parquet" '
+        '"_manifest.txt" "_resolve_run.txt"' in code
+    ), "BOTH provenance objects must be in the REQUIRED B2 presence list"
+    assert "bash scripts/verify_prune_provenance.sh" in code, (
+        "the provenance gate must be DELEGATED to the script — inline, it can only be "
+        "pinned by grepping this workflow's text, and a forged manifest passes that "
+        "(Weronika's mutation). The behavioural proof lives in test_prune_provenance.py."
+    )
+    assert 'if [ "${PROV_RC}" -ne 0 ]; then' in code, (
+        "a non-zero rc from the provenance gate must abort before any deletion"
+    )
 
 
 def test_operator_count_is_optional_and_cross_checked_when_supplied() -> None:
@@ -137,12 +145,13 @@ def test_operator_count_is_optional_and_cross_checked_when_supplied() -> None:
         "parquet being pruned against)"
     )
     code = _code_only(_ssh_script())
-    assert 'if [ -n "${EXPECTED_CANONICAL_IDS}" ]; then' in code, (
-        "the operator count must be skipped when left blank"
+    assert 'EXPECTED_CANONICAL_IDS="${EXPECTED_CANONICAL_IDS}"' in code, (
+        "the operator count must be passed through to the provenance gate"
     )
-    assert 'MF_CANON_IDS}" -ne "${EXPECTED_CANONICAL_IDS}' in code, (
-        "when supplied, the operator count must be cross-checked against the manifest"
-    )
+    # Its *behaviour* — skipped when blank, refused when it disagrees — is asserted by
+    # RUNNING the gate in test_prune_provenance.py, not by grepping this workflow. That is
+    # the whole lesson of Weronika's forged-manifest mutation: a guard pinned by substring
+    # is not pinned at all.
 
 
 def test_no_break_glass_input() -> None:
@@ -177,18 +186,46 @@ def test_no_break_glass_input() -> None:
     )
 
 
-def test_manifest_md5_verifies_the_bytes_we_pulled() -> None:
-    """Byte integrity is a SEPARATE property from completeness. Both are needed.
+def test_env_surface_is_allow_listed_too() -> None:
+    """The `env:` block is a bypass channel the INPUT allow-list cannot see (deploy#579).
 
-    The md5 catches a corrupt or truncated *transfer*. It does NOT catch a short *write* —
-    a short parquet has a perfectly good md5 of itself — which is what the count equality
-    is for. Neither substitutes for the other, and dropping either leaves a real door open.
+    A workflow-level `SKIP_PROVENANCE: ${{ vars.SKIP_PROVENANCE }}` leaves `set(inputs)`
+    untouched, so the input allow-list stays green while the guard is gutted. Allow-list the
+    env keys of the destructive step too.
+
+    Belt and braces: the gate's own behavioural suite proves no env var of ANY name can
+    unlock a provenance-less artifact (test_prune_provenance.py), because that property is
+    asserted where it lives — in the gate's behaviour — rather than in this file's grep.
     """
-    code = _code_only(_ssh_script())
-    assert 'GOT_MD5}" != "${MF_MD5}' in code, (
-        "the manifest md5 must be checked against the bytes actually pulled from B2"
+    doc = yaml.safe_load(WORKFLOW.read_text())
+    prune = next(s for s in doc["jobs"]["prune-narrators"]["steps"] if s.get("id") == "prune")
+    assert set(prune.get("env", {})) == {
+        "ENV_NAME",
+        "PARQUET_REF",
+        "EXPECTED_CANONICAL_IDS",
+        "DRY_RUN",
+        "IMAGE",
+        "PIPELINE_B2_KEY_ID",
+        "PIPELINE_B2_KEY",
+        "GITHUB_TOKEN",
+        "GITHUB_ACTOR",
+    }, (
+        f"unexpected env keys on the destructive step: {sorted(prune.get('env', {}))}. "
+        "Any NEW env var must be justified here — this is an allow-list precisely so a "
+        "bypass cannot arrive through a channel the input allow-list does not watch."
     )
-    assert "md5sum" in code, "the pulled parquet's md5 must actually be computed"
+
+    # And the `envs:` passlist is the actual TRANSPORT to the VPS: a var absent from it
+    # never reaches the gate at all, whatever the step env says. This is the structural
+    # complement to the gate's behavioural suite, and it is the one that matters, because
+    # a behavioural test can only try env names someone thought to write down — the exact
+    # deny-list weakness that let `bypass_completeness` through the first time. Set
+    # equality here needs nobody to have guessed the name.
+    passlist = [v.strip() for v in str(prune["with"]["envs"]).split(",") if v.strip()]
+    assert set(passlist) == set(prune["env"]), (
+        f"the ssh `envs:` passlist and the step `env:` block must name exactly the same "
+        f"vars; drift is a channel. envs={sorted(passlist)} env={sorted(prune['env'])}"
+    )
 
 
 def test_dry_run_fails_safe() -> None:
