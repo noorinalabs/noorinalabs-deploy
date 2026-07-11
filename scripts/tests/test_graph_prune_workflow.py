@@ -17,8 +17,18 @@ graph: at ``f=0.20`` of canonical rows retained it deletes **83.9%** of the grap
 proceeds, with ``missing=0``. The ceiling cannot be tightened either, because a legitimate
 full re-mint prune deletes 55.4% — the legitimate and catastrophic bands overlap.
 
-So the only thing that can separate them is provenance: the keep-set must match what its
-producing run declared it wrote (``curated/_manifest.txt``).
+So the only thing that can separate them is provenance: the keep-set must match a count
+declared *independently of the artifact*.
+
+**And the declared count this workflow can obtain today is only a partial floor.** The
+number a resolve run reports is a **read-back** of the parquet it just wrote
+(``src/resolve/__init__.py:344`` — the sole writer of ``canonical_narrator_count``), so it
+agrees with a short file. That catches a truncated *upload* and a wrong ``parquet_ref``
+whose count differs; it does **not** catch a partial write or a resolve stopped early,
+which are da#426's actual cases. The real fix is da#428: a count threaded from the
+producer's **in-memory tally before the write**, plus a run-completion assertion for
+"stopped early", which no count equality of any kind can see. These tests pin the guard
+that exists — they do not certify that the door is closed.
 
 These are cheap textual assertions running in the ``pytest (scripts)`` CI job. They are
 the only automated gate on this workflow's shell: actionlint does not shellcheck an
@@ -102,10 +112,29 @@ def test_declared_count_is_required_and_has_no_break_glass() -> None:
         "a default would let the operator skip the declaration without noticing"
     )
 
-    for name in inputs:
-        assert not any(
-            tok in name.lower() for tok in ("force", "override", "skip", "allow", "ignore")
-        ), f"workflow input '{name}' looks like a break-glass override on a destructive op"
+    # ALLOW-list, not a deny-list. The previous version of this test matched input names
+    # against ("force", "override", "skip", "allow", "ignore") — and Nino Kavtaradze
+    # defeated it in review by adding a real override input named `bypass_completeness`,
+    # which the suite passed. `unsafe_*`, `disable_*`, `emergency_*`, `no_verify` sail
+    # through it too.
+    #
+    # A deny-list of names can only ever catch the names someone thought of, so it is
+    # exactly the shape of guard this whole wave has been about: one that cannot see the
+    # thing it exists to catch, while reporting green. The input set here is small and
+    # stable, so enumerate it. Adding an input is then a deliberate act that has to come
+    # through this test — which is the point, because the input surface of a destructive
+    # workflow is precisely where a break-glass would appear.
+    assert set(inputs) == {
+        "env",
+        "parquet_ref",
+        "expected_canonical_ids",
+        "image",
+        "dry_run",
+    }, (
+        f"unexpected workflow_dispatch input set: {sorted(inputs)}. Any NEW input on a "
+        "destructive workflow must be justified here — this test is an allow-list "
+        "precisely so that a break-glass cannot arrive under a name nobody deny-listed."
+    )
 
 
 def test_manifest_when_present_must_agree_with_the_operator() -> None:

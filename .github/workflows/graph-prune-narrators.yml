@@ -81,16 +81,17 @@ on:
         type: string
       expected_canonical_ids:
         description: >-
-          REQUIRED. The number of distinct canonical narrator ids the resolve run
-          that produced this parquet_ref REPORTED writing. Take it from THAT RUN's
-          own output — never from the parquet you are about to prune against, which
-          would make this check circular and worthless. The prune refuses unless the
-          parquet yields exactly this many ids. This is the ONLY check here that is
-          not derived from the keep-set it validates: without it a truncated-but-
-          valid parquet deletes 83.9% of the graph with every other gate green
-          (da#426). Superseded automatically by curated/_manifest.txt once da#428
-          lands, which asserts the same equality from the producer instead of from
-          you.
+          REQUIRED. The count of distinct canonical narrator ids you expect this
+          parquet_ref to hold. The prune refuses unless the parquet yields exactly
+          this many. READ THE CAVEAT: today the count the resolve run prints
+          ("Canonical narrators : N") is itself a READ-BACK of the parquet it just
+          wrote (da src/resolve/__init__.py:344 — the sole writer of that field), so
+          it AGREES with a short file and cannot tell you the file is short. Until
+          da#428 threads the producer's in-memory tally through, this input catches a
+          truncated UPLOAD and a wrong parquet_ref whose count differs — but NOT a
+          partial write or a resolve stopped early. Supply the count you expect from
+          the corpus (e.g. the previous good run's), not a number you just read off
+          this artifact.
         required: true
         type: string
       image:
@@ -404,23 +405,50 @@ jobs:
             # the same thing.
             #
             # THE DECLARED COUNT. `expected_canonical_ids` is a REQUIRED workflow input,
-            # not an override — there is no break-glass, deliberately. An operator must
-            # state up front how many distinct canonical ids the producing RUN reported
-            # writing; the parquet must then yield exactly that many.
+            # not an override — there is no break-glass, deliberately. The parquet must
+            # yield exactly this many distinct canonical ids or the prune refuses.
             #
             # A declaration, not a threshold. A `--min-canonical-ids` FLOOR would not do:
             # a floor is still magnitude, only approached from below, and it accepts any
             # parquet at-or-above it — including a LARGER one from the wrong generation.
             # Only EQUALITY says "this is the whole keep-set, and it is this run's".
             #
-            # This is weaker than producer-signed provenance and is meant to be superseded
-            # by it (da#428). Its weakness is circularity: an operator who reads the number
-            # off the very parquet they are about to prune against has checked nothing, and
-            # the input's description says so in as many words. But it defends against every
-            # failure mode actually on the table — a resolve stopped early, a partial write,
-            # a truncated upload — because in each of those the run's reported count and the
-            # short parquet's count DISAGREE, and no gate derived from the parquet can see
-            # that disagreement.
+            # WHAT THIS ACTUALLY DEFENDS — 1 of the 3 short-parquet modes, not all 3.
+            # An earlier version of this comment claimed all three "DISAGREE" with the
+            # declared count. That was wrong, and the reason is worth stating precisely
+            # because it is also the spec for da#428.
+            #
+            # The count a resolve run REPORTS ("Canonical narrators : N") is not a tally.
+            # It is a read-back of the file the run just wrote:
+            #
+            #   src/resolve/__init__.py:344   table = pq.read_table(canonical_path)
+            #                                 metrics.canonical_narrator_count = table.num_rows
+            #
+            # That line is the SOLE writer of the field (default 0; a failed read leaves it
+            # at the default under a bare `except`). There is no independent tally anywhere
+            # in the pipeline, and publish_parquet.py emits no count at all. So:
+            #
+            #   truncated UPLOAD      -> CAUGHT. The file on disk was whole when resolve
+            #                            read it back, so the reported count is the whole
+            #                            count; the uploaded object is short; they disagree.
+            #                            (Once da#428 lands, the manifest md5 is the proper
+            #                            instrument for this — bytes, not counts.)
+            #   wrong parquet_ref     -> CAUGHT, when the other run's count differs.
+            #   partial WRITE         -> NOT CAUGHT. Metrics read back the short file.
+            #   resolve STOPPED EARLY -> NOT CAUGHT. Same: declared == actual == short,
+            #                            missing = 0, every derived gate green, and
+            #                            da#426's 83.9% deletion proceeds exactly as
+            #                            measured.
+            #
+            # The only count worth checking against is one the PRODUCER declares from its
+            # IN-MEMORY tally BEFORE the write — never a number re-read from the artifact
+            # afterwards, which agrees with whatever got written. That is da#428. And
+            # "stopped early" additionally needs a run-COMPLETION assertion, which no count
+            # equality of any kind can see: a run that halts after writing a coherent
+            # partial file is internally consistent by construction.
+            #
+            # So this input is a real but PARTIAL floor. It is not a substitute for da#428,
+            # and this comment must not be read as one.
             case "${EXPECTED_CANONICAL_IDS}" in
               ''|*[!0-9]*)
                 echo "ERROR: [${ENV_NAME}] expected_canonical_ids='${EXPECTED_CANONICAL_IDS}' is not a non-negative integer. It must be the count of distinct canonical ids the resolve run REPORTED writing." >&2
