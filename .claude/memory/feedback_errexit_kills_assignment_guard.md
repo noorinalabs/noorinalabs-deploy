@@ -69,4 +69,47 @@ invocation form than production.
 remediation text reaches stdout.** Prove it red against the unfixed tree first. Same family
 as [[feedback_silent_zero_is_not_a_measurement]]: a check that cannot fail is a decoration.
 
-Related: [[reference_b2_preflight_discriminator]].
+## RECURRED, 2026-07-11 (deploy#584) — and this memory did not stop it
+
+Same bug, same repo, two days later, in `restore.sh`:
+
+```bash
+set -euo pipefail
+RESTORE_RUN_TS="$(… | grep '^BACKUP_MANIFEST ' | tr … | sed …)"   # <-- dies HERE
+```
+
+On an artifact with **no manifest**, `grep` matches nothing → under `pipefail` the whole
+pipeline fails → the bare assignment is a failing simple command → **errexit kills
+`restore.sh`**. The recovery path died on exactly the artifacts its own fallback branch
+existed to serve. Fix: end the pipeline in `|| true`.
+
+**The author had read this file and quoted it in the sibling script's comments an hour
+earlier.** Knowing the rule did not help, because the *shape* looked different: #563 was
+`OUT="$(fn)"; RC=$?` (a guard reading an rc); #584 was a plain `VAR="$(pipeline)"` (just
+parsing a string). **There is no rc in sight, so the rule doesn't pattern-match.** The
+generalisation to hold instead:
+
+> **Under `set -e` + `pipefail`, ANY `VAR="$(…)"` whose command substitution can legitimately
+> produce NO OUTPUT is a crash, not an empty string.** `grep`, `sed -n`, `find … | head`,
+> `jq -e` — a no-match is a *normal, expected* outcome and a *non-zero* exit. Every such
+> assignment needs `|| true` (or a condition context). Ask of each one: **"what is the exit
+> status when this legitimately finds nothing?"**
+
+### The harness table, again — and it is the same three rows
+
+Every unit test passed. `_select()` ran the shipped block under `set -uo pipefail` —
+**errexit omitted**, exactly the row already in the table above. The harness ran production
+code under a *weaker shell mode than production*, so the one option that breaks the code was
+the one option missing.
+
+> **A harness that runs production code under a weaker shell mode is not running production
+> code.** Copy the script's own `set -…` line into the harness verbatim; never retype a
+> subset.
+
+It was caught by the **restore rehearsal** — the end-to-end job that runs the real script
+against a real stack, which went red on all four cases *including the intact-artifact
+positive control*. That is the argument for keeping an expensive end-to-end rehearsal even
+when the unit suite is green: it is the only harness that is not a paraphrase.
+
+Related: [[reference_b2_preflight_discriminator]], [[feedback_passing_repro_masks_bug]],
+[[feedback_calibrate_the_mutation_before_counting_it]].
