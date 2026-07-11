@@ -443,16 +443,48 @@ jobs:
             RC=0
             # shellcheck disable=SC2086  # LOAD_ARGS is an intentional arg split.
             ${COMPOSE_LOAD} run --rm --no-deps graph-load ${LOAD_ARGS} || RC=$?
-            if [ "${RC}" -ne 0 ]; then
-              echo "ERROR: [${ENV_NAME}] batch load '${LOAD_ARGS}' failed (rc=${RC})." >&2
-              exit "${RC}"
-            fi
+
+            # --- classify the loader rc against da's exit-code contract ---
+            # NOT every non-zero rc is a failed load (deploy#569/#570). The loader
+            # (da src/exit_codes.py, da#372/#384) has a rich exit space:
+            #   * rc=5 VALIDATION_FINDINGS — the load COMMITTED; post-load
+            #     validation merely reported data-quality findings. The graph IS
+            #     written, so we MUST still run the read-back below and surface the
+            #     findings as a WARNING — not report a failure and hide the
+            #     read-back, which is exactly the bug #569/#570 fix.
+            #   * rc=1 LOAD_FAILED / rc=8 DB_UNREACHABLE (nothing committed),
+            #     rc=6 REFUSED_ROWS (malformed-id / partial-graph data loss), or
+            #     any other non-zero — a TRUE failure: fail the job AND skip the
+            #     read-back.
+            # The rc->decision mapping is a single source of truth in
+            # scripts/classify_load_rc.sh (unit-tested in scripts/tests/), not
+            # re-encoded inline here. It runs from the /opt/noorinalabs-deploy
+            # checkout git-reset above, so the file is present. It always exits 0
+            # on a real rc; the DECISION is the stdout token.
+            LOAD_DECISION="$(sh scripts/classify_load_rc.sh "${RC}")"
+            case "${LOAD_DECISION}" in
+              FAILURE)
+                echo "ERROR: [${ENV_NAME}] batch load '${LOAD_ARGS}' FAILED (loader rc=${RC}) — no acceptable graph was committed; skipping read-back. See the da repo src/exit_codes.py for what rc=${RC} means." >&2
+                exit "${RC}"
+                ;;
+              FINDINGS)
+                echo "WARNING: [${ENV_NAME}] batch load '${LOAD_ARGS}' COMMITTED WITH FINDINGS (loader rc=${RC}, VALIDATION_FINDINGS): the graph WAS written, but post-load validation reported findings — review the loader log above. Proceeding to the read-back; NOT failing the job." >&2
+                ;;
+              SUCCESS)
+                : # clean committed load — proceed to read-back
+                ;;
+              *)
+                echo "ERROR: [${ENV_NAME}] internal: classify_load_rc.sh returned unexpected decision '${LOAD_DECISION}' for rc=${RC}; failing closed." >&2
+                exit 1
+                ;;
+            esac
 
             # --- post-load read-back (informational): source_corpus distribution.
+            #     Reached for any COMMITTED load — rc=0 (clean) OR rc=5 (findings).
             #     cypher-shell runs INSIDE the live neo4j container and reads the
             #     password from that container's OWN NEO4J_AUTH — never on our
             #     argv, never over the GH transport. Non-fatal: the load already
-            #     succeeded above; this is a sanity echo, not a gate. The trailing
+            #     committed above; this is a sanity echo, not a gate. The trailing
             #     `|| echo …` keeps it non-fatal under `set -e` too — the exec is
             #     the left arm of an OR list, which `-e` does not act on, and the
             #     echo makes the list succeed. Do not drop that arm. ---
@@ -461,7 +493,7 @@ jobs:
               'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "MATCH (h:Hadith) RETURN h.source_corpus AS source_corpus, count(*) AS hadiths ORDER BY hadiths DESC"' \
               || echo "    WARNING: [${ENV_NAME}] post-load read-back query failed (non-fatal)." >&2
 
-            echo "==> [${ENV_NAME}] batch load '${LOAD_ARGS}' complete (rc=0)."
+            echo "==> [${ENV_NAME}] batch load '${LOAD_ARGS}' complete — graph committed (loader rc=${RC})."
 
       - name: Report
         if: always()
