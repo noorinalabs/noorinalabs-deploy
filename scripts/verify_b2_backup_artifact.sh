@@ -217,27 +217,42 @@ scan() {
     fi
     rm -f "$err"
 
-    # --- 3. Group by BACKUP DIRECTORY, and ask each one whether it is complete.
+    # --- 3. Group by RUN, and ask each RUN whether it is restorable.
     #
-    # "At least one dump, over the floor, recent" is NOT what this PR claims to assert. It
+    # "At least one dump, over the floor, recent" is NOT what this script claims to assert. It
     # is "a RESTORABLE object exists". Those came apart badly (deploy#584 review, Nurul
-    # Hakim): a bucket holding only `isnad-pg` — no user-postgres, no Neo4j — WITH a
-    # `_backup_manifest.txt` explicitly saying `complete=false` was reported `fresh`.
+    # Hakim): a bucket holding only `isnad-pg` — no user-postgres, no Neo4j — WITH a manifest
+    # explicitly saying `complete=false` was reported `fresh`. `restore.sh`'s required-store
+    # gate REFUSES that artifact outright, so the one check that looks inside the bucket was
+    # certifying a backup our own restore path declines to restore — and the attestation was
+    # sitting right there, in the bucket, saying so.
     #
-    # `restore.sh`'s required-store gate REFUSES that artifact outright. So the one check
-    # that looks inside the bucket was certifying a backup our own restore path declines to
-    # restore — and the attestation was sitting right there, in the bucket, saying so.
+    # ---------------------------------------------------------------------------
+    # THE UNIT IS THE RUN, NOT THE DIRECTORY. (deploy#587)
+    # ---------------------------------------------------------------------------
+    # This grouped by DIRECTORY and read ONE fixed-name `_backup_manifest.txt` from each. But a
+    # directory is a DAY (`<category>/<DATE>`) and the dumps in it are RUNS
+    # (`isnad-<store>-<TS>`). `rclone copy` ADDS and never deletes, and backup.sh deliberately
+    # uploads partials — so a day holds SEVERAL runs, and the fixed-name manifest was
+    # OVERWRITTEN BY WHICHEVER RUN UPLOADED LAST.
     #
-    # And backup.sh MANUFACTURES these by design: it deliberately uploads a partial when a
-    # leg fails ("a partial backup beats none"). This is not a hypothetical artifact.
+    # A good 03:01 run followed by a partial 08:00 retry therefore lost its attestation, and
+    # this scanner reported `status=incomplete reason=no_complete_backup` OVER A BUCKET
+    # CONTAINING A COMPLETE BACKUP. A red alert saying there is no complete backup, when there
+    # is one — the same shape as the confident lie the `manifest_unreadable` fix condemns,
+    # reached by a third route.
     #
-    # So this now mirrors restore.sh's resolve_latest(): walk the backup directories
-    # newest-first and take the first one that ATTESTS its own completeness. Same
-    # `_backup_manifest.txt`, same `complete=true` predicate. If the consumer would refuse
-    # it, this must not call it fresh.
-    local -A dir_newest=() dir_dumps=() dir_undersized=() dir_files=()
-    local line ts size path epoch dir
-    local undersized_total=0
+    # backup.sh now writes `_backup_manifest-<TS>.txt`, one per run, never overwritten. So we
+    # enumerate the RUNS and take the newest one that BOTH attests `complete=true` AND whose
+    # dumps all arrived. Two instruments, at the granularity completeness actually has.
+    #
+    # A dump that ARRIVED but is UNATTESTED is never selectable — candidates come from the
+    # MANIFESTS, not from the dumps. Accepting "all three dumps happen to be present" in place
+    # of an attestation would drop the producer's word entirely and reintroduce exactly what
+    # deploy#584 closed.
+    local -A run_newest=() run_dumps=() run_files=() run_under=() dir_manifests=()
+    local line ts size path epoch dir bn rts key
+    local undersized_total=0 sized_total=0
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -245,10 +260,6 @@ scan() {
         line="${line#*;}"
         size="${line%%;*}"
         path="${line#*;}"
-        case "$path" in
-            *.dump | *.dump.zst) ;;
-            *) continue ;;
-        esac
 
         # ROOT_KEY, not "". **Bash associative arrays cannot take an empty subscript** —
         # `declare -A a; a[""]=1` is `bad array subscript`, a hard error. So a dump at the
@@ -265,34 +276,70 @@ scan() {
         # founding invariant is "an instrument failure is NOT a claim about your data"
         # terminated without a claim, with a failing exit code. It is the purest form of the
         # collapse this whole file exists to prevent.
-        #
-        # The empty string was doing double duty as "the root" AND as "nothing selected" (see
-        # `-z "$chosen"` below) — so even without the crash, a root-level backup would have
-        # reported `no_complete_backup`. One sentinel closes both.
         dir="$(dirname "$path")"
-        [[ "$dir" == "." ]] && dir="$ROOT_KEY"
+        if [[ "$dir" == "." ]]; then
+            dir="$ROOT_KEY"
+        fi
+        bn="$(basename "$path")"
 
-        # A ZERO-BYTE dump lists non-empty and restores nothing — the same sentence as the
-        # checksum-only bucket above, one level in. `pg_dump` failing after the shell has
-        # created the target leaves exactly this, and it uploads cleanly.
-        if [[ "${size:-0}" -lt "$MIN_DUMP_BYTES" ]]; then
-            undersized_total=$((undersized_total + 1))
-            dir_undersized["$dir"]=$(( ${dir_undersized["$dir"]:-0} + 1 ))
+        # A PER-RUN MANIFEST. This is a candidate RUN, not a dump.
+        #
+        # `_backup_manifest-` is OUR OWN literal prefix and the run id's shape is strict, so
+        # both halves of this pattern are tokens we control — nothing here paraphrases a name
+        # another component may rename (deploy#589).
+        if [[ "$bn" == _backup_manifest-*.txt ]]; then
+            rts="$(printf '%s' "$bn" | sed -n 's/^_backup_manifest-\([0-9]\{8\}-[0-9]\{6\}\)\.txt$/\1/p')"
+            if [[ -n "$rts" ]]; then
+                dir_manifests["$dir"]="${dir_manifests["$dir"]:-} ${rts}"
+            fi
             continue
         fi
 
-        dir_dumps["$dir"]=$(( ${dir_dumps["$dir"]:-0} + 1 ))
+        case "$path" in
+            *.dump | *.dump.zst) ;;
+            *) continue ;;
+        esac
+
+        # WHICH RUN DOES THIS DUMP BELONG TO? ANCHOR ON THE RUN ID; DO NOT PARSE THE STORE
+        # NAME (deploy#589). Matching the store segment as `[a-z0-9]+` cannot contain a hyphen,
+        # so renaming `userpg` to `user-pg` in the producer would not BREAK this parser — it
+        # would QUIETLY NARROW it, and the dump would become invisible to the arrival check
+        # while every test stayed green. The run id's format is strict and self-delimiting;
+        # the store segment is `.*` and its name is irrelevant here.
+        rts="$(printf '%s' "$bn" | sed -n 's/^isnad-.*-\([0-9]\{8\}-[0-9]\{6\}\)\.dump\(\.zst\)\{0,1\}$/\1/p')"
+        key="${dir}|${rts}"
+
+        # A ZERO-BYTE dump lists non-empty and restores nothing — the same sentence as the
+        # checksum-only bucket above, one level in. `pg_dump` failing after the shell has
+        # created the target leaves exactly this, and it uploads cleanly. Tracked PER RUN, so
+        # a corrupt dump is charged to the run that produced it and not to its neighbours.
+        if [[ "${size:-0}" -lt "$MIN_DUMP_BYTES" ]]; then
+            undersized_total=$((undersized_total + 1))
+            if [[ -n "$rts" ]]; then
+                run_under["$key"]=$(( ${run_under["$key"]:-0} + 1 ))
+            fi
+            continue
+        fi
+
+        sized_total=$((sized_total + 1))
+        # A sized dump we cannot attribute to any run. It counts as a dump (so the bucket is
+        # not "absent"), but it can never satisfy a run's arrival check.
+        if [[ -z "$rts" ]]; then
+            continue
+        fi
+
+        run_dumps["$key"]=$(( ${run_dumps["$key"]:-0} + 1 ))
         # The NAMES, not just the count. The count cannot answer "is user-postgres here?" —
         # and that is the only question that matters to a restore.
-        dir_files["$dir"]="${dir_files["$dir"]:-} $(basename "$path")"
+        run_files["$key"]="${run_files["$key"]:-} ${bn}"
         epoch="$(date -u -d "$ts" +%s 2>/dev/null || echo 0)"
-        if [[ "$epoch" -gt "${dir_newest["$dir"]:-0}" ]]; then
-            dir_newest["$dir"]="$epoch"
+        if [[ "$epoch" -gt "${run_newest["$key"]:-0}" ]]; then
+            run_newest["$key"]="$epoch"
         fi
     done <<< "$listing"
 
     # Nothing restorable anywhere.
-    if [[ ${#dir_newest[@]} -eq 0 ]]; then
+    if [[ "$sized_total" -eq 0 ]]; then
         if [[ "$undersized_total" -gt 0 ]]; then
             result absent undersized_dumps 0 -1 "$bucket_objects" "$undersized_total" -
         else
@@ -301,18 +348,45 @@ scan() {
         return $EXIT_ALERT
     fi
 
-    # Newest-first, exactly as resolve_latest walks them.
+    # The RUNS, newest first — across every directory, exactly as resolve_latest walks them.
+    #
+    # Ordered by the run's OWN newest dump mtime, NOT by the directory's. Using the directory's
+    # would let a later partial run's fresh dumps lend their freshness to the older good run we
+    # actually select — a stale backup reading `fresh`, which is the deflating direction and
+    # the dangerous one. Ties break on the run id, so the later run of a same-mtime pair (the
+    # fixture case, and any two runs uploaded within the same second) is still considered first.
     local -a ordered=()
-    while IFS= read -r dir; do ordered+=("$dir"); done < <(
-        for dir in "${!dir_newest[@]}"; do
-            printf '%s\t%s\n' "${dir_newest["$dir"]}" "$dir"
-        done | sort -rn | cut -f2-
+    while IFS= read -r key; do
+        [[ -n "$key" ]] && ordered+=("$key")
+    done < <(
+        for dir in "${!dir_manifests[@]}"; do
+            # Deliberate word-splitting: the value is a space-separated list of run ids.
+            # shellcheck disable=SC2086
+            for rts in ${dir_manifests["$dir"]}; do
+                printf '%s\t%s\t%s|%s\n' "${run_newest["${dir}|${rts}"]:-0}" "$rts" "$dir" "$rts"
+            done
+        done | sort -k1,1rn -k2,2r | cut -f3-
     )
 
-    local skipped=0 chosen="" chosen_epoch=0
-    for dir in "${ordered[@]}"; do
+    # A run that ATTESTS complete but did NOT fully arrive is a real fault — but it is not, by
+    # itself, an ALERT. If an older run is complete and intact, then a restorable backup DOES
+    # exist and `restore.sh latest` will find it; saying "no complete backup" would be the
+    # false alarm this whole issue is about. So we SKIP it, keep looking, and say so LOUDLY.
+    # If nothing else qualifies, its specific reason becomes the verdict.
+    #
+    # This is what keeps the scanner and `restore.sh` answering the SAME QUESTION. They must
+    # agree: a bucket the restore path can restore from must not be reported as an alert here,
+    # and one it would refuse must never be reported fresh.
+    local skipped=0 chosen="" chosen_ts="" chosen_epoch=0 chosen_dumps=0
+    local torn_count=0 torn_dir="" torn_reason="" torn_dumps=0
+    local key rts
+    for key in "${ordered[@]}"; do
+        dir="${key%|*}"
+        rts="${key##*|}"
         local mpath="${base}"
-        [[ "$dir" != "$ROOT_KEY" ]] && mpath="${base}/${dir}"
+        if [[ "$dir" != "$ROOT_KEY" ]]; then
+            mpath="${base}/${dir}"
+        fi
 
         # --- "I COULD NOT READ IT" IS NOT "IT DOES NOT ATTEST". ------------------
         #
@@ -341,15 +415,15 @@ scan() {
         # anything else => we could not look, and we must say so.
         local manifest mrc=0 merr
         merr="$(mktemp)"
-        manifest="$(rclone cat --log-level NOTICE "${mpath}/_backup_manifest.txt" 2>"$merr")" || mrc=$?
+        manifest="$(rclone cat --log-level NOTICE "${mpath}/_backup_manifest-${rts}.txt" 2>"$merr")" || mrc=$?
         if [[ "$mrc" -ne 0 && "$mrc" -ne 3 ]]; then
             if [[ "$QUIET_ERRORS" != "true" ]]; then
-                log ERROR "rclone could not READ the manifest at ${mpath} (rc=${mrc}). Its stderr follows:"
+                log ERROR "rclone could not READ the manifest for run ${rts} at ${mpath} (rc=${mrc}). Its stderr follows:"
                 sed 's/^/    /' "$merr" >&2
                 log ERROR "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look."
             fi
             rm -f "$merr"
-            result instrument_error manifest_unreadable "${dir_dumps["$dir"]}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
+            result instrument_error manifest_unreadable "${run_dumps["$key"]:-0}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
             return $EXIT_INSTRUMENT
         fi
         rm -f "$merr"
@@ -372,15 +446,41 @@ scan() {
             continue
         fi
 
-        # It attests complete — but attestation is the PRODUCER's word about what it wrote,
-        # not about what survived. A complete-attested directory holding a zero-byte dump is
-        # corrupt, and `complete=true` cannot see that. Both checks are needed.
-        if [[ "${dir_undersized["$dir"]:-0}" -gt 0 ]]; then
-            result incomplete undersized_dumps "${dir_dumps["$dir"]}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
-            return $EXIT_ALERT
+        # THE MANIFEST MUST BE ABOUT THE RUN IT IS NAMED FOR.
+        #
+        # The whole fix rests on the FILENAME's run id identifying the run. If the manifest's
+        # own `timestamp=` field disagrees with the name it is filed under, then binding the
+        # dumps of run X to an attestation about run Y is exactly the mis-binding this change
+        # exists to prevent — so refuse to use it. Cheap to check, and it fails closed.
+        local run_ts
+        run_ts="$(printf '%s\n' "$manifest" | grep '^BACKUP_MANIFEST ' | tr ' ' '\n' \
+            | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1)"
+        if [[ "$run_ts" != "$rts" ]]; then
+            log WARNING "manifest _backup_manifest-${rts}.txt declares timestamp=${run_ts:-<none>} — it does not attest the run it is named for."
+            torn_count=$((torn_count + 1))
+            if [[ -z "$torn_dir" ]]; then
+                torn_dir="$dir"
+                torn_reason="manifest_ts_mismatch"
+                torn_dumps="${run_dumps["$key"]:-0}"
+            fi
+            continue
         fi
 
-        # --- THE REQUIRED-STORE GATE, bound to the ATTESTED RUN. ----------------
+        # It attests complete — but attestation is the PRODUCER's word about what it WROTE,
+        # not about what SURVIVED. A complete-attested run holding a zero-byte dump is corrupt,
+        # and `complete=true` cannot see that. Both instruments are needed.
+        if [[ "${run_under["$key"]:-0}" -gt 0 ]]; then
+            log WARNING "run ${rts} in ${dir} attests complete=true but carries an UNDERSIZED dump — not restorable."
+            torn_count=$((torn_count + 1))
+            if [[ -z "$torn_dir" ]]; then
+                torn_dir="$dir"
+                torn_reason="undersized_dumps"
+                torn_dumps="${run_dumps["$key"]:-0}"
+            fi
+            continue
+        fi
+
+        # --- THE REQUIRED-STORE GATE, bound to THIS RUN. ------------------------
         #
         # `complete=true` is the producer's account of what it DUMPED. It says nothing about
         # what UPLOADED. backup.sh writes the manifest locally and then `rclone copy`s the
@@ -388,73 +488,87 @@ scan() {
         # `complete=true` sitting above a half-finished upload. The previous version of this
         # scanner reported that `fresh` (deploy#584: proven — `status=fresh dumps=1` over a
         # bucket with no user-postgres and no Neo4j, which restore.sh exits 1 on). Checking
-        # the attestation is not the same as checking the artifact, and I had only done the
-        # first while the comment above claimed the second.
+        # the attestation is not the same as checking the artifact.
         #
-        # Bind to the RUN, not merely to the store names. The manifest declares
-        # `timestamp=<TS>`, and every dump of that run is named `isnad-<store>-<TS>.*`. So the
-        # producer names the run and the consumer verifies THAT RUN arrived intact. Store
-        # names alone would be satisfied by a stale dump left behind by an earlier failed run
-        # in the same day-directory — B2 accumulates those, because `rclone copy` adds and
-        # never deletes, while the fixed-name manifest is overwritten by whichever ran last.
+        # The arrival test is scoped to THIS RUN's own files (`run_files`), not to the
+        # directory's. A day-directory accumulates runs, so a check that asked only "is there
+        # an isnad-pg somewhere in here?" would be satisfied by a dump left behind by a
+        # DIFFERENT, failed run — and that is precisely how a torn restore gets certified.
         #
         # THE REQUIRED SET IS THIS SCRIPT'S OWN, deliberately NOT read from the manifest's
         # `stores=` field — the same reasoning restore.sh states for REQUIRED_STORES. A set
         # taken from the artifact lets a partial backup declare itself
         # complete-for-what-it-happens-to-hold: perfect circularity, and invisible.
-        local run_ts
-        run_ts="$(printf '%s\n' "$manifest" | grep '^BACKUP_MANIFEST ' | tr ' ' '\n' \
-            | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1)"
-        if [[ -z "$run_ts" ]]; then
-            # backup.sh always writes it. Absent ⇒ not a manifest we know how to verify.
-            result incomplete manifest_no_timestamp "${dir_dumps["$dir"]}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
-            return $EXIT_ALERT
-        fi
-
-        local have=" ${dir_files["$dir"]:-} " missing=""
-        [[ "$have" == *" isnad-pg-${run_ts}.dump "* ]]      || missing="${missing},isnad-pg"
-        [[ "$have" == *" isnad-userpg-${run_ts}.dump "* ]]  || missing="${missing},isnad-userpg"
-        [[ "$have" == *" isnad-neo4j-${run_ts}.dump.zst "* || "$have" == *" isnad-neo4j-${run_ts}.dump "* ]] \
+        local have=" ${run_files["$key"]:-} " missing=""
+        [[ "$have" == *" isnad-pg-${rts}.dump "* ]]      || missing="${missing},isnad-pg"
+        [[ "$have" == *" isnad-userpg-${rts}.dump "* ]]  || missing="${missing},isnad-userpg"
+        [[ "$have" == *" isnad-neo4j-${rts}.dump.zst "* || "$have" == *" isnad-neo4j-${rts}.dump "* ]] \
             || missing="${missing},isnad-neo4j"
         if [[ -n "$missing" ]]; then
-            log ERROR "attested run ${run_ts} is missing required store(s): ${missing#,}"
-            log ERROR "  restore.sh REFUSES this artifact — it must not be reported fresh."
-            result incomplete "missing_stores${missing}" "${dir_dumps["$dir"]}" -1 "$bucket_objects" "$undersized_total" "${dir:-/}"
-            return $EXIT_ALERT
+            log WARNING "attested run ${rts} in ${dir} is missing required store(s): ${missing#,}"
+            log WARNING "  restore.sh REFUSES this run — it must not be reported fresh."
+            torn_count=$((torn_count + 1))
+            if [[ -z "$torn_dir" ]]; then
+                torn_dir="$dir"
+                torn_reason="missing_stores${missing}"
+                torn_dumps="${run_dumps["$key"]:-0}"
+            fi
+            continue
         fi
 
         chosen="$dir"
-        chosen_epoch="${dir_newest["$dir"]}"
+        chosen_ts="$rts"
+        # The CHOSEN RUN's own newest dump — never the directory's. See the ordering note above:
+        # a later partial run in the same day would otherwise lend its freshness to the older
+        # run we actually selected, and a stale backup would read `fresh`.
+        chosen_epoch="${run_newest["$key"]:-0}"
+        chosen_dumps="${run_dumps["$key"]:-0}"
         break
     done
 
-    if [[ -z "$chosen" && "$chosen_epoch" -eq 0 ]]; then
-        # Dumps exist, but not one backup directory attests completeness.
+    if [[ -z "$chosen" ]]; then
+        # An ATTESTED run that did not ARRIVE is the most specific thing we can say, so it
+        # outranks the generic verdict. This is the deploy#584 diagnosis, preserved: the
+        # operator is told WHICH store is missing, not merely that nothing qualified.
+        if [[ "$torn_count" -gt 0 ]]; then
+            result incomplete "$torn_reason" "$torn_dumps" -1 "$bucket_objects" "$undersized_total" "${torn_dir:-/}"
+            return $EXIT_ALERT
+        fi
+        # Dumps exist, but not one RUN attests completeness.
         result incomplete no_complete_backup 0 -1 "$bucket_objects" "$undersized_total" -
         return $EXIT_ALERT
     fi
 
-    [[ "$skipped" -gt 0 ]] && log WARNING "skipped ${skipped} backup director(ies) that do not attest complete=true"
+    # We found a restorable run — but a torn one existed too, and that is still a fault. It is
+    # NOT an alert (an older run is restorable, and restore.sh will find it), but it must not be
+    # silent: an upload that landed its attestation and not its dumps will keep happening.
+    if [[ "$torn_count" -gt 0 ]]; then
+        log WARNING "${torn_count} run(s) attest complete=true but did NOT fully arrive (see above)."
+        log WARNING "  An older run IS restorable, so this is not an ALERT — but the torn upload is real."
+    fi
+    if [[ "$skipped" -gt 0 ]]; then
+        log WARNING "skipped ${skipped} run(s) that do not attest complete=true"
+    fi
 
-    local now delta age_h dumps
-    dumps="${dir_dumps["$chosen"]}"
+    local now delta age_h
     now="$(date -u +%s)"
     delta=$(( now - chosen_epoch ))
+    log INFO "selected run ${chosen_ts} in ${chosen} (${chosen_dumps} dump(s))"
 
     # --- 4. A FUTURE timestamp is a broken clock, not a fresh backup. -------
     if [[ "$delta" -lt $(( -FUTURE_TOLERANCE_SECONDS )) ]]; then
-        result instrument_error future_timestamp "$dumps" $(( delta / 3600 )) "$bucket_objects" "$undersized_total" "${chosen:-/}"
+        result instrument_error future_timestamp "$chosen_dumps" $(( delta / 3600 )) "$bucket_objects" "$undersized_total" "${chosen:-/}"
         return $EXIT_INSTRUMENT
     fi
 
     age_h=$(( delta / 3600 ))
 
     if [[ "$age_h" -gt "$MAX_AGE_HOURS" ]]; then
-        result stale too_old "$dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
+        result stale too_old "$chosen_dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
         return $EXIT_ALERT
     fi
 
-    result fresh - "$dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
+    result fresh - "$chosen_dumps" "$age_h" "$bucket_objects" "$undersized_total" "${chosen:-/}"
     return $EXIT_OK
 }
 
@@ -521,6 +635,9 @@ self_test() {
     # user-postgres dump never uploaded", and the scanner was never asked. A fixture that
     # paraphrases the producer's format tests the paraphrase.
     RUN_TS=20260711-030100
+    # A LATER run on the SAME DAY. The day-directory accumulates, so this is what a retry after
+    # a failed nightly leaves beside the run that already succeeded (deploy#587).
+    LATE_TS=20260711-080000
     _mkbackup() { # <dir> <complete> [dump-bytes] [run-ts]
         local d="$1" complete="$2" bytes="${3:-$(( MIN_DUMP_BYTES * 2 ))}" ts="${4:-$RUN_TS}"
         mkdir -p "$d"
@@ -528,7 +645,17 @@ self_test() {
         head -c "$bytes" /dev/zero > "${d}/isnad-userpg-${ts}.dump"
         head -c "$bytes" /dev/zero > "${d}/isnad-neo4j-${ts}.dump.zst"
         printf 'BACKUP_MANIFEST complete=%s stores=postgres,user-postgres,neo4j timestamp=%s category=daily\n' \
-            "$complete" "$ts" > "${d}/_backup_manifest.txt"
+            "$complete" "$ts" > "${d}/_backup_manifest-${ts}.txt"
+    }
+    # A PARTIAL run: the isnad pg dump made it, user-postgres and Neo4j did not. backup.sh
+    # produces exactly this BY DESIGN ("a partial backup beats none") and uploads it into the
+    # SAME day-directory as the good run. Its manifest no longer overwrites the good run's.
+    _mkpartial() { # <dir> [run-ts]
+        local d="$1" ts="${2:-$LATE_TS}"
+        mkdir -p "$d"
+        head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero > "${d}/isnad-pg-${ts}.dump"
+        printf 'BACKUP_MANIFEST complete=false stores=postgres timestamp=%s category=daily\n' \
+            "$ts" > "${d}/_backup_manifest-${ts}.txt"
     }
     # Age is a property of the RUN, not of one file: `newest` is the max mtime in the
     # directory, so ageing a single dump while its siblings stay fresh does not age the
@@ -570,6 +697,49 @@ self_test() {
     _mkbackup "${tmp}/incomplete/daily/2026-07-11" false
     _expect incomplete-manifest "${tmp}/incomplete" "" incomplete "$EXIT_ALERT"
 
+    # -----------------------------------------------------------------------------------
+    # deploy#587 — A GOOD RUN FOLLOWED BY A PARTIAL ONE, IN THE SAME DAY-DIRECTORY.
+    #
+    # THE DEFECT THIS CHANGE EXISTS TO CLOSE. The 03:01 nightly succeeds completely; an 08:00
+    # retry fails halfway and uploads its `complete=false` manifest. With a FIXED-NAME manifest
+    # the partial one overwrote the good one, and this scanner reported
+    #
+    #     status=incomplete reason=no_complete_backup ... bucket_objects=7
+    #
+    # — a red alert saying THERE IS NO COMPLETE BACKUP, over a bucket containing one.
+    #
+    # Both orderings are here, and they are NOT the same test. Only the good-then-partial one
+    # reproduces #587; partial-then-good is the ordering deploy#584 already handled, and it is
+    # here so that fixing the first cannot regress the second.
+    _mkbackup "${tmp}/good_then_partial/daily/2026-07-11" true
+    _mkpartial "${tmp}/good_then_partial/daily/2026-07-11"
+    _expect good-run-then-partial-run "${tmp}/good_then_partial" "" fresh "$EXIT_OK" 1
+
+    _mkpartial "${tmp}/partial_then_good/daily/2026-07-11" 20260711-020000
+    _mkbackup "${tmp}/partial_then_good/daily/2026-07-11" true
+    _expect partial-run-then-good-run "${tmp}/partial_then_good" "" fresh "$EXIT_OK" 1
+
+    # THE GOOD RUN IS NEITHER FIRST NOR LAST. A selection that took the newest manifest, or the
+    # oldest, or "the only one", passes both fixtures above and fails this one.
+    _mkpartial "${tmp}/three_runs/daily/2026-07-11" 20260711-020000
+    _mkbackup "${tmp}/three_runs/daily/2026-07-11" true
+    _mkpartial "${tmp}/three_runs/daily/2026-07-11" 20260711-080000
+    _expect three-runs-good-in-the-middle "${tmp}/three_runs" "" fresh "$EXIT_OK" 1
+
+    # A DAY WITH ZERO MANIFESTS — the enumeration LEGITIMATELY MATCHES NOTHING.
+    #
+    # Under `set -euo pipefail` this is the shape that CRASHES rather than returning empty. The
+    # scanner must return a VERDICT here, not die: a crash prints no claim and exits non-zero,
+    # and every consumer reads a non-zero exit as a verdict about the backups.
+    mkdir -p "${tmp}/no_manifests/daily/2026-07-11"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero \
+        > "${tmp}/no_manifests/daily/2026-07-11/isnad-pg-${RUN_TS}.dump"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero \
+        > "${tmp}/no_manifests/daily/2026-07-11/isnad-userpg-${RUN_TS}.dump"
+    head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero \
+        > "${tmp}/no_manifests/daily/2026-07-11/isnad-neo4j-${RUN_TS}.dump.zst"
+    _expect all-three-dumps-but-no-manifest "${tmp}/no_manifests" "" incomplete "$EXIT_ALERT"
+
     # MISSING REQUIRED STORE — `complete=true` above a HALF-FINISHED UPLOAD.
     #
     # THE DEFECT THIS SCANNER SHIPPED WITH. backup.sh writes the manifest locally and then
@@ -582,7 +752,7 @@ self_test() {
     head -c "$(( MIN_DUMP_BYTES * 2 ))" /dev/zero \
         > "${tmp}/missing_store/daily/2026-07-11/isnad-pg-${RUN_TS}.dump"
     printf 'BACKUP_MANIFEST complete=true stores=postgres,user-postgres,neo4j timestamp=%s category=daily\n' \
-        "$RUN_TS" > "${tmp}/missing_store/daily/2026-07-11/_backup_manifest.txt"
+        "$RUN_TS" > "${tmp}/missing_store/daily/2026-07-11/_backup_manifest-${RUN_TS}.txt"
     _expect incomplete-missing-store "${tmp}/missing_store" "" incomplete "$EXIT_ALERT"
 
     # STALE DUMP MASQUERADING AS THE ATTESTED RUN — the store is PRESENT, from the WRONG RUN.
@@ -638,7 +808,7 @@ self_test() {
     # ABSENT — lists NON-empty, restores nothing. Checksums and a manifest, no dumps.
     mkdir -p "${tmp}/nodumps"
     : > "${tmp}/nodumps/isnad-pg-old.dump.sha256"
-    : > "${tmp}/nodumps/_backup_manifest.txt"
+    : > "${tmp}/nodumps/_backup_manifest-${RUN_TS}.txt"
     _expect absent-no-dumps "${tmp}/nodumps" "" absent "$EXIT_ALERT"
 
     # STALE — a real, COMPLETE backup, far too old.

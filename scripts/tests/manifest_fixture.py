@@ -35,6 +35,14 @@ _PRINTF = re.compile(
     r"printf '(?P<fmt>BACKUP_MANIFEST [^']*)'\s*\\?\s*\n?\s*(?P<args>(?:\"\$\w+\"\s*)+)",
 )
 
+# `MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_backup_manifest-${TIMESTAMP}.txt"`
+_MANIFEST_FILE = re.compile(r'MANIFEST_FILE="\$\{LOCAL_BACKUP_PATH\}/(?P<name>[^"]+)"')
+
+# The default run id used across the fixtures. `backup.sh` builds it with
+# `date -u +%Y%m%d-%H%M%S`, so it is strict and self-delimiting — which is why every parser in
+# the consumers anchors on THIS and never on the store name (deploy#589).
+DEFAULT_RUN_TS = "20260711-030100"
+
 
 def manifest_format() -> tuple[str, list[str]]:
     """The producer's format string and the shell variables that fill it, in order."""
@@ -46,10 +54,40 @@ def manifest_format() -> tuple[str, list[str]]:
     return m.group("fmt"), re.findall(r'"\$(\w+)"', m.group("args"))
 
 
+def manifest_filename(run_ts: str = DEFAULT_RUN_TS) -> str:
+    """The manifest's FILE NAME, read out of `backup.sh` — never restated here.
+
+    The name is not decoration; it is the deploy#587 fix. ``_backup_manifest.txt`` is a FIXED
+    name inside a directory that holds MULTIPLE RUNS — the B2 path is ``<category>/<DATE>`` (a
+    DAY), the dumps in it are ``isnad-<store>-<TS>`` (a RUN), ``rclone copy`` adds and never
+    deletes, and ``backup.sh`` deliberately uploads partials. So the fixed-name manifest was
+    overwritten by **whichever run uploaded last**, and a good run followed by a partial one
+    ERASED ITS OWN ATTESTATION.
+
+    This is the other half of what ``build_manifest`` already does for the manifest's CONTENTS:
+    the artifact does not name itself in the test's words. A fixture that hard-codes
+    ``_backup_manifest.txt`` would keep passing against a producer that had stopped writing it.
+    """
+    m = _MANIFEST_FILE.search(BACKUP_SH.read_text())
+    assert m is not None, (
+        "could not find backup.sh's `MANIFEST_FILE=` assignment. If the producer changed how "
+        "it names the manifest, the fixtures must follow it — do not hand-write one."
+    )
+    name = m.group("name")
+    assert "${TIMESTAMP}" in name, (
+        f"backup.sh names its manifest {name!r} — the RUN ID is not in the name, so a "
+        "day-directory holding several runs has ONE manifest and the last run to upload "
+        "OVERWRITES the attestation of every run before it. A good run followed by a partial "
+        "one then erases its own attestation (deploy#587). Completeness is a property of a "
+        "RUN, so the manifest must be named for its run."
+    )
+    return name.replace("${TIMESTAMP}", run_ts)
+
+
 def build_manifest(
     *,
     complete: bool = True,
-    run_ts: str = "20260711-030100",
+    run_ts: str = DEFAULT_RUN_TS,
     stores: str = "postgres,user-postgres,neo4j",
     category: str = "daily",
 ) -> bytes:

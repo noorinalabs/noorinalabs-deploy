@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 import pytest
-from manifest_fixture import build_manifest, manifest_format
+from manifest_fixture import build_manifest, manifest_filename, manifest_format
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 SCANNER = SCRIPTS_DIR / "verify_b2_backup_artifact.sh"
@@ -60,13 +60,27 @@ REAL_DUMP = b"P" * 4096
 # backup.sh's run id: `date -u +%Y%m%d-%H%M%S`. The dumps of a run are ALL named for it.
 RUN_TS = "20260711-030100"
 
+# A LATER run on the SAME DAY. B2's path is `<category>/<DATE>` — a DAY — so a retry after a
+# failed nightly lands its dumps and its manifest right beside the run that already succeeded.
+# Nothing about this is exotic; backup.sh uploads partials by design (deploy#587).
+LATE_TS = "20260711-080000"
+EARLY_TS = "20260711-020000"
+
 # The three stores restore.sh REQUIRES, in backup.sh's own filename forms. Neo4j's dump is
 # compressed, so it lands as `.dump.zst`.
-STORE_FILES = {
-    "isnad-pg": f"isnad-pg-{RUN_TS}.dump",
-    "isnad-userpg": f"isnad-userpg-{RUN_TS}.dump",
-    "isnad-neo4j": f"isnad-neo4j-{RUN_TS}.dump.zst",
-}
+ALL_STORES = ("isnad-pg", "isnad-userpg", "isnad-neo4j")
+
+
+def store_files(run_ts: str = RUN_TS) -> dict[str, str]:
+    """The dump filenames of ONE run. Every dump of a run is named for that run."""
+    return {
+        "isnad-pg": f"isnad-pg-{run_ts}.dump",
+        "isnad-userpg": f"isnad-userpg-{run_ts}.dump",
+        "isnad-neo4j": f"isnad-neo4j-{run_ts}.dump.zst",
+    }
+
+
+STORE_FILES = store_files(RUN_TS)
 
 
 # Rendered from BACKUP.SH'S OWN printf — format string and argument order both parsed out of
@@ -86,7 +100,7 @@ def _backup_dir(
     *,
     complete: bool = True,
     dump: bytes = REAL_DUMP,
-    stores: tuple[str, ...] = ("isnad-pg", "isnad-userpg", "isnad-neo4j"),
+    stores: tuple[str, ...] = ALL_STORES,
 ) -> Path:
     """A WHOLE RUN — all three required stores, named as backup.sh names them.
 
@@ -101,16 +115,37 @@ def _backup_dir(
 def _write_run(
     d: Path,
     *,
+    run_ts: str = RUN_TS,
     complete: bool = True,
     dump: bytes = REAL_DUMP,
-    stores: tuple[str, ...] = ("isnad-pg", "isnad-userpg", "isnad-neo4j"),
+    stores: tuple[str, ...] = ALL_STORES,
+    manifest: bool = True,
 ) -> Path:
-    """Write one backup RUN into an arbitrary directory."""
+    """Write one backup RUN into a directory — which may already hold OTHER runs.
+
+    The manifest is named by ``backup.sh``'s own ``MANIFEST_FILE=`` assignment, not by us. That
+    is the whole of deploy#587: with a FIXED name, writing a second run into this directory
+    would silently CLOBBER the first run's attestation — and the fixture would be unable to
+    express the very defect it needs to reproduce, because it would reproduce it on itself.
+
+    ``manifest=False`` builds the "arrived but UNATTESTED" artifact: dumps with no manifest.
+    """
     d.mkdir(parents=True, exist_ok=True)
+    files = store_files(run_ts)
     for s in stores:
-        (d / STORE_FILES[s]).write_bytes(dump)
-    (d / "_backup_manifest.txt").write_bytes(_manifest(complete))
+        (d / files[s]).write_bytes(dump)
+    if manifest:
+        (d / manifest_filename(run_ts)).write_bytes(_manifest(complete, run_ts))
     return d
+
+
+def _partial_run(d: Path, run_ts: str = LATE_TS) -> Path:
+    """A PARTIAL run: isnad-pg dumped, user-postgres and Neo4j did not.
+
+    backup.sh produces exactly this by design — "a partial backup beats none" — and uploads it
+    into the SAME day-directory as the good run, exiting non-zero afterwards.
+    """
+    return _write_run(d, run_ts=run_ts, complete=False, stores=("isnad-pg",))
 
 
 def _age(d: Path, epoch: float) -> None:
@@ -199,7 +234,7 @@ def test_bucket_with_no_dumps_is_absent(tmp_path: Path) -> None:
     it lists non-empty, so "is anything there?" is the wrong question. Only dumps count.
     """
     (tmp_path / "isnad-pg-old.dump.sha256").write_bytes(b"x")
-    (tmp_path / "_backup_manifest.txt").write_bytes(b"x")
+    (tmp_path / manifest_filename()).write_bytes(b"x")
     rc, line = _scan(tmp_path)
     assert rc == EXIT_ALERT
     assert _field(line, "status") == "absent"
@@ -288,7 +323,7 @@ def test_zero_byte_dump_is_not_restorable(tmp_path: Path) -> None:
     d = tmp_path / "daily" / "2026-07-11"
     d.mkdir(parents=True)
     (d / STORE_FILES["isnad-pg"]).write_bytes(b"")
-    (d / "_backup_manifest.txt").write_bytes(_manifest(True))
+    (d / manifest_filename()).write_bytes(_manifest(True))
     rc, line = _scan(tmp_path)
     assert rc == EXIT_ALERT, f"a zero-byte dump is not restorable: {line}"
     assert _field(line, "status") == "absent"
@@ -482,14 +517,48 @@ def test_complete_attested_but_undersized_dump_is_not_fresh(tmp_path: Path) -> N
     """The producer's word about what it WROTE is not a claim about what SURVIVED.
 
     A user-postgres dump that uploaded as zero bytes, beside a healthy pg and neo4j, inside a
-    directory whose manifest says `complete=true`. The attestation cannot see this; the size
-    floor can. Both are needed.
+    run whose manifest says `complete=true`. The attestation cannot see this; the size floor
+    can. Both are needed.
+
+    THE FIXTURE USED TO WRITE ``isnad-userpg-a.dump`` — a name backup.sh CANNOT PRODUCE (the run
+    id is always ``%Y%m%d-%H%M%S``) — while leaving the run's REAL user-postgres dump healthy and
+    in place. So it did not build the artifact its own docstring describes, and it passed for a
+    reason that had nothing to do with the run: under the old DIRECTORY-scoped check, ANY stray
+    zero-byte `*.dump` anywhere in the day condemned the whole day, including one belonging to no
+    run at all. A fixture in the test's own invented shorthand tests the shorthand.
+
+    The truncated dump must be the ATTESTED RUN'S OWN. That is the artifact a torn upload
+    actually leaves, and it is the one that must not be reported fresh.
     """
     d = _backup_dir(tmp_path, complete=True)
-    (d / "isnad-userpg-a.dump").write_bytes(b"")
+    (d / STORE_FILES["isnad-userpg"]).write_bytes(b"")  # the RUN's own dump, truncated
     rc, line = _scan(tmp_path)
     assert rc == EXIT_ALERT, f"a complete-attested backup with a 0-byte dump is not fresh: {line}"
     assert _field(line, "reason") == "undersized_dumps"
+
+
+def test_an_undersized_dump_from_another_run_does_not_condemn_the_good_one(tmp_path: Path) -> None:
+    """The corrupt dump belongs to a DIFFERENT run. The good run is intact and restorable.
+
+    A failed 08:00 retry leaves a zero-byte pg dump in the day-directory beside the complete,
+    healthy 03:01 run. Scoping the size floor to the DIRECTORY made that stray file condemn the
+    good run — a red alert over a bucket holding a restorable backup, which is the same false
+    alarm deploy#587 is about, one level in. Scoping it to the RUN charges the corruption to the
+    run that produced it.
+
+    It is still REPORTED (`undersized=1`) — a fault we survived is not a fault we hide.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)  # the good 03:01 run, all three healthy
+    (d / f"isnad-pg-{LATE_TS}.dump").write_bytes(b"")  # 08:00 retry: zero-byte pg dump
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK, (
+        f"the 03:01 run is complete, attested and INTACT — a corrupt dump from a later failed "
+        f"run must not condemn it: {line}"
+    )
+    assert _field(line, "status") == "fresh"
+    assert _field(line, "undersized") == "1", f"the corrupt dump must still be REPORTED: {line}"
 
 
 def test_undersized_is_reported_unconditionally(tmp_path: Path) -> None:
@@ -540,25 +609,27 @@ def test_restore_sh_completeness_predicate_matches_a_real_manifest() -> None:
     manifest `backup.sh` actually produces. **Asserting the call site is not the same as
     asserting the callee works.** This test runs the predicate.
     """
-    restore = SCRIPTS_DIR / "restore.sh"
-    body = restore.read_text()
-    fn = body[body.index("backup_is_complete()") : body.index("\nresolve_latest()")]
+    body = RESTORE_SH.read_text()
+    # The predicate lives in the shipped `manifest_attests_complete` helper, which
+    # `backup_is_complete` and `select_local_run` both call (deploy#587 gave them a second
+    # caller, so it stopped being inline). RUN THE SHIPPED TEXT — do not retype the pipeline
+    # here, or this test would assert against its own paraphrase.
+    fn = body[body.index("manifest_attests_complete() {") : body.index("\n# Did every store")]
+    assert "grep -qx 'complete=true'" in fn, (
+        "the completeness predicate must match `complete=true` as a WHOLE TOKEN; the "
+        "anchored-prefix regex it shipped with can never match a real manifest"
+    )
+    assert "manifest_attests_complete" in body[body.index("backup_is_complete() {") :], (
+        "backup_is_complete must consult the shipped predicate, not its own copy of it"
+    )
 
     def _predicate(manifest: bytes) -> int:
-        # Run the shipped predicate's own pipeline against the manifest.
-        script = (
-            "printf '%s\\n' \"$1\" | grep '^BACKUP_MANIFEST ' | tr ' ' '\\n' "
-            "| grep -qx 'complete=true'"
-        )
+        script = fn + '\nprintf "%s\\n" "$1" | manifest_attests_complete\n'
         return subprocess.run(  # noqa: S603
             ["bash", "-c", script, "_", manifest.decode().strip()],  # noqa: S607
             check=False,
         ).returncode
 
-    assert "grep -qx 'complete=true'" in fn, (
-        "backup_is_complete must match `complete=true` as a WHOLE TOKEN; the anchored-prefix "
-        "regex it shipped with can never match a real manifest"
-    )
     assert _predicate(_manifest(True)) == 0, "a complete manifest must MATCH"
     assert _predicate(_manifest(False)) != 0, "an incomplete manifest must NOT match"
 
@@ -604,11 +675,18 @@ def test_stale_dump_from_an_earlier_run_does_not_satisfy_the_attested_run(tmp_pa
     """
     d = _backup_dir(tmp_path, complete=True)
     (d / STORE_FILES["isnad-pg"]).unlink()
-    (d / "isnad-pg-20260711-020000.dump").write_bytes(REAL_DUMP)  # the FAILED 02:00 run
+    (d / f"isnad-pg-{EARLY_TS}.dump").write_bytes(REAL_DUMP)  # the FAILED 02:00 run
 
     rc, line = _scan(tmp_path)
     assert rc == EXIT_ALERT, f"a dump from the wrong run must not satisfy the gate: {line}"
-    assert _field(line, "dumps") == "3", "three dumps are present — none of that helps"
+    # `dumps=` counts the REPORTED RUN's dumps, not the directory's (deploy#587 — the unit is
+    # the run). THREE dump files are in this directory; only TWO of them belong to the run the
+    # manifest attests, and the third — the 02:00 leftover — is exactly the file that must NOT
+    # be allowed to stand in for the missing one. Counting the directory's three would report
+    # the very conflation this gate exists to refuse.
+    assert _field(line, "dumps") == "2", (
+        f"the attested run has TWO of its three dumps; the 02:00 leftover is not its pg: {line}"
+    )
     assert "isnad-pg" in _field(line, "reason")
 
 
@@ -639,8 +717,11 @@ def _select(restore_dir: Path) -> dict[str, str]:
     """
     region = _shipped_region("# Find dump files.", "# A backup containing no dumps at all")
     # The selection block calls these, so the harness must carry the SHIPPED ones — a
-    # re-typed `count_runs` here would be exactly the paraphrase this suite exists to refuse.
+    # re-typed `count_runs` or `select_local_run` here would be exactly the paraphrase this
+    # suite exists to refuse.
     helpers = _shipped_region("list_runs() {", "\nlist_backups()")
+    # `select_local_run` lives past `list_backups`, so it needs its own slice (deploy#587).
+    helpers += "\n" + _shipped_region("select_local_run() {", "\nresolve_latest()")
     script = (
         "set -euo pipefail\n"
         # To STDERR — so the selection's own output stays parseable, but the script's messages
@@ -707,7 +788,7 @@ def test_restore_selection_is_deterministic_across_many_two_run_directories(tmp_
         for s in STORE_FILES.values():
             (d / s).write_bytes(REAL_DUMP)
         (d / f"isnad-pg-20260711-{older}.dump").write_bytes(b"S" * 4096)
-        (d / "_backup_manifest.txt").write_bytes(_manifest(True))
+        (d / manifest_filename()).write_bytes(_manifest(True))
 
         got = _select(d)
         assert got["PG"] == STORE_FILES["isnad-pg"], (
@@ -755,7 +836,7 @@ def test_restore_selection_survives_an_artifact_with_no_manifest(tmp_path: Path)
     d.mkdir(parents=True)
     for f in STORE_FILES.values():
         (d / f).write_bytes(REAL_DUMP)
-    assert not (d / "_backup_manifest.txt").exists()
+    assert not (d / manifest_filename()).exists()
 
     got = _select(d)  # must not raise
     assert got["PG"] == STORE_FILES["isnad-pg"]
@@ -790,14 +871,23 @@ def _backup_is_complete(root: Path, path: str) -> int:
     `:local:` is rclone's local backend, so `${RCLONE_REMOTE}:${B2_BUCKET}/...` resolves to a
     real path and the function's rc handling is exercised for real — not against a stub whose
     rcs I chose to believe.
+
+    Under restore.sh's OWN shell mode. This ran ``set -uo pipefail`` — **errexit omitted** — and
+    a harness that runs production code under a weaker shell mode is not running production
+    code. It is the same omission that hid the deploy#584 crash from every unit test, and it
+    matters more here than it did there: ``backup_is_complete`` now ENUMERATES the per-run
+    manifests, and enumeration is precisely the operation that can LEGITIMATELY MATCH NOTHING —
+    which, under ``-e`` + ``pipefail``, is a CRASH and not an empty string.
     """
     body = RESTORE_SH.read_text()
+    # The manifest helpers live above `list_backups`; `backup_is_complete` calls them.
+    helpers = body[body.index("manifest_runs() {") : body.index("\nlist_backups()")]
     fn = body[body.index("backup_is_complete() {") : body.index("\nresolve_latest()")]
     script = (
-        "set -uo pipefail\n"
-        "log() { :; }\n"
+        "set -euo pipefail\n"
+        'log() { shift; echo "$*" >&2; }\n'
         'RCLONE_REMOTE=":local"\n'
-        f'B2_BUCKET="{root}"\n' + fn + "\n"
+        f'B2_BUCKET="{root}"\n' + helpers + "\n" + fn + "\n"
         'backup_is_complete "$1"\n'
     )
     return subprocess.run(  # noqa: S603
@@ -812,22 +902,59 @@ ATTESTS, DOES_NOT_ATTEST, CANNOT_READ = 0, 1, 2
 
 
 def test_backup_is_complete_separates_all_three_outcomes(tmp_path: Path) -> None:
-    d = tmp_path / "daily" / "2026-07-11"
-    d.mkdir(parents=True)
+    """The dumps must be REAL, not merely a manifest.
 
-    # (1) reads it, and it attests
-    (d / "_backup_manifest.txt").write_bytes(_manifest(True))
+    ``backup_is_complete`` is a TWO-INSTRUMENT check (deploy#584, at run granularity since
+    deploy#587): the attestation says what was DUMPED, the listing says what ARRIVED, and it
+    needs BOTH. A fixture that writes only a manifest cannot distinguish "attests and arrived"
+    from "attests over an empty directory" — so the positive case is a whole run.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+
+    # (1) reads it, it attests, and the dumps ARRIVED
+    _write_run(d, complete=True)
     assert _backup_is_complete(tmp_path, "daily/2026-07-11") == ATTESTS
 
     # (2) reads it, and it does NOT attest
-    (d / "_backup_manifest.txt").write_bytes(_manifest(False))
+    (d / manifest_filename()).write_bytes(_manifest(False))
     assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST
 
     # (3) NO manifest — rclone rc=3 on local, rc=0/empty on B2. ABSENT, not an error.
-    (d / "_backup_manifest.txt").unlink()
+    (d / manifest_filename()).unlink()
     assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST, (
         "a missing manifest is 'does not attest', NOT an instrument failure — rc=3 on the "
         "local backend must not be mistaken for the bad-key rc=1"
+    )
+
+
+def test_backup_is_complete_requires_the_dumps_to_have_ARRIVED(tmp_path: Path) -> None:
+    """`complete=true` over a half-finished upload is not a restorable backup.
+
+    backup.sh writes the manifest locally and then ``rclone copy``s the directory, so a copy
+    interrupted after the manifest object lands leaves exactly this in B2. The attestation is
+    the producer's word about what it DUMPED; only the listing knows what ARRIVED.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, complete=True, stores=("isnad-pg",))  # attests all three; only pg arrived
+
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST, (
+        "a complete-attested run whose user-postgres and Neo4j dumps never arrived must not "
+        "be selected — restore.sh's required-store gate REFUSES it"
+    )
+
+
+def test_backup_is_complete_never_accepts_dumps_without_an_attestation(tmp_path: Path) -> None:
+    """ARRIVED but UNATTESTED. All three dumps are here; nothing vouches for them.
+
+    Accepting "all three dumps are present" in place of the producer's attestation would drop
+    the attestation entirely and reintroduce exactly what deploy#584 closed: a partial backup
+    that happens to hold three files from three different runs would look complete.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, complete=True, manifest=False)
+
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST, (
+        "dumps with no manifest must NOT be accepted — the candidates are the MANIFESTS"
     )
 
 
@@ -840,7 +967,7 @@ def test_unreadable_manifest_is_not_reported_as_incomplete(tmp_path: Path) -> No
     """
     d = tmp_path / "daily" / "2026-07-11"
     d.mkdir(parents=True)
-    m = d / "_backup_manifest.txt"
+    m = d / manifest_filename()
     m.write_bytes(_manifest(True))
     m.chmod(0o000)  # rclone rc=1 — the same class as a 401/bad key
     try:
@@ -863,7 +990,7 @@ def test_scanner_reports_unreadable_manifest_as_instrument_error(tmp_path: Path)
     INSIDE the change built to enforce the invariant.
     """
     d = _backup_dir(tmp_path, complete=True)  # a GOOD, COMPLETE, FRESH backup
-    m = d / "_backup_manifest.txt"
+    m = d / manifest_filename()
 
     rc, line = _scan(tmp_path)  # control: the manifest is readable
     assert rc == EXIT_OK and _field(line, "status") == "fresh", f"control must be fresh: {line}"
@@ -890,7 +1017,7 @@ def test_manifest_with_a_true_line_after_a_false_one_does_not_attest(tmp_path: P
     """
     d = tmp_path / "daily" / "2026-07-11"
     d.mkdir(parents=True)
-    (d / "_backup_manifest.txt").write_bytes(_manifest(False) + _manifest(True))
+    (d / manifest_filename()).write_bytes(_manifest(False) + _manifest(True))
     assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST
 
 
@@ -913,7 +1040,7 @@ def test_fallback_refuses_a_directory_holding_more_than_one_run(tmp_path: Path) 
     for f in STORE_FILES.values():  # the complete 03:01 run
         (d / f).write_bytes(REAL_DUMP)
     (d / "isnad-pg-20260711-080000.dump").write_bytes(b"S" * 4096)  # the failed 08:00 rerun
-    assert not (d / "_backup_manifest.txt").exists()  # nothing to bind to
+    assert not (d / manifest_filename()).exists()  # nothing to bind to
 
     with pytest.raises(subprocess.CalledProcessError) as e:
         _select(d)
@@ -1028,3 +1155,347 @@ def test_scanner_never_exits_without_a_result_line(tmp_path: Path) -> None:
         rc, line = _scan(tmp_path, **env)
         assert line, f"no result line for env={env} (rc={rc}) — the scanner must never be mute"
         assert _field(line, "status"), f"result line carries no status: {line}"
+
+
+# ===========================================================================================
+# deploy#587 — THE MANIFEST IS PER-DIRECTORY BUT COMPLETENESS IS PER-RUN.
+#
+# `_backup_manifest.txt` was a FIXED NAME inside a directory that holds MULTIPLE RUNS:
+#
+#   the B2 path is `<category>/<DATE>`          -> a DAY
+#   the dumps inside are `isnad-<store>-<TS>`   -> a RUN
+#
+# `rclone copy` ADDS and never deletes, and backup.sh deliberately uploads partials, so a day
+# routinely holds several runs — and the fixed-name manifest was OVERWRITTEN BY WHICHEVER RUN
+# UPLOADED LAST, good or not. A GOOD RUN FOLLOWED BY A PARTIAL ONE ERASED ITS OWN ATTESTATION.
+#
+# THE SHAPES BELOW ARE THE POINT, NOT THE COUNT. The deploy#584 review built ~20 fixtures over
+# six rounds and EVERY ONE of them put the dumps in a subdirectory, with exactly ONE run in it.
+# One structural shape, twenty times. The battery could not produce the condition, so it could
+# not see the crash it then approved — and the missing shape was the DOCUMENTED usage.
+#
+# So these are enumerated by SHAPE:
+#
+#   good -> partial          the #587 defect itself
+#   partial -> good          the ordering #584 handled — must not regress
+#   partial -> good -> partial   the good run is neither first nor last
+#   exactly one run          the common case
+#   zero manifests           the enumeration legitimately matches NOTHING (errexit crash)
+#   root vs subdirectory     the shape the whole #584 battery lacked
+#   manifest, no dump        attested but did not arrive
+#   dump, no manifest        arrived but unattested — must NOT be accepted
+# ===========================================================================================
+
+
+def _age_run(d: Path, run_ts: str, epoch: float) -> None:
+    """Re-date ONE RUN's dumps, leaving its neighbours in the same directory alone."""
+    for name in store_files(run_ts).values():
+        f = d / name
+        if f.exists():
+            os.utime(f, (epoch, epoch))
+
+
+# --- SHAPE: good run, then a partial one, in the same day ----------------------------------
+
+
+def test_scanner_good_run_then_partial_run_is_still_fresh(tmp_path: Path) -> None:
+    """THE DEFECT. A red alert saying THERE IS NO COMPLETE BACKUP, over a bucket holding one.
+
+    The 03:01 nightly succeeds completely. An 08:00 retry fails halfway and uploads its
+    `complete=false` manifest — which, under a fixed name, LANDED ON TOP OF the good run's.
+    The scanner then read the survivor and reported:
+
+        status=incomplete reason=no_complete_backup dumps=0 ... bucket_objects=7
+
+    Fails closed, so nothing was at risk — and that is exactly why it matters. It is a FALSE
+    ALARM ON THE ONE CHECK THAT MUST BE BELIEVED, in a routine scenario, and alert fatigue on a
+    backup alert is how deploy#559 happened: a signal nobody trusted, so nobody looked.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)  # the good 03:01 run
+    _partial_run(d, run_ts=LATE_TS)  # the partial 08:00 retry, uploaded LAST
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK, (
+        f"a COMPLETE, INTACT run is in this bucket. The scanner must not cry wolf over it "
+        f"because a later partial run also landed in the same day-directory: {line}"
+    )
+    assert _field(line, "status") == "fresh"
+    assert _field(line, "newest") == "daily/2026-07-11"
+
+
+def test_restore_selects_the_good_run_when_a_partial_one_uploaded_after_it(tmp_path: Path) -> None:
+    """Under `--allow-partial` this bound to the PARTIAL run and restored only its pg dump —
+
+    reporting user-postgres and Neo4j as MISSING while both sat in that very directory, intact,
+    from the good run. The good run's three dumps are RIGHT THERE; the only thing lost was its
+    attestation, and only because a fixed filename let a later run overwrite it.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)
+    _partial_run(d, run_ts=LATE_TS)
+
+    got = _select(d)
+    good = store_files(RUN_TS)
+    assert got["PG"] == good["isnad-pg"], (
+        f"must select the GOOD run's pg dump, not the partial run's leftover: {got}"
+    )
+    assert got["USER_PG"] == good["isnad-userpg"], f"the good run's user-postgres is here: {got}"
+    assert got["NEO4J"] == good["isnad-neo4j"], f"the good run's Neo4j dump is here: {got}"
+
+
+def test_resolve_latest_does_not_walk_past_a_day_whose_good_run_was_followed_by_a_partial(
+    tmp_path: Path,
+) -> None:
+    """It restored a backup TWO DAYS OLDER than the best one available, and called the newer
+
+    day "incomplete" — which the operator will believe.
+    """
+    _write_run(tmp_path / "daily" / "2026-07-08", complete=True)
+    d = tmp_path / "daily" / "2026-07-10"
+    _write_run(d, run_ts=RUN_TS, complete=True)
+    _partial_run(d, run_ts=LATE_TS)
+    (tmp_path / "weekly").mkdir()
+
+    assert _backup_is_complete(tmp_path, "daily/2026-07-10") == ATTESTS, (
+        "the 07-10 day HOLDS a complete, intact run — it must not be reported incomplete "
+        "merely because a later partial run overwrote nothing"
+    )
+
+
+# --- SHAPE: partial run first, then the good one (the ordering #584 already handled) --------
+
+
+def test_partial_run_then_good_run_still_resolves(tmp_path: Path) -> None:
+    """The ordering deploy#584 thought of. Fixing #587 must not regress it."""
+    d = tmp_path / "daily" / "2026-07-11"
+    _partial_run(d, run_ts=EARLY_TS)  # failed 02:00
+    _write_run(d, run_ts=RUN_TS, complete=True)  # good 03:01, uploaded after
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK, f"the good run is the newest AND complete: {line}"
+    assert _field(line, "status") == "fresh"
+
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == ATTESTS
+    assert _select(d)["PG"] == store_files(RUN_TS)["isnad-pg"]
+
+
+# --- SHAPE: three runs, the good one neither first nor last ---------------------------------
+
+
+def test_good_run_neither_first_nor_last(tmp_path: Path) -> None:
+    """A selection that takes "the newest manifest", "the oldest", or "the only one" passes
+
+    both single-partial fixtures above and fails HERE. The good run is in the middle.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _partial_run(d, run_ts=EARLY_TS)  # 02:00 failed
+    _write_run(d, run_ts=RUN_TS, complete=True)  # 03:01 good
+    _partial_run(d, run_ts=LATE_TS)  # 08:00 failed
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK, f"the middle run is complete and intact: {line}"
+    assert _field(line, "status") == "fresh"
+
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == ATTESTS
+
+    got = _select(d)
+    good = store_files(RUN_TS)
+    assert (got["PG"], got["USER_PG"], got["NEO4J"]) == (
+        good["isnad-pg"],
+        good["isnad-userpg"],
+        good["isnad-neo4j"],
+    ), f"all three stores must come from the ONE run that is complete: {got}"
+
+
+# --- SHAPE: exactly one run (the common case) ----------------------------------------------
+
+
+def test_exactly_one_complete_run_in_the_day(tmp_path: Path) -> None:
+    """The POSITIVE CONTROL. A suite that only ever refuses proves every bucket is empty."""
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, complete=True)
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_OK and _field(line, "status") == "fresh", line
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == ATTESTS
+    assert _select(d)["USER_PG"] == STORE_FILES["isnad-userpg"]
+
+
+# --- SHAPE: a day with ZERO manifests -------------------------------------------------------
+
+
+def test_a_day_with_zero_manifests_does_not_crash_any_consumer(tmp_path: Path) -> None:
+    """ENUMERATION THAT LEGITIMATELY MATCHES NOTHING IS A CRASH, NOT AN EMPTY STRING.
+
+    Under ``set -euo pipefail``, a `VAR="$(... | grep ...)"` whose pipeline matches nothing is a
+    FAILING SIMPLE COMMAND — errexit kills the script outright. Listing the per-run manifests is
+    exactly that operation, and a directory with no manifest is entirely ordinary (every
+    pre-deploy#559 backup). This shipped once already, in deploy#584, and no unit test could see
+    it because the harness omitted ``-e``.
+
+    Every consumer must return a VERDICT here, not die. A crash prints no claim and exits
+    non-zero — and every caller reads a non-zero exit as a claim about the BACKUPS.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, complete=True, manifest=False)  # all three dumps, NO manifest at all
+
+    rc, line = _scan(tmp_path)
+    assert line, "THE SCANNER PRINTED NO RESULT LINE. A crash is not a verdict."
+    assert rc == EXIT_ALERT and _field(line, "status") == "incomplete", (
+        f"dumps with no attestation are not a backup we can promise a restore from: {line}"
+    )
+
+    # rc 1 = 'does not attest'. NOT 2 (instrument error) and NOT a crash.
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST
+
+    # And the local selection must still fall back rather than die.
+    got = _select(d)  # must not raise
+    assert got["PG"] == STORE_FILES["isnad-pg"]
+
+
+# --- SHAPE: dumps at the BUCKET ROOT vs in a subdirectory -----------------------------------
+#
+# THE SHAPE NINO'S ENTIRE #584 BATTERY LACKED. ~20 fixtures, every one of them a subdirectory.
+# The empty-associative-array-subscript crash lived in the DOCUMENTED `B2_PREFIX` invocation
+# and nothing could reach it. A fixture set with one structural shape is one fixture.
+
+
+def test_multi_run_selection_at_the_bucket_root(tmp_path: Path) -> None:
+    """The same #587 shape with NO subdirectory — dumps at the root of the scanned scope."""
+    _write_run(tmp_path, run_ts=RUN_TS, complete=True)
+    _partial_run(tmp_path, run_ts=LATE_TS)
+
+    rc, line = _scan(tmp_path)
+    assert line, "THE SCANNER PRINTED NO RESULT LINE. A crash is not a verdict."
+    assert rc == EXIT_OK, f"a complete run at the bucket root is still a complete run: {line}"
+    assert _field(line, "status") == "fresh"
+    assert _field(line, "newest") == "/", f"the root sentinel, not an empty subscript: {line}"
+
+    assert _select(tmp_path)["PG"] == store_files(RUN_TS)["isnad-pg"]
+
+
+def test_multi_run_selection_under_an_explicit_prefix(tmp_path: Path) -> None:
+    """The DOCUMENTED `B2_PREFIX` invocation, with more than one run under it."""
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)
+    _partial_run(d, run_ts=LATE_TS)
+
+    rc, line = _scan(tmp_path, B2_PREFIX="daily/2026-07-11")
+    assert line, "THE SCANNER PRINTED NO RESULT LINE. A crash is not a verdict."
+    assert rc == EXIT_OK, f"every dump sits at the root of the scanned scope here: {line}"
+    assert _field(line, "status") == "fresh"
+
+
+# --- SHAPE: manifest present, dump missing / dump present, manifest missing -----------------
+
+
+def test_attested_run_whose_dumps_did_not_arrive_is_not_selected(tmp_path: Path) -> None:
+    """`complete=true` above a HALF-FINISHED UPLOAD. The attestation says what was DUMPED;
+
+    only the listing knows what ARRIVED. An older, intact run is present — and IT is the answer.
+    The torn run must not be selected, and must not silently pass either.
+    """
+    old = tmp_path / "daily" / "2026-07-10"
+    _write_run(old, run_ts="20260710-030100", complete=True)  # yesterday: good
+    new = tmp_path / "daily" / "2026-07-11"
+    _write_run(new, run_ts=RUN_TS, complete=True, stores=("isnad-pg",))  # today: torn
+
+    assert _backup_is_complete(tmp_path, "daily/2026-07-11") == DOES_NOT_ATTEST, (
+        "attests all three, only pg arrived — restore.sh's required-store gate REFUSES it"
+    )
+    assert _backup_is_complete(tmp_path, "daily/2026-07-10") == ATTESTS
+
+
+def test_arrived_but_unattested_dumps_are_never_promoted_to_a_backup(tmp_path: Path) -> None:
+    """The dumps are all here. Nothing vouches for them. That is NOT a complete backup.
+
+    Accepting "all three dumps are present" in place of the producer's attestation would drop
+    the attestation entirely — reintroducing precisely what deploy#584 closed, and the issue
+    says so explicitly: a consumer-only fix is not sufficient.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, complete=True, manifest=False)
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, f"unattested dumps must not be reported fresh: {line}"
+    assert _field(line, "status") == "incomplete"
+    assert _field(line, "reason") == "no_complete_backup"
+
+
+# --- The producer must NAME the manifest for its run ----------------------------------------
+
+
+def test_producer_writes_one_manifest_per_run(tmp_path: Path) -> None:
+    """The fix is only real if the PRODUCER stops overwriting. A consumer-only fix cannot work:
+
+    once the good run's manifest is gone there is NO SURVIVING ATTESTATION for it, and no
+    consumer can recover what was never written.
+    """
+    name = manifest_filename(RUN_TS)  # asserts `${TIMESTAMP}` is in backup.sh's MANIFEST_FILE
+    assert RUN_TS in name, f"the manifest must be named for its run: {name}"
+    assert name != "_backup_manifest.txt"
+
+    # Two runs in one directory must produce TWO manifests. Under the old fixed name this is
+    # one file, and the second write destroys the first run's verdict.
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)
+    _partial_run(d, run_ts=LATE_TS)
+    manifests = sorted(p.name for p in d.glob("_backup_manifest*"))
+    assert manifests == sorted([manifest_filename(RUN_TS), manifest_filename(LATE_TS)]), (
+        f"each run must keep its own attestation; got {manifests}"
+    )
+
+
+def test_stale_run_is_not_freshened_by_a_later_partial_run(tmp_path: Path) -> None:
+    """AGE IS A PROPERTY OF THE RUN WE SELECTED, NOT OF THE DIRECTORY IT SITS IN.
+
+    The last COMPLETE run is three days old. A partial retry ran an hour ago and dropped a fresh
+    pg dump into the SAME day-directory. If freshness is taken from the DIRECTORY's newest dump,
+    that partial run lends its timestamp to the stale run we actually selected — and a backup
+    three days old reports `fresh`.
+
+    That is the DEFLATING direction: a stale backup reading fresh is a MISSED alarm on the one
+    check standing between us and an unrecoverable delete. It is the same class as the TZ skew
+    this scanner already pins, reached through the run/directory confusion of deploy#587.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)  # the good run...
+    _age_run(d, RUN_TS, time.time() - 72 * 3600)  # ...but it is THREE DAYS OLD
+    _partial_run(d, run_ts=LATE_TS)  # a partial retry, dumped just now
+
+    rc, line = _scan(tmp_path, MAX_AGE_HOURS="30")
+    assert _field(line, "status") == "stale", (
+        f"the only COMPLETE run is 72h old — a fresh dump from a later PARTIAL run must not "
+        f"lend it their timestamp: {line}"
+    )
+    assert rc == EXIT_ALERT
+    age = int(_field(line, "newest_age_hours"))
+    assert age >= 70, f"the reported age must be the SELECTED RUN's, not the directory's: {line}"
+
+
+def test_a_manifest_filed_under_the_wrong_run_id_is_not_trusted(tmp_path: Path) -> None:
+    """The whole fix rests on the FILENAME's run id identifying the run.
+
+    So the manifest must be ABOUT the run it is named for. If `_backup_manifest-<A>.txt` declares
+    `timestamp=<B>`, then binding run A's dumps to an attestation about run B is exactly the
+    mis-binding this change exists to prevent — a torn restore, certified by a manifest that was
+    telling the truth about a different run.
+
+    backup.sh cannot produce this (it writes both from the same `$TIMESTAMP`), which is precisely
+    why it needs a test: nothing else would ever exercise it, and a guard no fixture can reach is
+    a guard that is not there. It fails CLOSED.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    _write_run(d, run_ts=RUN_TS, complete=True)
+    # The manifest is NAMED for the 03:01 run but ATTESTS the 08:00 one.
+    (d / manifest_filename(RUN_TS)).write_bytes(_manifest(True, run_ts=LATE_TS))
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, (
+        f"a manifest that does not attest the run it is filed under must NOT be trusted: {line}"
+    )
+    assert _field(line, "status") == "incomplete"
+    assert _field(line, "reason") == "manifest_ts_mismatch", (
+        f"and it must say WHY, not merely refuse: {line}"
+    )

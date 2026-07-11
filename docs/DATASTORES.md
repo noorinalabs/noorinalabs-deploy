@@ -148,10 +148,34 @@ could not help: it watches the *backup*, and the backup correctly reported that 
 **The restore was the thing that lied.**
 
 So **completeness is a property of the artifact, and the artifact declares it**:
-`backup.sh` writes `_backup_manifest.txt` (`BACKUP_MANIFEST complete=<bool> stores=<csv>`),
+`backup.sh` writes a manifest (`BACKUP_MANIFEST complete=<bool> stores=<csv> timestamp=<run>`),
 and `resolve_latest` selects the newest backup that declares itself **complete**, naming any
 it skipped. A directory with no manifest is not complete — every pre-deploy#559 backup
 predates `user-postgres` coverage entirely.
+
+### Completeness is per-RUN, so the manifest is per-run (deploy#587)
+
+The manifest is `_backup_manifest-<TIMESTAMP>.txt` — **one per run, never overwritten** — and
+not the fixed `_backup_manifest.txt` it started as. The distinction is the whole of deploy#587:
+
+| the path      | `<category>/<DATE>`        | a **day**  |
+| the dumps in it | `isnad-<store>-<TIMESTAMP>` | a **run** |
+
+`rclone copy` **adds and never deletes**, and `backup.sh` deliberately uploads partials, so a
+day-directory routinely holds **several runs** — and a fixed-name manifest is overwritten by
+**whichever run uploaded last**, good or not. A good 03:01 run followed by a partial 08:00
+retry therefore **erased its own attestation**, and both consumers believed the survivor:
+`verify_b2_backup_artifact.sh` reported `no_complete_backup` over a bucket *containing* a
+complete backup, and `restore.sh latest` walked past that day to one two days older.
+
+Both fail in the safe direction, and that is exactly why it mattered: a **false alarm on the
+one check that must be believed**. Alert fatigue on a backup alert is how deploy#559 happened.
+
+Consumers therefore enumerate the run manifests and select the **newest run that both attests
+`complete=true` and whose dumps all arrived** — two instruments, at the granularity
+completeness actually has. The attestation says what was **dumped**; the listing says what
+**arrived**; a `complete=true` above a half-finished upload is neither. Dumps that arrived but
+carry **no** attestation are never selected: the candidates are the manifests.
 
 The manifest is **not** the source of the expected set. `restore.sh` carries its own list of
 required stores; if the expected set came from the artifact, a partial backup would declare

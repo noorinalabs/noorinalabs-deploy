@@ -37,7 +37,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from manifest_fixture import build_manifest
+from manifest_fixture import build_manifest, manifest_filename
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -312,12 +312,24 @@ def _resolve_latest(root: Path) -> str:
 
     `:local:` is rclone's local backend, so `${RCLONE_REMOTE}:${B2_BUCKET}/...` resolves to a
     real directory tree and both `rclone lsf` and `backup_is_complete` run for real.
+
+    Under restore.sh's OWN shell mode — ``set -euo pipefail``. This omitted ``-e``, and a
+    harness that runs production code under a weaker shell mode is not running production code:
+    with ``pipefail``, a pipeline that legitimately matches NOTHING is a failing simple command
+    and **errexit kills the script**. That is not hypothetical here — ``backup_is_complete`` now
+    ENUMERATES the per-run manifests, and a day-directory with no manifest is entirely ordinary.
+    The deploy#584 crash of exactly this shape was caught by the restore rehearsal and by no
+    unit test, because of this missing ``-e``.
+
+    The slice starts at `list_runs` so the shipped manifest helpers come with it — `resolve_latest`
+    calls `backup_is_complete`, which calls them.
     """
     body = _restore_text()
-    fns = body[body.index("backup_is_complete() {") : body.index("\nverify_checksums()")]
+    fns = body[body.index("list_runs() {") : body.index("\nverify_checksums()")]
     script = (
-        "set -uo pipefail\n"
-        "log() { :; }\n"
+        "set -euo pipefail\n"
+        # resolve_latest's STDOUT is its return value, so diagnostics must not land there.
+        'log() { shift; echo "$*" >&2; }\n'
         'RCLONE_REMOTE=":local"\n'
         f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
     )
@@ -328,6 +340,40 @@ def _resolve_latest(root: Path) -> str:
         check=True,
     )
     return r.stdout.strip()
+
+
+def _write_run(
+    d: Path,
+    *,
+    run_ts: str = TIMESTAMP,
+    complete: bool = True,
+    stores: tuple[str, ...] = ("isnad-pg", "isnad-userpg", "isnad-neo4j"),
+    manifest: bool = True,
+) -> Path:
+    """A WHOLE backup RUN, in backup.sh's own filenames and its own manifest format.
+
+    ``resolve_latest`` is a TWO-INSTRUMENT check: the manifest says what was DUMPED, the listing
+    says what ARRIVED, and a run must satisfy both (deploy#584, at run granularity since
+    deploy#587). A fixture that writes one pg dump beside a manifest claiming all three stores
+    is a TORN artifact — it cannot serve as the positive control, because the thing it is
+    controlling for is precisely that all three arrived.
+
+    The manifest's NAME and CONTENTS both come from ``backup.sh`` (see manifest_fixture.py).
+    Hand-writing either lets the fixture agree with a broken parser forever.
+    """
+    d.mkdir(parents=True, exist_ok=True)
+    names = {
+        "isnad-pg": f"isnad-pg-{run_ts}.dump",
+        "isnad-userpg": f"isnad-userpg-{run_ts}.dump",
+        "isnad-neo4j": f"isnad-neo4j-{run_ts}.dump.zst",
+    }
+    for s in stores:
+        (d / names[s]).write_bytes(b"P" * 4096)
+    if manifest:
+        (d / manifest_filename(run_ts)).write_bytes(
+            build_manifest(complete=complete, run_ts=run_ts)
+        )
+    return d
 
 
 def _backup_dump_filenames() -> dict[str, str]:
@@ -519,8 +565,10 @@ def test_resolve_latest_selects_a_complete_backup() -> None:
     can rebuild — while the previous night's good backup sits there unselected.
     """
     code = _code_only(_restore_text())
-    assert "_backup_manifest.txt" in code, (
-        "completeness is a property of the artifact and the artifact must declare it"
+    assert "_backup_manifest-" in code, (
+        "completeness is a property of the RUN and the artifact must declare it PER RUN — a "
+        "fixed-name manifest in a day-directory holding several runs is overwritten by "
+        "whichever run uploads last (deploy#587)"
     )
 
     # This test used to assert the LITERAL call line —
@@ -542,13 +590,7 @@ def test_resolve_latest_selects_a_complete_backup() -> None:
         # The NEWEST directory is INCOMPLETE; the older one is complete. Selecting by name
         # picks 07-11 — the artifact missing the store nothing can rebuild.
         for date, complete in (("2026-07-10", True), ("2026-07-11", False)):
-            d = root / "daily" / date
-            d.mkdir(parents=True)
-            (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
-            (d / "_backup_manifest.txt").write_text(
-                f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
-                f"stores=postgres,user-postgres,neo4j timestamp={TIMESTAMP} category=daily\n"
-            )
+            _write_run(root / "daily" / date, complete=complete)
         (root / "weekly").mkdir()
 
         assert _resolve_latest(root) == "daily/2026-07-10", (
@@ -559,9 +601,15 @@ def test_resolve_latest_selects_a_complete_backup() -> None:
 def test_backup_declares_its_own_completeness() -> None:
     """The producer attests to what it actually wrote — it is the only party that knows."""
     code = _backup_code()
-    assert "_backup_manifest.txt" in code, "backup.sh must write a completeness manifest"
     assert "BACKUP_MANIFEST complete=" in code, (
         "the manifest must declare whether this backup is complete"
+    )
+    # And it must be named for its RUN. `manifest_filename()` reads backup.sh's own
+    # `MANIFEST_FILE=` assignment and REFUSES a name without `${TIMESTAMP}` in it: a fixed name
+    # inside a day-directory that holds several runs is overwritten by whichever run uploads
+    # last, so a good run followed by a partial one ERASES ITS OWN ATTESTATION (deploy#587).
+    assert TIMESTAMP in manifest_filename(TIMESTAMP), (
+        "the manifest must be named for the run it attests"
     )
     # And the manifest must NOT be the source of the expected set — that would let a
     # partial backup declare itself complete-for-what-it-happens-to-hold.
@@ -627,7 +675,10 @@ def _resolve_latest_rc(root: str) -> tuple[int, str]:
     body = _restore_text()
     fns = body[body.index("list_runs() {") : body.index("\nverify_checksums()")]
     script = (
-        "set -uo pipefail\n"
+        # restore.sh's OWN shell mode. See `_resolve_latest` — `set -uo pipefail` without `-e`
+        # is a harness that cannot see an errexit crash, and enumerating the per-run manifests
+        # is exactly the operation that can legitimately match nothing.
+        "set -euo pipefail\n"
         'log() { shift; echo "$*"; }\n'
         'RCLONE_REMOTE=":local"\n'
         f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
@@ -667,18 +718,37 @@ def test_resolve_latest_does_not_report_a_failed_listing_as_no_backups() -> None
 def test_resolve_latest_still_resolves_when_the_listing_works(tmp_path: Path) -> None:
     """The POSITIVE control. A guard that refuses everything is not a guard."""
     for date, complete in (("2026-07-10", True), ("2026-07-11", False)):
-        d = tmp_path / "daily" / date
-        d.mkdir(parents=True)
-        (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
-        (d / "_backup_manifest.txt").write_text(
-            f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
-            f"stores=postgres,user-postgres,neo4j timestamp={TIMESTAMP} category=daily\n"
-        )
+        _write_run(tmp_path / "daily" / date, complete=complete)
     (tmp_path / "weekly").mkdir()
 
     rc, out = _resolve_latest_rc(str(tmp_path))
     assert rc == 0, f"the good control must resolve: {out}"
     assert "daily/2026-07-10" in out
+
+
+def test_resolve_latest_picks_the_good_run_when_a_partial_one_uploaded_after_it(
+    tmp_path: Path,
+) -> None:
+    """deploy#587 — a GOOD run followed by a PARTIAL one, in the same day-directory.
+
+    With a fixed-name manifest the partial run's `complete=false` landed ON TOP of the good
+    run's attestation, so `resolve_latest` skipped the whole day, called it "incomplete" to the
+    operator, and restored a backup TWO DAYS OLDER — while a complete, intact run sat inside the
+    day it walked past. The direction is safe; the consequence is that in a real recovery it
+    silently hands the operator an older backup than the best one available.
+    """
+    _write_run(tmp_path / "daily" / "2026-07-08", run_ts="20260708-030100", complete=True)
+    day = tmp_path / "daily" / "2026-07-10"
+    _write_run(day, run_ts="20260710-030100", complete=True)  # the good nightly
+    _write_run(  # the 08:00 retry: pg only, and it uploaded LAST
+        day, run_ts="20260710-080000", complete=False, stores=("isnad-pg",)
+    )
+    (tmp_path / "weekly").mkdir()
+
+    assert _resolve_latest(tmp_path) == "daily/2026-07-10", (
+        "'latest' must select the day holding a COMPLETE, INTACT run — not walk past it to an "
+        "older backup because a later partial run also landed in that day-directory"
+    )
 
 
 def test_list_backups_does_not_report_a_failed_listing_as_none() -> None:
@@ -754,16 +824,13 @@ def test_resolve_latest_does_not_read_rclone_stderr_as_a_backup_directory(tmp_pa
     and it corrupts the warning block added precisely so an operator is not left guessing —
     telling them a lie instead of nothing.
     """
-    d = tmp_path / "daily" / "2026-07-11"
-    d.mkdir(parents=True)
-    (d / f"isnad-pg-{TIMESTAMP}.dump").write_bytes(b"P" * 4096)
-    (d / "_backup_manifest.txt").write_bytes(build_manifest(complete=True, run_ts=TIMESTAMP))
+    _write_run(tmp_path / "daily" / "2026-07-11", complete=True)
     (tmp_path / "weekly").mkdir()
 
     body = _restore_text()
     fns = body[body.index("list_runs() {") : body.index("\nverify_checksums()")]
     script = (
-        "set -uo pipefail\n"
+        "set -euo pipefail\n"
         'log() { shift; echo "$*"; }\n'
         'RCLONE_REMOTE=":local"\n'
         f'B2_BUCKET="{tmp_path}"\n' + fns + "\nresolve_latest\n"
