@@ -47,12 +47,38 @@ And it corrupted the warning block added for the right reason — *"an operator 
 about why the newest backup was passed over will assume the tool is broken"* — so it now told
 them **a lie instead of nothing**.
 
-## The rule is about the DESTINATION, not the redirect
+## The rule is about the CONSUMER, not the redirect — corrected twice
 
-`2>&1` is not banned. `backup.sh` does `PREFLIGHT_OUT="$(set +e; preflight_b2 2>&1)"` and that
-is **correct**, because `PREFLIGHT_OUT` is only ever `printf`'d to the log — commentary in,
-commentary out. **The bug is `2>&1` into a variable that is subsequently PARSED.** Ask of every
-capture: *is this string going to be read as data?* If yes, stderr must not be in it.
+**First cut (mine, too narrow):** *"the bug is `2>&1` into a VARIABLE that is subsequently
+parsed."* `backup.sh`'s `PREFLIGHT_OUT="$(preflight_b2 2>&1)"` is correct, because that
+variable is only ever `printf`'d — commentary in, commentary out.
+
+**Correction (Nino Kavtaradze), and it matters.** `restore.sh::restore_postgres` does
+`pg_restore … > "$out" 2>&1` and then **greps `$out`** for `errors ignored on restore: [0-9]+`.
+That **is** a parse of merged stderr — **and it is not a bug, it is REQUIRED**, because
+`pg_restore` writes that count to stderr. My sweep saw this line, called it "a redirect into a
+log file, not a variable parsed as data," and moved on. **Both halves were wrong** — it *is*
+parsed, and the destination being a file rather than a variable is irrelevant. **I reached the
+right verdict by the wrong reasoning**, which is the same defect this PR kept punishing: a
+conclusion that happens to be correct is not evidence the method was.
+
+**The invariant, stated over the CONSUMER:**
+
+> **Merging commentary into data is fatal exactly when the consumer treats EVERY LINE AS A
+> RECORD. It is harmless — and sometimes required — when the consumer SEARCHES FOR A SPECIFIC
+> KNOWN TOKEN.**
+
+`resolve_latest` iterates `$dirs` line by line and treats each as a backup directory: a
+**record** consumer, so one NOTICE line becomes one phantom backup. `restore_postgres` greps
+for a fixed pattern: a **search** consumer, so extra lines are inert.
+
+**How to apply:** ask of every capture — **"does my reader ITERATE this, or SEARCH it?"**
+Iterate ⇒ stderr must not be in it. Search for a known token ⇒ merging is fine, and may be the
+only way to get the token at all. The destination is a red herring: **variable or file, the
+question is the same.**
+
+An over-broad rule ("never `2>&1`") is its own harm — it fires on correct code and teaches
+people to ignore it.
 
 **How to apply:**
 
