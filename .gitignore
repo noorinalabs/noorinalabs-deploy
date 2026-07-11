@@ -57,3 +57,8 @@ Thumbs.db
 # this repo's index locally before rolling up, so nothing depends on a committed
 # copy. See issue deploy#571 / main#939.
 ontology/structural/
+
+# Agent scratch space — commit-message drafts and working files. Gitignored in the
+# parent org repo; this repo had drifted, and a draft reached a branch bound for main
+# (deploy#574 review). Never a build input.
+.claude/scratch/

@@ -280,12 +280,19 @@ def test_summary_key_extraction_cannot_be_hijacked() -> None:
         "record_field must anchor the key to the START of a token (^key=), or a future "
         "key ending in an existing key's name will hijack it (da#419)"
     )
-    # And there must be exactly ONE extractor. There used to be two, and one of them —
-    # the provenance one, written single-quoted with doubled backslashes — could never
-    # match, so the workflow aborted on the first honest artifact and the completeness
-    # binding was unreachable dead code. Two extractors is one too many to keep right.
+    # Exactly ONE extractor IN THE ssh BODY. There used to be two, and one of them — the
+    # provenance one, single-quoted with doubled backslashes — could never match, so the
+    # workflow aborted on the first honest artifact and the completeness binding was
+    # unreachable dead code. Two extractors in one shell is one too many to keep right.
+    #
+    # SCOPE, precisely, because a claim that overreaches is its own defect: `code` is the ssh
+    # `script:` body. The Report step has a THIRD extractor (`result_field`) — a separate
+    # step, a separate shell on the runner, so it CANNOT share this function. It is correctly
+    # double-quoted, and its failure mode is a cosmetic summary rather than a delete. Nobody
+    # should read this assertion as covering it. (It renders the summary a prod approver
+    # reads, so it is not nothing — it is just not this.)
     assert code.count('| sed -n "s/^$') == 1, (
-        "there must be exactly one token extractor in this workflow; a second one is a "
+        "there must be exactly one token extractor in the ssh body; a second one is a "
         "second chance to get the shell quoting wrong, and that is precisely what happened"
     )
     assert re.search(r"summary_field\(\) \{\s*record_field ", _ssh_script()), (

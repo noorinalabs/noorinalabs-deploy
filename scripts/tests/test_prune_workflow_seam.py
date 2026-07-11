@@ -139,13 +139,18 @@ for a in "$@"; do
   if [ "$a" = "prune-narrators" ]; then
     for b in "$@"; do [ "$b" = "--dry-run" ] && DRY=1; done
     ORPH=$(( {GRAPH_TOTAL} - {canonical_in_parquet} ))
-    S="PRUNE_NARRATORS_SUMMARY canonical={canonical_in_parquet}"
-    S="$S graph_total={GRAPH_TOTAL} orphans=${{ORPH}} missing=0"
+    S="PRUNE_NARRATORS_SUMMARY canonical={canonical_in_parquet} graph_total={GRAPH_TOTAL}"
     if [ -n "${{DRY:-}}" ]; then
-      echo "$S deleted=0"
+      # dry-run: orphans = would-delete, deleted = 0
+      echo "$S orphans=${{ORPH}} deleted=0 missing=0"
     else
+      # real run: `orphans` is the POST-count and is 0 — da#413's contract, and Gate D
+      # asserts it. A stub that reports orphans=${{ORPH}} after a real prune describes an
+      # impossible graph (it deleted them and they are still there), and the workflow
+      # correctly refuses it. That bug lived here undetected because the old positive
+      # control asserted on a string printed BEFORE the prune, so it never got this far.
       echo "REAL_PRUNE_ISSUED" >> "{audit}"
-      echo "$S deleted=${{ORPH}}"
+      echo "$S orphans=0 deleted=${{ORPH}} missing=0"
     fi
     exit 0
   fi
@@ -227,12 +232,20 @@ def test_caller_does_not_forge_provenance(tmp_path: Path) -> None:
     """
     root, audit = _sandbox(tmp_path, publish_provenance=False)
     _run_ssh_block(root, tmp_path)
-    pulled = Path.home()  # not used; the real check is the data dir below
-    del pulled
+
+    # UNCONDITIONAL. These used to sit behind `if data.exists():` — and with no provenance in
+    # B2, `verify_present` aborts BEFORE the rclone pull ever creates that directory, so
+    # `data.exists()` was False, both assertions were SKIPPED, and the test passed on its
+    # remaining line — which is satisfied by verify_present refusing and says nothing about
+    # forging (deploy#581). The test named for the anti-forge property did not test it.
+    #
+    # A non-existent path does not exist, so dropping the guard costs nothing in the honest
+    # case and makes the assertions bite in the case that matters: a caller which drops the
+    # objects from verify_present AND synthesizes them locally reaches the pull, creates this
+    # directory, and fills it with its own evidence.
     data = tmp_path / ".cache" / "noorinalabs-graph-prune" / "data" / "curated"
-    if data.exists():
-        assert not (data / "_resolve_run.txt").exists(), "the caller fabricated a resolve record"
-        assert not (data / "_manifest.txt").exists(), "the caller fabricated a manifest"
+    assert not (data / "_resolve_run.txt").exists(), "the caller fabricated a resolve record"
+    assert not (data / "_manifest.txt").exists(), "the caller fabricated a manifest"
     assert "REAL_PRUNE_ISSUED" not in (audit.read_text() if audit.exists() else "")
 
 
@@ -256,15 +269,38 @@ def test_da426_short_parquet_is_blocked_end_to_end(tmp_path: Path) -> None:
 
 
 def test_honest_artifact_reaches_the_real_prune(tmp_path: Path) -> None:
-    """The positive control for the whole seam: an honest artifact must actually prune.
+    """The positive control for the whole seam — and it must assert on the SENTINEL.
 
-    Without this, every refusal above could be passing because the workflow is broken rather
-    than because the guards work — which is exactly what was happening.
+    Every negative in this file asserts ``REAL_PRUNE_ISSUED not in audit``. Those assertions
+    are worth exactly nothing unless something establishes that the audit trail CAN record a
+    prune. An earlier version of this test — despite its name — never checked that the real
+    prune was reached: its only assertion was on ``"COMPLETENESS: parquet yields exactly"``,
+    **a string printed BEFORE the prune is issued**. It would have printed identically had the
+    workflow aborted one line later.
+
+    Weronika Zielinska disabled the sentinel entirely (the docker stub never writes
+    ``REAL_PRUNE_ISSUED``, so the audit trail is dead) and the suite reported **8 passed**.
+    Every "no prune was issued" assertion in this file was vacuous: they would all pass
+    against a harness that can never record a prune at all.
+
+    That is the exact shape this whole PR has been about — a green that means either the
+    guard held or the instrument recorded nothing — sitting inside the harness whose entire
+    job is to prove the guard holds. So this test now asserts the prune was REALLY issued,
+    which is what arms every negative below it.
     """
     root, audit = _sandbox(tmp_path)
     r = _run_ssh_block(root, tmp_path, DRY_RUN="false")
+    assert r.returncode == 0, (
+        f"an honest artifact must prune cleanly.\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
     assert "COMPLETENESS: parquet yields exactly" in r.stdout, (
         f"the completeness binding did not pass an honest artifact.\n{r.stdout}\n{r.stderr}"
+    )
+    # THE line that arms the rest of the file.
+    assert audit.exists() and "REAL_PRUNE_ISSUED" in audit.read_text(), (
+        "the audit trail did not record a prune on an HONEST artifact. Either the workflow "
+        "never reached the real prune, or the sentinel is dead — and if the sentinel is dead, "
+        "every `REAL_PRUNE_ISSUED not in audit` assertion in this file is vacuous."
     )
 
 
