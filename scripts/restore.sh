@@ -588,8 +588,15 @@ verify_checksums "$RESTORE_DIR"
 # is named `isnad-<store>-<TS>.*`. So bind the selection to it: the producer names the run,
 # the consumer restores THAT RUN or none of it. A store missing from the attested run then
 # falls through to the required-store gate below, which is exactly where it belongs.
-RESTORE_RUN_TS="$(printf '%s\n' "$(cat "${RESTORE_DIR}/_backup_manifest.txt" 2>/dev/null || true)" \
-    | grep '^BACKUP_MANIFEST ' | tr ' ' '\n' | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1)"
+# The trailing `|| true` is LOAD-BEARING, and its absence was caught by the restore rehearsal
+# rather than by any unit test. This script runs under `set -euo pipefail`. An artifact with
+# no manifest — every pre-deploy#559 backup, and the rehearsal's own fixtures — makes `grep`
+# match nothing, which under `pipefail` fails the WHOLE pipeline, which makes this bare
+# assignment a FAILING SIMPLE COMMAND, at which point errexit kills restore.sh outright. The
+# recovery path would have died on exactly the artifacts the fallback below exists to serve.
+# Same shape as deploy#563's `OUT="$(fn)"; RC=$?`, which is dead on every failing path.
+RESTORE_RUN_TS="$(grep '^BACKUP_MANIFEST ' "${RESTORE_DIR}/_backup_manifest.txt" 2>/dev/null \
+    | tr ' ' '\n' | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1 || true)"
 
 if [[ -n "$RESTORE_RUN_TS" ]]; then
     log "INFO" "Manifest attests run ${RESTORE_RUN_TS} — selecting that run's dumps"

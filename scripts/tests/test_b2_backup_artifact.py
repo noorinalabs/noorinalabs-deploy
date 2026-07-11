@@ -624,10 +624,18 @@ def _shipped_region(start: str, end: str) -> str:
 
 
 def _select(restore_dir: Path) -> dict[str, str]:
-    """Execute restore.sh's REAL selection block against a directory."""
+    """Execute restore.sh's REAL selection block against a directory.
+
+    Under restore.sh's OWN shell mode. This first read ``set -uo pipefail`` — **errexit
+    omitted** — and that single missing ``-e`` hid a crash: with ``pipefail``, a ``grep`` that
+    matches nothing fails the whole pipeline, so a bare ``VAR="$(... | grep ...)"`` assignment
+    is a failing simple command and **errexit kills the script**. Every test here passed; the
+    restore REHEARSAL caught it. A harness that runs production code under a weaker shell mode
+    is not running production code.
+    """
     region = _shipped_region("# Find dump files.", "# A backup containing no dumps at all")
     script = (
-        "set -uo pipefail\n"
+        "set -euo pipefail\n"
         "log() { :; }\n"
         'RESTORE_DIR="$1"\n' + region + "\n"
         'printf "PG=%s\\n" "$(basename "${PG_DUMP:-}")"\n'
@@ -711,3 +719,29 @@ def test_restore_selection_without_a_manifest_is_newest_not_arbitrary(tmp_path: 
         (d / f"isnad-pg-20260711-{hh:02d}0000.dump").write_bytes(REAL_DUMP)
 
     assert _select(d)["PG"] == "isnad-pg-20260711-120000.dump", "must pick the NEWEST run"
+
+
+def test_restore_selection_survives_an_artifact_with_no_manifest(tmp_path: Path) -> None:
+    """errexit + pipefail + a `grep` that matches nothing = restore.sh DIES.
+
+    `restore.sh` runs under `set -euo pipefail`. An artifact with no `_backup_manifest.txt` —
+    every pre-deploy#559 backup, and the restore rehearsal's own fixtures — makes the manifest
+    `grep` match nothing; under `pipefail` that fails the whole pipeline; and a bare
+    `VAR="$(...)"` assignment whose command substitution fails IS a failing simple command, so
+    **errexit kills the script**. The recovery path would have died on exactly the artifacts
+    the newest-by-name fallback exists to serve.
+
+    Not one unit test could see it, because the harness ran the block under `set -uo pipefail`
+    with **errexit omitted**. The restore REHEARSAL caught it — it runs the real script. This
+    test now runs the block under restore.sh's own shell mode, so the harness can see it too.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    for f in STORE_FILES.values():
+        (d / f).write_bytes(REAL_DUMP)
+    assert not (d / "_backup_manifest.txt").exists()
+
+    got = _select(d)  # must not raise
+    assert got["PG"] == STORE_FILES["isnad-pg"]
+    assert got["USER_PG"] == STORE_FILES["isnad-userpg"]
+    assert got["NEO4J"] == STORE_FILES["isnad-neo4j"]
