@@ -84,12 +84,13 @@ on:
           OPTIONAL corroboration — leave blank unless you have a reason. The
           provenance check is curated/_manifest.txt, which is REQUIRED and which the
           producing run signs; this input is not a substitute for it and is not the
-          gate. It exists for the one failure the manifest cannot see: you meant run
-          A and typed run B's parquet_ref. B's manifest and B's parquet agree with
+          gate. It exists for the one failure that record cannot see: you meant run A
+          and typed run B's parquet_ref. B's resolve record and B's parquet agree with
           each other perfectly, so everything else passes — only a human saying "I
           expected roughly this many" catches it. If supplied, it must equal the
-          manifest's canonical_ids or the prune refuses. Do NOT read the number off
-          the parquet you are pruning against; that is circular and proves nothing.
+          canonical_ids in curated/_resolve_run.txt or the prune refuses. Do NOT read
+          the number off the parquet you are pruning against; that is circular and
+          proves nothing.
         required: false
         type: string
         default: ""
@@ -390,9 +391,24 @@ jobs:
             #
             # The right axis is provenance: the keep-set must match what its producing
             # run DECLARED it wrote. A short parquet is then detectably short at ANY f.
-            # da's publish_parquet.py writes curated/_manifest.txt LAST, declaring:
             #
-            #   CANONICAL_MANIFEST file=<name> rows=<n> canonical_ids=<n> md5=<32hex> bytes=<n>
+            # WHO declares it is the whole question, and an earlier version of this comment
+            # got it dangerously wrong — it specified the count on the MANIFEST, which is
+            # the one artifact that cannot honestly carry one. publish_parquet.py is a
+            # SEPARATE process that starts after resolve has exited, with no pyarrow and no
+            # tally; the only count it could compute is a READ-BACK of the parquet it is
+            # uploading, which agrees perfectly with a truncated one. That comment was a
+            # specification for reintroducing the bug, addressed to da#428's implementer.
+            #
+            # The contract is split by who can attest to what (da#428):
+            #
+            #   curated/_resolve_run.txt   RESOLVE_RUN canonical_ids=<n> run_status=complete git_sha=<sha>
+            #                              Written by RESOLVE from its IN-MEMORY tally, taken
+            #                              BEFORE the write. The only honest count there is.
+            #
+            #   curated/_manifest.txt      CANONICAL_MANIFEST file=<name> md5=<32hex> bytes=<n>
+            #                              Written by the publisher. md5 + bytes ONLY. The gate
+            #                              REFUSES a manifest that carries canonical_ids.
             #
             # `canonical_ids` is the count of DISTINCT NON-EMPTY canonical_id values —
             # deliberately NOT the naive row count. da's read_canonical_ids() returns a
@@ -438,6 +454,39 @@ jobs:
             # whoever computes the number. This split is what makes a read-back
             # implementation of da#428 structurally impossible instead of merely
             # discouraged.
+            # record_field <captured-output> <record-keyword> <key>: the integer value of
+            # <key> on the <record-keyword> line. THE ONLY EXTRACTOR IN THIS FILE.
+            #
+            # There used to be two, and one of them could never match. The provenance
+            # extractor was written SINGLE-quoted carrying doubled backslashes:
+            #
+            #   sed -n 's/^canonical_ids=\\([0-9][0-9]*\\)$/\\1/p'
+            #
+            # Single quotes do no escape processing, so sed received a literal `\\(` and
+            # matched NOTHING, ever. The gate would emit `canonical_ids=129234`, this would
+            # extract empty, and the workflow would die on the first HONEST artifact anyone
+            # published — leaving the completeness binding below as unreachable dead code.
+            # It failed closed, so no data was ever at risk; but the error named the
+            # provenance gate, so the fix that suggests itself under pressure is to weaken
+            # the check. A false-FAIL on a destructive op is how a good gate gets deleted.
+            #
+            # It is the SAME defect as the `[0-9a-f]` charclass that could not read
+            # `run_status=complete` — an extractor that cannot match, whose empty result is
+            # a silent zero — reintroduced one layer up, in the caller, by the very commit
+            # that fixed it in the gate. So there is now exactly ONE of these, used by both
+            # seams, with a positive control on each (scripts/tests/test_prune_workflow_seam.py).
+            #
+            # Whole-TOKEN match (da#419): split on spaces, require an exact `key=<int>`
+            # token, so no key can be hijacked by a longer one ending in its name.
+            record_field() {
+              printf '%s\n' "$1" \
+                | grep -o "$2 .*" \
+                | head -n1 \
+                | tr ' ' '\n' \
+                | sed -n "s/^$3=\\([0-9][0-9]*\\)\$/\\1/p" \
+                | head -n1
+            }
+
             echo "==> [${ENV_NAME}] provenance gate (scripts/verify_prune_provenance.sh)"
             PROV_OUT=""
             PROV_RC=0
@@ -451,12 +500,7 @@ jobs:
             fi
 
             # The producer's tally — the ONLY number here not derived from the artifact.
-            PROV_CANON_IDS="$(printf '%s\n' "${PROV_OUT}" \
-              | grep -o 'PRUNE_PROVENANCE .*' \
-              | head -n1 \
-              | tr ' ' '\n' \
-              | sed -n 's/^canonical_ids=\\([0-9][0-9]*\\)$/\\1/p' \
-              | head -n1)"
+            PROV_CANON_IDS="$(record_field "${PROV_OUT}" PRUNE_PROVENANCE canonical_ids)"
             if [ -z "${PROV_CANON_IDS}" ]; then
               echo "ERROR: [${ENV_NAME}] provenance gate exited 0 but emitted no canonical_ids. A missing instrument reading is a stop, never a silent pass." >&2
               exit 1
@@ -520,12 +564,7 @@ jobs:
             # makes the hijack structurally impossible rather than merely unlikely: no
             # key can be a suffix of another when both must match the whole token.
             summary_field() {
-              printf '%s\n' "$1" \
-                | grep -o 'PRUNE_NARRATORS_SUMMARY .*' \
-                | head -n1 \
-                | tr ' ' '\n' \
-                | sed -n "s/^$2=\\([0-9][0-9]*\\)$/\\1/p" \
-                | head -n1
+              record_field "$1" PRUNE_NARRATORS_SUMMARY "$2"
             }
 
             # emit_result <outcome> <canonical> <graph_total> <orphans> <deleted> <missing> <post>
@@ -821,8 +860,11 @@ jobs:
               echo ""
             fi
 
-            echo "The keep-set is bound to its producing run: \`curated/_manifest.txt\` declares the canonical-id"
-            echo "count and md5, and the prune REFUSES if either disagrees with the parquet it pulled (deploy#574)."
+            echo "The keep-set is bound to its producing run. \`curated/_resolve_run.txt\` — written by RESOLVE"
+            echo "from its in-memory tally BEFORE the write — declares the canonical-id count and that the run"
+            echo "completed; \`curated/_manifest.txt\` declares only the md5 of the bytes published. The prune"
+            echo "REFUSES if either disagrees with the parquet it pulled, and refuses outright if the manifest"
+            echo "carries a count at all (a publisher can only read one back). (deploy#574)"
             echo "Magnitude ceilings alone cannot catch a short-but-valid parquet — da#426 measured 83.9% of the"
             echo "graph deleted at \`missing=0\` with every derived gate green."
             echo ""
