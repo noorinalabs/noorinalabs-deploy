@@ -54,23 +54,71 @@ EXIT_INSTRUMENT = 2
 REAL_DUMP = b"P" * 4096
 
 
+# backup.sh's run id: `date -u +%Y%m%d-%H%M%S`. The dumps of a run are ALL named for it.
+RUN_TS = "20260711-030100"
+
+# The three stores restore.sh REQUIRES, in backup.sh's own filename forms. Neo4j's dump is
+# compressed, so it lands as `.dump.zst`.
+STORE_FILES = {
+    "isnad-pg": f"isnad-pg-{RUN_TS}.dump",
+    "isnad-userpg": f"isnad-userpg-{RUN_TS}.dump",
+    "isnad-neo4j": f"isnad-neo4j-{RUN_TS}.dump.zst",
+}
+
+
 # EXACTLY the line backup.sh writes (scripts/backup.sh, the `printf 'BACKUP_MANIFEST ...'`).
 # Not a paraphrase: the bug this fixture exposed was that a predicate could never match the
 # real thing, and a fixture that restates the format in the test's own words could not have
 # revealed it.
-def _manifest(complete: bool) -> bytes:
+def _manifest(complete: bool, run_ts: str = RUN_TS) -> bytes:
     return (
         f"BACKUP_MANIFEST complete={'true' if complete else 'false'} "
-        "stores=postgres,user-postgres,neo4j timestamp=20260711-030100 category=daily\n"
+        f"stores=postgres,user-postgres,neo4j timestamp={run_ts} category=daily\n"
     ).encode()
 
 
-def _backup_dir(root: Path, *, complete: bool = True, dump: bytes = REAL_DUMP) -> Path:
-    d = root / "daily" / "2026-07-11"
+def _backup_dir(
+    root: Path,
+    *,
+    complete: bool = True,
+    dump: bytes = REAL_DUMP,
+    stores: tuple[str, ...] = ("isnad-pg", "isnad-userpg", "isnad-neo4j"),
+) -> Path:
+    """A WHOLE RUN — all three required stores, named as backup.sh names them.
+
+    The first version of this helper wrote a single file called ``isnad-pg-a.dump``. So the
+    fixture had **no concept of a run**, and could not express "the user-postgres dump never
+    uploaded" — the scanner was therefore never asked, and it answered ``fresh`` over a
+    bucket ``restore.sh`` exits 1 on. ``stores`` exists to build exactly that bad artifact.
+    """
+    return _write_run(root / "daily" / "2026-07-11", complete=complete, dump=dump, stores=stores)
+
+
+def _write_run(
+    d: Path,
+    *,
+    complete: bool = True,
+    dump: bytes = REAL_DUMP,
+    stores: tuple[str, ...] = ("isnad-pg", "isnad-userpg", "isnad-neo4j"),
+) -> Path:
+    """Write one backup RUN into an arbitrary directory."""
     d.mkdir(parents=True, exist_ok=True)
-    (d / "isnad-pg-a.dump").write_bytes(dump)
+    for s in stores:
+        (d / STORE_FILES[s]).write_bytes(dump)
     (d / "_backup_manifest.txt").write_bytes(_manifest(complete))
     return d
+
+
+def _age(d: Path, epoch: float) -> None:
+    """Re-date the WHOLE RUN.
+
+    `newest` is the max mtime in the directory, so ageing one dump while its siblings stay
+    fresh does not age the backup — the assertion would pass for the wrong reason, or not at
+    all. Age is a property of the run, not of one file.
+    """
+    for f in sorted(d.iterdir()):
+        if f.suffix in (".dump", ".zst"):
+            os.utime(f, (epoch, epoch))
 
 
 def _scan(root: Path | str, **env: str) -> tuple[int, str]:
@@ -105,7 +153,7 @@ def test_fresh_dump_is_accepted(tmp_path: Path) -> None:
     rc, line = _scan(tmp_path)
     assert rc == EXIT_OK, f"a fresh dump must pass: {line}"
     assert _field(line, "status") == "fresh"
-    assert _field(line, "dumps") == "1"
+    assert _field(line, "dumps") == "3"
 
 
 def test_fresh_dump_age_is_not_skewed(tmp_path: Path) -> None:
@@ -156,8 +204,7 @@ def test_bucket_with_no_dumps_is_absent(tmp_path: Path) -> None:
 
 def test_stale_dump_is_an_alert(tmp_path: Path) -> None:
     d = _backup_dir(tmp_path, complete=True)
-    old = time.time() - (60 * 3600)
-    os.utime(d / "isnad-pg-a.dump", (old, old))
+    _age(d, time.time() - (60 * 3600))
     rc, line = _scan(tmp_path, MAX_AGE_HOURS="30")
     assert rc == EXIT_ALERT
     assert _field(line, "status") == "stale"
@@ -236,7 +283,7 @@ def test_zero_byte_dump_is_not_restorable(tmp_path: Path) -> None:
     """
     d = tmp_path / "daily" / "2026-07-11"
     d.mkdir(parents=True)
-    (d / "isnad-pg-a.dump").write_bytes(b"")
+    (d / STORE_FILES["isnad-pg"]).write_bytes(b"")
     (d / "_backup_manifest.txt").write_bytes(_manifest(True))
     rc, line = _scan(tmp_path)
     assert rc == EXIT_ALERT, f"a zero-byte dump is not restorable: {line}"
@@ -256,8 +303,7 @@ def test_future_timestamp_is_an_instrument_error_not_fresh(tmp_path: Path) -> No
     then reports them fresh.
     """
     d = _backup_dir(tmp_path, complete=True)
-    future = time.time() + (30 * 24 * 3600)
-    os.utime(d / "isnad-pg-a.dump", (future, future))
+    _age(d, time.time() + (30 * 24 * 3600))
     rc, line = _scan(tmp_path)
     assert rc == EXIT_INSTRUMENT, f"a future timestamp is a broken clock, not a backup: {line}"
     assert _field(line, "status") == "instrument_error"
@@ -272,19 +318,8 @@ def test_one_future_object_cannot_mask_a_stale_bucket(tmp_path: Path) -> None:
     `status=fresh`, rc=0. One bad-clock upload converts this job into a permanent green
     light on the exact signal it was built to provide.
     """
-    d_old = tmp_path / "daily" / "2026-06-01"
-    d_old.mkdir(parents=True)
-    (d_old / "isnad-pg-a.dump").write_bytes(REAL_DUMP)
-    (d_old / "_backup_manifest.txt").write_bytes(_manifest(True))
-    t_old = time.time() - (40 * 24 * 3600)
-    os.utime(d_old / "isnad-pg-a.dump", (t_old, t_old))
-
-    d_fut = tmp_path / "daily" / "2026-08-10"
-    d_fut.mkdir(parents=True)
-    (d_fut / "isnad-pg-a.dump").write_bytes(REAL_DUMP)
-    (d_fut / "_backup_manifest.txt").write_bytes(_manifest(True))
-    t_fut = time.time() + (30 * 24 * 3600)
-    os.utime(d_fut / "isnad-pg-a.dump", (t_fut, t_fut))
+    _age(_write_run(tmp_path / "daily" / "2026-06-01"), time.time() - (40 * 24 * 3600))
+    _age(_write_run(tmp_path / "daily" / "2026-08-10"), time.time() + (30 * 24 * 3600))
 
     rc, line = _scan(tmp_path)
     assert rc == EXIT_INSTRUMENT, (
@@ -432,7 +467,8 @@ def test_backup_with_no_manifest_is_not_fresh(tmp_path: Path) -> None:
     """Every pre-deploy#559 backup predates user-postgres coverage entirely."""
     d = tmp_path / "daily" / "2026-07-11"
     d.mkdir(parents=True)
-    (d / "isnad-pg-a.dump").write_bytes(REAL_DUMP)
+    for f in STORE_FILES.values():
+        (d / f).write_bytes(REAL_DUMP)
     rc, line = _scan(tmp_path)
     assert rc == EXIT_ALERT
     assert _field(line, "status") == "incomplete"
@@ -521,3 +557,157 @@ def test_restore_sh_completeness_predicate_matches_a_real_manifest() -> None:
     )
     assert _predicate(_manifest(True)) == 0, "a complete manifest must MATCH"
     assert _predicate(_manifest(False)) != 0, "an incomplete manifest must NOT match"
+
+
+# ---------------------------------------------------------------------------
+# The required-store gate: `fresh` must mean "restore.sh would restore this".
+#
+# `complete=true` is the producer's account of what it DUMPED, not of what UPLOADED.
+# backup.sh writes the manifest locally and then `rclone copy`s the directory, so a copy
+# interrupted after the manifest object lands leaves `complete=true` above a half-finished
+# upload. The scanner reported that `fresh` (dumps=1, exit=0) over a bucket with no
+# user-postgres and no Neo4j — the two stores no pipeline artifact can rebuild — while
+# restore.sh's required-store gate exits 1 on it.
+# ---------------------------------------------------------------------------
+def test_complete_attested_but_missing_stores_is_not_fresh(tmp_path: Path) -> None:
+    _backup_dir(tmp_path, complete=True, stores=("isnad-pg",))
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, f"a bucket restore.sh REFUSES must not be fresh: {line}"
+    assert _field(line, "status") == "incomplete"
+    reason = _field(line, "reason")
+    assert "isnad-userpg" in reason, f"must NAME the missing store: {line}"
+    assert "isnad-neo4j" in reason, f"must NAME the missing store: {line}"
+
+
+def test_missing_store_is_reported_even_though_a_dump_exists(tmp_path: Path) -> None:
+    """`dumps > 0` is not `restorable`. The count cannot answer "is user-postgres here?"."""
+    _backup_dir(tmp_path, complete=True, stores=("isnad-pg", "isnad-neo4j"))
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT
+    assert _field(line, "dumps") == "2", "two dumps ARE present — and it is still not restorable"
+    assert "isnad-userpg" in _field(line, "reason"), (
+        "user-postgres holds accounts, sessions and audit_log, and NO pipeline artifact can "
+        f"rebuild it — its absence must be named, not summarised away: {line}"
+    )
+
+
+def test_stale_dump_from_an_earlier_run_does_not_satisfy_the_attested_run(tmp_path: Path) -> None:
+    """B2's day-directory accumulates runs; `rclone copy` adds and never deletes.
+
+    A dump left behind by an earlier FAILED run sits beside the good ones. A check that asked
+    only "is there an isnad-pg here?" is satisfied by it. Binding to the attested RUN is what
+    separates them.
+    """
+    d = _backup_dir(tmp_path, complete=True)
+    (d / STORE_FILES["isnad-pg"]).unlink()
+    (d / "isnad-pg-20260711-020000.dump").write_bytes(REAL_DUMP)  # the FAILED 02:00 run
+
+    rc, line = _scan(tmp_path)
+    assert rc == EXIT_ALERT, f"a dump from the wrong run must not satisfy the gate: {line}"
+    assert _field(line, "dumps") == "3", "three dumps are present — none of that helps"
+    assert "isnad-pg" in _field(line, "reason")
+
+
+# ---------------------------------------------------------------------------
+# restore.sh's dump SELECTION — executed, not paraphrased.
+#
+# These run the SHIPPED TEXT of restore.sh's selection block. A test that retypes the logic
+# tests the retyping: it stays green when the shipped code changes underneath it, which is
+# precisely how the `backup_is_complete` bug survived a green suite and two approvals.
+# ---------------------------------------------------------------------------
+RESTORE_SH = SCRIPTS_DIR / "restore.sh"
+
+
+def _shipped_region(start: str, end: str) -> str:
+    body = RESTORE_SH.read_text()
+    return body[body.index(start) : body.index(end)]
+
+
+def _select(restore_dir: Path) -> dict[str, str]:
+    """Execute restore.sh's REAL selection block against a directory."""
+    region = _shipped_region("# Find dump files.", "# A backup containing no dumps at all")
+    script = (
+        "set -uo pipefail\n"
+        "log() { :; }\n"
+        'RESTORE_DIR="$1"\n' + region + "\n"
+        'printf "PG=%s\\n" "$(basename "${PG_DUMP:-}")"\n'
+        'printf "USER_PG=%s\\n" "$(basename "${USER_PG_DUMP:-}")"\n'
+        'printf "NEO4J=%s\\n" "$(basename "${NEO4J_DUMP:-}")"\n'
+    )
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", script, "_", str(restore_dir)],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = {}
+    for ln in r.stdout.splitlines():
+        k, _, v = ln.partition("=")
+        out[k] = v
+    return out
+
+
+def test_restore_selects_the_attested_run_not_a_leftover_from_a_failed_one(tmp_path: Path) -> None:
+    """THE TORN RESTORE. Each store was selected by an independent unsorted `find | head -1`.
+
+    A day-directory can hold a failed 02:00 run and a good 14:00 run side by side — backup.sh
+    uploads partials by design. The three stores could therefore be selected from DIFFERENT
+    RUNS: isnad Postgres from the failed attempt, Neo4j from the good one. Referentially
+    inconsistent, and every gate green — the required-store gate sees all three present,
+    `verify_checksums` passes (a checksum binds a file to ITSELF, it cannot see that the file
+    is from the wrong run), and the manifest says `complete=true`.
+
+    MANY decoys, deliberately. A SINGLE leftover makes this test a coin flip: `find` order is
+    filesystem hash order, so one decoy lands before the attested dump only about half the
+    time — and the first version of this test PASSED against the unfixed code for exactly that
+    reason. A test that detects an arbitrary-order bug only half the time is not a detector.
+    With twelve decoys an arbitrary picker is wrong essentially always, and the assertion
+    means what it says.
+    """
+    d = _backup_dir(tmp_path, complete=True)
+    for hh in range(1, 13):  # twelve earlier FAILED runs, all leftover in the same day-dir
+        (d / f"isnad-pg-20260711-{hh:02d}0000.dump").write_bytes(b"S" * 4096)
+
+    got = _select(d)
+    assert got["PG"] == STORE_FILES["isnad-pg"], (
+        f"must restore the ATTESTED run ({RUN_TS}), never a leftover from a failed one: {got}"
+    )
+    assert got["USER_PG"] == STORE_FILES["isnad-userpg"]
+    assert got["NEO4J"] == STORE_FILES["isnad-neo4j"]
+
+
+def test_restore_selection_is_deterministic_across_many_two_run_directories(tmp_path: Path) -> None:
+    """`find` emits READDIR order — neither chronological nor stable.
+
+    Measured over 48 two-run day-directories, the shipped `find | head -1` selected the OLDER
+    dump in 14 of them. It is not "usually right"; it is arbitrary, and which way it falls
+    depends on the filenames. A single benign trial is not evidence of safety.
+    """
+    for i, older in enumerate(["020000", "030000", "040000", "060000", "080000", "120000"]):
+        d = tmp_path / f"case{i}" / "daily" / "2026-07-11"
+        d.mkdir(parents=True)
+        for s in STORE_FILES.values():
+            (d / s).write_bytes(REAL_DUMP)
+        (d / f"isnad-pg-20260711-{older}.dump").write_bytes(b"S" * 4096)
+        (d / "_backup_manifest.txt").write_bytes(_manifest(True))
+
+        got = _select(d)
+        assert got["PG"] == STORE_FILES["isnad-pg"], (
+            f"leftover {older} must never be selected over the attested run {RUN_TS}: {got}"
+        )
+
+
+def test_restore_selection_without_a_manifest_is_newest_not_arbitrary(tmp_path: Path) -> None:
+    """Pre-deploy#559 artifacts carry no manifest, so no run can be bound.
+
+    We cannot be CORRECT there, but we can be DETERMINISTIC: the timestamp is `%Y%m%d-%H%M%S`,
+    which sorts chronologically as text, so newest-by-name beats readdir order in every case.
+    """
+    d = tmp_path / "daily" / "2026-07-11"
+    d.mkdir(parents=True)
+    # Twelve candidates, for the same reason as above: with two, readdir order returns the
+    # newest by luck about half the time, and the assertion proves nothing.
+    for hh in range(1, 13):
+        (d / f"isnad-pg-20260711-{hh:02d}0000.dump").write_bytes(REAL_DUMP)
+
+    assert _select(d)["PG"] == "isnad-pg-20260711-120000.dump", "must pick the NEWEST run"

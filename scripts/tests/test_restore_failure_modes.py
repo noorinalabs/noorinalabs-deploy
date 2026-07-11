@@ -297,6 +297,11 @@ def test_backup_dumps_user_postgres() -> None:
     assert "isnad-userpg-" in code, "the user-service dump needs its own artifact name"
 
 
+# One concrete run id, substituted into BOTH the producer's `${TIMESTAMP}` and the consumer's
+# `${RESTORE_RUN_TS}`, so the two sides are compared against the same run.
+TIMESTAMP = "20260709-120000"
+
+
 def _backup_dump_filenames() -> dict[str, str]:
     """Concrete filenames ``backup.sh`` actually writes, read out of the script.
 
@@ -309,7 +314,7 @@ def _backup_dump_filenames() -> dict[str, str]:
         re.M,
     )
     found = {
-        m.group("var"): m.group("name").replace("${TIMESTAMP}", "20260709-120000")
+        m.group("var"): m.group("name").replace("${TIMESTAMP}", TIMESTAMP)
         for m in pattern.finditer(_backup_code())
     }
     assert found, "could not parse any *_DUMP_FILE assignment out of backup.sh"
@@ -317,12 +322,24 @@ def _backup_dump_filenames() -> dict[str, str]:
 
 
 def _restore_globs() -> dict[str, list[str]]:
-    """The ``find -name '<glob>'`` patterns ``restore.sh`` actually selects each dump by."""
-    globs = {}
+    """The ``find -name <glob>`` patterns ``restore.sh`` actually selects each dump by.
+
+    Selection is now bound to the run the manifest attests (deploy#584): the primary branch
+    globs ``isnad-<store>-${RESTORE_RUN_TS}.dump`` and a fallback branch keeps the old
+    ``isnad-<store>-*.dump`` for artifacts with no manifest. So this ACCUMULATES the patterns
+    from both branches — each one has to satisfy the no-cross-match invariant, not just
+    whichever happens to be parsed last. ``${RESTORE_RUN_TS}`` is substituted with the same
+    concrete timestamp the producer parser uses, so the two sides are compared like for like.
+    """
+    globs: dict[str, list[str]] = {}
     for line in _code_only(_restore_text()).splitlines():
-        m = re.match(r"^(?P<var>[A-Z0-9_]+)_DUMP=\$\(find ", line)
-        if m:
-            globs[m.group("var")] = re.findall(r"-name '([^']+)'", line)
+        m = re.match(r"^\s*(?P<var>[A-Z0-9_]+)_DUMP=\$\(find ", line)
+        if not m:
+            continue
+        # -name 'single' or -name "double"
+        found = re.findall(r"""-name ['"]([^'"]+)['"]""", line)
+        pats = [p.replace("${RESTORE_RUN_TS}", TIMESTAMP) for p in found]
+        globs.setdefault(m.group("var"), []).extend(pats)
     assert globs, "could not parse any *_DUMP=$(find ...) glob out of restore.sh"
     return globs
 

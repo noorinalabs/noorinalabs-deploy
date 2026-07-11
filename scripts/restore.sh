@@ -564,9 +564,49 @@ verify_checksums "$RESTORE_DIR"
 # `isnad-pg-*` must not also match `isnad-userpg-*`, and it does not: the prefixes
 # diverge at the character after "isnad-". Keep it that way if the names ever change —
 # restoring the user-service dump into the isnad database would be silent and severe.
-PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-pg-*.dump' -type f | head -1)
-USER_PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-userpg-*.dump' -type f | head -1)
-NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name 'isnad-neo4j-*.dump.zst' -o -name 'isnad-neo4j-*.dump' \) -type f | head -1)
+#
+# ---------------------------------------------------------------------------
+# SELECT THE ATTESTED RUN — not "whatever `find` hands back first"
+# ---------------------------------------------------------------------------
+# These three were `find ... | head -1`. `find` emits READDIR order, which is neither
+# chronological nor stable — and a backup directory can legitimately hold dumps from MORE
+# THAN ONE RUN. B2's day-directory accumulates: the path is `<category>/<DATE>` (a day),
+# the dumps inside it are `isnad-<store>-<TIMESTAMP>` (a run), `rclone copy` ADDS and never
+# deletes, and the fixed-name `_backup_manifest.txt` is overwritten by whichever run
+# uploaded last. backup.sh deliberately uploads partials ("a partial backup beats none"),
+# so a failed 02:00 run and a good 14:00 run land side by side — routinely, by design.
+#
+# Measured over 48 two-run day-directories, `find | head -1` selected the OLDER dump in
+# 14 of them. And because each store was selected by an INDEPENDENT `find`, the three could
+# come from DIFFERENT RUNS: isnad Postgres from the failed 02:00 attempt, Neo4j from the
+# good 14:00 one — a TORN RESTORE across datastores, referentially inconsistent, with the
+# required-store gate satisfied (all three present), `verify_checksums` green (a checksum
+# binds a file to ITSELF; it cannot see that the file is from the wrong run) and
+# `complete=true` on the manifest. Every gate we have would have passed it.
+#
+# The manifest already carries the run id — `timestamp=<TS>` — and every dump of that run
+# is named `isnad-<store>-<TS>.*`. So bind the selection to it: the producer names the run,
+# the consumer restores THAT RUN or none of it. A store missing from the attested run then
+# falls through to the required-store gate below, which is exactly where it belongs.
+RESTORE_RUN_TS="$(printf '%s\n' "$(cat "${RESTORE_DIR}/_backup_manifest.txt" 2>/dev/null || true)" \
+    | grep '^BACKUP_MANIFEST ' | tr ' ' '\n' | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1)"
+
+if [[ -n "$RESTORE_RUN_TS" ]]; then
+    log "INFO" "Manifest attests run ${RESTORE_RUN_TS} — selecting that run's dumps"
+    PG_DUMP=$(find "$RESTORE_DIR" -name "isnad-pg-${RESTORE_RUN_TS}.dump" -type f | head -1)
+    USER_PG_DUMP=$(find "$RESTORE_DIR" -name "isnad-userpg-${RESTORE_RUN_TS}.dump" -type f | head -1)
+    NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name "isnad-neo4j-${RESTORE_RUN_TS}.dump.zst" \
+        -o -name "isnad-neo4j-${RESTORE_RUN_TS}.dump" \) -type f | head -1)
+else
+    # No manifest (a pre-deploy#559 artifact, or a hand-assembled directory under
+    # --allow-partial). We cannot bind to a run, so at least be DETERMINISTIC: the timestamp
+    # is `%Y%m%d-%H%M%S`, which sorts chronologically as text, so `sort -r | head -1` is the
+    # NEWEST — never an arbitrary one. Strictly better than readdir order in every case.
+    log "WARNING" "No manifest timestamp — falling back to newest-by-name (cannot bind to a run)"
+    PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-pg-*.dump' -type f | sort -r | head -1)
+    USER_PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-userpg-*.dump' -type f | sort -r | head -1)
+    NEO4J_DUMP=$(find "$RESTORE_DIR" \( -name 'isnad-neo4j-*.dump.zst' -o -name 'isnad-neo4j-*.dump' \) -type f | sort -r | head -1)
+fi
 
 # A backup containing no dumps at all is not a backup. Previously the `find`s coming
 # back empty produced warnings, "=== Restore complete ===", and exit 0 — an empty
