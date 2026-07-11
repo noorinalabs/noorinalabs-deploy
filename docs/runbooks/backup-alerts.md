@@ -190,7 +190,7 @@ Ordered by status. `MAX_AGE_HOURS` defaults to 30 (one nightly plus slack);
 | `incomplete` | `manifest_ts_mismatch` | `_backup_manifest-<TS>.txt` declares a `timestamp=` that is **not** the `<TS>` it is filed under (or declares none at all), so it cannot attest the run it is named for and is refused. Nothing older qualified. | A producer bug in `backup.sh`'s manifest write. **Do not hand-edit the manifest to clear this** — that binding is the only thing preventing a torn restore (dumps of run X certified by an attestation about run Y). |
 | `instrument_error` | `unreachable` | `rclone lsf` on the bucket (or the prefix) failed outright. Credentials, network, or a wrong bucket name. **Nothing is known about the backups.** | Not a backup alert — do not triage backups. Check `BACKUP_B2_KEY_ID` / `BACKUP_B2_APP_KEY` / `BACKUP_B2_BUCKET` for that environment; the job prints `rclone`'s stderr. Classify by **capability probe**, never by `rclone`'s message text — a read-only key's 401 reads as "failed to create bucket" (deploy#559). |
 | `instrument_error` | `manifest_unreadable` | The manifest object could not be **read** — a transient 401, a throttle, a network blip. "I could not read it" is **not** "it does not attest". | Re-run the job; check credentials. Do **not** read this as an incomplete backup: the dumps may be perfectly fine. |
-| `instrument_error` | `future_timestamp` | **THE VPS CLOCK IS WRONG. THIS IS NOT A BACKUP PROBLEM.** `rclone` preserves the source mtime, so an object's timestamp *is* the VPS clock at dump time. A timestamp more than 300s in the future means the box's clock is ahead. | **Fix NTP on the VPS.** `timedatectl status` on the box; confirm `systemd-timesyncd` (or `chrony`) is running and synchronized. **Left alone this latches:** `newest` is selected by max epoch, so a single future-dated object masks an entire stale bucket — and a one-sided age bound would report it `fresh` forever, permanently greening the one signal we built this job to trust. |
+| `instrument_error` | `future_timestamp` | **The VPS clock is wrong, so this READING cannot be trusted.** `rclone` preserves the source mtime, so an object's timestamp *is* the VPS clock at dump time; a timestamp more than 300s in the future means the box's clock was ahead when it uploaded. It is a broken *instrument* — and it says **nothing either way** about whether your backups are healthy. **Do not read it as "backups are fine".** | **Two steps, and the second is not optional** — see [`future_timestamp`: fixing NTP does not clear it](#future_timestamp-fixing-ntp-does-not-clear-it). Fixing the clock alone leaves the job red for the whole skew window, and the poisoned object may be **hiding a `stale` bucket underneath**. |
 
 > **`bucket_objects` is the prefix discriminator.** An `absent` verdict with
 > `bucket_objects > 0` means "the bucket has contents, just not where I looked" —
@@ -198,6 +198,71 @@ Ordered by status. `MAX_AGE_HOURS` defaults to 30 (one nightly plus slack);
 > *prefix* is indistinguishable by exit code from an empty bucket (`lsf -R` returns
 > rc=0 and no output for both), which is why the reachability probe is on the
 > **bucket** and this field exists.
+
+### `future_timestamp`: fixing NTP does not clear it
+
+**Left alone this latches:** `newest` is selected by max epoch, so a single future-dated
+object masks an entire stale bucket — and a one-sided age bound would report it `fresh`
+forever, permanently greening the one signal we built this job to trust.
+
+That is the mechanism. Two consequences follow from it, and an operator who does not know
+them will do the obvious thing and get nowhere.
+
+**1. The bad clock is FROZEN INTO THE OBJECT. Correcting the clock does not re-date it.**
+
+`rclone` preserves the *source* mtime at upload, so a poisoned object keeps its future
+timestamp forever. Fixing NTP stops **new** poisoned objects; it does nothing about the one
+already in the bucket. Measured against the scanner:
+
+| bucket | poisoned object | verdict |
+|---|---|---|
+| healthy backup, 1h old | present | `instrument_error reason=future_timestamp`, **rc=2** |
+| healthy backup, 1h old | removed | `fresh`, rc=0 |
+
+So the job stays **red for the entire skew window** — 30 days, if the clock was 30 days
+ahead — over backups that are completely fine. An operator who fixes NTP, re-runs, and sees
+the identical red has no next move. **The object has to go.**
+
+**2. `future_timestamp` PREEMPTS `stale`. The reading may be hiding a dead bucket.**
+
+The future check returns *before* the age check ever runs
+(`verify_b2_backup_artifact.sh:620` vs `:627`). So a poisoned object does not merely produce
+a confusing verdict — it **suppresses** the `stale` verdict underneath it:
+
+| bucket | poisoned object | verdict |
+|---|---|---|
+| **no backup for 40 days** | present | `instrument_error reason=future_timestamp`, rc=2 — **the staleness is invisible** |
+| **no backup for 40 days** | removed | `stale reason=too_old newest_age_hours=960`, rc=1 |
+
+The scanner *can* see the dead bucket. The poisoned object is what stops it. This is why the
+meaning cell says the reading is untrustworthy and **not** that your backups are fine: that
+claim is true of the **instrument** and can be false of the **bucket at the same moment.**
+
+**Triage — a path that actually terminates:**
+
+1. **Fix the clock on the VPS.** `timedatectl status`; confirm `systemd-timesyncd` (or
+   `chrony`) is running and synchronized. This stops the bleeding — no new poisoned objects.
+2. **Remove or re-date the poisoned object(s).** The result line's `newest=` field names the
+   directory holding it. Until it leaves the scanned scope, every subsequent run reports
+   `future_timestamp` regardless of the clock, and regardless of the true state of the bucket.
+3. **Re-run the check.** This step is the point of the other two. The verdict underneath may
+   be `fresh` — or it may be `stale`, and you have not learned which until the poisoned object
+   is gone. **Do not close the incident on a green NTP check.**
+
+> **Delete-vs-preserve — and yes, this is the opposite of the ruling in [`TornBackup`](#tornbackup).**
+>
+> The `torn` row says *do not delete the torn run*: there, the artifact is **evidence** of a
+> producer bug, the bucket still holds a good older run, and deleting it destroys the
+> diagnosis while the fault recurs tomorrow.
+>
+> Here the poisoned object **is the fault, not evidence of it.** Its *contents* may be a
+> perfectly good dump; what is broken is its **timestamp**, and the timestamp is the very
+> field the scanner selects on — so it is actively masking every other verdict, including a
+> `stale` one you need to see. It cannot stay in the scanned scope.
+>
+> If you want the forensic record, note the run id and the mtime (or copy the object outside
+> the scanned prefix) **before** removing it. Preserve the evidence if you like; do not
+> preserve the mask.
 
 ### Reading the job
 
