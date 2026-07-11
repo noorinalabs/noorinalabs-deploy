@@ -1,7 +1,7 @@
 # Restore rehearsal (deploy#560)
 #
 # Runs scripts/restore_rehearsal.sh, which drives the REAL scripts/restore.sh against an
-# ephemeral compose stack and requires it to REJECT four deliberately broken backup
+# ephemeral compose stack and requires it to REJECT five deliberately broken backup
 # artifacts before it is allowed to trust the intact one. See that script's header for
 # the failure modes and why the negatives run first.
 #
@@ -84,7 +84,7 @@ jobs:
             echo ""
             echo "Drove \`scripts/restore.sh\` against an ephemeral compose stack."
             echo ""
-            echo "Four broken artifacts must each produce a non-zero exit **before** the intact"
+            echo "Five broken artifacts must each produce a non-zero exit **before** the intact"
             echo "artifact is trusted, and the intact restore is verified by asserting on restored"
             echo "content (row counts, sampled records, Neo4j node count) rather than exit status."
             echo ""

@@ -79,19 +79,30 @@ restore aimed at a scratch stack could have overwritten the production graph.
 | B2 `noorinalabs-pipeline` | `terraform/backblaze/` | raw → dedup → enriched → normalized → staged pipeline artifacts | no separate copy | This *is* the source of truth from which the graph is rebuilt. It has lifecycle rules but no second copy. |
 | B2 backups bucket | `terraform/backblaze/` (added by deploy#559) | the dumps this document describes | n/a | Did not exist before deploy#559. See the warning below. |
 
-## The state of backups, as of 2026-07-09
+## The state of backups, as of 2026-07-10
 
 Read this before trusting anything above.
 
-1. **No backup has ever been taken.** `isnad-backup.timer` is not installed on stg or
-   prod (`systemctl list-unit-files 'isnad*'` → `0 unit files listed` on both).
-   Tracked by deploy#558.
-2. **There is no backup credential.** `.github/actions/write-deploy-env/action.yml` maps
-   `BACKUP_B2_KEY_ID` / `BACKUP_B2_APP_KEY` / `BACKUP_B2_BUCKET` onto the bare `B2_*`
-   names `backup.sh` requires. Those three secrets do not exist at repo scope or on
-   either Environment, so `.env` on both hosts contains `B2_KEY_ID=''`. `backup.sh`
-   aborts at its `: "${B2_KEY_ID:?…}"` preflight before dumping a byte.
-3. **There was no destination bucket.** deploy#559 adds the Terraform; an owner must
+1. **No backup has ever been taken.** `isnad-backup.timer` had never been installed on
+   stg or prod (`systemctl list-unit-files 'isnad*'` → `0 unit files listed` on both,
+   2026-07-09). deploy#558 fixes the install: cloud-init now enables the timer with
+   `--now`, `scripts/converge_host.sh` installs it on already-provisioned hosts, and
+   `scripts/assert_host_state.sh` asserts the result in `verify-deploy`. The timer
+   therefore goes active on the next deploy to each host — and it will then **fail**,
+   for the reason in 2.
+2. **There is still no backup credential.** `.github/actions/write-deploy-env/action.yml`
+   maps `BACKUP_B2_KEY_ID` / `BACKUP_B2_APP_KEY` / `BACKUP_B2_BUCKET` onto the bare
+   `B2_*` names `backup.sh` requires. Those three secrets do not exist at repo scope or
+   on either Environment, so `.env` on both hosts contains `B2_KEY_ID=''`, and
+   `backup.sh` aborts at its credential preflight before dumping a byte.
+
+   Combined with 1, this has an operational consequence worth stating plainly: once the
+   timer is active, the 03:01 UTC run fails, `assert_host_state.sh` sees a failed run,
+   `verify-stg` goes red, and the `stg-verify-result` gate **hard-blocks prod
+   promotion**. That is the gate behaving exactly as designed — it is refusing to
+   promote a host whose backups are failing. The missing piece is a credential only an
+   owner can mint, not a check that needs softening.
+3. **There is no destination bucket.** deploy#559 adds the Terraform; an owner must
    apply it (the apply needs the B2 master key) and set the three secrets.
 
 Until 1–3 are resolved, every "yes" in the tables above describes what `backup.sh` *will*
