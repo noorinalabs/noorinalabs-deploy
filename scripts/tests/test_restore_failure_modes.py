@@ -297,18 +297,78 @@ def test_backup_dumps_user_postgres() -> None:
     assert "isnad-userpg-" in code, "the user-service dump needs its own artifact name"
 
 
+def _backup_dump_filenames() -> dict[str, str]:
+    """Concrete filenames ``backup.sh`` actually writes, read out of the script.
+
+    Parses ``<NAME>_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-...${TIMESTAMP}.dump"`` and
+    substitutes a real timestamp, so the names under test are the producer's own — not
+    literals restated in the test, which would agree with themselves forever.
+    """
+    pattern = re.compile(
+        r'^(?P<var>[A-Z0-9_]+)_DUMP_FILE="\$\{LOCAL_BACKUP_PATH\}/(?P<name>[^"]+)"',
+        re.M,
+    )
+    found = {
+        m.group("var"): m.group("name").replace("${TIMESTAMP}", "20260709-120000")
+        for m in pattern.finditer(_backup_code())
+    }
+    assert found, "could not parse any *_DUMP_FILE assignment out of backup.sh"
+    return found
+
+
+def _restore_globs() -> dict[str, list[str]]:
+    """The ``find -name '<glob>'`` patterns ``restore.sh`` actually selects each dump by."""
+    globs = {}
+    for line in _code_only(_restore_text()).splitlines():
+        m = re.match(r"^(?P<var>[A-Z0-9_]+)_DUMP=\$\(find ", line)
+        if m:
+            globs[m.group("var")] = re.findall(r"-name '([^']+)'", line)
+    assert globs, "could not parse any *_DUMP=$(find ...) glob out of restore.sh"
+    return globs
+
+
 def test_backup_userpg_artifact_name_cannot_be_matched_by_the_isnad_glob() -> None:
-    """``isnad-pg-*.dump`` must not also select ``isnad-userpg-*.dump``.
+    """The isnad glob must not select the user-service dump ``backup.sh`` really writes.
 
     restore.sh finds each dump by glob. If the user-service dump were named such that the
-    isnad glob matched it, a restore would load the user database into the isnad database
-    silently.
+    isnad glob matched it, a restore would silently load the user database into the isnad
+    database — and the rehearsal would not catch it, because the rehearsal constructs the
+    artifact names itself rather than taking them from backup.sh.
+
+    So this reads the producer's names and the consumer's globs from the two scripts and
+    checks them against each other. Rename the dump in backup.sh without updating
+    restore.sh's glob, or vice versa, and this fails.
     """
     import fnmatch
 
-    assert not fnmatch.fnmatch("isnad-userpg-20260709-120000.dump", "isnad-pg-*.dump")
-    assert fnmatch.fnmatch("isnad-pg-20260709-120000.dump", "isnad-pg-*.dump")
-    assert fnmatch.fnmatch("isnad-userpg-20260709-120000.dump", "isnad-userpg-*.dump")
+    names = _backup_dump_filenames()
+    globs = _restore_globs()
+
+    for var in ("PG", "USER_PG", "NEO4J"):
+        assert var in names, f"backup.sh no longer defines {var}_DUMP_FILE"
+        assert var in globs, f"restore.sh no longer selects {var}_DUMP by glob"
+
+    def matches(filename: str, patterns: list[str]) -> bool:
+        return any(fnmatch.fnmatch(filename, p) for p in patterns)
+
+    # Each dump is found by its own glob...
+    for var in ("PG", "USER_PG"):
+        assert matches(names[var], globs[var]), (
+            f"restore.sh's {var} glob {globs[var]} does not match the file backup.sh "
+            f"writes ({names[var]}) — that dump would be silently skipped on restore"
+        )
+
+    # ...and the isnad glob does NOT also swallow the user-service dump. This is the
+    # assertion that matters: it is the one that goes red on a bad rename.
+    assert not matches(names["USER_PG"], globs["PG"]), (
+        f"restore.sh's isnad glob {globs['PG']} also matches the user-service dump "
+        f"({names['USER_PG']}) — a restore would load the user database into the isnad "
+        f"database"
+    )
+    assert not matches(names["PG"], globs["USER_PG"]), (
+        f"restore.sh's user-service glob {globs['USER_PG']} also matches the isnad dump "
+        f"({names['PG']})"
+    )
 
 
 def test_backup_fails_when_user_postgres_dump_fails() -> None:

@@ -10,10 +10,18 @@
 #   B2_BUCKET       — Backblaze B2 bucket name
 #
 # Optional environment variables:
-#   POSTGRES_USER   — PostgreSQL user (default: isnad)
-#   POSTGRES_DB     — PostgreSQL database (default: isnad_graph)
-#   USER_POSTGRES_USER — user-service PostgreSQL user (default: noorina_user)
-#   USER_POSTGRES_DB   — user-service database (default: noorina_users)
+#   POSTGRES_USER      — isnad PostgreSQL user (default: isnad)
+#   POSTGRES_DB        — isnad PostgreSQL database (default: isnad_graph)
+#   USER_POSTGRES_USER — user-service PostgreSQL user (default: user_service)
+#   USER_POSTGRES_DB   — user-service database (default: user_service)
+#   COMPOSE_FILE       — Docker Compose file (default: compose/docker-compose.prod.yml,
+#                        resolved relative to /opt/noorinalabs-deploy/)
+#   BACKUP_DIR         — Local backup staging root (default: /var/lib/noorinalabs-backups,
+#                        a persistent path managed via tmpfiles.d to survive reboots —
+#                        see deploy#121 Bug A for the /tmp/-namespace failure this avoids)
+#   DAILY_RETAIN       — Number of daily backups to keep (default: 7)
+#   WEEKLY_RETAIN      — Number of weekly backups to keep (default: 4)
+#   DRY_RUN            — Set to "true" to show what would be pruned without deleting
 #
 # Datastore coverage (deploy#559). The full enumeration, including WHY each store is
 # or is not dumped, lives in docs/DATASTORES.md. Summary:
@@ -26,14 +34,6 @@
 # `user-postgres` is the only store here whose contents cannot be reconstructed from
 # the published pipeline artifact. The artifact rebuilds the graph; it does not rebuild
 # the users. It had NO backup coverage at all before deploy#559.
-#   COMPOSE_FILE    — Docker Compose file (default: compose/docker-compose.prod.yml,
-#                     resolved relative to /opt/noorinalabs-deploy/)
-#   BACKUP_DIR      — Local backup staging root (default: /var/lib/noorinalabs-backups,
-#                     a persistent path managed via tmpfiles.d to survive reboots —
-#                     see deploy#121 Bug A for the /tmp/-namespace failure this avoids)
-#   DAILY_RETAIN    — Number of daily backups to keep (default: 7)
-#   WEEKLY_RETAIN   — Number of weekly backups to keep (default: 4)
-#   DRY_RUN         — Set to "true" to show what would be pruned without deleting
 #
 # Usage:
 #   ./scripts/backup.sh
