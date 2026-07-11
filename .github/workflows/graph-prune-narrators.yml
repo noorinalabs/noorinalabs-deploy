@@ -583,6 +583,57 @@ jobs:
 
             NARR_Q='MATCH (n:Narrator) RETURN count(n) AS narrators'
 
+            # =====================================================================
+            # LOAD-PROVENANCE GATE (deploy#580) — the ONLY gate derived from the GRAPH
+            # =====================================================================
+            # Everything above this — the provenance gate, the completeness binding, `missing`,
+            # and Gates A-D below — is derived from the KEEP-SET. They prove the prune obeyed
+            # the parquet. NOT ONE OF THEM CAN ASK WHETHER IT WAS THE RIGHT PARQUET.
+            #
+            # The case they all miss is a GENUINE BUT OLDER, SMALLER run — not corrupt, not
+            # foreign, a real earlier resolve run:
+            #   * its _resolve_run.txt is valid and its tally agrees with its parquet (they
+            #     were published together), so the provenance gate PASSES;
+            #   * its md5 matches, so the byte-integrity check PASSES;
+            #   * its ids are a SUBSET of what the graph now holds, so `missing` is ~0 —
+            #     `missing` does not merely miss this case, it CERTIFIES it;
+            #   * the completeness equality PASSES, because the parquet really does hold
+            #     exactly what its producing run declared;
+            #   * and expected_canonical_ids, if supplied, AGREES — because it is that run's
+            #     real count.
+            # Every automated check goes green and the prune deletes every narrator loaded
+            # since. `missing` is structurally blind here and no fix to it can help: it bounds
+            # `canonical − graph`, none of which can be DELETED. The over-deletion lives
+            # entirely in `graph − canonical` — precisely the set this tool exists to delete.
+            #
+            # The graph, however, knows which ref it was loaded from, because
+            # deploy-data-load.yml stamps it. That stamp is independent of BOTH the parquet
+            # and the operator — which is exactly what makes it worth having, since the
+            # parquet cannot vouch for itself and the operator has no independently-sourced
+            # number either (the pipeline's only count is a read-back of the artifact).
+            #
+            # It also turns the hazard the `parquet_ref` input help text has been NAMING and
+            # LEAVING UNENFORCED — "this MUST be the SAME parquet_ref that was loaded" — from
+            # a doc comment into a gate.
+            #
+            # Runs for dry_run TOO, and that is not pedantry: a dry run against the wrong ref
+            # prints a confident "would delete N" that is the most reassuring possible prelude
+            # to an operator setting dry_run=false.
+            echo "==> [${ENV_NAME}] load-provenance gate: is this the ref the graph was LOADED from?"
+            PROV_Q=""
+            PROV_Q="$(bash scripts/graph_load_provenance.sh read-query)" \
+              || { echo "ERROR: [${ENV_NAME}] could not build the load-provenance read-back query." >&2; exit 1; }
+            GRAPH_PROV=""
+            GRAPH_PROV="$(run_cypher "${PROV_Q}")" \
+              || { echo "ERROR: [${ENV_NAME}] the load-provenance read-back query FAILED TO EXECUTE. A gate that cannot read its instrument is a STOP, never a pass — an unreadable stamp is not an absent one, and neither is a licence to prune." >&2; exit 1; }
+            LOADPROV_RC=0
+            PRUNE_PARQUET_REF="${PARQUET_REF}" PROVENANCE_OUTPUT="${GRAPH_PROV}" \
+              bash scripts/graph_load_provenance.sh verify || LOADPROV_RC=$?
+            if [ "${LOADPROV_RC}" -ne 0 ]; then
+              echo "ERROR: [${ENV_NAME}] load-provenance gate REFUSED this prune (rc=${LOADPROV_RC}). NO deletion was attempted." >&2
+              exit 1
+            fi
+
             # GHCR login so the loader image can be pulled; trap logs out at
             # end-of-run so no credentials persist on the box.
             trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
@@ -860,6 +911,13 @@ jobs:
               echo ""
             fi
 
+            echo "**The graph vouches for the ref.** \`deploy-data-load.yml\` stamps the \`parquet_ref\` it loaded"
+            echo "onto the graph, and this prune REFUSES unless it is pruning against that same ref (deploy#580)."
+            echo "It is the only gate here derived from neither the parquet nor the operator — and it is the only"
+            echo "one that can see a **genuine but older, smaller** run: that run's record is valid, its md5 matches,"
+            echo "its ids are a SUBSET of the graph so \`missing\` is 0, and the completeness equality passes — every"
+            echo "parquet-derived check goes green while the prune deletes every narrator loaded since."
+            echo ""
             echo "The keep-set is bound to its producing run. \`curated/_resolve_run.txt\` — written by RESOLVE"
             echo "from its in-memory tally BEFORE the write — declares the canonical-id count and that the run"
             echo "completed; \`curated/_manifest.txt\` declares only the md5 of the bytes published. The prune"

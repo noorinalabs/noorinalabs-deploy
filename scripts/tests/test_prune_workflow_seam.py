@@ -47,6 +47,12 @@ GRAPH_TOTAL = 160614
 # da#426's measured short-parquet case: f=0.20 of the canonical rows retained.
 SHORT_COUNT = 25847
 
+# The ref the operator dispatches the prune against (the `parquet_ref` input).
+PRUNE_REF = "staged/narrator-resolve/test"
+# A DIFFERENT, GENUINE, EARLIER resolve run (deploy#580). Not corrupt. Not foreign. Correctly
+# published, complete, internally consistent — and simply not the one the graph holds.
+OTHER_REF = "staged/narrator-resolve/2026-06-28-9b1e7d3"
+
 
 def _ssh_script() -> str:
     doc = yaml.safe_load(WORKFLOW.read_text())
@@ -70,20 +76,24 @@ def _sandbox(
     run_status: str = "complete",
     publish_provenance: bool = True,
     manifest_md5_correct: bool = True,
+    stamped_ref: str | None = PRUNE_REF,
+    stamped_status: str = "complete",
 ) -> tuple[Path, Path]:
     """A fake VPS. Returns (repo_root, b2_dir).
 
     `canonical_in_parquet` is what the loader's dry-run REPORTS reading out of the parquet;
     `declared` is what resolve's record says it wrote. Making these differ is exactly the
     da#426 short-parquet case, and the completeness binding must catch it.
+
+    `stamped_ref` is what the GRAPH says it was loaded from (deploy#580) — `None` for a graph
+    that carries no load-provenance stamp at all, which is every graph loaded before #580.
     """
     root = tmp_path / "repo"
     (root / "scripts").mkdir(parents=True)
     (root / "compose").mkdir()
-    # The real gate — not a stub. The seam under test is workflow -> THIS.
-    (root / "scripts" / "verify_prune_provenance.sh").write_bytes(
-        (SCRIPTS_DIR / "verify_prune_provenance.sh").read_bytes()
-    )
+    # The real gates — not stubs. The seam under test is workflow -> THESE.
+    for gate in ("verify_prune_provenance.sh", "graph_load_provenance.sh"):
+        (root / "scripts" / gate).write_bytes((SCRIPTS_DIR / gate).read_bytes())
     (root / "compose" / "docker-compose.prod.yml").write_text("services: {}\n")
     (root / ".env").write_text("NEO4J_PASSWORD=x\n")
 
@@ -117,6 +127,20 @@ esac
 exit 0
 ''',
     )
+    # The graph's answer to the load-provenance read-back (deploy#580), rendered the way
+    # `cypher-shell --format plain` really renders a string column: header, then a QUOTED row.
+    # `stamped_ref=None` means the graph carries no stamp — the query matches nothing and
+    # returns the header alone, which is exactly what a pre-#580 graph does.
+    if stamped_ref is None:
+        provenance_rows = "echo provenance"
+    else:
+        provenance_rows = (
+            "echo provenance; "
+            f"echo '\"GRAPH_LOAD_PROVENANCE parquet_ref={stamped_ref} "
+            f"load_status={stamped_status} stamped_at=2026-07-11T04:12:03Z "
+            f"image=img:test\"'"
+        )
+
     # The loader. `prune-narrators --dry-run` reports what the PARQUET actually holds.
     _stub(
         bins,
@@ -125,6 +149,9 @@ exit 0
 echo "$@" >> "{audit}"
 for a in "$@"; do
   case "$a" in
+    *GRAPH_LOAD_PROVENANCE*)
+      {provenance_rows}
+      exit 0 ;;
     *"count(n)"*)
       echo "narrators"
       if grep -q REAL_PRUNE_ISSUED "{audit}" 2>/dev/null; then
@@ -174,7 +201,7 @@ def _run_ssh_block(root: Path, tmp_path: Path, **env: str) -> subprocess.Complet
             "PATH": path,
             "HOME": str(tmp_path),
             "ENV_NAME": "stg",
-            "PARQUET_REF": "staged/narrator-resolve/test",
+            "PARQUET_REF": PRUNE_REF,
             "EXPECTED_CANONICAL_IDS": "",
             "DRY_RUN": "true",
             "IMAGE": "img:test",
@@ -317,3 +344,93 @@ def test_bad_md5_blocked_at_the_seam(tmp_path: Path) -> None:
     r = _run_ssh_block(root, tmp_path, DRY_RUN="false")
     assert r.returncode != 0
     assert "REAL_PRUNE_ISSUED" not in (audit.read_text() if audit.exists() else "")
+
+
+# ---------------------------------------------------------------------------
+# LOAD PROVENANCE (deploy#580) — the wrong-ref prune, blocked END TO END.
+# ---------------------------------------------------------------------------
+def test_valid_but_wrong_ref_is_refused_end_to_end(tmp_path: Path) -> None:
+    """THE #580 CASE, through the real ssh block: a genuine but older, smaller run.
+
+    The keep-set in B2 here is the DEFAULT sandbox artifact — the same one
+    ``test_honest_artifact_reaches_the_real_prune`` drives all the way to a real prune. It is
+    complete, its resolve record is valid, its md5 matches, its tally agrees with its parquet.
+    **Every parquet-derived gate in this workflow passes it**, and that is not an assumption:
+    the honest-artifact test proves it by pruning with it.
+
+    The only thing changed is which ref the GRAPH was loaded from. That single fact must stop
+    the prune — because nothing else can. In production the operator's ref would name a real
+    earlier run whose ids are a subset of the graph, so ``missing`` is 0, the completeness
+    equality holds, and the prune deletes every narrator loaded since.
+    """
+    root, audit = _sandbox(tmp_path, stamped_ref=OTHER_REF)
+    r = _run_ssh_block(root, tmp_path, DRY_RUN="false", PARQUET_REF=PRUNE_REF)
+    out = r.stdout + r.stderr
+
+    assert r.returncode != 0, (
+        "the workflow pruned against a ref the graph was NOT loaded from. Every other gate "
+        f"went green — they are all derived from the keep-set.\n{out}"
+    )
+    assert "REAL_PRUNE_ISSUED" not in (audit.read_text() if audit.exists() else ""), (
+        "a DELETE was issued against a graph loaded from a different resolve run"
+    )
+    # The diagnostic must name BOTH refs. An operator halted on an irreversible op needs to see
+    # what the graph holds and what they typed, side by side — backups have never run.
+    assert OTHER_REF in out, "the diagnostic does not name the ref the graph was LOADED from"
+    assert PRUNE_REF in out, "the diagnostic does not name the ref the operator TYPED"
+    assert "WRONG REF" in out
+
+
+def test_wrong_ref_is_refused_on_a_dry_run_too(tmp_path: Path) -> None:
+    """A dry run against the wrong ref prints a confident "would delete N".
+
+    That is the most reassuring possible prelude to an operator setting dry_run=false, so the
+    gate refuses in both modes rather than quietly reporting a meaningless plan.
+    """
+    root, audit = _sandbox(tmp_path, stamped_ref=OTHER_REF)
+    r = _run_ssh_block(root, tmp_path, DRY_RUN="true", PARQUET_REF=PRUNE_REF)
+    assert r.returncode != 0, "a dry run against the wrong ref must refuse, not report a plan"
+    assert "would DETACH DELETE" not in r.stdout, (
+        "the workflow printed a would-delete count for a ref the graph was never loaded from"
+    )
+    assert "REAL_PRUNE_ISSUED" not in (audit.read_text() if audit.exists() else "")
+
+
+def test_unstamped_graph_issues_no_prune(tmp_path: Path) -> None:
+    """Every graph loaded before #580 carries no stamp. The prune must be inert against it."""
+    root, audit = _sandbox(tmp_path, stamped_ref=None)
+    r = _run_ssh_block(root, tmp_path, DRY_RUN="false")
+    assert r.returncode != 0, "an unstamped graph must not be prunable"
+    assert "NO load-provenance stamp" in r.stdout + r.stderr
+    assert "REAL_PRUNE_ISSUED" not in (audit.read_text() if audit.exists() else "")
+
+
+def test_half_loaded_graph_issues_no_prune_even_against_its_own_ref(tmp_path: Path) -> None:
+    """A load that died mid-write leaves `in_progress`. Refuse — against its OWN ref, too.
+
+    Note the ref here is the RIGHT one. The graph still must not be pruned: a half-loaded graph
+    holds narrators that no keep-set names, so the prune deletes exactly those.
+    """
+    root, audit = _sandbox(tmp_path, stamped_ref=PRUNE_REF, stamped_status="in_progress")
+    r = _run_ssh_block(root, tmp_path, DRY_RUN="false", PARQUET_REF=PRUNE_REF)
+    assert r.returncode != 0
+    assert "did NOT complete" in r.stdout + r.stderr
+    assert "REAL_PRUNE_ISSUED" not in (audit.read_text() if audit.exists() else "")
+
+
+def test_the_caller_does_not_forge_the_stamp(tmp_path: Path) -> None:
+    """The forge, one layer up — the shape that shipped green TWICE in this workflow.
+
+    Hardening ``graph_load_provenance.sh`` does nothing if the CALLER writes the stamp it is
+    about to check. So: with no stamp on the graph, the workflow must never issue a MERGE that
+    creates one. The audit log records every docker invocation, so a caller that stamps the
+    graph on the prune path is visible here — and nowhere else.
+    """
+    root, audit = _sandbox(tmp_path, stamped_ref=None)
+    _run_ssh_block(root, tmp_path, DRY_RUN="false")
+    log = audit.read_text() if audit.exists() else ""
+    assert "MERGE (p:LoadProvenance" not in log, (
+        "the PRUNE workflow wrote a load-provenance stamp. Only a LOAD may stamp the graph; a "
+        "prune that manufactures the evidence it then checks is not gated at all."
+    )
+    assert "REAL_PRUNE_ISSUED" not in log
