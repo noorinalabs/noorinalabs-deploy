@@ -79,6 +79,20 @@ on:
           No bucket name, no leading slash.
         required: true
         type: string
+      expected_canonical_ids:
+        description: >-
+          REQUIRED. The number of distinct canonical narrator ids the resolve run
+          that produced this parquet_ref REPORTED writing. Take it from THAT RUN's
+          own output — never from the parquet you are about to prune against, which
+          would make this check circular and worthless. The prune refuses unless the
+          parquet yields exactly this many ids. This is the ONLY check here that is
+          not derived from the keep-set it validates: without it a truncated-but-
+          valid parquet deletes 83.9% of the graph with every other gate green
+          (da#426). Superseded automatically by curated/_manifest.txt once da#428
+          lands, which asserts the same equality from the producer instead of from
+          you.
+        required: true
+        type: string
       image:
         description: >-
           Loader image ref. Leave empty to resolve the env-scoped default
@@ -163,6 +177,7 @@ jobs:
         env:
           ENV_NAME: ${{ inputs.env }}
           PARQUET_REF: ${{ inputs.parquet_ref }}
+          EXPECTED_CANONICAL_IDS: ${{ inputs.expected_canonical_ids }}
           DRY_RUN: ${{ inputs.dry_run }}
           IMAGE: ${{ steps.resolve.outputs.image }}
           # B2 read credentials for the pipeline bucket — consumed by rclone on
@@ -192,7 +207,7 @@ jobs:
           # exposed: this is the same stdout already streamed to the (public) job log,
           # and the RCLONE_* scrub above is what keeps credentials out of both.
           capture_stdout: true
-          envs: ENV_NAME,PARQUET_REF,DRY_RUN,IMAGE,PIPELINE_B2_KEY_ID,PIPELINE_B2_KEY,GITHUB_TOKEN,GITHUB_ACTOR
+          envs: ENV_NAME,PARQUET_REF,EXPECTED_CANONICAL_IDS,DRY_RUN,IMAGE,PIPELINE_B2_KEY_ID,PIPELINE_B2_KEY,GITHUB_TOKEN,GITHUB_ACTOR
           script: |
             set -euo pipefail
 
@@ -312,11 +327,12 @@ jobs:
             # The canonical set is ALL a prune needs — narrators_canonical.parquet
             # alone. No staging/edge Parquet is read (unlike deploy-data-load.yml).
             #
-            # _manifest.txt is required TOO, and its absence is a hard refusal. See the
-            # COMPLETENESS BINDING block below for why a prune without it is unsafe at
-            # any magnitude. It is published LAST by da's publish_parquet.py, so its
-            # presence is itself the evidence that the publish ran to completion.
-            verify_present "${B2_BASE}/curated" "narrators_canonical.parquet" "_manifest.txt"
+            # curated/_manifest.txt is pulled too if it exists, but is NOT required here:
+            # nothing publishes it yet (da#428). The completeness binding does not depend
+            # on it — `expected_canonical_ids` is the required declaration, and the
+            # manifest, once it exists, replaces the human as the declarer. See the
+            # COMPLETENESS BINDING block below.
+            verify_present "${B2_BASE}/curated" "narrators_canonical.parquet"
             echo "    B2 presence check PASSED."
 
             # Stable, git-untracked data dir OUTSIDE the /opt checkout (so the git
@@ -387,57 +403,96 @@ jobs:
             # correct prune, which is its own incident. Producer and consumer must count
             # the same thing.
             #
-            # NO manifest, NO prune. There is no break-glass input, deliberately: an
-            # override on an irreversible op with no provenance is exactly the flag that
-            # gets set at 03:00 by someone who just wants the job to go green.
+            # THE DECLARED COUNT. `expected_canonical_ids` is a REQUIRED workflow input,
+            # not an override — there is no break-glass, deliberately. An operator must
+            # state up front how many distinct canonical ids the producing RUN reported
+            # writing; the parquet must then yield exactly that many.
+            #
+            # A declaration, not a threshold. A `--min-canonical-ids` FLOOR would not do:
+            # a floor is still magnitude, only approached from below, and it accepts any
+            # parquet at-or-above it — including a LARGER one from the wrong generation.
+            # Only EQUALITY says "this is the whole keep-set, and it is this run's".
+            #
+            # This is weaker than producer-signed provenance and is meant to be superseded
+            # by it (da#428). Its weakness is circularity: an operator who reads the number
+            # off the very parquet they are about to prune against has checked nothing, and
+            # the input's description says so in as many words. But it defends against every
+            # failure mode actually on the table — a resolve stopped early, a partial write,
+            # a truncated upload — because in each of those the run's reported count and the
+            # short parquet's count DISAGREE, and no gate derived from the parquet can see
+            # that disagreement.
+            case "${EXPECTED_CANONICAL_IDS}" in
+              ''|*[!0-9]*)
+                echo "ERROR: [${ENV_NAME}] expected_canonical_ids='${EXPECTED_CANONICAL_IDS}' is not a non-negative integer. It must be the count of distinct canonical ids the resolve run REPORTED writing." >&2
+                exit 1 ;;
+            esac
+            if [ "${EXPECTED_CANONICAL_IDS}" -le 0 ]; then
+              echo "ERROR: [${ENV_NAME}] expected_canonical_ids must be > 0 — a prune against a zero-id keep-set would delete the whole graph." >&2
+              exit 1
+            fi
+            echo "    declared: the producing run wrote ${EXPECTED_CANONICAL_IDS} distinct canonical ids (operator-supplied)."
+
+            # THE MANIFEST — machine provenance, when it exists. NOT required, because
+            # nothing publishes it yet: verified 2026-07-11 that a published ref holds the
+            # parquets and nothing else (da#428 adds it). When it lands it becomes the
+            # authoritative declarer and the operator's number is corroboration rather than
+            # the sole binding. Present-and-disagreeing is a hard refusal either way — two
+            # independent declarations that contradict each other mean one of them is
+            # wrong, and on a destructive op that is a stop, not a coin-toss.
             MANIFEST="${PRUNE_DATA_DIR}/curated/_manifest.txt"
             if [ ! -s "${MANIFEST}" ]; then
-              echo "ERROR: [${ENV_NAME}] curated/_manifest.txt is absent or empty under parquet_ref '${PARQUET_REF}'." >&2
-              echo "  The keep-set has no provenance: nothing declares how many canonical ids the producing run" >&2
-              echo "  intended to write, so a truncated-but-valid parquet is indistinguishable from a complete one" >&2
-              echo "  and would silently delete most of the graph (da#426 measured 83.9% at f=0.20, missing=0)." >&2
-              echo "  Re-publish this ref with a manifest (da publish_parquet.py). Refusing to prune." >&2
-              exit 1
-            fi
+              echo "    NOTE: curated/_manifest.txt is absent under '${PARQUET_REF}' — this keep-set carries no"
+              echo "          producer-signed provenance (da#428). The completeness binding falls back to the"
+              echo "          REQUIRED operator-declared count above, which is weaker: it trusts that the number"
+              echo "          came from the run's report and not from the parquet itself."
+            else
+              # manifest_field <key>: the value for <key> on the CANONICAL_MANIFEST line for
+              # narrators_canonical.parquet. Whole-token match, same discipline as
+              # summary_field (da#419) — no key may be hijacked by one ending in its name.
+              manifest_field() {
+                grep '^CANONICAL_MANIFEST ' "${MANIFEST}" \
+                  | grep ' file=narrators_canonical.parquet ' \
+                  | head -n1 \
+                  | tr ' ' '\n' \
+                  | sed -n "s/^$1=\\([0-9a-f][0-9a-f]*\\)$/\\1/p" \
+                  | head -n1
+              }
 
-            # manifest_field <key>: the value for <key> on the CANONICAL_MANIFEST line
-            # for narrators_canonical.parquet. Whole-token match, same discipline as
-            # summary_field (da#419) — no key may be hijacked by one ending in its name.
-            manifest_field() {
-              grep '^CANONICAL_MANIFEST ' "${MANIFEST}" \
-                | grep ' file=narrators_canonical.parquet ' \
-                | head -n1 \
-                | tr ' ' '\n' \
-                | sed -n "s/^$1=\\([0-9a-f][0-9a-f]*\\)$/\\1/p" \
-                | head -n1
-            }
+              MF_CANON_IDS="$(manifest_field canonical_ids)"
+              MF_MD5="$(manifest_field md5)"
+              if [ -z "${MF_CANON_IDS}" ] || [ -z "${MF_MD5}" ]; then
+                echo "ERROR: [${ENV_NAME}] curated/_manifest.txt is present but has no usable CANONICAL_MANIFEST line for narrators_canonical.parquet (canonical_ids='${MF_CANON_IDS}' md5='${MF_MD5}')." >&2
+                echo "  Expected: CANONICAL_MANIFEST file=narrators_canonical.parquet rows=<n> canonical_ids=<n> md5=<32hex> bytes=<n>" >&2
+                echo "  A manifest we cannot read is a manifest we do not have — and an unreadable one is more" >&2
+                echo "  likely a corrupted publish than a formatting quirk. Refusing to prune." >&2
+                exit 1
+              fi
 
-            MF_CANON_IDS="$(manifest_field canonical_ids)"
-            MF_MD5="$(manifest_field md5)"
-            if [ -z "${MF_CANON_IDS}" ] || [ -z "${MF_MD5}" ]; then
-              echo "ERROR: [${ENV_NAME}] curated/_manifest.txt has no usable CANONICAL_MANIFEST line for narrators_canonical.parquet (canonical_ids='${MF_CANON_IDS}' md5='${MF_MD5}')." >&2
-              echo "  Expected: CANONICAL_MANIFEST file=narrators_canonical.parquet rows=<n> canonical_ids=<n> md5=<32hex> bytes=<n>" >&2
-              echo "  A manifest we cannot read is a manifest we do not have. Refusing to prune." >&2
-              exit 1
-            fi
+              # BYTE INTEGRITY — the bytes we hold are the bytes the producer published.
+              # Catches a corrupt/truncated TRANSFER. It does NOT catch a short WRITE: a
+              # short parquet has a perfectly good md5 of itself. The count equality below
+              # is what catches that. Neither substitutes for the other.
+              GOT_MD5="$(md5sum "${PRUNE_DATA_DIR}/curated/narrators_canonical.parquet" | cut -d' ' -f1)"
+              if [ "${GOT_MD5}" != "${MF_MD5}" ]; then
+                echo "ERROR: [${ENV_NAME}] narrators_canonical.parquet md5 mismatch — the bytes on this box are NOT the bytes the producing run published (manifest=${MF_MD5} pulled=${GOT_MD5}). Refusing to prune against an artifact we cannot vouch for." >&2
+                exit 1
+              fi
+              echo "    manifest: md5 MATCHES the published artifact (${GOT_MD5})."
 
-            # (a) BYTE INTEGRITY — the bytes we hold are the bytes the producer published.
-            #     This catches a corrupt/truncated TRANSFER. It does NOT catch a short
-            #     WRITE (a short parquet has a perfectly good md5 of itself), which is
-            #     what (b) is for. Both are needed; neither substitutes for the other.
-            GOT_MD5="$(md5sum "${PRUNE_DATA_DIR}/curated/narrators_canonical.parquet" | cut -d' ' -f1)"
-            if [ "${GOT_MD5}" != "${MF_MD5}" ]; then
-              echo "ERROR: [${ENV_NAME}] narrators_canonical.parquet md5 mismatch — the bytes on this box are NOT the bytes the producing run published." >&2
-              echo "  manifest: ${MF_MD5}" >&2
-              echo "  pulled  : ${GOT_MD5}" >&2
-              echo "  Refusing to prune against an artifact we cannot vouch for." >&2
-              exit 1
+              # The producer and the operator must agree. If they do not, one of them is
+              # describing a different run, and we do not get to guess which.
+              if [ "${MF_CANON_IDS}" -ne "${EXPECTED_CANONICAL_IDS}" ]; then
+                echo "ERROR: [${ENV_NAME}] the manifest and the operator disagree about this run." >&2
+                echo "  manifest (producer-signed): ${MF_CANON_IDS} canonical ids" >&2
+                echo "  expected_canonical_ids    : ${EXPECTED_CANONICAL_IDS} (operator-supplied)" >&2
+                echo "  One of these describes a different resolve run. Refusing to prune." >&2
+                exit 1
+              fi
+              echo "    manifest: producer-signed count AGREES with the operator (${MF_CANON_IDS})."
             fi
-            echo "    manifest: md5 MATCHES the published artifact (${GOT_MD5})."
-            echo "    manifest: producing run declared ${MF_CANON_IDS} distinct canonical ids."
-            # (b) COMPLETENESS is asserted below, once the dry-run has reported how many
-            #     canonical ids the parquet ACTUALLY yields (`canonical=`). It cannot be
-            #     checked here: only da's reader can tell us what the file really holds.
+            # COMPLETENESS itself is asserted below, once the dry-run has reported how many
+            # canonical ids the parquet ACTUALLY yields (`canonical=`). It cannot be checked
+            # here: only da's reader can tell us what the file really holds.
 
             # Pin the loader image for the compose graph-load service and point its
             # read-only data bind-mount at the pulled dir. Both are exported env
@@ -568,23 +623,30 @@ jobs:
             fi
             echo "    canonical ids: ${CANON_N} | graph total: ${GRAPH_M} | orphans (would delete): ${ORPHANS_K} | missing: ${MISSING_N}"
 
-            # --- COMPLETENESS BINDING (b): the keep-set is the WHOLE keep-set ---------
-            # The parquet on this box yields CANON_N distinct canonical ids. The run that
-            # produced it declared MF_CANON_IDS. If those differ, the file is not what its
-            # producer says it is — the short-parquet case that `missing` certifies as
-            # healthy (missing=0) and that no magnitude ceiling can separate from a
-            # legitimate 55.4%-deleting re-mint. This equality is the ONLY gate in this
-            # workflow not derived from the keep-set it is validating.
-            if [ "${CANON_N}" -ne "${MF_CANON_IDS}" ]; then
-              echo "ERROR: [${ENV_NAME}] COMPLETENESS CHECK FAILED — the canonical parquet is not the one its producing run published." >&2
-              echo "  declared by the producing run : ${MF_CANON_IDS} distinct canonical ids" >&2
+            # --- COMPLETENESS BINDING: the keep-set is the WHOLE keep-set --------------
+            # The parquet on this box yields CANON_N distinct canonical ids. The producing
+            # run was declared to have written EXPECTED_CANONICAL_IDS (by the manifest when
+            # it exists, cross-checked against the operator above; by the operator alone
+            # until da#428 lands). If those differ, the file is not the whole keep-set —
+            # the short-parquet case that `missing` certifies as healthy (missing=0) and
+            # that no magnitude ceiling can separate from a legitimate 55.4%-deleting
+            # re-mint, because the bands overlap.
+            #
+            # This equality is the ONLY gate in this workflow not derived from the keep-set
+            # it is validating. Everything else here — the whole-graph sanity check,
+            # EXPECTED_POST, Gates A-D — reads the same parquet and can only ever confirm
+            # that the prune did what the parquet said.
+            if [ "${CANON_N}" -ne "${EXPECTED_CANONICAL_IDS}" ]; then
+              echo "ERROR: [${ENV_NAME}] COMPLETENESS CHECK FAILED — the canonical parquet is not the whole keep-set of the run it claims to be." >&2
+              echo "  declared by the producing run : ${EXPECTED_CANONICAL_IDS} distinct canonical ids" >&2
               echo "  actually read from the parquet: ${CANON_N}" >&2
-              echo "  This is a SHORT keep-set. Every id in it is real, so 'missing' is ${MISSING_N} and every" >&2
-              echo "  derived gate downstream would go green while the prune deleted the $(( GRAPH_M - CANON_N )) narrators the" >&2
-              echo "  keep-set failed to name. NO node was deleted. Re-publish the ref and re-run." >&2
+              echo "  Every id in this keep-set is real, so 'missing' is ${MISSING_N} and EVERY derived gate" >&2
+              echo "  downstream would go green while the prune deleted the $(( GRAPH_M - CANON_N )) narrators the keep-set" >&2
+              echo "  failed to name. da#426 measured this shape deleting 83.9% of the graph with missing=0." >&2
+              echo "  NO node was deleted. Re-publish the ref, or correct expected_canonical_ids if IT is wrong." >&2
               exit 1
             fi
-            echo "    COMPLETENESS: parquet yields exactly the ${MF_CANON_IDS} canonical ids its producing run declared."
+            echo "    COMPLETENESS: parquet yields exactly the ${EXPECTED_CANONICAL_IDS} canonical ids the producing run declared."
 
             # `missing` is REPORTED, never asserted to be 0. da#414's own contract puts
             # this policy here rather than in the subcommand, and the naive policy is a

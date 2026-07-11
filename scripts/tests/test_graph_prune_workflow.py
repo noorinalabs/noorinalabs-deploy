@@ -58,25 +58,30 @@ def _code_only(text: str) -> str:
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 
-def test_completeness_binding_is_present_and_refuses() -> None:
-    """The keep-set must be bound to its producing run, or the prune must refuse.
+def test_completeness_binding_asserts_equality_against_a_declared_count() -> None:
+    """The keep-set must equal what its producing run declared, or the prune must refuse.
 
-    Without this the workflow will delete 83.9% of the graph on a short-but-valid
-    parquet and print a passing verification (da#426).
+    Without this the workflow deletes 83.9% of the graph on a short-but-valid parquet and
+    prints a passing verification (da#426). Note this is EQUALITY against a declaration,
+    not a floor: a `--min-canonical-ids` threshold is still magnitude, only approached
+    from below, and would accept a larger parquet from the wrong generation.
     """
-    script = _ssh_script()
-    assert "_manifest.txt" in script, (
-        "the prune must fetch curated/_manifest.txt — the keep-set's only provenance"
-    )
-    assert 'CANON_N}" -ne "${MF_CANON_IDS}' in script, (
+    code = _code_only(_ssh_script())
+    assert 'CANON_N}" -ne "${EXPECTED_CANONICAL_IDS}' in code, (
         "the completeness binding must assert the canonical ids READ from the parquet "
-        "equal the count its producing run DECLARED; without that equality a truncated "
+        "EQUAL the count the producing run DECLARED; without that equality a truncated "
         "parquet is indistinguishable from a complete one"
     )
+    # A floor would be a magnitude threshold wearing a provenance costume.
+    for floor in ('-lt "${EXPECTED_CANONICAL_IDS}"', '-ge "${EXPECTED_CANONICAL_IDS}"'):
+        assert floor not in code, (
+            f"the binding must be equality, not a floor ({floor}) — a floor accepts any "
+            "parquet at-or-above it, including a larger one from the wrong generation"
+        )
 
 
-def test_absent_manifest_is_a_hard_refusal_with_no_break_glass() -> None:
-    """No manifest, no prune — and no override input to wave it through.
+def test_declared_count_is_required_and_has_no_break_glass() -> None:
+    """`expected_canonical_ids` is a REQUIRED input, and nothing can wave it through.
 
     An override on an irreversible op with no provenance is the flag that gets set at
     03:00 by someone who just wants the job green.
@@ -85,13 +90,40 @@ def test_absent_manifest_is_a_hard_refusal_with_no_break_glass() -> None:
     # `on` is parsed by PyYAML as the boolean True (YAML 1.1) — look it up either way.
     trigger = doc.get("on", doc.get(True))
     inputs = trigger["workflow_dispatch"]["inputs"]
+
+    assert "expected_canonical_ids" in inputs, (
+        "the workflow must require the operator to declare the producing run's canonical "
+        "count — it is the only signal not derived from the keep-set being validated"
+    )
+    assert inputs["expected_canonical_ids"].get("required") is True, (
+        "expected_canonical_ids must be REQUIRED; an optional provenance check is not one"
+    )
+    assert "default" not in inputs["expected_canonical_ids"], (
+        "a default would let the operator skip the declaration without noticing"
+    )
+
     for name in inputs:
         assert not any(
             tok in name.lower() for tok in ("force", "override", "skip", "allow", "ignore")
         ), f"workflow input '{name}' looks like a break-glass override on a destructive op"
 
-    script = _ssh_script()
-    assert '[ ! -s "${MANIFEST}" ]' in script, "an absent/empty manifest must be tested for"
+
+def test_manifest_when_present_must_agree_with_the_operator() -> None:
+    """The manifest (da#428) is machine provenance; it does not merely decorate.
+
+    It is not required — nothing publishes it yet — but a manifest that CONTRADICTS the
+    operator means one of them describes a different run, and on a destructive op that is
+    a stop, not a coin-toss.
+    """
+    code = _code_only(_ssh_script())
+    assert "_manifest.txt" in code, "the prune must pull curated/_manifest.txt when present"
+    assert 'MF_CANON_IDS}" -ne "${EXPECTED_CANONICAL_IDS}' in code, (
+        "a present manifest must be cross-checked against the operator's declaration"
+    )
+    assert 'GOT_MD5}" != "${MF_MD5}' in code, (
+        "a present manifest must be used to verify the bytes we pulled are the bytes "
+        "that were published"
+    )
 
 
 def test_dry_run_fails_safe() -> None:
