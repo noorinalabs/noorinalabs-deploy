@@ -813,3 +813,87 @@ def test_list_backups_does_not_print_rclone_stderr_as_a_backup_name(tmp_path: Pa
     assert r.returncode == 0, f"a healthy bucket must list cleanly: {out}"
     assert "NOTICE" not in out, f"rclone's stderr is being printed as a backup name:\n{out}"
     assert "2026-07-11/" in r.stdout, f"the real backup must still be listed:\n{out}"
+
+
+# --------------------------------------------------------------------------
+# deploy#589 — the paraphrase in the PRODUCT
+# --------------------------------------------------------------------------
+
+
+def _list_runs(directory: Path) -> list[str]:
+    """Execute restore.sh's SHIPPED `list_runs` against a real directory."""
+    body = _restore_text()
+    fn = body[body.index("list_runs() {") : body.index("\ncount_runs()")]
+    r = subprocess.run(  # noqa: S603
+        ["bash", "-c", fn + '\nlist_runs "$1"\n', "_", str(directory)],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return r.stdout.split()
+
+
+def test_list_runs_sees_every_dump_the_producer_actually_writes(tmp_path: Path) -> None:
+    """The run-counter is bound to `backup.sh`'s REAL filenames, not to names I typed.
+
+    `count_runs` feeds the refuse-on-ambiguity gate, so a dump this parser cannot see is a run
+    that does not exist as far as the gate is concerned.
+    """
+    names = _backup_dump_filenames()  # parsed out of backup.sh
+    assert names, "no *_DUMP_FILE names parsed from backup.sh"
+    for name in names.values():
+        # backup.sh compresses the Neo4j dump after writing it.
+        for fname in (name, f"{name}.zst"):
+            (tmp_path / fname).write_bytes(b"P" * 4096)
+        (tmp_path / f"{name}.sha256").write_bytes(b"x")  # sidecar — must be ignored
+
+    assert _list_runs(tmp_path) == [TIMESTAMP], (
+        f"every dump backup.sh writes belongs to run {TIMESTAMP}; list_runs saw "
+        f"{_list_runs(tmp_path)}. A dump this parser cannot see is a run the "
+        "refuse-on-ambiguity gate cannot count."
+    )
+
+
+def test_a_store_rename_cannot_make_a_run_invisible(tmp_path: Path) -> None:
+    """deploy#589. The store segment was `[a-z0-9]+` — which CANNOT CONTAIN A HYPHEN.
+
+    Rename `userpg` -> `user-pg` in the producer and every dump of that store becomes invisible
+    to `list_runs`. That does not BREAK the parser, it QUIETLY NARROWS it — and what it stops
+    seeing is exactly what the guard downstream needs to count:
+
+        run rendered invisible -> count_runs falls to 1 -> the refuse-on-ambiguity gate
+        stops refusing -> THE TORN RESTORE COMES BACK -> and nothing goes red.
+
+    **A paraphrase in the product is worse than one in a test, because the test paraphrases
+    too, so it stays green.** So the parser must anchor on the RUN ID — whose format is strict
+    and self-delimiting — and must not care what the store is called.
+    """
+    # Two runs. The 08:00 leftover is written under a HYPHENATED store name.
+    for name in ("isnad-pg", "isnad-userpg", "isnad-neo4j"):
+        (tmp_path / f"{name}-20260711-030100.dump").write_bytes(b"P" * 4096)
+    (tmp_path / "isnad-user-pg-20260711-080000.dump").write_bytes(b"S" * 4096)
+
+    runs = _list_runs(tmp_path)
+    assert runs == ["20260711-030100", "20260711-080000"], (
+        f"a hyphenated store name made an entire run INVISIBLE: saw {runs}. count_runs would "
+        "fall to 1, the refuse-on-ambiguity gate would stand down, and the torn restore "
+        "would come back with nothing red."
+    )
+
+
+def test_list_runs_does_not_constrain_the_store_charset() -> None:
+    """Pin the SHAPE, not the instance — the store segment must not be enumerated.
+
+    A charset for the store name is a paraphrase of the producer's naming, and it is the
+    paraphrase that silently narrows. The run id is the only thing worth parsing.
+    """
+    fn = _code_only(_restore_text())
+    fn = fn[fn.index("list_runs() {") : fn.index("count_runs()")]
+    assert "[a-z0-9]" not in fn, (
+        "list_runs is matching the store name against a character class again. A producer-side "
+        "rename would not break it — it would silently narrow it, and the refuse-on-ambiguity "
+        "gate downstream would stop refusing. Anchor on the run id instead (deploy#589)."
+    )
+    assert "[0-9]\\{8\\}-[0-9]\\{6\\}" in fn, (
+        "list_runs must anchor on the run id's strict %Y%m%d-%H%M%S shape"
+    )

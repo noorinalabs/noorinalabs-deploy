@@ -170,9 +170,27 @@ list_category() {
 # `%Y%m%d-%H%M%S` run id, so the filenames themselves carry which run each dump belongs to.
 # A B2 day-directory accumulates runs (`rclone copy` adds and never deletes), so "how many
 # runs are in here?" is a question the artifact can answer without a manifest.
+#
+# ---------------------------------------------------------------------------
+# ANCHOR ON THE RUN ID. DO NOT PARSE THE STORE NAME. (deploy#589)
+# ---------------------------------------------------------------------------
+# This matched the store segment as `[a-z0-9]\{1,\}` — which CANNOT CONTAIN A HYPHEN. Rename
+# `userpg` to `user-pg` in backup.sh and every dump of that store becomes INVISIBLE here:
+#
+#   isnad-user-pg-20260711-030100.dump   ->   (no match)
+#
+# A producer-side rename does not BREAK this parser — it QUIETLY NARROWS it. And what it
+# stops seeing is exactly what the guard downstream needs to count: with a run rendered
+# invisible, `count_runs` falls to 1, the refuse-on-ambiguity gate stops refusing, and THE
+# TORN RESTORE COMES BACK — with nothing red anywhere. A paraphrase in the PRODUCT is worse
+# than one in a test: the test paraphrases too, so it stays green.
+#
+# So do not parse the part that can change. The RUN ID is what we want and its format is
+# strict and self-delimiting (`%Y%m%d-%H%M%S`), so anchor on THAT and let the store segment be
+# anything at all. Sidecars still fall out for free: `.sha256` does not end in `.dump[.zst]`.
 list_runs() {
     find "$1" \( -name 'isnad-*.dump' -o -name 'isnad-*.dump.zst' \) -type f -printf '%f\n' 2>/dev/null \
-        | sed -n 's/^isnad-[a-z0-9]\{1,\}-\([0-9]\{8\}-[0-9]\{6\}\)\.dump\(\.zst\)\{0,1\}$/\1/p' \
+        | sed -n 's/^isnad-.*-\([0-9]\{8\}-[0-9]\{6\}\)\.dump\(\.zst\)\{0,1\}$/\1/p' \
         | sort -u
 }
 
