@@ -419,7 +419,37 @@ done
 # carries its own list of required stores. If the expected set came from the artifact, a
 # partial backup would declare itself complete-for-what-it-happens-to-hold — the same
 # circularity that a read-back count has, and it would be just as invisible.
-MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_backup_manifest.txt"
+#
+# ---------------------------------------------------------------------------
+# ONE MANIFEST PER RUN. NOT ONE PER DIRECTORY. (deploy#587)
+# ---------------------------------------------------------------------------
+# This was `_backup_manifest.txt` — a FIXED name — and completeness is not a property of a
+# directory. It is a property of a RUN:
+#
+#   the B2 path is `<category>/<DATE>`            -> a DAY
+#   the dumps inside are `isnad-<store>-<TS>`     -> a RUN
+#
+# `rclone copy` ADDS and never deletes, and this script deliberately uploads partials ("a
+# partial backup beats none", below), so a day-directory routinely holds MORE THAN ONE RUN —
+# and the fixed-name manifest was overwritten by WHICHEVER RUN UPLOADED LAST, good or not.
+#
+# So a GOOD run followed by a PARTIAL one ERASED THE GOOD RUN'S ATTESTATION. The 03:01 nightly
+# succeeds completely; an 08:00 retry fails halfway and uploads its `complete=false` manifest
+# over the good one. Both consumers then read the surviving attestation and believe it:
+# `verify_b2_backup_artifact.sh` reported `status=incomplete reason=no_complete_backup` over a
+# bucket containing a complete backup, and `restore.sh latest` walked past that day and
+# restored one TWO DAYS OLDER — while the good run sat intact in the day it skipped.
+#
+# Both fail in the safe direction — a false alarm, an older restore — and that is precisely
+# the problem: it is a false alarm ON THE ONE CHECK THAT MUST BE BELIEVED. Alert fatigue on a
+# backup alert is how deploy#559 happened.
+#
+# Naming the manifest for its run makes the attestation the granularity that completeness
+# actually has. Runs accumulate side by side, each one carrying its own verdict, and nothing
+# overwrites anything. The consumers enumerate them and pick the newest run that BOTH attests
+# `complete=true` AND whose dumps all arrived (deploy#584's two-instrument check, at run
+# granularity: the attestation says what was DUMPED, the listing says what ARRIVED).
+MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_backup_manifest-${TIMESTAMP}.txt"
 BACKUP_STORES=""
 $PG_OK && BACKUP_STORES="${BACKUP_STORES}postgres,"
 $USER_PG_OK && BACKUP_STORES="${BACKUP_STORES}user-postgres,"

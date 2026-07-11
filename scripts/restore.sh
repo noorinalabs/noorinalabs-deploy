@@ -200,6 +200,104 @@ count_runs() {
     printf '%s\n' "${n:-0}"
 }
 
+# ---------------------------------------------------------------------------
+# THE MANIFEST IS PER-RUN, SO THE SELECTION IS PER-RUN. (deploy#587)
+# ---------------------------------------------------------------------------
+# backup.sh writes `_backup_manifest-<TIMESTAMP>.txt` — one per RUN, never overwritten. It
+# used to write a fixed `_backup_manifest.txt` into a DAY-directory that holds several runs,
+# so the last run to upload overwrote the attestation of every run before it. A good run
+# followed by a partial one erased its own attestation, and both consumers believed the
+# survivor.
+#
+# The run ids of the manifests in a listing (one filename per line on stdin), NEWEST FIRST.
+# `%Y%m%d-%H%M%S` sorts chronologically as text, so `sort -r` IS newest-first.
+#
+# ANCHOR ON THE RUN ID (deploy#589). `_backup_manifest-` is OUR OWN literal prefix and the run
+# id's shape is strict and self-delimiting, so both halves of this pattern are things we
+# control. Nothing here paraphrases a token another component is free to rename — which is the
+# mistake `list_runs` made about the STORE segment, where a producer-side rename would not
+# BREAK the parser but QUIETLY NARROW it.
+#
+# `sed -n` exits 0 when it matches nothing, so this pipeline does NOT trip `pipefail` on a
+# directory with no manifests — but every CALLER still assigns it with an explicit `|| VAR=""`,
+# because "legitimately matched nothing" is the ordinary case here and it must never be a crash.
+manifest_runs() {
+    sed -n 's/^_backup_manifest-\([0-9]\{8\}-[0-9]\{6\}\)\.txt$/\1/p' | sort -ru
+}
+
+# Does <manifest-text> ATTEST `complete=true`?
+#
+# WHOLE-TOKEN match on the FIRST `BACKUP_MANIFEST ` line. Both halves are load-bearing and both
+# were bugs (deploy#584):
+#
+#   * `grep '^BACKUP_MANIFEST .*[[:space:]]complete=true'` COULD NEVER MATCH — `complete=` is
+#     the FIRST token after `BACKUP_MANIFEST `, so the anchor's literal space consumes the only
+#     space there is and `.*[[:space:]]` then demands a second one that never exists.
+#   * FIRST LINE ONLY — unioning tokens across every line lets a corrupt artifact carrying BOTH a
+#     `complete=false` and a `complete=true` line match. It fails OPEN, and a line-1 read is free.
+#
+# ---------------------------------------------------------------------------
+# NO EARLY-EXIT PIPELINE. `pipefail` TURNS SIGPIPE INTO "DOES NOT ATTEST". (deploy#591 review)
+# ---------------------------------------------------------------------------
+# This was:
+#
+#   grep '^BACKUP_MANIFEST ' | head -n1 | tr ' ' '\n' | grep -qx 'complete=true'
+#
+# and under `set -euo pipefail` it can report a COMPLETE, INTACT, ATTESTING run as NOT
+# ATTESTING. When the producer of a pipe stage outruns a consumer that exits early, the
+# producer takes SIGPIPE and dies 141 — and **`pipefail` promotes that 141 to the rc of the
+# whole pipeline even though the final `grep -qx` SUCCEEDED.** The scanner then prints
+# `no_complete_backup` over a bucket holding a complete backup: THE #587 CONFIDENT LIE, by a
+# fourth route, in the parser this very change ships. Found by Nurul Hakim.
+#
+# There were TWO early-exit consumers, not one, and fixing only the first leaves the shape:
+#
+#   measured, `set -euo pipefail`, first line attests complete=true:
+#     grep | head -n1 | tr | grep -qx      100k lines -> rc=141   huge first line -> rc=141
+#     grep -m1 | tr | grep -qx             100k lines -> rc=141   huge first line -> rc=141
+#                                          ^ `grep -qx` exits on the match and SIGPIPEs `tr`.
+#
+# So the fix is not to swap `head` for `-m1`; it is to have NO PIPELINE. A herestring is a file
+# descriptor, not a pipe: `grep -m1` may stop reading it early and nothing dies. The token test
+# is then plain bash. Latent today (it needs a manifest ~700x what the producer writes) and it
+# fails closed — but a guard with a known path that silently disarms it is not a correct guard,
+# it is an incomplete one, and here the shape can simply be DELETED rather than guarded.
+manifest_attests_complete() {
+    local first="" tok
+    local IFS=$' \t\n'
+    first="$(grep -m1 '^BACKUP_MANIFEST ' <<< "$1")" || return 1
+    # Deliberate word-splitting: the manifest's fields are space-separated, and an exact token
+    # match cannot be defeated by a key that ends in another key's name (`xcomplete=true`).
+    # shellcheck disable=SC2086
+    for tok in $first; do
+        if [[ "$tok" == "complete=true" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Did every store REQUIRED for run <ts> actually ARRIVE in <listing>?
+#
+# THE ATTESTATION SAYS WHAT WAS DUMPED. THE LISTING SAYS WHAT ARRIVED. You need both, and they
+# are different questions: backup.sh writes the manifest locally and then `rclone copy`s the
+# directory, so a copy interrupted after the manifest object lands leaves `complete=true`
+# sitting above a half-finished upload (deploy#584).
+#
+# THE REQUIRED SET IS THIS SCRIPT'S OWN — deliberately NOT read from the manifest's `stores=`
+# field, for the same reason REQUIRED_STORES below is not. A set taken from the artifact lets a
+# partial backup declare itself complete-for-what-it-happens-to-hold: perfect circularity.
+#
+# <listing> is a space-delimited set of basenames, padded with a space at BOTH ends, so that a
+# `*" name "*` test cannot match a substring of a longer name.
+run_dumps_arrived() {
+    local ts="$1" have="$2"
+    [[ "$have" == *" isnad-pg-${ts}.dump "* ]]     || return 1
+    [[ "$have" == *" isnad-userpg-${ts}.dump "* ]] || return 1
+    [[ "$have" == *" isnad-neo4j-${ts}.dump.zst "* || "$have" == *" isnad-neo4j-${ts}.dump "* ]] || return 1
+    return 0
+}
+
 list_backups() {
     log "INFO" "Available backups in ${B2_BUCKET}:"
     local failed=0
@@ -214,16 +312,19 @@ list_backups() {
     return "$failed"
 }
 
-# Does the backup directory at <category>/<date> declare itself COMPLETE?
-# Reads `_backup_manifest.txt` (written by backup.sh, deploy#559). A directory with no
-# manifest is NOT complete: every pre-#559 backup predates user-postgres coverage entirely,
-# so treating "no manifest" as "probably fine" would hand `latest` the exact artifact class
-# this change exists to stop.
+# Does the backup directory at <category>/<date> CONTAIN A RESTORABLE RUN?
+#
+# Not "does this DIRECTORY attest complete" — a directory is a DAY, and completeness is a
+# property of a RUN (deploy#587). This enumerates the per-run manifests backup.sh writes
+# (`_backup_manifest-<TS>.txt`) and looks for the newest run that BOTH attests `complete=true`
+# AND whose dumps all arrived. A day with no manifest at all is NOT complete: every pre-#559
+# backup predates user-postgres coverage entirely, so treating "no manifest" as "probably fine"
+# would hand `latest` the exact artifact class this change exists to stop.
 #
 # THREE outcomes, not two:
-#   0 = attests complete
-#   1 = read it, and it does NOT attest (or there is no manifest)
-#   2 = COULD NOT READ IT  <- not a value of the predicate. A separate answer.
+#   0 = a restorable run exists (its run id is PRINTED)
+#   1 = looked, and there is none (no manifest, none attests, or none arrived intact)
+#   2 = COULD NOT LOOK  <- not a value of the predicate. A separate answer.
 #
 # This read was `rclone cat … 2>/dev/null || true`, with the rc DISCARDED, so a transient
 # 401 / throttle / network blip collapsed into "does not attest" — and `resolve_latest` then
@@ -236,46 +337,157 @@ list_backups() {
 #   cat existing    -> rc=0 (B2)  rc=0 (local)
 #   cat nonexistent -> rc=0 EMPTY (B2)  rc=3 (local)   <- absent. Not an error.
 #   cat, bad key    -> rc=1 (B2)  rc=1 (local)         <- CANNOT EVALUATE
+# On success it PRINTS THE CHOSEN RUN ID on stdout — so every `log` below goes to stderr.
+# `log()` writes to STDOUT (see above), and this function's stdout is now captured by its
+# caller; an unredirected diagnostic would be read back as a run id.
 backup_is_complete() {
     local path="$1"
-    local manifest rc=0
-    manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest.txt" 2>/dev/null)" || rc=$?
-    if [[ "$rc" -ne 0 && "$rc" -ne 3 ]]; then
-        log "ERROR" "Could not READ the manifest at ${path} (rclone rc=${rc})."
-        log "ERROR" "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look."
+    local listing lrc=0 lerr
+
+    # --- WHAT ARRIVED. The listing is the first of the two instruments. -----------
+    #
+    # `|| lrc=$?` and NOT a bare assignment: under `set -euo pipefail` an assignment whose
+    # command substitution fails IS a failing simple command, and errexit fires AT THE
+    # ASSIGNMENT — the rc check below would be dead code on every failing path (deploy#563).
+    #
+    # rc=3 is `not found` on rclone's LOCAL backend; on B2 a nonexistent prefix is rc=0 with
+    # EMPTY output. Neither is an instrument failure — the backends simply disagree, and this
+    # is the same disagreement measured in verify_b2_backup_artifact.sh. Anything else means
+    # WE COULD NOT LOOK, which is a third outcome and not a value of the predicate.
+    lerr="$(mktemp)"
+    listing="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/" 2>"$lerr")" || lrc=$?
+    if [[ "$lrc" -ne 0 && "$lrc" -ne 3 ]]; then
+        log "ERROR" "Could not LIST ${path} (rclone rc=${lrc}):" >&2
+        sed 's/^/    /' "$lerr" >&2
+        log "ERROR" "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look." >&2
+        rm -f "$lerr"
         return 2
     fi
-    [[ -n "$manifest" ]] || return 1
-    # WHOLE-TOKEN match. The predicate this replaces was:
+    rm -f "$lerr"
+
+    # A directory with NO run manifests is an ordinary artifact — every pre-deploy#559 backup
+    # predates the manifest entirely.
     #
-    #   grep -q '^BACKUP_MANIFEST .*[[:space:]]complete=true\([[:space:]]\|$\)'
+    # ---------------------------------------------------------------------------
+    # WHAT ACTUALLY PROTECTS THIS — and it is NOT what the first version of this comment said.
+    # ---------------------------------------------------------------------------
+    # I wrote that a matching-nothing pipeline here "kills the script outright". That is FALSE,
+    # twice over, and Nino Kavtaradze measured both (deploy#591 review):
     #
-    # and it COULD NEVER MATCH. `complete=` is the FIRST token backup.sh writes after
-    # `BACKUP_MANIFEST `, so the literal space in the anchor consumes the only space there
-    # is, and `.*[[:space:]]complete=true` then demands a SECOND one that never exists.
+    #   1. THE NO-MATCH CONTRACT IS PER-COMMAND, NOT A UNIX CONVENTION. `manifest_runs` is
+    #      `sed -n …p | sort -ru`, and BOTH EXIT 0 on no match — so this pipeline cannot fail
+    #      on an empty result at all. Only `grep` has the "no match is exit 1" contract:
     #
-    # So `backup_is_complete` returned false for EVERY backup, `resolve_latest` skipped all
-    # of them, and `restore.sh latest` could not select an artifact at all — it would have
-    # reported "No COMPLETE backup found in B2 bucket" over a bucket full of good backups.
-    # It failed CLOSED, so nothing was ever at risk; but the recovery path was inert, and it
-    # shipped in deploy#577 with a green suite.
+    #        grep                        no-match -> 1  -> would crash
+    #        sed -n '/x/p'               no-match -> 0  -> cannot
+    #        find                        no-match -> 0  -> cannot
+    #        find, unreadable directory           -> 1  -> crashes ON AN ERROR, never a no-match
     #
-    # It survived because #577's tests are TEXTUAL: they assert this function is CALLED
-    # (correctly — that was the deploy#577 review's own lesson) and never once run its
-    # predicate against a manifest `backup.sh` actually produces. Found by deploy#584, whose
-    # fixture was a real manifest.
+    #   2. ERREXIT DOES NOT REACH IN HERE ANYWAY. `shopt inherit_errexit` is UNSET, and this
+    #      function is invoked inside a command substitution (`run_ts="$(backup_is_complete …)"`),
+    #      so errexit is not inherited by the subshell — REGARDLESS of the call site's context.
+    #      That is a GLOBAL SHELL OPTION, not a property of the caller: anyone who adds
+    #      `shopt -s inherit_errexit` arms every `$( )` in this file at once.
     #
-    # Splitting on spaces and matching an exact `complete=true` token is order-independent
-    # and cannot be defeated by a key that ends in another key's name.
-    #
-    # `head -n1`: attest on the FIRST manifest line only. Unioning tokens across every line
-    # lets a corrupt artifact carrying both a `complete=false` and a `complete=true` line
-    # match — it fails OPEN, and reading line 1 costs nothing.
-    printf '%s\n' "$manifest" \
-        | grep '^BACKUP_MANIFEST ' \
-        | head -n1 \
-        | tr ' ' '\n' \
-        | grep -qx 'complete=true'
+    # So `|| runs=""` is DEFENCE IN DEPTH, not the load-bearing guard: it keeps this correct if
+    # someone sets `inherit_errexit`, or edits `manifest_runs` to use `grep`. The guard that IS
+    # load-bearing is the TOP-LEVEL `RESTORE_RUN_TS="$(select_local_run …)" || RESTORE_RUN_TS=""`
+    # — there the substitution's non-zero rc IS the assignment's rc, at top level, under
+    # errexit, and removing the `||` kills restore.sh on every artifact with no manifest. That
+    # is the deploy#584 shape, and it is the one the tests pin.
+    local runs=""
+    runs="$(printf '%s\n' "$listing" | manifest_runs)" || runs=""
+    [[ -n "$runs" ]] || return 1
+
+    # Declared and assigned SEPARATELY (SC2155). `local x="$(cmd)"` takes the exit status of
+    # `local`, not of the command substitution — the same class of dead guard as deploy#563's
+    # `OUT="$(fn)"; RC=$?`, and worth avoiding even where the rc is not consulted.
+    local have
+    have=" $(printf '%s' "$listing" | tr '\n' ' ') "
+    local ts manifest mrc chosen=""
+    local torn=()
+
+    # NEWEST RUN THAT BOTH ATTESTS AND ARRIVED. Not merely the newest that attests: a
+    # `complete=true` above a half-finished upload is the artifact an interrupted `rclone copy`
+    # leaves behind, and it is not restorable.
+    while IFS= read -r ts; do
+        [[ -z "$ts" ]] && continue
+
+        mrc=0
+        manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest-${ts}.txt" 2>/dev/null)" || mrc=$?
+        if [[ "$mrc" -ne 0 && "$mrc" -ne 3 ]]; then
+            # "I COULD NOT READ IT" IS NOT "IT DOES NOT ATTEST". A transient 401, a throttle or
+            # a network blip on the manifest object must NOT collapse into "incomplete" — that
+            # is how `resolve_latest` came to tell an operator mid-incident "No COMPLETE backup
+            # found in B2 bucket" over a bucket full of good ones (deploy#584).
+            log "ERROR" "Could not READ the manifest for run ${ts} at ${path} (rclone rc=${mrc})." >&2
+            log "ERROR" "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look." >&2
+            return 2
+        fi
+        [[ -n "$manifest" ]] || continue
+
+        manifest_attests_complete "$manifest" || continue
+
+        if ! run_dumps_arrived "$ts" "$have"; then
+            torn+=("$ts")
+            continue
+        fi
+
+        chosen="$ts"
+        break
+    done <<< "$runs"
+
+    if [[ ${#torn[@]} -gt 0 ]]; then
+        # Loud, even when an older run saves us. An upload that landed its attestation and not
+        # its dumps is a real fault, and it must not be silent just because it was survivable.
+        log "WARNING" "  ${path}: run(s) ${torn[*]} attest complete=true but their dumps did NOT all arrive" >&2
+    fi
+
+    [[ -n "$chosen" ]] || return 1
+    printf '%s\n' "$chosen"
+}
+
+# The newest run in a LOCAL directory that we should restore, or nothing.
+#
+# Same selection as backup_is_complete, over a downloaded artifact rather than the bucket.
+#
+# TWO PASSES, and the second one matters:
+#
+#   1. the newest run that ATTESTS complete AND whose dumps ALL ARRIVED — the run we want;
+#   2. failing that, the newest run that attests ANYTHING AT ALL.
+#
+# Pass 2 is not a weakening. Binding to a run is what stops a TORN restore (an isnad Postgres
+# from one run beside a Neo4j from another); it is a DIFFERENT question from whether the run is
+# complete. So we still bind — and the required-store gate downstream then names exactly what is
+# missing and REFUSES, or, under `--allow-partial`, restores what is there. Both are honest.
+# Selecting NO run here would instead drop us into the no-manifest fallback, which is strictly
+# less safe.
+select_local_run() {
+    local dir="$1"
+    local listing="" runs="" have ts manifest fallback=""
+
+    listing="$(find "$dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null)" || listing=""
+    runs="$(printf '%s\n' "$listing" | manifest_runs)" || runs=""
+    [[ -n "$runs" ]] || return 1
+    have=" $(printf '%s' "$listing" | tr '\n' ' ') "
+
+    while IFS= read -r ts; do
+        [[ -z "$ts" ]] && continue
+        manifest="$(cat "${dir}/_backup_manifest-${ts}.txt" 2>/dev/null)" || continue
+        [[ -n "$manifest" ]] || continue
+
+        # The newest run we could READ is the fallback, whatever it attests.
+        [[ -n "$fallback" ]] || fallback="$ts"
+
+        manifest_attests_complete "$manifest" || continue
+        run_dumps_arrived "$ts" "$have" || continue
+
+        printf '%s\n' "$ts"
+        return 0
+    done <<< "$runs"
+
+    [[ -n "$fallback" ]] || return 1
+    printf '%s\n' "$fallback"
 }
 
 resolve_latest() {
@@ -324,12 +536,21 @@ resolve_latest() {
             [[ -z "$dir" ]] && continue
             dir="${dir%/}"
             if [[ "$dir" > "$latest_date" ]]; then
+                # CAPTURE its stdout. `backup_is_complete` now PRINTS the run id it chose, and
+                # `resolve_latest`'s own stdout IS its return value — an uncaptured run id would
+                # be concatenated onto the path the caller reads.
+                #
+                # Declare and assign SEPARATELY: `local x="$(...)" || rc=$?` can never see a
+                # failure, because the exit status of a `local` builtin is `local`'s, not the
+                # substitution's — the same class of dead guard as deploy#563's `OUT="$(fn)"; RC=$?`.
                 local brc=0
-                backup_is_complete "${category}/${dir}" || brc=$?
+                local run_ts=""
+                run_ts="$(backup_is_complete "${category}/${dir}")" || brc=$?
                 case "$brc" in
                     0)
                         latest_date="$dir"
                         latest="${category}/${dir}"
+                        log "INFO" "  ${category}/${dir}: restorable run ${run_ts}" >&2
                         ;;
                     1)
                         skipped+=("${category}/${dir}")
@@ -734,10 +955,11 @@ verify_checksums "$RESTORE_DIR"
 # These three were `find ... | head -1`. `find` emits READDIR order, which is neither
 # chronological nor stable — and a backup directory can legitimately hold dumps from MORE
 # THAN ONE RUN. B2's day-directory accumulates: the path is `<category>/<DATE>` (a day),
-# the dumps inside it are `isnad-<store>-<TIMESTAMP>` (a run), `rclone copy` ADDS and never
-# deletes, and the fixed-name `_backup_manifest.txt` is overwritten by whichever run
-# uploaded last. backup.sh deliberately uploads partials ("a partial backup beats none"),
-# so a failed 02:00 run and a good 14:00 run land side by side — routinely, by design.
+# the dumps inside it are `isnad-<store>-<TIMESTAMP>` (a run), and `rclone copy` ADDS and never
+# deletes. backup.sh deliberately uploads partials ("a partial backup beats none"), so a failed
+# 02:00 run and a good 14:00 run land side by side — routinely, by design. (Each run now carries
+# its OWN `_backup_manifest-<TS>.txt`; the single fixed-name manifest this code was first
+# written against was overwritten by whichever run uploaded last — deploy#587.)
 #
 # Measured over 48 two-run day-directories, `find | head -1` selected the OLDER dump in
 # 14 of them. And because each store was selected by an INDEPENDENT `find`, the three could
@@ -747,19 +969,31 @@ verify_checksums "$RESTORE_DIR"
 # binds a file to ITSELF; it cannot see that the file is from the wrong run) and
 # `complete=true` on the manifest. Every gate we have would have passed it.
 #
-# The manifest already carries the run id — `timestamp=<TS>` — and every dump of that run
-# is named `isnad-<store>-<TS>.*`. So bind the selection to it: the producer names the run,
-# the consumer restores THAT RUN or none of it. A store missing from the attested run then
-# falls through to the required-store gate below, which is exactly where it belongs.
-# The trailing `|| true` is LOAD-BEARING, and its absence was caught by the restore rehearsal
-# rather than by any unit test. This script runs under `set -euo pipefail`. An artifact with
-# no manifest — every pre-deploy#559 backup, and the rehearsal's own fixtures — makes `grep`
-# match nothing, which under `pipefail` fails the WHOLE pipeline, which makes this bare
-# assignment a FAILING SIMPLE COMMAND, at which point errexit kills restore.sh outright. The
-# recovery path would have died on exactly the artifacts the fallback below exists to serve.
-# Same shape as deploy#563's `OUT="$(fn)"; RC=$?`, which is dead on every failing path.
-RESTORE_RUN_TS="$(grep '^BACKUP_MANIFEST ' "${RESTORE_DIR}/_backup_manifest.txt" 2>/dev/null \
-    | tr ' ' '\n' | sed -n 's/^timestamp=\(..*\)$/\1/p' | head -1 || true)"
+# Each run carries its own `_backup_manifest-<TS>.txt`, and every dump of that run is named
+# `isnad-<store>-<TS>.*`. So bind the selection to a RUN: the producer names the run, the
+# consumer restores THAT RUN or none of it. A store missing from the selected run then falls
+# through to the required-store gate below, which is exactly where it belongs.
+#
+# `select_local_run` picks the newest run that ATTESTS complete AND whose dumps ALL ARRIVED,
+# falling back to the newest run that attests anything (see its comment). Before deploy#587
+# this read a single FIXED-NAME manifest, so in a day-directory holding a good run and a later
+# partial one it bound to whichever uploaded LAST — and under `--allow-partial` it would
+# restore only the partial run's pg dump while the good run's three dumps sat beside it.
+#
+# `|| RESTORE_RUN_TS=""` is THE LOAD-BEARING GUARD — this one, and not the `|| runs=""` inside
+# the functions (see `backup_is_complete` for why those are only defence in depth).
+#
+# The mechanism is the ASSIGNMENT'S OWN rc, not anything about pipefail or no-match contracts:
+# `select_local_run` RETURNS 1 when the directory has no manifest — every pre-deploy#559 backup,
+# and the rehearsal's own fixtures — and a command substitution's exit status IS the exit status
+# of the assignment that reads it. At TOP LEVEL, under `set -e`, that is a failing simple command
+# and errexit kills restore.sh outright. The recovery path would die on exactly the artifacts the
+# fallback below exists to serve.
+#
+# Removing the `||` here is the deploy#584 crash, reproduced: it was caught then by the restore
+# rehearsal and by NO unit test. It is pinned by a unit test now, and by a mutation.
+RESTORE_RUN_TS=""
+RESTORE_RUN_TS="$(select_local_run "$RESTORE_DIR")" || RESTORE_RUN_TS=""
 
 if [[ -n "$RESTORE_RUN_TS" ]]; then
     log "INFO" "Manifest attests run ${RESTORE_RUN_TS} — selecting that run's dumps"
