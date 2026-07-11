@@ -145,6 +145,7 @@ jobs:
           echo "Resolved loader image: ${img}"
 
       - name: Run batch load on ${{ inputs.env }} VPS
+        id: load
         uses: appleboy/ssh-action@v1
         env:
           ENV_NAME: ${{ inputs.env }}
@@ -423,6 +424,68 @@ jobs:
             COMPOSE="docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env"
             COMPOSE_LOAD="${COMPOSE} --profile graph-load"
 
+            # run_cypher <query>: run a query INSIDE the live neo4j container, reading the
+            # password from that container's OWN NEO4J_AUTH — never on our argv, never over
+            # the GH transport (CWE-214). Same helper graph-prune-narrators.yml uses.
+            run_cypher() {
+              # SC2016: the ${NEO4J_AUTH#neo4j/} and "$1" are single-quoted ON PURPOSE —
+              # they must expand inside the neo4j container's `sh -c` (reading THAT
+              # container's NEO4J_AUTH), not on the VPS host. The query text is not a secret.
+              # shellcheck disable=SC2016
+              ${COMPOSE} exec -T neo4j sh -c \
+                'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "$1"' \
+                _ "$1"
+            }
+
+            # =====================================================================
+            # GRAPH-SIDE LOAD PROVENANCE (deploy#580) — stamp the ref we are loading
+            # =====================================================================
+            # graph-prune-narrators.yml prunes the graph to the canonical set of whatever
+            # parquet_ref an operator types, and EVERY gate it has is derived from that
+            # parquet — so they can only ever confirm the prune obeyed the keep-set, never
+            # that it was the RIGHT keep-set. A genuine but OLDER, SMALLER run passes all of
+            # them (valid record, matching md5, ids a SUBSET of the graph so missing=0) while
+            # the prune deletes every narrator loaded since. No parquet-derived gate can see
+            # that, because the parquet is internally perfect.
+            #
+            # This is the other half of the only gate that can: the LOAD records which ref it
+            # loaded, and the prune refuses unless it is pruning against that same ref.
+            #
+            # STATUS IS STAMPED IN TWO PHASES, AND THE ORDER IS THE SAFETY PROPERTY:
+            #   in_progress  BEFORE the loader touches the graph
+            #   complete     ONLY after it commits (rc classified SUCCESS or FINDINGS)
+            # A load that dies mid-write therefore leaves the graph stamped `in_progress`,
+            # and the prune gate refuses it AGAINST ANY REF — including its own. That is the
+            # fail-closed direction and it is deliberate: a half-loaded graph holds narrators
+            # that no keep-set names, and a prune deletes exactly those. Re-run the load to
+            # clear it.
+            #
+            # The Cypher is BUILT BY scripts/graph_load_provenance.sh, not assembled here.
+            # PARQUET_REF and IMAGE are free-text workflow_dispatch inputs interpolated into
+            # a single-quoted Cypher literal, so the script whitelists their charset (a `'`
+            # here is an injection into a statement with graph write access) — and being a
+            # script, that guard is EXECUTED by scripts/tests/test_load_provenance.py rather
+            # than pinned by grepping this file's text, which is what let a forged manifest
+            # ship green twice (deploy#574/#581).
+            stamp_provenance() {
+              _stamp_status="$1"
+              _stamp_cypher=""
+              _stamp_rc=0
+              # NOT `2>&1`: the output IS the Cypher statement, so folding stderr into it
+              # would splice a diagnostic into a query we are about to run against the graph
+              # (deploy#584 — stderr is COMMENTARY, not DATA). Diagnostics flow to the log.
+              _stamp_cypher="$(PARQUET_REF="${PARQUET_REF}" LOAD_STATUS="${_stamp_status}" \
+                IMAGE="${IMAGE}" LOAD_ARGS="${LOAD_ARGS}" \
+                bash scripts/graph_load_provenance.sh stamp)" || _stamp_rc=$?
+              if [ "${_stamp_rc}" -ne 0 ] || [ -z "${_stamp_cypher}" ]; then
+                echo "ERROR: [${ENV_NAME}] could not build the load-provenance stamp (rc=${_stamp_rc}). Refusing to load a graph we cannot stamp: an unstamped graph is one the prune gate can never trust, and the prune is the operation that cannot be undone." >&2
+                return 1
+              fi
+              run_cypher "${_stamp_cypher}" >/dev/null \
+                || { echo "ERROR: [${ENV_NAME}] failed to write the load-provenance stamp (status=${_stamp_status}) to the graph." >&2; return 1; }
+              echo "    stamped: parquet_ref=${PARQUET_REF} load_status=${_stamp_status}"
+            }
+
             # GHCR login so the loader image can be pulled; trap logs out at
             # end-of-run so no credentials persist on the box.
             trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
@@ -432,6 +495,12 @@ jobs:
             echo "==> [${ENV_NAME}] pulling loader image ${GRAPH_LOAD_IMAGE} ..."
             ${COMPOSE_LOAD} pull graph-load \
               || { echo "ERROR: [${ENV_NAME}] compose pull graph-load (${GRAPH_LOAD_IMAGE}) failed." >&2; exit 1; }
+
+            # Stamp BEFORE the write. If this fails we have not touched the graph, and we
+            # must not: a load nobody can attribute to a ref is a graph nobody can prune.
+            echo "==> [${ENV_NAME}] load-provenance: stamping parquet_ref BEFORE the load (in_progress)"
+            stamp_provenance in_progress \
+              || { echo "ERROR: [${ENV_NAME}] refusing to run the load — the graph could not be stamped." >&2; exit 1; }
 
             # --- run the load (--no-deps: DBs are already up on the live stack;
             #     do NOT let `run` recreate neo4j). LOAD_ARGS is a controlled
@@ -479,6 +548,17 @@ jobs:
                 ;;
             esac
 
+            # --- load COMMITTED: promote the stamp to `complete` ------------------
+            # Reached ONLY on SUCCESS (rc=0) or FINDINGS (rc=5) — both of which committed a
+            # graph. The FAILURE arm above has already exited, deliberately leaving the stamp
+            # at `in_progress`, which the prune gate refuses against ANY ref. That is the
+            # whole point of the two-phase stamp: rc=6 (REFUSED_ROWS) can leave a PARTIAL
+            # graph, and a partial graph holds narrators that no keep-set names — so pruning
+            # it, against any ref at all, deletes exactly those. Re-run the load to clear it.
+            echo "==> [${ENV_NAME}] load-provenance: load committed — stamping complete"
+            stamp_provenance complete \
+              || { echo "ERROR: [${ENV_NAME}] the load COMMITTED but the graph could not be stamped 'complete'. The graph holds ${PARQUET_REF} but does not say so, and the prune gate will refuse it. Re-run this load to reconcile the stamp." >&2; exit 1; }
+
             # --- post-load read-back (informational): source_corpus distribution.
             #     Reached for any COMMITTED load — rc=0 (clean) OR rc=5 (findings).
             #     cypher-shell runs INSIDE the live neo4j container and reads the
@@ -519,5 +599,13 @@ jobs:
               echo "Dry run — B2 presence verified; no Parquet downloaded, no loader run, no graph write."
             fi
             echo "Source: \`noorinalabs-pipeline/${PARQUET_REF}\` (B2) → rclone on the VPS → loader compose service."
+            if [ "${DRY_RUN}" != "true" ]; then
+              echo ""
+              echo "**Load provenance (deploy#580):** a committed load stamps \`parquet_ref\` onto the graph"
+              echo "(\`(:LoadProvenance {scope:'graph'})\`), and \`graph-prune-narrators.yml\` REFUSES to prune"
+              echo "against any other ref. \`in_progress\` is stamped before the write and \`complete\` only after"
+              echo "the loader commits — so a load that dies mid-write leaves a graph the prune refuses against"
+              echo "ANY ref, including its own. Re-run this load to clear it."
+            fi
             echo "stg-gated: prod runs ONLY as a promotion of a verified-good stg load."
           } >> "$GITHUB_STEP_SUMMARY"
