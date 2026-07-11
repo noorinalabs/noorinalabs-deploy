@@ -88,7 +88,9 @@ def test_restore_postgres_does_not_downgrade_failure_to_warning() -> None:
         "restore_postgres() reintroduced the swallow that let a failed pg_restore "
         "report success (deploy#560)"
     )
-    assert re.search(r'log "ERROR" "pg_restore FAILED', body), (
+    # The message is label-prefixed since deploy#559 ("PostgreSQL (user-service): ...").
+    # Match the invariant part, not the exact prefix.
+    assert re.search(r'log "ERROR" ".*pg_restore FAILED', body), (
         "restore_postgres() must log an ERROR when pg_restore exits non-zero"
     )
     assert "return 1" in body, "restore_postgres() must return non-zero when pg_restore fails"
@@ -269,3 +271,285 @@ def test_rehearsal_compose_publishes_no_ports_and_uses_scratch_volumes() -> None
     assert "noorinalabs_" not in text, (
         "the rehearsal stack must not reference production volume names"
     )
+
+
+# --------------------------------------------------------------------------
+# Backup coverage (deploy#559)
+# --------------------------------------------------------------------------
+
+BACKUP = SCRIPTS_DIR / "backup.sh"
+
+
+def _backup_code() -> str:
+    return _code_only(BACKUP.read_text())
+
+
+def test_backup_dumps_user_postgres() -> None:
+    """user-postgres holds the only state no artifact can rebuild.
+
+    Accounts, sessions, RBAC and the ``audit_log`` relocated out of Neo4j. Before
+    deploy#559 ``backup.sh`` dumped only neo4j and the isnad postgres.
+    """
+    code = _backup_code()
+    assert "dump_postgres user-postgres" in code, (
+        "backup.sh must dump the user-postgres service (accounts, sessions, audit_log)"
+    )
+    assert "isnad-userpg-" in code, "the user-service dump needs its own artifact name"
+
+
+def _backup_dump_filenames() -> dict[str, str]:
+    """Concrete filenames ``backup.sh`` actually writes, read out of the script.
+
+    Parses ``<NAME>_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-...${TIMESTAMP}.dump"`` and
+    substitutes a real timestamp, so the names under test are the producer's own — not
+    literals restated in the test, which would agree with themselves forever.
+    """
+    pattern = re.compile(
+        r'^(?P<var>[A-Z0-9_]+)_DUMP_FILE="\$\{LOCAL_BACKUP_PATH\}/(?P<name>[^"]+)"',
+        re.M,
+    )
+    found = {
+        m.group("var"): m.group("name").replace("${TIMESTAMP}", "20260709-120000")
+        for m in pattern.finditer(_backup_code())
+    }
+    assert found, "could not parse any *_DUMP_FILE assignment out of backup.sh"
+    return found
+
+
+def _restore_globs() -> dict[str, list[str]]:
+    """The ``find -name '<glob>'`` patterns ``restore.sh`` actually selects each dump by."""
+    globs = {}
+    for line in _code_only(_restore_text()).splitlines():
+        m = re.match(r"^(?P<var>[A-Z0-9_]+)_DUMP=\$\(find ", line)
+        if m:
+            globs[m.group("var")] = re.findall(r"-name '([^']+)'", line)
+    assert globs, "could not parse any *_DUMP=$(find ...) glob out of restore.sh"
+    return globs
+
+
+def test_backup_userpg_artifact_name_cannot_be_matched_by_the_isnad_glob() -> None:
+    """The isnad glob must not select the user-service dump ``backup.sh`` really writes.
+
+    restore.sh finds each dump by glob. If the user-service dump were named such that the
+    isnad glob matched it, a restore would silently load the user database into the isnad
+    database — and the rehearsal would not catch it, because the rehearsal constructs the
+    artifact names itself rather than taking them from backup.sh.
+
+    So this reads the producer's names and the consumer's globs from the two scripts and
+    checks them against each other. Rename the dump in backup.sh without updating
+    restore.sh's glob, or vice versa, and this fails.
+    """
+    import fnmatch
+
+    names = _backup_dump_filenames()
+    globs = _restore_globs()
+
+    for var in ("PG", "USER_PG", "NEO4J"):
+        assert var in names, f"backup.sh no longer defines {var}_DUMP_FILE"
+        assert var in globs, f"restore.sh no longer selects {var}_DUMP by glob"
+
+    def matches(filename: str, patterns: list[str]) -> bool:
+        return any(fnmatch.fnmatch(filename, p) for p in patterns)
+
+    # Each dump is found by its own glob...
+    for var in ("PG", "USER_PG"):
+        assert matches(names[var], globs[var]), (
+            f"restore.sh's {var} glob {globs[var]} does not match the file backup.sh "
+            f"writes ({names[var]}) — that dump would be silently skipped on restore"
+        )
+
+    # ...and the isnad glob does NOT also swallow the user-service dump. This is the
+    # assertion that matters: it is the one that goes red on a bad rename.
+    assert not matches(names["USER_PG"], globs["PG"]), (
+        f"restore.sh's isnad glob {globs['PG']} also matches the user-service dump "
+        f"({names['USER_PG']}) — a restore would load the user database into the isnad "
+        f"database"
+    )
+    assert not matches(names["PG"], globs["USER_PG"]), (
+        f"restore.sh's user-service glob {globs['USER_PG']} also matches the isnad dump "
+        f"({names['PG']})"
+    )
+
+
+def test_backup_fails_when_user_postgres_dump_fails() -> None:
+    """A partial backup missing the irreplaceable store must not exit 0."""
+    code = _backup_code()
+    assert '"$USER_PG_OK" == "false"' in code, (
+        "backup.sh must account for the user-postgres dump in its exit status"
+    )
+
+
+def test_backup_neo4j_bypasses_the_privilege_dropping_entrypoint() -> None:
+    """BACKUP_DIR is 0700 root:root; the entrypoint's neo4j(7474) cannot write there."""
+    code = _backup_code()
+    assert "--entrypoint neo4j-admin" in code and "--user 0:0" in code, (
+        "backup.sh's neo4j dump must bypass the entrypoint, which drops privileges to "
+        "neo4j(7474) and then fails with AccessDeniedException on /backups"
+    )
+
+
+def test_backup_resolves_neo4j_volume_through_the_compose_project() -> None:
+    code = _backup_code()
+    assert not re.search(r"docker volume ls.*grep", code), (
+        "backup.sh must not select the neo4j data volume by grepping host-global "
+        "`docker volume ls` output"
+    )
+
+
+def test_datastore_inventory_exists_and_covers_every_compose_volume() -> None:
+    """Every named volume in the prod compose file must appear in docs/DATASTORES.md.
+
+    A stateful service added without a row here is exactly the omission deploy#559 exists
+    to prevent: an undocumented gap and a deliberate exclusion are indistinguishable
+    during an incident.
+    """
+    import yaml
+
+    doc = REPO_ROOT / "docs" / "DATASTORES.md"
+    assert doc.exists(), "docs/DATASTORES.md must exist"
+    text = doc.read_text()
+
+    compose = yaml.safe_load((REPO_ROOT / "compose" / "docker-compose.prod.yml").read_text())
+    volumes = list((compose.get("volumes") or {}).keys())
+    assert volumes, "expected named volumes in the prod compose file"
+
+    missing = [v for v in volumes if v not in text]
+    assert not missing, (
+        f"docs/DATASTORES.md does not account for these compose volumes: {missing}. "
+        "Add a row stating whether it is backed up and why."
+    )
+
+
+# --------------------------------------------------------------------------
+# The required-store gate (deploy#559 review — Nurul Hakim, Lucas Ferreira)
+# --------------------------------------------------------------------------
+def test_absent_dump_is_as_fatal_as_a_failed_one() -> None:
+    """A MISSING store must fail the restore, not warn about it.
+
+    restore.sh set ``FAILED=1`` only when a dump was PRESENT and its restore failed. A dump
+    that was absent entirely logged a WARNING, recorded ``skipped (no dump)``, and never
+    touched ``FAILED`` — so the script printed ``=== Restore complete ===`` and exited **0**
+    on a backup with no accounts, no sessions and no ``audit_log`` in it. The all-empty case
+    was caught and the one-store-missing case was not: a guard on each side of the hole and
+    none in it.
+
+    Reachable by an artifact backup.sh itself produces: a partial upload lands in B2
+    date-stamped, checksums cleanly, and ``latest`` selected it by directory NAME.
+
+    backup.sh already refuses to call a partial backup a success (``USER_PG_OK`` is inside
+    its non-zero-exit condition). The identical argument applies to the consumer, and had
+    not been carried across.
+    """
+    code = _code_only(_restore_text())
+    assert "MISSING_STORES" in code, "restore.sh must compute the set of expected-but-absent stores"
+    assert "if [[ ${#MISSING_STORES[@]} -gt 0 ]]; then" in code, (
+        "an absent expected store must be tested for, not merely warned about"
+    )
+    assert "ALLOW_PARTIAL" in code, (
+        "the DR escape hatch must be an explicit opt-in, so the default is refuse"
+    )
+    # Default-deny: the refusal branch must exit non-zero.
+    refuse = code.split("if [[ ${#MISSING_STORES[@]} -gt 0 ]]; then", 1)[1].split("fi", 1)[0]
+    assert "exit 1" in refuse, (
+        "without --allow-partial an incomplete backup must EXIT NON-ZERO. Documentation is "
+        "not enforcement: during an incident nobody reads the header comment, they read the "
+        "exit code and the last line."
+    )
+
+
+def test_allow_partial_is_opt_in_not_default() -> None:
+    code = _code_only(_restore_text())
+    assert "ALLOW_PARTIAL=false" in code, (
+        "--allow-partial must default to false; a restore that silently tolerates a missing "
+        "store is the defect this gate exists to close"
+    )
+
+
+def test_resolve_latest_selects_a_complete_backup() -> None:
+    """`latest` must not mean "newest directory name".
+
+    A partial backup is date-stamped and checksums cleanly; at rest it is indistinguishable
+    from a complete one. Selecting by name means that the night the user-postgres dump
+    fails, `latest` picks precisely the artifact missing the only store no pipeline artifact
+    can rebuild — while the previous night's good backup sits there unselected.
+    """
+    code = _code_only(_restore_text())
+    assert "_backup_manifest.txt" in code, (
+        "completeness is a property of the artifact and the artifact must declare it"
+    )
+    # Assert the CALL, not merely the definition. A first version of this test checked only
+    # that `backup_is_complete` appeared somewhere in the file — which it still does when
+    # the call site is replaced by `if true`, leaving the function defined, unused, and the
+    # newest-by-name bug fully restored. A guard is not pinned by the existence of the
+    # function that implements it; it is pinned by the branch that calls it.
+    body = code.split("resolve_latest() {", 1)[1].split("\n}", 1)[0]
+    assert 'if backup_is_complete "${category}/${dir}"; then' in body, (
+        "resolve_latest must actually CALL backup_is_complete when selecting; otherwise "
+        "'latest' is still the newest directory NAME and will pick a partial backup"
+    )
+    assert "skipped" in body, (
+        "an operator told nothing about why the newest backup was passed over will assume "
+        "the tool is broken and reach for the one it refused"
+    )
+
+
+def test_backup_declares_its_own_completeness() -> None:
+    """The producer attests to what it actually wrote — it is the only party that knows."""
+    code = _backup_code()
+    assert "_backup_manifest.txt" in code, "backup.sh must write a completeness manifest"
+    assert "BACKUP_MANIFEST complete=" in code, (
+        "the manifest must declare whether this backup is complete"
+    )
+    # And the manifest must NOT be the source of the expected set — that would let a
+    # partial backup declare itself complete-for-what-it-happens-to-hold.
+    rcode = _code_only(_restore_text())
+    assert "REQUIRED_STORES" in rcode, (
+        "restore.sh must carry its OWN list of required stores. If the expected set came "
+        "from the artifact, a partial backup would declare itself complete — the same "
+        "circularity as a read-back count, and just as invisible."
+    )
+
+
+def test_every_negative_fixture_must_name_the_reason_it_fails_for() -> None:
+    """A negative that passes for the WRONG reason is a test that has stopped testing.
+
+    ``expect_fail`` used to assert only a non-zero exit. When restore.sh learned to refuse an
+    incomplete backup, two fixtures that contained only the dump they mutate began being
+    rejected for MISSING STORES — *before* their truncated dump was ever read. They still
+    passed. The truncation path they exist to exercise was no longer tested at all, and
+    nothing said so.
+
+    That is the same defect class as a guard that cannot see what it exists to catch,
+    reappearing inside the suite that guards against it. So every negative names the error it
+    expects, and the rehearsal fails if it gets a different one.
+    """
+    text = REHEARSAL.read_text()
+    assert 'expect_fail() {\n    local name="$1" src="$2" want="$3"' in text, (
+        "expect_fail must take an expected-reason argument"
+    )
+    assert 'elif ! grep -q "$want" "$logfile"; then' in text, (
+        "expect_fail must assert the failure happened for the expected reason"
+    )
+    # And every call site must supply one.
+    calls = [ln for ln in text.splitlines() if ln.strip().startswith("expect_fail ")]
+    assert len(calls) >= 6, f"expected at least 6 negative fixtures, found {len(calls)}"
+    for ln in calls:
+        # name + dir + reason => at least 3 quoted args
+        assert ln.count('"') >= 6, (
+            f"negative fixture does not name its expected reason: {ln.strip()}"
+        )
+
+
+def test_truncation_fixtures_start_from_a_complete_artifact() -> None:
+    """Or the completeness gate rejects them before their truncation is ever exercised."""
+    text = REHEARSAL.read_text()
+    assert "copy_full_artifact() {" in text, (
+        "a helper must build the truncation fixtures from a COMPLETE backup"
+    )
+    for fx in ('local trunc="${WORK}/fx_truncated"', 'local utrunc="${WORK}/fx_user_truncated"'):
+        idx = text.index(fx)
+        window = text[idx : idx + 200]
+        assert "copy_full_artifact" in window, (
+            f"fixture {fx} must start from a complete artifact, or the missing-store gate "
+            "refuses it first and the truncation is never tested"
+        )

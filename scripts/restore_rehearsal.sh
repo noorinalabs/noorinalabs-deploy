@@ -45,13 +45,16 @@ mkdir -p "$WORK"
 ARTIFACT="${WORK}/artifact"
 TS="$(date -u +%Y%m%d-%H%M%S)"
 PG_DUMP_NAME="isnad-pg-${TS}.dump"
+USER_PG_DUMP_NAME="isnad-userpg-${TS}.dump"
 NEO4J_DUMP_NAME="isnad-neo4j-${TS}.dump"
 
 SEED_ROWS=500
+SEED_USER_ROWS=37
 SEED_NODES=250
 # Sampled identifiers must fall inside their store's seeded range, or the assertion
 # fails for a reason that has nothing to do with the restore.
 PG_SAMPLE_ID=377
+USER_SAMPLE_ID=11
 NEO4J_SAMPLE_ID=137
 
 PASS_COUNT=0
@@ -104,6 +107,10 @@ guard() {
         log "ERROR" "NEO4J_SAMPLE_ID=${NEO4J_SAMPLE_ID} exceeds SEED_NODES=${SEED_NODES}"
         exit 1
     fi
+    if [[ "$USER_SAMPLE_ID" -gt "$SEED_USER_ROWS" ]]; then
+        log "ERROR" "USER_SAMPLE_ID=${USER_SAMPLE_ID} exceeds SEED_USER_ROWS=${SEED_USER_ROWS}"
+        exit 1
+    fi
 }
 
 cleanup() {
@@ -128,6 +135,11 @@ psql_q() {
     dc exec -T postgres psql -U isnad -d isnad_graph -tAc "$1" 2>/dev/null | tr -d ' \r'
 }
 
+# user-postgres stands in for the store holding accounts, sessions and audit_log.
+user_psql_q() {
+    dc exec -T user-postgres psql -U user_service -d user_service -tAc "$1" 2>/dev/null | tr -d ' \r'
+}
+
 # cypher-shell credentials go through the environment inside the container, never
 # on argv, so they cannot surface in `docker inspect` or a process listing.
 cypher_q() {
@@ -144,15 +156,16 @@ start_stack() {
     dc down -v --remove-orphans >/dev/null 2>&1 || true
     dc up -d
 
-    log "INFO" "Waiting for postgres + neo4j to report healthy..."
+    log "INFO" "Waiting for postgres + user-postgres + neo4j to report healthy..."
     local waited=0
     while :; do
-        local pg_h neo_h
+        local pg_h upg_h neo_h
         pg_h=$(docker inspect --format '{{.State.Health.Status}}' "$(dc ps -q postgres)" 2>/dev/null || echo starting)
+        upg_h=$(docker inspect --format '{{.State.Health.Status}}' "$(dc ps -q user-postgres)" 2>/dev/null || echo starting)
         neo_h=$(docker inspect --format '{{.State.Health.Status}}' "$(dc ps -q neo4j)" 2>/dev/null || echo starting)
-        [[ "$pg_h" == "healthy" && "$neo_h" == "healthy" ]] && break
+        [[ "$pg_h" == "healthy" && "$upg_h" == "healthy" && "$neo_h" == "healthy" ]] && break
         if [[ $waited -ge 240 ]]; then
-            log "ERROR" "Stack did not become healthy (postgres=${pg_h} neo4j=${neo_h})"
+            log "ERROR" "Stack did not become healthy (postgres=${pg_h} user-postgres=${upg_h} neo4j=${neo_h})"
             dc ps
             exit 1
         fi
@@ -188,14 +201,28 @@ DROP TABLE IF EXISTS narrator;
 CREATE TABLE narrator (id int PRIMARY KEY, name text NOT NULL);
 INSERT INTO narrator SELECT g, 'narrator_' || g FROM generate_series(1, ${SEED_ROWS}) g;
 SQL
+    # Shaped like the real user_service schema: an accounts table and the audit_log
+    # relocated out of Neo4j on 2026-06-30. Neither is reconstructible from the
+    # pipeline artifact, which is the whole reason this store must be covered.
+    dc exec -T user-postgres psql -U user_service -d user_service -q -v ON_ERROR_STOP=1 <<SQL
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS users;
+CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL UNIQUE);
+CREATE TABLE audit_log (id int PRIMARY KEY, action text NOT NULL);
+INSERT INTO users SELECT g, 'user_' || g || '@example.test' FROM generate_series(1, ${SEED_USER_ROWS}) g;
+INSERT INTO audit_log SELECT g, 'action_' || g FROM generate_series(1, ${SEED_USER_ROWS}) g;
+SQL
+
     cypher_q "MATCH (n) DETACH DELETE n" >/dev/null
     cypher_q "UNWIND range(1, ${SEED_NODES}) AS i CREATE (:Narrator {id: i, name: 'narrator_' + i})" >/dev/null
 
-    local rows nodes
+    local rows user_rows nodes
     rows=$(psql_q "SELECT count(*) FROM narrator")
+    user_rows=$(user_psql_q "SELECT count(*) FROM users")
     nodes=$(cypher_q "MATCH (n:Narrator) RETURN count(n)")
-    log "INFO" "Seeded: pg rows=${rows} neo4j nodes=${nodes}"
+    log "INFO" "Seeded: pg rows=${rows} user-pg rows=${user_rows} neo4j nodes=${nodes}"
     [[ "$rows" == "$SEED_ROWS" ]] || { log "ERROR" "pg seed failed (${rows})"; exit 1; }
+    [[ "$user_rows" == "$SEED_USER_ROWS" ]] || { log "ERROR" "user-pg seed failed (${user_rows})"; exit 1; }
     [[ "$nodes" == "$SEED_NODES" ]] || { log "ERROR" "neo4j seed failed (${nodes})"; exit 1; }
 }
 
@@ -210,6 +237,11 @@ create_artifact() {
     local pg_size
     pg_size=$(stat -c%s "${ARTIFACT}/${PG_DUMP_NAME}")
     [[ "$pg_size" -gt 0 ]] || { log "ERROR" "pg_dump produced an empty file"; exit 1; }
+
+    dc exec -T user-postgres pg_dump -U user_service -d user_service --format=custom > "${ARTIFACT}/${USER_PG_DUMP_NAME}"
+    local user_pg_size
+    user_pg_size=$(stat -c%s "${ARTIFACT}/${USER_PG_DUMP_NAME}")
+    [[ "$user_pg_size" -gt 0 ]] || { log "ERROR" "user-postgres pg_dump produced an empty file"; exit 1; }
 
     # Neo4j dump requires the database offline, exactly as backup.sh does it.
     dc stop neo4j >/dev/null
@@ -269,17 +301,35 @@ run_restore() {
         RESTORE_DIR="${WORK}/stage-$(basename "$src")" \
         POSTGRES_USER=isnad \
         POSTGRES_DB=isnad_graph \
+        USER_POSTGRES_USER=user_service \
+        USER_POSTGRES_DB=user_service \
         ./scripts/restore.sh --force local
     ) > "$logfile" 2>&1
 }
 
+# expect_fail <name> <dir> <expected-reason-substring>
+#
+# The third argument is NOT optional, and it is the whole lesson of the deploy#577 review.
+# This used to assert only a non-zero exit. When restore.sh learned to refuse an INCOMPLETE
+# backup, two fixtures that had contained only the dump they mutate began being rejected for
+# MISSING STORES — before their truncated dump was ever read. They still "passed". The
+# truncation path they exist to exercise was no longer tested at all, and nothing said so.
+#
+# A negative that passes for the wrong reason is a test that has silently stopped testing.
+# It is the same defect class as a guard that cannot see what it exists to catch, living
+# inside the suite that guards against it. So each negative must now name the reason it
+# expects, and get it.
 expect_fail() {
-    local name="$1" src="$2"
+    local name="$1" src="$2" want="$3"
     local logfile="${WORK}/${name}.log" rc=0
-    log "INFO" "--- negative case: ${name} (restore.sh MUST exit non-zero) ---"
+    log "INFO" "--- negative case: ${name} (restore.sh MUST exit non-zero, because: ${want}) ---"
     run_restore "$src" "$logfile" || rc=$?
     if [[ $rc -eq 0 ]]; then
         fail "${name}: restore.sh exited 0 on a broken artifact — the check cannot fail"
+        sed 's/^/        /' "$logfile"
+    elif ! grep -q "$want" "$logfile"; then
+        fail "${name}: restore.sh exited ${rc}, but NOT for the expected reason (${want}). It failed for: $(grep -m1 '\[ERROR\]' "$logfile" | sed 's/.*\[ERROR\] //')"
+        fail "    A negative that fails for the wrong reason is a test that has stopped testing."
         sed 's/^/        /' "$logfile"
     else
         pass "${name}: restore.sh exited ${rc} — $(grep -m1 '\[ERROR\]' "$logfile" | sed 's/.*\[ERROR\] //' || echo 'failed as required')"
@@ -304,6 +354,25 @@ expect_pass() {
 # ---------------------------------------------------------------------------
 # Broken-artifact fixtures
 # ---------------------------------------------------------------------------
+# copy_full_artifact <dir>: every dump + checksum from the intact artifact.
+#
+# The truncation fixtures MUST start from a COMPLETE backup. They used to contain only the
+# dump they mutate — and the moment restore.sh learned to refuse an incomplete backup
+# (deploy#577 review), that made them inert: they were rejected for MISSING STORES before
+# their truncated dump was ever read, so they passed for the wrong reason and the
+# truncation path they exist to exercise was no longer tested at all.
+#
+# A negative fixture must fail for the reason it was built to test. Otherwise the suite is
+# green and the check it names is untested — which is the defect this whole review has been
+# about, reappearing inside the tests that guard against it.
+copy_full_artifact() {
+    local dst="$1"
+    mkdir -p "$dst"
+    cp "${ARTIFACT}/${PG_DUMP_NAME}"          "${ARTIFACT}/${PG_DUMP_NAME}.sha256"          "$dst/"
+    cp "${ARTIFACT}/${USER_PG_DUMP_NAME}"     "${ARTIFACT}/${USER_PG_DUMP_NAME}.sha256"     "$dst/"
+    cp "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst"   "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst.sha256"   "$dst/"
+}
+
 make_fixtures() {
     log "INFO" "Building broken-artifact fixtures..."
 
@@ -312,7 +381,7 @@ make_fixtures() {
     #     restore itself can detect it. This is the fixture that caught the swallowed
     #     pg_restore exit code.
     local trunc="${WORK}/fx_truncated"
-    mkdir -p "$trunc"
+    copy_full_artifact "$trunc"
     local full half
     full=$(stat -c%s "${ARTIFACT}/${PG_DUMP_NAME}")
     half=$(( full / 2 ))
@@ -325,6 +394,46 @@ make_fixtures() {
         exit 1
     fi
     log "INFO" "  truncated fixture: ${full}B -> ${tsize}B, checksum recomputed to match"
+
+    # (a2) Truncated USER-POSTGRES dump, checksum recomputed to match. Exercises the
+    #      failing direction of the store added in deploy#559 — a backup leg nobody has
+    #      seen fail is a backup leg nobody has tested.
+    local utrunc="${WORK}/fx_user_truncated"
+    copy_full_artifact "$utrunc"
+    local ufull uhalf
+    ufull=$(stat -c%s "${ARTIFACT}/${USER_PG_DUMP_NAME}")
+    uhalf=$(( ufull / 2 ))
+    head -c "$uhalf" "${ARTIFACT}/${USER_PG_DUMP_NAME}" > "${utrunc}/${USER_PG_DUMP_NAME}"
+    ( cd "$utrunc" && sha256sum "${USER_PG_DUMP_NAME}" > "${USER_PG_DUMP_NAME}.sha256" )
+    local utsize
+    utsize=$(stat -c%s "${utrunc}/${USER_PG_DUMP_NAME}")
+    if [[ "$utsize" -ge "$ufull" ]]; then
+        log "ERROR" "user-pg truncation fixture is inert (${utsize} >= ${ufull})"
+        exit 1
+    fi
+    log "INFO" "  user-pg truncated fixture: ${ufull}B -> ${utsize}B, checksum recomputed to match"
+
+    # (a3) EVERY dump valid, checksums correct — but the user-postgres dump is simply NOT
+    #      THERE. This is the fixture that was missing, and the hole it exercises was live:
+    #      restore.sh set FAILED=1 only when a dump was PRESENT and failed. An ABSENT dump
+    #      logged a WARNING and never touched FAILED, so the script printed
+    #      "=== Restore complete ===" and exited 0 on a backup with no accounts, no
+    #      sessions and no audit_log in it.
+    #
+    #      It is reachable by an artifact backup.sh itself produces: a partial upload lands
+    #      in B2 date-stamped, checksums cleanly, and `latest` selected it by directory name.
+    #      Nothing here is corrupt. Everything present is valid. That is the point — this
+    #      fixture is well-formed by construction, which is exactly why the other five
+    #      negatives could not catch it.
+    local nouserpg="${WORK}/fx_no_userpg"
+    mkdir -p "$nouserpg"
+    cp "${ARTIFACT}/${PG_DUMP_NAME}"    "${ARTIFACT}/${PG_DUMP_NAME}.sha256"    "$nouserpg/"
+    cp "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst" "${ARTIFACT}/${NEO4J_DUMP_NAME}.zst.sha256" "$nouserpg/"
+    if [[ -e "${nouserpg}/${USER_PG_DUMP_NAME}" ]]; then
+        log "ERROR" "no-userpg fixture is inert — the user-pg dump is present in it"
+        exit 1
+    fi
+    log "INFO" "  no-userpg fixture: valid isnad-pg + neo4j + correct checksums, user-pg ABSENT"
 
     # (b) Dump present, zero checksum files. Verification of nothing must not pass.
     local nosums="${WORK}/fx_nosums"
@@ -348,7 +457,7 @@ make_fixtures() {
 assert_restored_content() {
     log "INFO" "--- asserting on restored CONTENT (not on exit status) ---"
 
-    local rows sample nodes node_sample
+    local rows sample nodes node_sample user_rows audit_rows user_sample
 
     rows=$(psql_q "SELECT count(*) FROM narrator")
     if [[ "$rows" == "$SEED_ROWS" ]]; then
@@ -362,6 +471,28 @@ assert_restored_content() {
         pass "postgres sampled record id=${PG_SAMPLE_ID} restored: ${sample}"
     else
         fail "postgres sampled record id=${PG_SAMPLE_ID}: expected narrator_${PG_SAMPLE_ID}, got '${sample}'"
+    fi
+
+    # user-postgres: the store that cannot be rebuilt from the pipeline artifact.
+    user_rows=$(user_psql_q "SELECT count(*) FROM users")
+    if [[ "$user_rows" == "$SEED_USER_ROWS" ]]; then
+        pass "user-postgres users row count restored: ${user_rows}"
+    else
+        fail "user-postgres users row count: expected ${SEED_USER_ROWS}, got '${user_rows}'"
+    fi
+
+    audit_rows=$(user_psql_q "SELECT count(*) FROM audit_log")
+    if [[ "$audit_rows" == "$SEED_USER_ROWS" ]]; then
+        pass "user-postgres audit_log row count restored: ${audit_rows}"
+    else
+        fail "user-postgres audit_log row count: expected ${SEED_USER_ROWS}, got '${audit_rows}'"
+    fi
+
+    user_sample=$(user_psql_q "SELECT email FROM users WHERE id = ${USER_SAMPLE_ID}")
+    if [[ "$user_sample" == "user_${USER_SAMPLE_ID}@example.test" ]]; then
+        pass "user-postgres sampled account id=${USER_SAMPLE_ID} restored: ${user_sample}"
+    else
+        fail "user-postgres sampled account id=${USER_SAMPLE_ID}: expected user_${USER_SAMPLE_ID}@example.test, got '${user_sample}'"
     fi
 
     nodes=$(cypher_q "MATCH (n:Narrator) RETURN count(n)")
@@ -385,12 +516,14 @@ assert_restored_content() {
 empty_scratch_stores() {
     log "INFO" "Emptying scratch datastores so a no-op restore cannot masquerade as success..."
     dc exec -T postgres psql -U isnad -d isnad_graph -q -c 'DROP TABLE IF EXISTS narrator;'
+    dc exec -T user-postgres psql -U user_service -d user_service -q -c 'DROP TABLE IF EXISTS audit_log; DROP TABLE IF EXISTS users;'
     cypher_q "MATCH (n) DETACH DELETE n" >/dev/null
 
-    local rows nodes
+    local rows nodes user_rows
     rows=$(psql_q "SELECT count(*) FROM narrator" || true)
+    user_rows=$(user_psql_q "SELECT count(*) FROM users" || true)
     nodes=$(cypher_q "MATCH (n:Narrator) RETURN count(n)")
-    log "INFO" "Pre-restore state: pg narrator table absent (query yields '${rows:-<error>}'), neo4j nodes=${nodes}"
+    log "INFO" "Pre-restore state: pg narrator absent ('${rows:-<error>}'), user-pg users absent ('${user_rows:-<error>}'), neo4j nodes=${nodes}"
     if [[ "$nodes" != "0" ]]; then
         log "ERROR" "neo4j not emptied (nodes=${nodes}) — the positive case would be unfalsifiable"
         exit 1
@@ -413,10 +546,15 @@ main() {
     make_fixtures
 
     # Negatives first: prove the check can go red before we trust it green.
-    expect_fail "truncated_dump_matching_checksum" "${WORK}/fx_truncated"
-    expect_fail "zero_checksum_files"              "${WORK}/fx_nosums"
-    expect_fail "empty_backup"                     "${WORK}/fx_empty"
-    expect_fail "bitrot_stale_checksum"            "${WORK}/fx_bitrot"
+    # Each negative names the reason it must fail for. See expect_fail().
+    expect_fail "truncated_dump_matching_checksum" "${WORK}/fx_truncated"      "PostgreSQL (isnad): pg_restore"
+    expect_fail "truncated_user_pg_dump"           "${WORK}/fx_user_truncated" "PostgreSQL (user-service): pg_restore"
+    # Well-formed by construction: nothing corrupt, everything present is valid, and the
+    # user-postgres dump is simply absent. The one the other five could not see.
+    expect_fail "no_user_pg_dump_at_all"           "${WORK}/fx_no_userpg"      "Restore REFUSED"
+    expect_fail "zero_checksum_files"              "${WORK}/fx_nosums"         "No checksum files found"
+    expect_fail "empty_backup"                     "${WORK}/fx_empty"          "No checksum files found"
+    expect_fail "bitrot_stale_checksum"            "${WORK}/fx_bitrot"         "Checksum MISMATCH"
 
     # Positive.
     empty_scratch_stores

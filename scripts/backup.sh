@@ -10,16 +10,30 @@
 #   B2_BUCKET       — Backblaze B2 bucket name
 #
 # Optional environment variables:
-#   POSTGRES_USER   — PostgreSQL user (default: isnad)
-#   POSTGRES_DB     — PostgreSQL database (default: isnad_graph)
-#   COMPOSE_FILE    — Docker Compose file (default: compose/docker-compose.prod.yml,
-#                     resolved relative to /opt/noorinalabs-deploy/)
-#   BACKUP_DIR      — Local backup staging root (default: /var/lib/noorinalabs-backups,
-#                     a persistent path managed via tmpfiles.d to survive reboots —
-#                     see deploy#121 Bug A for the /tmp/-namespace failure this avoids)
-#   DAILY_RETAIN    — Number of daily backups to keep (default: 7)
-#   WEEKLY_RETAIN   — Number of weekly backups to keep (default: 4)
-#   DRY_RUN         — Set to "true" to show what would be pruned without deleting
+#   POSTGRES_USER      — isnad PostgreSQL user (default: isnad)
+#   POSTGRES_DB        — isnad PostgreSQL database (default: isnad_graph)
+#   USER_POSTGRES_USER — user-service PostgreSQL user (default: user_service)
+#   USER_POSTGRES_DB   — user-service database (default: user_service)
+#   COMPOSE_FILE       — Docker Compose file (default: compose/docker-compose.prod.yml,
+#                        resolved relative to /opt/noorinalabs-deploy/)
+#   BACKUP_DIR         — Local backup staging root (default: /var/lib/noorinalabs-backups,
+#                        a persistent path managed via tmpfiles.d to survive reboots —
+#                        see deploy#121 Bug A for the /tmp/-namespace failure this avoids)
+#   DAILY_RETAIN       — Number of daily backups to keep (default: 7)
+#   WEEKLY_RETAIN      — Number of weekly backups to keep (default: 4)
+#   DRY_RUN            — Set to "true" to show what would be pruned without deleting
+#
+# Datastore coverage (deploy#559). The full enumeration, including WHY each store is
+# or is not dumped, lives in docs/DATASTORES.md. Summary:
+#
+#   dumped here:  neo4j (graph), postgres (isnad relational + pgvector),
+#                 user-postgres (accounts, sessions, RBAC, audit_log)
+#   deliberately NOT dumped: redis, user-redis, prometheus, loki, kafka, caddy,
+#                 grafana, neo4j_logs, loki_runtime, st_model_cache
+#
+# `user-postgres` is the only store here whose contents cannot be reconstructed from
+# the published pipeline artifact. The artifact rebuilds the graph; it does not rebuild
+# the users. It had NO backup coverage at all before deploy#559.
 #
 # Usage:
 #   ./scripts/backup.sh
@@ -35,6 +49,12 @@ umask 077
 # ---------------------------------------------------------------------------
 POSTGRES_USER="${POSTGRES_USER:-isnad}"
 POSTGRES_DB="${POSTGRES_DB:-isnad_graph}"
+# Defaults match the live stg/prod values (`user_service` for both). compose declares
+# both as `:?`-required, so in practice they always arrive via the systemd
+# EnvironmentFile; the defaults exist so an operator running this by hand does not
+# silently dump the wrong database.
+USER_POSTGRES_USER="${USER_POSTGRES_USER:-user_service}"
+USER_POSTGRES_DB="${USER_POSTGRES_DB:-user_service}"
 COMPOSE_FILE="${COMPOSE_FILE:-compose/docker-compose.prod.yml}"
 BACKUP_DIR="${BACKUP_DIR:-/var/lib/noorinalabs-backups}"
 DAILY_RETAIN="${DAILY_RETAIN:-7}"
@@ -171,35 +191,100 @@ if ! docker compose -f "$COMPOSE_FILE" ps --format json &>/dev/null; then
     exit 1
 fi
 
+# Verify the B2 credential BEFORE stopping Neo4j and dumping gigabytes. Discovering at
+# upload time that the key cannot write means we took an outage for nothing.
+#
+# The preflight classifies by capability probe rather than by rclone's error text,
+# because rclone's text does not identify the failure: a read-only key's 401 surfaces as
+# "failed to create bucket", and a missing bucket is indistinguishable from a
+# wrongly-scoped key. See scripts/b2_preflight.sh. (deploy#559)
+PREFLIGHT="$(dirname "${BASH_SOURCE[0]}")/b2_preflight.sh"
+if [[ -f "$PREFLIGHT" ]]; then
+    # shellcheck source=scripts/b2_preflight.sh
+    source "$PREFLIGHT"
+
+    # `PREFLIGHT_OUT="$(preflight_b2 2>&1)"` followed by `PREFLIGHT_RC=$?` looks right and
+    # is dead code on every failing path. This script runs under `set -euo pipefail`, and
+    # an assignment whose command substitution exits non-zero IS a failing simple command:
+    # errexit fires AT THE ASSIGNMENT. Nothing below it runs. The operator saw exactly one
+    # line, from the EXIT trap — "Backup script exited with code 1" — and never the verdict
+    # or its remediation. The guard that exists so nobody chases rclone's lying
+    # "failed to create bucket" was, in the only place it runs, silent.
+    #
+    # Measured (bash 5.2.21): failing preflight under `set -e`
+    #   before: exit 1, stdout has no "verdict=" and no "B2 preflight failed"
+    #   after:  exit 1, stdout carries the full verdict + remediation
+    #
+    # `|| PREFLIGHT_RC=$?` puts the assignment in a condition context, which suspends
+    # errexit for it. The inner `set +e` additionally protects the probes: without it, a
+    # caller with `shopt -s inherit_errexit` would kill preflight_b2 at the first failing
+    # `rclone` call, before it could compute a verdict at all.
+    PREFLIGHT_RC=0
+    PREFLIGHT_OUT="$(set +e; preflight_b2 2>&1)" || PREFLIGHT_RC=$?
+    printf '%s\n' "$PREFLIGHT_OUT" | tee -a "$LOG_FILE"
+    if [[ "$PREFLIGHT_RC" -ne 0 ]]; then
+        log "ERROR" "B2 preflight failed — refusing to dump databases we cannot upload"
+        exit 1
+    fi
+else
+    log "ERROR" "Missing ${PREFLIGHT} — cannot verify B2 credentials before dumping"
+    exit 1
+fi
+
 log "INFO" "=== Backup started (${BACKUP_CATEGORY}) ==="
 log "INFO" "Timestamp: ${TIMESTAMP}"
 log "INFO" "Local staging: ${LOCAL_BACKUP_PATH}"
 log "INFO" "Remote target: ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}"
 
 PG_OK=false
+USER_PG_OK=false
 NEO4J_OK=false
 
 # ---------------------------------------------------------------------------
-# 1. PostgreSQL dump
+# 1. PostgreSQL dumps (isnad + user-service)
 # ---------------------------------------------------------------------------
-PG_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-pg-${TIMESTAMP}.dump"
+# dump_postgres <compose-service> <user> <db> <outfile> <label>
+# Echoes nothing; returns 0 on a non-empty dump, 1 otherwise.
+dump_postgres() {
+    local service="$1" pg_user="$2" pg_db="$3" outfile="$4" label="$5"
 
-log "INFO" "Starting PostgreSQL dump..."
-if docker compose -f "$COMPOSE_FILE" exec -T postgres \
-    pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom \
-    > "$PG_DUMP_FILE" 2>>"$LOG_FILE"; then
-
-    PG_SIZE=$(stat -c%s "$PG_DUMP_FILE" 2>/dev/null || stat -f%z "$PG_DUMP_FILE" 2>/dev/null)
-    if [[ "$PG_SIZE" -gt 0 ]]; then
-        log "INFO" "PostgreSQL dump complete: $(du -h "$PG_DUMP_FILE" | cut -f1)"
-        PG_OK=true
-    else
-        log "ERROR" "PostgreSQL dump produced empty file"
-        rm -f "$PG_DUMP_FILE"
+    log "INFO" "Starting ${label} dump (service=${service} db=${pg_db})..."
+    if ! docker compose -f "$COMPOSE_FILE" exec -T "$service" \
+        pg_dump -U "$pg_user" -d "$pg_db" --format=custom \
+        > "$outfile" 2>>"$LOG_FILE"; then
+        log "ERROR" "${label} dump failed"
+        rm -f "$outfile"
+        return 1
     fi
-else
-    log "ERROR" "PostgreSQL dump failed"
-    rm -f "$PG_DUMP_FILE"
+
+    local size
+    size=$(stat -c%s "$outfile" 2>/dev/null || stat -f%z "$outfile" 2>/dev/null)
+    # A zero-byte dump is the failure mode that produces a backup you cannot restore
+    # from and only discover during an incident. pg_dump can exit 0 having written
+    # nothing if its stdout redirection failed.
+    if [[ "${size:-0}" -le 0 ]]; then
+        log "ERROR" "${label} dump produced empty file"
+        rm -f "$outfile"
+        return 1
+    fi
+
+    log "INFO" "${label} dump complete: $(du -h "$outfile" | cut -f1)"
+    return 0
+}
+
+PG_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-pg-${TIMESTAMP}.dump"
+if dump_postgres postgres "$POSTGRES_USER" "$POSTGRES_DB" "$PG_DUMP_FILE" "PostgreSQL (isnad)"; then
+    PG_OK=true
+fi
+
+# user-postgres holds accounts, roles, sessions, oauth_accounts, subscriptions,
+# totp_secrets and the audit_log relocated out of Neo4j on 2026-06-30. None of it is
+# reconstructible from the published pipeline artifact — that rebuilds the graph, not
+# the users. It had no backup coverage of any kind before deploy#559.
+USER_PG_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-userpg-${TIMESTAMP}.dump"
+if dump_postgres user-postgres "$USER_POSTGRES_USER" "$USER_POSTGRES_DB" \
+    "$USER_PG_DUMP_FILE" "PostgreSQL (user-service)"; then
+    USER_PG_OK=true
 fi
 
 # ---------------------------------------------------------------------------
@@ -227,17 +312,40 @@ done
 if [[ $WAITED -lt $MAX_WAIT ]]; then
     log "INFO" "Neo4j stopped (waited ${WAITED}s). Running dump..."
 
-    # Determine the volume name (compose project prefix + volume name)
-    NEO4J_VOLUME=$(docker volume ls --format '{{.Name}}' | grep -E '(neo4j_data|neo4j-data)$' | head -1)
-    if [[ -z "$NEO4J_VOLUME" ]]; then
-        log "ERROR" "Cannot find Neo4j data volume"
+    # Resolve the data volume from THIS compose project's neo4j container rather than
+    # by grepping every volume on the host. `docker volume ls | grep neo4j_data` matches
+    # across all compose projects, so on a box running more than one stack the backup
+    # could silently dump a different project's graph and be restored over the real one.
+    # (deploy#559, same resolution as restore.sh restore_neo4j().)
+    NEO4J_CID=$(docker compose -f "$COMPOSE_FILE" ps -aq neo4j 2>/dev/null | head -1)
+    if [[ -z "$NEO4J_CID" ]]; then
+        NEO4J_VOLUME=""
     else
-        # Use bare docker run (not compose run) to avoid service config conflicts
+        NEO4J_VOLUME=$(docker inspect \
+            --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' \
+            "$NEO4J_CID")
+    fi
+    if [[ -z "$NEO4J_VOLUME" ]]; then
+        log "ERROR" "Cannot resolve the Neo4j data volume for ${COMPOSE_FILE} — refusing to guess"
+    else
+        log "INFO" "Resolved Neo4j data volume: ${NEO4J_VOLUME}"
+        # Use bare docker run (not compose run) to avoid service config conflicts.
+        #
+        # `--user 0:0 --entrypoint neo4j-admin` is required, not cosmetic. The
+        # neo4j:5-community entrypoint drops privileges to neo4j(7474) even when the
+        # container starts as root. BACKUP_DIR is 0700 root:root (tmpfiles.d), and this
+        # script runs as root under systemd, so the dropped user cannot write the
+        # /backups bind mount: `neo4j-admin` dies with "AccessDeniedException: /backups"
+        # and the Neo4j leg of every backup fails. Measured on neo4j:5-community during
+        # deploy#560: entrypoint path -> uid 7474 -> exit 1; bypass -> uid 0 ->
+        # "Dump completed successfully". Same fix as restore.sh restore_neo4j().
         if docker run --rm \
+            --user 0:0 \
+            --entrypoint neo4j-admin \
             -v "${NEO4J_VOLUME}:/data" \
             -v "${LOCAL_BACKUP_PATH}:/backups" \
             neo4j:5-community \
-            neo4j-admin database dump neo4j --to-path=/backups/ 2>>"$LOG_FILE"; then
+            database dump neo4j --to-path=/backups/ 2>>"$LOG_FILE"; then
 
             # The dump command outputs to /backups/neo4j.dump — rename it
             if [[ -f "${LOCAL_BACKUP_PATH}/neo4j.dump" ]]; then
@@ -294,15 +402,59 @@ for f in "$LOCAL_BACKUP_PATH"/isnad-*; do
 done
 
 # ---------------------------------------------------------------------------
+# 3b. Declare what this backup actually contains (deploy#559 review)
+# ---------------------------------------------------------------------------
+# A partial backup is uploaded deliberately ("a partial backup beats none"), and once it
+# lands in B2 it is date-stamped, checksums cleanly, and is INDISTINGUISHABLE AT REST from
+# a complete one. `restore.sh latest` picks the newest directory NAME. So the night the
+# user-postgres dump fails, the artifact `latest` selects is precisely the one missing the
+# only store that cannot be rebuilt from the pipeline artifact.
+#
+# Completeness is a property of the artifact, so the artifact must declare it. This is the
+# same shape as `_resolve_run.txt` in da#428: the PRODUCER attests to what it actually
+# wrote, because it is the only party that knows, and the consumer refuses anything that
+# does not attest completeness.
+#
+# Note what this manifest is NOT: it is not the source of the EXPECTED set. restore.sh
+# carries its own list of required stores. If the expected set came from the artifact, a
+# partial backup would declare itself complete-for-what-it-happens-to-hold — the same
+# circularity that a read-back count has, and it would be just as invisible.
+MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_backup_manifest.txt"
+BACKUP_STORES=""
+$PG_OK && BACKUP_STORES="${BACKUP_STORES}postgres,"
+$USER_PG_OK && BACKUP_STORES="${BACKUP_STORES}user-postgres,"
+$NEO4J_OK && BACKUP_STORES="${BACKUP_STORES}neo4j,"
+BACKUP_STORES="${BACKUP_STORES%,}"
+
+if $PG_OK && $USER_PG_OK && $NEO4J_OK; then
+    BACKUP_COMPLETE=true
+else
+    BACKUP_COMPLETE=false
+fi
+
+printf 'BACKUP_MANIFEST complete=%s stores=%s timestamp=%s category=%s\n' \
+    "$BACKUP_COMPLETE" "$BACKUP_STORES" "$TIMESTAMP" "$BACKUP_CATEGORY" > "$MANIFEST_FILE"
+sha256sum "$MANIFEST_FILE" | sed "s|${LOCAL_BACKUP_PATH}/||" > "${MANIFEST_FILE}.sha256"
+log "INFO" "Manifest: complete=${BACKUP_COMPLETE} stores=${BACKUP_STORES}"
+
+# ---------------------------------------------------------------------------
 # 4. Upload to Backblaze B2
 # ---------------------------------------------------------------------------
-if [[ "$PG_OK" == "false" && "$NEO4J_OK" == "false" ]]; then
-    log "ERROR" "Both PostgreSQL and Neo4j dumps failed — nothing to upload"
+if [[ "$PG_OK" == "false" && "$USER_PG_OK" == "false" && "$NEO4J_OK" == "false" ]]; then
+    log "ERROR" "All dumps failed — nothing to upload"
     exit 1
 fi
 
-if [[ "$PG_OK" == "false" || "$NEO4J_OK" == "false" ]]; then
+if [[ "$PG_OK" == "false" || "$USER_PG_OK" == "false" || "$NEO4J_OK" == "false" ]]; then
+    # Upload what we have — a partial backup beats none — but the run still exits
+    # non-zero below, so the systemd OnFailure marker fires and the operator is told.
     log "WARNING" "Partial backup — uploading available dumps only"
+fi
+
+# A user-postgres failure is called out separately because it is the one store whose
+# contents cannot be rebuilt from the pipeline artifact.
+if [[ "$USER_PG_OK" == "false" ]]; then
+    log "ERROR" "user-postgres dump FAILED — accounts, sessions and audit_log are NOT in this backup"
 fi
 
 log "INFO" "Uploading to B2: ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}/"
@@ -361,16 +513,24 @@ prune_old_backups "weekly" "$((WEEKLY_RETAIN * 7))"
 # Summary
 # ---------------------------------------------------------------------------
 log "INFO" "=== Backup summary ==="
-log "INFO" "PostgreSQL: $(if $PG_OK; then echo "OK"; else echo "FAILED"; fi)"
-log "INFO" "Neo4j:      $(if $NEO4J_OK; then echo "OK"; else echo "FAILED"; fi)"
+log "INFO" "PostgreSQL (isnad):        $(if $PG_OK; then echo "OK"; else echo "FAILED"; fi)"
+log "INFO" "PostgreSQL (user-service): $(if $USER_PG_OK; then echo "OK"; else echo "FAILED"; fi)"
+log "INFO" "Neo4j:                     $(if $NEO4J_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "Category:   ${BACKUP_CATEGORY}"
 log "INFO" "Remote:     ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}/"
 log "INFO" "=== Backup finished ==="
 
 # A partial backup is a failed backup: exit non-zero WITHOUT emitting the
 # success gauge, so isnad-backup.service's `OnFailure=` fires the failure marker
-# and BackupStale keeps counting from the last COMPLETE backup.
-if [[ "$PG_OK" == "false" || "$NEO4J_OK" == "false" ]]; then
+# and BackupStale keeps counting from the last COMPLETE backup (deploy#565).
+#
+# `USER_PG_OK` belongs in this condition, not just alongside it. The success gauge is
+# what the alerts treat as "a complete, restorable backup exists". If a run that failed
+# to dump user-postgres still emitted it, the one store that cannot be rebuilt from the
+# pipeline artifact could be missing from every backup we hold and the dashboards would
+# stay green — the exact silence deploy#565 closed, reopened through the leg deploy#559
+# adds.
+if [[ "$PG_OK" == "false" || "$USER_PG_OK" == "false" || "$NEO4J_OK" == "false" ]]; then
     log "ERROR" "Partial backup — success metric NOT emitted"
     exit 1
 fi

@@ -36,3 +36,20 @@ output "pipeline_ro_key" {
   value       = b2_application_key.pipeline_ro.application_key
   sensitive   = true
 }
+
+output "backups_bucket_name" {
+  description = "B2 bucket name for database backups (BACKUP_B2_BUCKET)"
+  value       = b2_bucket.backups.bucket_name
+}
+
+output "backups_rw_key_id" {
+  description = "Application key ID with read/write access to the backups bucket (BACKUP_B2_KEY_ID)"
+  value       = b2_application_key.backups_rw.application_key_id
+  sensitive   = true
+}
+
+output "backups_rw_key" {
+  description = "Application key secret with read/write access to the backups bucket (BACKUP_B2_APP_KEY)"
+  value       = b2_application_key.backups_rw.application_key
+  sensitive   = true
+}
