@@ -95,12 +95,24 @@ on:
         default: true
 
 concurrency:
-  # Serialize prune ops per env. A prune batch-DETACH-DELETEs against the live
-  # graph; it must never overlap another graph write (a load, a migrate, a
-  # concurrent prune) on the same env. Queue, don't cancel — a mid-prune cancel
-  # could leave a partially-pruned graph; let the in-flight prune finish. (The
-  # DETACH DELETE is batched + idempotent, so a re-dispatch after a completed
-  # prune simply finds 0 orphans.)
+  # Serializes this workflow AGAINST ITSELF, per env. That is all it does, and the
+  # comment here previously claimed more (deploy#576).
+  #
+  # What it does NOT do: exclude the other graph writers. deploy-data-load.yml uses
+  # `data-load-<env>` and graph-ops.yml uses `graph-ops-<env>` — three DISJOINT groups,
+  # so a load and a prune can run against the same graph simultaneously. That is not
+  # merely untidy: the differential gates below (EXPECTED_POST, Gate B/C) are computed
+  # from a dry-run snapshot and re-checked after the write, so a concurrent load landing
+  # between the two makes a CORRECT prune fail its own verification and print a
+  # "restore from backup" message. A false-FAIL on a destructive op is its own incident.
+  #
+  # The shared `graph-write-<env>` group that would actually exclude them across all
+  # three workflows is deploy#576. Until that lands, do not dispatch a prune while a
+  # load or a graph-ops migrate is in flight on the same env.
+  #
+  # Queue, don't cancel — a mid-prune cancel could leave a partially-pruned graph; let
+  # the in-flight prune finish. (The DETACH DELETE is batched + idempotent, so a
+  # re-dispatch after a completed prune simply finds 0 orphans.)
   group: graph-prune-narrators-${{ inputs.env }}
   cancel-in-progress: false
 
@@ -146,6 +158,7 @@ jobs:
           echo "Resolved loader image: ${img}"
 
       - name: Prune narrators on ${{ inputs.env }} VPS
+        id: prune
         uses: appleboy/ssh-action@v1
         env:
           ENV_NAME: ${{ inputs.env }}
@@ -172,6 +185,13 @@ jobs:
           # the binding limit. Dry-run is seconds.
           command_timeout: 1h
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          # Capture the remote stdout so the Report step can lift the PRUNE_RESULT line
+          # out of it and put the actual NUMBERS in the job summary (deploy#575). The
+          # summary a prod approver reads was outcome-free — env/ref/dry_run/image only
+          # — while what the op would DO stayed buried in this step's log. Nothing new is
+          # exposed: this is the same stdout already streamed to the (public) job log,
+          # and the RCLONE_* scrub above is what keeps credentials out of both.
+          capture_stdout: true
           envs: ENV_NAME,PARQUET_REF,DRY_RUN,IMAGE,PIPELINE_B2_KEY_ID,PIPELINE_B2_KEY,GITHUB_TOKEN,GITHUB_ACTOR
           script: |
             set -euo pipefail
@@ -291,7 +311,12 @@ jobs:
             echo "==> [${ENV_NAME}] verify B2 presence under ${B2_BASE}"
             # The canonical set is ALL a prune needs — narrators_canonical.parquet
             # alone. No staging/edge Parquet is read (unlike deploy-data-load.yml).
-            verify_present "${B2_BASE}/curated" "narrators_canonical.parquet"
+            #
+            # _manifest.txt is required TOO, and its absence is a hard refusal. See the
+            # COMPLETENESS BINDING block below for why a prune without it is unsafe at
+            # any magnitude. It is published LAST by da's publish_parquet.py, so its
+            # presence is itself the evidence that the publish ran to completion.
+            verify_present "${B2_BASE}/curated" "narrators_canonical.parquet" "_manifest.txt"
             echo "    B2 presence check PASSED."
 
             # Stable, git-untracked data dir OUTSIDE the /opt checkout (so the git
@@ -307,15 +332,112 @@ jobs:
             mkdir -p "${PRUNE_DATA_DIR}/curated" \
               || { echo "ERROR: [${ENV_NAME}] cannot create ${PRUNE_DATA_DIR} (is \$HOME=${HOME} writable by 'deploy'?)" >&2; exit 1; }
 
-            echo "==> [${ENV_NAME}] rclone pull curated/narrators_canonical.parquet -> ${PRUNE_DATA_DIR}/curated"
+            echo "==> [${ENV_NAME}] rclone pull curated/{narrators_canonical.parquet,_manifest.txt} -> ${PRUNE_DATA_DIR}/curated"
             rclone copy "${B2_BASE}/curated/" "${PRUNE_DATA_DIR}/curated/" \
               --include "narrators_canonical.parquet" \
+              --include "_manifest.txt" \
               --log-level INFO \
               || { echo "ERROR: [${ENV_NAME}] rclone pull of narrators_canonical.parquet failed." >&2; exit 1; }
             if [ ! -s "${PRUNE_DATA_DIR}/curated/narrators_canonical.parquet" ]; then
               echo "ERROR: [${ENV_NAME}] narrators_canonical.parquet is absent or empty after pull — refusing to prune against a missing canonical set." >&2
               exit 1
             fi
+
+            # =====================================================================
+            # COMPLETENESS BINDING — bind the keep-set to the run that produced it
+            # (deploy#574 / da#426). This is the safety property of this workflow.
+            # =====================================================================
+            # EVERY other gate here — the whole-graph sanity check, EXPECTED_POST, and
+            # post-op Gates A-D — is DERIVED from the keep-set it is meant to validate.
+            # They prove the prune obeyed the parquet. Not one of them can ask whether
+            # it was the RIGHT parquet, because `parquet_ref` is free text.
+            #
+            # `missing` (da#414) closes the STALE-parquet door: a keep-set from a
+            # different generation names ids this graph never saw, and da refuses.
+            #
+            # It does NOT close the SHORT-parquet door, and no magnitude ceiling can.
+            # On a truncated-but-same-generation parquet (resolve stopped early, partial
+            # write, truncated upload) every id in the keep-set genuinely IS in the
+            # graph, so `missing` is exactly 0. It does not merely miss that case: it
+            # CERTIFIES it. da#426 measured the real subcommand against a 160,614-node
+            # graph, varying the fraction `f` of canonical rows the parquet retains:
+            #
+            #   f=0.124 -> deletes 90.0% -> REFUSED by da's 0.9 ceiling
+            #   f=0.20  -> deletes 83.9% -> PROCEEDS: 134,768 legitimate narrators gone
+            #   f=0.40  -> deletes 67.8% -> PROCEEDS
+            #   f=0.60  -> deletes 51.7% -> PROCEEDS
+            #
+            # ...with missing=0 in every row. And the ceiling cannot be tightened,
+            # because a LEGITIMATE full re-mint prune — the case this workflow exists
+            # for — deletes 55.4%. The legitimate and the catastrophic bands OVERLAP.
+            # There is no threshold that separates them. Magnitude is the wrong axis.
+            #
+            # The right axis is provenance: the keep-set must match what its producing
+            # run DECLARED it wrote. A short parquet is then detectably short at ANY f.
+            # da's publish_parquet.py writes curated/_manifest.txt LAST, declaring:
+            #
+            #   CANONICAL_MANIFEST file=<name> rows=<n> canonical_ids=<n> md5=<32hex> bytes=<n>
+            #
+            # `canonical_ids` is the count of DISTINCT NON-EMPTY canonical_id values —
+            # deliberately NOT the naive row count. da's read_canonical_ids() returns a
+            # `set` and filters falsy ids, so `canonical=` in PRUNE_NARRATORS_SUMMARY is
+            # a distinct-non-empty count. Comparing it against a raw row count would
+            # false-FAIL on any duplicate or null id in the parquet — and a false-FAIL
+            # on a destructive op sends an operator to "restore from backup" for a
+            # correct prune, which is its own incident. Producer and consumer must count
+            # the same thing.
+            #
+            # NO manifest, NO prune. There is no break-glass input, deliberately: an
+            # override on an irreversible op with no provenance is exactly the flag that
+            # gets set at 03:00 by someone who just wants the job to go green.
+            MANIFEST="${PRUNE_DATA_DIR}/curated/_manifest.txt"
+            if [ ! -s "${MANIFEST}" ]; then
+              echo "ERROR: [${ENV_NAME}] curated/_manifest.txt is absent or empty under parquet_ref '${PARQUET_REF}'." >&2
+              echo "  The keep-set has no provenance: nothing declares how many canonical ids the producing run" >&2
+              echo "  intended to write, so a truncated-but-valid parquet is indistinguishable from a complete one" >&2
+              echo "  and would silently delete most of the graph (da#426 measured 83.9% at f=0.20, missing=0)." >&2
+              echo "  Re-publish this ref with a manifest (da publish_parquet.py). Refusing to prune." >&2
+              exit 1
+            fi
+
+            # manifest_field <key>: the value for <key> on the CANONICAL_MANIFEST line
+            # for narrators_canonical.parquet. Whole-token match, same discipline as
+            # summary_field (da#419) — no key may be hijacked by one ending in its name.
+            manifest_field() {
+              grep '^CANONICAL_MANIFEST ' "${MANIFEST}" \
+                | grep ' file=narrators_canonical.parquet ' \
+                | head -n1 \
+                | tr ' ' '\n' \
+                | sed -n "s/^$1=\\([0-9a-f][0-9a-f]*\\)$/\\1/p" \
+                | head -n1
+            }
+
+            MF_CANON_IDS="$(manifest_field canonical_ids)"
+            MF_MD5="$(manifest_field md5)"
+            if [ -z "${MF_CANON_IDS}" ] || [ -z "${MF_MD5}" ]; then
+              echo "ERROR: [${ENV_NAME}] curated/_manifest.txt has no usable CANONICAL_MANIFEST line for narrators_canonical.parquet (canonical_ids='${MF_CANON_IDS}' md5='${MF_MD5}')." >&2
+              echo "  Expected: CANONICAL_MANIFEST file=narrators_canonical.parquet rows=<n> canonical_ids=<n> md5=<32hex> bytes=<n>" >&2
+              echo "  A manifest we cannot read is a manifest we do not have. Refusing to prune." >&2
+              exit 1
+            fi
+
+            # (a) BYTE INTEGRITY — the bytes we hold are the bytes the producer published.
+            #     This catches a corrupt/truncated TRANSFER. It does NOT catch a short
+            #     WRITE (a short parquet has a perfectly good md5 of itself), which is
+            #     what (b) is for. Both are needed; neither substitutes for the other.
+            GOT_MD5="$(md5sum "${PRUNE_DATA_DIR}/curated/narrators_canonical.parquet" | cut -d' ' -f1)"
+            if [ "${GOT_MD5}" != "${MF_MD5}" ]; then
+              echo "ERROR: [${ENV_NAME}] narrators_canonical.parquet md5 mismatch — the bytes on this box are NOT the bytes the producing run published." >&2
+              echo "  manifest: ${MF_MD5}" >&2
+              echo "  pulled  : ${GOT_MD5}" >&2
+              echo "  Refusing to prune against an artifact we cannot vouch for." >&2
+              exit 1
+            fi
+            echo "    manifest: md5 MATCHES the published artifact (${GOT_MD5})."
+            echo "    manifest: producing run declared ${MF_CANON_IDS} distinct canonical ids."
+            # (b) COMPLETENESS is asserted below, once the dry-run has reported how many
+            #     canonical ids the parquet ACTUALLY yields (`canonical=`). It cannot be
+            #     checked here: only da's reader can tell us what the file really holds.
 
             # Pin the loader image for the compose graph-load service and point its
             # read-only data bind-mount at the pulled dir. Both are exported env
@@ -356,8 +478,43 @@ jobs:
             # line (da#413 contract). Empty if the line/key is absent — callers
             # HARD-FAIL on empty (a missing instrument reading is a stop, never a
             # silent pass — feedback_silent_zero_is_not_a_measurement).
+            #
+            # The key is matched as a WHOLE TOKEN, not as a substring (da#419). The
+            # previous form was:
+            #
+            #   sed -n "s/.*PRUNE_NARRATORS_SUMMARY .*$2=\([0-9][0-9]*\).*/\1/p"
+            #
+            # whose `.*` before the key is unanchored, so `$2=deleted` also matches the
+            # tail of any key ENDING in "deleted" — `edges_deleted=` being the obvious
+            # future one — and, being greedy, would return the RIGHTMOST such match.
+            # `missing=` (the key da#414 just added) happens not to collide with the
+            # existing four, so this is not a live miscount today; it is a trap armed for
+            # the next key, and this workflow is about to depend on more of them.
+            #
+            # Splitting the line on spaces and requiring an exact `^key=<int>$` token
+            # makes the hijack structurally impossible rather than merely unlikely: no
+            # key can be a suffix of another when both must match the whole token.
             summary_field() {
-              printf '%s\n' "$1" | sed -n "s/.*PRUNE_NARRATORS_SUMMARY .*$2=\\([0-9][0-9]*\\).*/\\1/p" | head -n1
+              printf '%s\n' "$1" \
+                | grep -o 'PRUNE_NARRATORS_SUMMARY .*' \
+                | head -n1 \
+                | tr ' ' '\n' \
+                | sed -n "s/^$2=\\([0-9][0-9]*\\)$/\\1/p" \
+                | head -n1
+            }
+
+            # emit_result <outcome> <canonical> <graph_total> <orphans> <deleted> <missing> <post>
+            # ONE machine-readable line, lifted out of the captured remote stdout by the
+            # Report step so the job summary carries the actual numbers (deploy#575).
+            #
+            # Emitted ONLY on a terminal SUCCESS path. Its ABSENCE after a failure is
+            # itself the signal: the Report step then prints "counts not reported" rather
+            # than rendering zeros. A zero we never measured is not a measurement, and on
+            # a destructive op a summary reading "deleted 0" when the truth is unknown is
+            # the most dangerous thing this workflow could print.
+            emit_result() {
+              printf 'PRUNE_RESULT outcome=%s canonical=%s graph_total=%s orphans=%s deleted=%s missing=%s post=%s\n' \
+                "$1" "$2" "$3" "$4" "$5" "$6" "$7"
             }
 
             NARR_Q='MATCH (n:Narrator) RETURN count(n) AS narrators'
@@ -404,11 +561,44 @@ jobs:
             CANON_N="$(summary_field "${DRY_OUT}" canonical)"
             GRAPH_M="$(summary_field "${DRY_OUT}" graph_total)"
             ORPHANS_K="$(summary_field "${DRY_OUT}" orphans)"
-            if [ -z "${CANON_N}" ] || [ -z "${GRAPH_M}" ] || [ -z "${ORPHANS_K}" ]; then
-              echo "ERROR: [${ENV_NAME}] could not parse the PRUNE_NARRATORS_SUMMARY line from prune-narrators --dry-run (canonical='${CANON_N}' graph_total='${GRAPH_M}' orphans='${ORPHANS_K}'). da#413 must emit 'PRUNE_NARRATORS_SUMMARY canonical=<n> graph_total=<n> orphans=<n> deleted=<n>'. Refusing to proceed without a verifiable instrument reading." >&2
+            MISSING_N="$(summary_field "${DRY_OUT}" missing)"
+            if [ -z "${CANON_N}" ] || [ -z "${GRAPH_M}" ] || [ -z "${ORPHANS_K}" ] || [ -z "${MISSING_N}" ]; then
+              echo "ERROR: [${ENV_NAME}] could not parse the PRUNE_NARRATORS_SUMMARY line from prune-narrators --dry-run (canonical='${CANON_N}' graph_total='${GRAPH_M}' orphans='${ORPHANS_K}' missing='${MISSING_N}'). da#414 must emit 'PRUNE_NARRATORS_SUMMARY canonical=<n> graph_total=<n> orphans=<n> deleted=<n> missing=<n>'. Refusing to proceed without a verifiable instrument reading." >&2
               exit 1
             fi
-            echo "    canonical ids: ${CANON_N} | graph total: ${GRAPH_M} | orphans (would delete): ${ORPHANS_K}"
+            echo "    canonical ids: ${CANON_N} | graph total: ${GRAPH_M} | orphans (would delete): ${ORPHANS_K} | missing: ${MISSING_N}"
+
+            # --- COMPLETENESS BINDING (b): the keep-set is the WHOLE keep-set ---------
+            # The parquet on this box yields CANON_N distinct canonical ids. The run that
+            # produced it declared MF_CANON_IDS. If those differ, the file is not what its
+            # producer says it is — the short-parquet case that `missing` certifies as
+            # healthy (missing=0) and that no magnitude ceiling can separate from a
+            # legitimate 55.4%-deleting re-mint. This equality is the ONLY gate in this
+            # workflow not derived from the keep-set it is validating.
+            if [ "${CANON_N}" -ne "${MF_CANON_IDS}" ]; then
+              echo "ERROR: [${ENV_NAME}] COMPLETENESS CHECK FAILED — the canonical parquet is not the one its producing run published." >&2
+              echo "  declared by the producing run : ${MF_CANON_IDS} distinct canonical ids" >&2
+              echo "  actually read from the parquet: ${CANON_N}" >&2
+              echo "  This is a SHORT keep-set. Every id in it is real, so 'missing' is ${MISSING_N} and every" >&2
+              echo "  derived gate downstream would go green while the prune deleted the $(( GRAPH_M - CANON_N )) narrators the" >&2
+              echo "  keep-set failed to name. NO node was deleted. Re-publish the ref and re-run." >&2
+              exit 1
+            fi
+            echo "    COMPLETENESS: parquet yields exactly the ${MF_CANON_IDS} canonical ids its producing run declared."
+
+            # `missing` is REPORTED, never asserted to be 0. da#414's own contract puts
+            # this policy here rather than in the subcommand, and the naive policy is a
+            # trap: a legitimately partial load (REFUSED_ROWS, STOPPED_AT_LIMIT,
+            # nodes-only) leaves canonical ids unloaded, so missing>0 is NORMAL and a
+            # `missing == 0` refusal would block correct prunes. Worse, it is not even a
+            # safety property: on the short-parquet case it reads 0 and CERTIFIES the
+            # thing it was supposed to catch. The completeness binding above is what
+            # actually closes that door; this is an operator signal, not a gate.
+            if [ "${MISSING_N}" -gt 0 ]; then
+              echo "    NOTE: ${MISSING_N} canonical id(s) are not present in the graph. Expected after a" \
+                   "partial/nodes-only load; da refuses outright if this is a large fraction" \
+                   "(ForeignCanonicalSetError). Not treated as a failure here."
+            fi
             # The subcommand and the workflow must agree on the graph's narrator
             # count, or one of them is reading a different graph/state.
             if [ "${GRAPH_M}" -ne "${NARR_PRE}" ]; then
@@ -423,10 +613,25 @@ jobs:
 
             EXPECTED_POST="$(( NARR_PRE - ORPHANS_K ))"
 
-            if [ "${DRY_RUN}" = "true" ]; then
+            # FAIL-SAFE DRY RUN. Tested as `!= "false"`, NOT as `= "true"`.
+            #
+            # `= "true"` fails OPEN: every value that is not exactly the string "true"
+            # falls through to a REAL prune. `dry_run` reaches this script as a string via
+            # the ssh-action `envs:` passlist, so "True", "1", "yes", a value dropped from
+            # the passlist (empty), or a typo all mean "delete for real" under the old
+            # test. The default is true and the input is a boolean, so this is not a
+            # likely path — but the failure it produces is an unrecoverable one, and the
+            # safe default costs nothing. Anything we do not positively recognise as
+            # "false" is treated as a dry run: the operator has to be UNAMBIGUOUS to
+            # destroy data.
+            if [ "${DRY_RUN}" != "false" ]; then
+              if [ "${DRY_RUN}" != "true" ]; then
+                echo "WARNING: [${ENV_NAME}] dry_run='${DRY_RUN}' is not the string 'true' or 'false'. Treating it as a DRY RUN and deleting nothing. Pass dry_run=false explicitly to prune for real." >&2
+              fi
               echo "==> [${ENV_NAME}] DRY RUN — canonical set read OK; NO delete issued."
               echo "    would DETACH DELETE ${ORPHANS_K} orphan Narrator node(s) (id NOT in the ${CANON_N}-id canonical set)."
               echo "    ${EXPECTED_POST} Narrator node(s) would remain."
+              emit_result dry-run "${CANON_N}" "${GRAPH_M}" "${ORPHANS_K}" 0 "${MISSING_N}" "${EXPECTED_POST}"
               echo "==> [${ENV_NAME}] dry run complete (exit 0)."
               exit 0
             fi
@@ -436,6 +641,7 @@ jobs:
             if [ "${ORPHANS_K}" -eq 0 ]; then
               echo "==> [${ENV_NAME}] 0 orphan Narrator nodes — graph already matches the canonical set; nothing to prune (idempotent no-op)."
               echo "==> [${ENV_NAME}] prune-narrators complete — 0 deleted, ${NARR_PRE} preserved."
+              emit_result no-op "${CANON_N}" "${GRAPH_M}" 0 0 "${MISSING_N}" "${NARR_PRE}"
               exit 0
             fi
 
@@ -482,17 +688,31 @@ jobs:
               exit 1
             fi
             # Gate D — no orphan remains (subcommand's own post-count is 0), and the
-            # surviving set is within the canonical id count (can't exceed it).
+            # surviving set is EXACTLY the canonical ids the graph actually holds.
             if [ "${ORPHANS_POST_SUB}" -ne 0 ]; then
               echo "ERROR: [${ENV_NAME}] prune verification FAILED — subcommand reports ${ORPHANS_POST_SUB} orphan(s) still present after the prune." >&2
               exit 1
             fi
-            if [ "${NARR_POST}" -gt "${CANON_N}" ]; then
-              echo "ERROR: [${ENV_NAME}] prune verification FAILED — ${NARR_POST} Narrator nodes remain but the canonical set has only ${CANON_N} ids; a superset of the canonical set survived." >&2
+            # `-gt` was too weak: it only refused a SUPERSET. A prune that deleted too
+            # much — canonical narrators removed — leaves a strict SUBSET, which `-gt`
+            # waves through. Equality is the real invariant.
+            #
+            # But the right-hand side is NOT a bare CANON_N. The survivors are the
+            # canonical ids the GRAPH HOLDS, which is CANON_N minus the ones it never
+            # had: `missing`. Asserting `NARR_POST == CANON_N` would false-FAIL every
+            # legitimately partial load (REFUSED_ROWS / STOPPED_AT_LIMIT / nodes-only),
+            # where missing > 0 is normal and correct — and a false-FAIL on a destructive
+            # op sends an operator to "restore from backup" after a prune that did
+            # exactly the right thing.
+            CANON_IN_GRAPH="$(( CANON_N - MISSING_N ))"
+            if [ "${NARR_POST}" -ne "${CANON_IN_GRAPH}" ]; then
+              echo "ERROR: [${ENV_NAME}] prune verification FAILED — ${NARR_POST} Narrator nodes remain, but the canonical set holds ${CANON_N} ids of which ${MISSING_N} were never in this graph, so exactly ${CANON_IN_GRAPH} should survive." >&2
+              echo "  Fewer means canonical (referenced) narrators were deleted; more means orphans survived. Investigate before re-running." >&2
               exit 1
             fi
 
-            echo "    deleted ${DELETED_D} orphan narrator node(s); ${NARR_POST} preserved (all in the ${CANON_N}-id canonical set); 0 orphans remain."
+            echo "    deleted ${DELETED_D} orphan narrator node(s); ${NARR_POST} preserved (exactly the ${CANON_IN_GRAPH} canonical ids this graph holds); 0 orphans remain."
+            emit_result pruned "${CANON_N}" "${GRAPH_M}" "${ORPHANS_K}" "${DELETED_D}" "${MISSING_N}" "${NARR_POST}"
             echo "==> [${ENV_NAME}] prune-narrators complete — post-op verification PASSED."
 
       - name: Report
@@ -503,8 +723,32 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           IMAGE: ${{ steps.resolve.outputs.image }}
           JOB_STATUS: ${{ job.status }}
+          # The remote stdout, captured (deploy#575). The PRUNE_RESULT line is lifted out
+          # of it below so the summary carries WHAT THE OP DID, not just what it was
+          # asked to do. A human approving an irreversible operation should not have to
+          # open the ssh step's log to find out how many nodes it deletes.
+          PRUNE_STDOUT: ${{ steps.prune.outputs.stdout }}
         run: |
           set -euo pipefail
+
+          # Whole-token extraction, same discipline as the remote summary_field (da#419).
+          result_field() {
+            printf '%s\n' "${PRUNE_STDOUT}" \
+              | grep -o 'PRUNE_RESULT .*' \
+              | head -n1 \
+              | tr ' ' '\n' \
+              | sed -n "s/^$1=\\([0-9A-Za-z-][0-9A-Za-z-]*\\)$/\\1/p" \
+              | head -n1
+          }
+
+          R_OUTCOME="$(result_field outcome || true)"
+          R_CANON="$(result_field canonical || true)"
+          R_GRAPH="$(result_field graph_total || true)"
+          R_ORPHANS="$(result_field orphans || true)"
+          R_DELETED="$(result_field deleted || true)"
+          R_MISSING="$(result_field missing || true)"
+          R_POST="$(result_field post || true)"
+
           {
             echo "## Prune narrators (${ENV_NAME}): ${JOB_STATUS}"
             echo ""
@@ -513,9 +757,42 @@ jobs:
             echo "- **Dry run:** ${DRY_RUN}"
             echo "- **Image:** ${IMAGE}"
             echo ""
-            if [ "${DRY_RUN}" = "true" ]; then
-              echo "Dry run — canonical set read; would-delete count reported; NO delete issued."
+
+            if [ -n "${R_OUTCOME}" ]; then
+              echo "### Counts"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Outcome | \`${R_OUTCOME}\` |"
+              echo "| Canonical ids (keep-set) | ${R_CANON} |"
+              echo "| Narrator nodes before | ${R_GRAPH} |"
+              if [ "${R_OUTCOME}" = "dry-run" ]; then
+                echo "| Orphans — **would delete** | **${R_ORPHANS}** |"
+                echo "| Narrators that would remain | ${R_POST} |"
+              else
+                echo "| Orphans predicted | ${R_ORPHANS} |"
+                echo "| **Deleted** | **${R_DELETED}** |"
+                echo "| Narrator nodes after | ${R_POST} |"
+              fi
+              echo "| Canonical ids not in graph (\`missing\`) | ${R_MISSING} |"
+              echo ""
+            else
+              # No PRUNE_RESULT line: the remote script never reached a terminal success
+              # path. Say that, rather than render zeros — a fabricated "deleted 0" on a
+              # destructive op is worse than an honest "unknown".
+              echo "### Counts"
+              echo ""
+              echo "**Not reported.** The prune did not reach a terminal success path, so no counts were"
+              echo "emitted. Do NOT read this as \"nothing happened\" — read the step log to establish what"
+              echo "the graph's state actually is before re-running."
+              echo ""
             fi
+
+            echo "The keep-set is bound to its producing run: \`curated/_manifest.txt\` declares the canonical-id"
+            echo "count and md5, and the prune REFUSES if either disagrees with the parquet it pulled (deploy#574)."
+            echo "Magnitude ceilings alone cannot catch a short-but-valid parquet — da#426 measured 83.9% of the"
+            echo "graph deleted at \`missing=0\` with every derived gate green."
+            echo ""
             echo "Orphan = Narrator id NOT in the run's narrators_canonical.parquet (da#352: the collapsed set, incl. 18,518 that still HAVE edges). Zero-degree canonical bio nodes are PRESERVED."
             echo "stg-gated: prod runs ONLY as a promotion of a verified-good stg prune."
           } >> "$GITHUB_STEP_SUMMARY"
