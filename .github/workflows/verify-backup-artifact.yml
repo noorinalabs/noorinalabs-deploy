@@ -64,9 +64,16 @@ jobs:
     # the operator has to go LOOKING for at 3am is a runbook that does not exist. This job
     # emits ELEVEN distinct (status, reason) outcomes — deploy#588 said ten; the eleventh is
     # `incomplete reason=undersized_dumps`, which shares its reason STRING with an `absent`
-    # row and is a different fault — and they map nearly one-to-one onto different fixes. The
-    # least guessable of them, `future_timestamp`, is not a backup problem at all: it is a
-    # broken VPS clock (deploy#588).
+    # row and is a different fault — and they map nearly one-to-one onto different fixes.
+    #
+    # The least guessable is `future_timestamp`: a broken VPS CLOCK, so the READING cannot be
+    # trusted. Say exactly that and no more. It is NOT the same as "the backups are fine" —
+    # the future guard returns BEFORE the age check, so a poisoned object SUPPRESSES a `stale`
+    # verdict underneath it (measured: a bucket with no backup for 40 days reports
+    # `future_timestamp`, not `stale`). And fixing NTP does not clear it: `rclone` preserves
+    # the source mtime, so the bad clock is frozen into the object at upload and the object
+    # must be removed or re-dated. A claim that is true of the INSTRUMENT and false of the
+    # BUCKET is the exact hazard this whole script refuses to ship (deploy#588, #594 review).
     env:
       RUNBOOK: docs/runbooks/backup-alerts.md#backupartifactcheck
       RUNBOOK_TORN: docs/runbooks/backup-alerts.md#tornbackup
