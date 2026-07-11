@@ -1090,6 +1090,12 @@ else
     # We cannot bind to a run, so at least be DETERMINISTIC: the timestamp
     # is `%Y%m%d-%H%M%S`, which sorts chronologically as text, so `sort -r | head -1` is the
     # NEWEST — never an arbitrary one. Strictly better than readdir order in every case.
+    #
+    # And these `head -1`s cannot SIGPIPE for a reason stronger than the bounded-producer one
+    # above: `sort` is a FULL CONSUMER. It must read all of `find`'s output before it can emit
+    # its first line, so `find` has already closed by the time `head` quits — there is no writer
+    # left to signal at ANY input size. (Nurul: bounded producer; Aisha: full consumer in the
+    # middle. Both hold; the second needs no size argument.)
     log "WARNING" "No manifest timestamp — falling back to newest-by-name (cannot bind to a run)"
     PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-pg-*.dump' -type f | sort -r | head -1)
     USER_PG_DUMP=$(find "$RESTORE_DIR" -name 'isnad-userpg-*.dump' -type f | sort -r | head -1)

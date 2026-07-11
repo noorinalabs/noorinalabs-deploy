@@ -180,7 +180,7 @@ Ordered by status. `MAX_AGE_HOURS` defaults to 30 (one nightly plus slack);
 
 | status | reason | Meaning | Action |
 |---|---|---|---|
-| `fresh` | — | The newest attested run declares `complete=true`, all three required stores arrived, none is under the size floor, and it is within the age bound. | Nothing — **unless `torn>0`**, which is a producer fault on a green run. See [`TornBackup`](#tornbackup). |
+| `fresh` | — | The newest attested run declares `complete=true`, all three required stores arrived, none is under the size floor, and it is within the age bound. | Nothing — **unless `torn>0` or `undersized>0`.** Both are faults that ride on a green line: `torn` is [a producer that attested and then didn't deliver](#tornbackup); `undersized` is [a corrupt dump in some *other* run in the bucket](#undersized0-on-a-green-line). |
 | `stale` | `too_old` | A complete, intact run exists, but its newest dump is older than `MAX_AGE_HOURS`. The nightly has stopped landing. | Same triage as [`BackupStale`](#backupstale): `systemctl list-timers isnad-backup.timer`, then `journalctl -u isnad-backup.service --since '48 hours ago'`. |
 | `absent` | `no_dumps` | Bucket reachable; **not one** dump object under the scanned scope. | **Check `bucket_objects` first.** If it is `> 0` the bucket has contents but nothing under the scanned prefix — a wrong `BACKUP_B2_BUCKET`/`B2_PREFIX` reads as `absent`, so verify the path before concluding data loss. If it is `0`, backups have never landed: triage as [`BackupNeverSucceeded`](#backupneversucceeded). |
 | `absent` | `undersized_dumps` | Dumps exist, but **every one** is below `MIN_DUMP_BYTES`. A 0-byte file is what `pg_dump` leaves when it fails *after* the shell has created the target — it then uploads cleanly and `rclone` returns 0. | The **dump** leg is failing, not the upload leg. `journalctl -u isnad-backup.service`; check disk on `/var/lib/noorinalabs-backups`. |
@@ -204,6 +204,12 @@ Ordered by status. `MAX_AGE_HOURS` defaults to 30 (one nightly plus slack);
 **Left alone this latches:** `newest` is selected by max epoch, so a single future-dated
 object masks an entire stale bucket — and a one-sided age bound would report it `fresh`
 forever, permanently greening the one signal we built this job to trust.
+
+One qualifier on "a single object": candidates for `newest` come from the **manifests**
+(`verify_b2_backup_artifact.sh:423-428`), never from a bare dump. So the poisoning object
+must belong to a run that **attests `complete=true` and whose required stores all arrived** —
+a stray future-dated dump with no manifest is never selected, and never masks anything. The
+scenario is real; it just takes a future-dated *attested run*, not any future-dated file.
 
 That is the mechanism. Two consequences follow from it, and an operator who does not know
 them will do the obvious thing and get nowhere.
@@ -349,6 +355,52 @@ you have to move:
 > metric carries the field: the signal reaches a human only via the step summary and
 > the run's warning annotation. Closing that needs a page-able carrier, which is a
 > separate change from this runbook. Until then, **read the summary of a green run.**
+
+## `undersized>0` on a green line
+
+**Severity:** medium. **Signal:** `undersized=N` with `N > 0` on the result line — and,
+like `torn`, **it can sit on a `fresh`, rc=0 line.** It is the second field on this line
+that is a fault on a job that passed, and for the same reason: a usable backup exists, so
+reddening over it would be the cry-wolf failure that let deploy#559 sit unnoticed. Red must
+keep meaning *you cannot restore*.
+
+### It is NOT a subset of `torn` — the counts answer different questions
+
+`undersized_total` (`verify_b2_backup_artifact.sh:378`) counts below-floor dumps
+**bucket-wide** — including dumps in runs that are *skipped* (honest `complete=false`
+partials) or *unattributable*. The `torn` increment for a corrupt dump (`:527`) reads the
+**per-run** `run_under[key]` and sits **downstream of the attests-complete gate**. So a
+corrupt dump in an *unattested* run raises `undersized` and can **never** raise `torn`.
+`torn` is not a superset of `undersized`, and a green line can carry `undersized>0 torn=0`:
+
+```text
+status=fresh reason=- dumps=3 newest_age_hours=1 bucket_objects=10 undersized=1 torn=0   rc=0
+```
+
+That bucket holds one good attested run an hour old **plus** an honest `complete=false`
+partial whose `pg_dump` left a 0-byte file — exactly the artifact
+`verify_b2_backup_artifact.sh:118-124` describes.
+
+### What it means, and what to do
+
+**It is not "nothing".** A bucket-wide undersized count on a green run means *some* run in
+the bucket wrote a corrupt (0-byte or truncated) dump. The attested run you would restore
+from is fine — that is why the line is green — but **the producer is failing intermittently,
+and the next run may be the one you need.**
+
+1. Read the job log for the `undersized` context, then on the box:
+   `journalctl -u isnad-backup.service --since '48 hours ago'`. A dump that lists non-empty
+   but is under the 1 KiB floor is what `pg_dump` leaves when it fails *after* the shell has
+   created the target — the same failure mode as the `absent reason=undersized_dumps` row,
+   but here it is confined to a run that is not the one being restored.
+2. **The fix is in the producer.** Do not clear the field by deleting the partial — like
+   `torn`, it is evidence that recurs; unlike `future_timestamp`, it is not itself masking a
+   verdict, so there is no operational need to remove it.
+3. This does **not** flip the job red, and should not: a restorable backup exists. It is a
+   *degrading producer* signal, not a *restore-impossible* one.
+
+> **Known gap — same as `torn`.** No metric carries `undersized` either; it reaches a human
+> only through the step summary and the log. Read the summary of a green run.
 
 ## Testing a change to these rules
 
