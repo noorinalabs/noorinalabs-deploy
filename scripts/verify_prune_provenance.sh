@@ -94,9 +94,19 @@ token_value() {
 
 # The CANONICAL_MANIFEST line for OUR parquet. A manifest may describe several
 # objects; match the `file=` token exactly, never a substring.
+#
+# The `file` value is a PRODUCER-CHOSEN identifier (a filename), so its charclass is
+# [[:graph:]] — the POSIX "printable non-space" class — NOT a range. A range like
+# `[!-~]` is a byte-order assumption that GNU sed evaluates by LOCALE COLLATION: under
+# a language locale such as en_US.UTF-8 (every deploy VPS) the collated range excludes
+# ordinary filename bytes (`.`, `_`), the whole match returns empty, and the gate
+# false-refuses a valid keep-set with "has no md5" — with no deletion, but also no
+# prune (deploy#599). [[:graph:]] is locale-safe and is the WIDEST printable class, so
+# it does not "quietly narrow" the way an enumerated subset would (deploy#589); a
+# filename byte that somehow fell outside it would fail CLOSED, never silently through.
 manifest_line() {
     grep '^CANONICAL_MANIFEST ' "${MANIFEST}" 2>/dev/null | while IFS= read -r _l; do
-        if [ "$(token_value "${_l}" file '[!-~]')" = "${PARQUET_NAME}" ]; then
+        if [ "$(token_value "${_l}" file '[[:graph:]]')" = "${PARQUET_NAME}" ]; then
             printf '%s\n' "${_l}"
             return 0
         fi
