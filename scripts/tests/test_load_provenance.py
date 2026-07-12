@@ -461,3 +461,81 @@ def test_verify_reads_the_status_the_stamp_writes() -> None:
         "the refusal did not come from the status VALUE — it may be refusing because the "
         "status was unreadable, which would make the incompleteness check vacuous"
     )
+
+
+# ===========================================================================
+# Locale robustness — `token_value` must not depend on collation order (deploy#601).
+# ===========================================================================
+# `token_value` extracted `key=value` with the bracket RANGE `[!-~]`. GNU sed evaluates a
+# range by the locale's COLLATION order, not codepoint order: under a glibc language locale
+# such as en_US.UTF-8 (the locale on every deploy VPS) the collated span `!`..`~` excludes
+# ordinary ref bytes (`/`, `-`, `.`), so `parquet_ref=staged/narrator-resolve/<date>-<sha>`
+# extracted to EMPTY and `verify` false-refused a correctly-stamped graph with "NO stamp".
+# Every test above runs under C / C.UTF-8 (codepoint order), which does NOT reproduce it —
+# the same test-vs-prod gap as the sibling verify_prune_provenance.sh matcher (deploy#599).
+# The fix is the POSIX class `[[:graph:]]`, which is locale-independent.
+_QUIRK_LOCALE_CANDIDATES = (
+    "en_US.UTF-8",
+    "en_US.utf8",
+    "en_GB.UTF-8",
+    "de_DE.UTF-8",
+    "fr_FR.UTF-8",
+    "es_ES.UTF-8",
+)
+
+
+def _locale_reproducing_the_range_quirk() -> str | None:
+    """First installed locale under which sed's ``[!-~]`` FAILS to match a ref-like token.
+
+    An INSTRUMENT CHECK, not a formality: a green assertion under a locale that does not
+    reproduce the quirk (C / C.UTF-8) proves nothing about the fix, so the test below refuses
+    to run under one. An *uninstalled* locale makes glibc fall back to C — where ``[!-~]``
+    matches — so the probe rejects it too.
+    """
+    probe = "staged/narrator-resolve/2026-07-12-bd133e6\n"  # the '/','-','.' bytes at issue
+    for loc in _QUIRK_LOCALE_CANDIDATES:
+        env = {**os.environ, "LC_ALL": loc, "LC_COLLATE": loc, "LANG": loc}
+        try:
+            r = subprocess.run(  # noqa: S603
+                ["sed", "-n", r"s/^\([!-~][!-~]*\)$/HIT/p"],  # noqa: S607
+                input=probe,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        if r.returncode == 0 and "HIT" not in r.stdout:
+            return loc
+    return None
+
+
+@pytest.mark.parametrize("quoted", [True, False])
+def test_verify_parses_the_ref_under_a_collation_quirk_locale(quoted: bool) -> None:
+    """`verify` must accept a correctly-stamped graph regardless of the VPS's locale (deploy#601).
+
+    Runs the real `verify` under a locale proven above to break the old ``[!-~]`` range, in
+    both transport renderings. Before the ``[[:graph:]]`` fix this refuses with "NO stamp"
+    (the ref token extracts empty); after it, rc=0.
+    """
+    loc = _locale_reproducing_the_range_quirk()
+    if loc is None:
+        pytest.skip(
+            "no installed locale reproduces the [!-~] collation quirk "
+            "(C / C.UTF-8 use codepoint order); cannot exercise deploy#601 here"
+        )
+    assert loc is not None  # narrow for mypy --ignore-missing-imports (pytest.skip untyped)
+    ok = _verify(
+        REF_A,
+        _graph_says(ref=REF_A, quoted=quoted),
+        LC_ALL=loc,
+        LC_COLLATE=loc,
+        LANG=loc,
+        LC_CTYPE=loc,
+    )
+    assert ok.returncode == 0, (
+        f"verify refused a correctly-stamped graph under {loc} (quoted={quoted}): the "
+        f"parquet_ref token matcher is locale-collation-sensitive (deploy#601).\n{ok.stderr}"
+    )
+    assert f"LOAD_PROVENANCE_OK parquet_ref={REF_A}" in ok.stdout

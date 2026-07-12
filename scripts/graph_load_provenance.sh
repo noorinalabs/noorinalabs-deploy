@@ -163,12 +163,20 @@ validate_parquet_ref() {
 # Whole-TOKEN extraction: split the line on spaces and match an exact `key=value`
 # token, so no key can be hijacked by a longer key ending in its name (da#419).
 #
-# The value charclass is `[!-~]` — every printable non-space character. That is
+# The value charclass is `[[:graph:]]` — the POSIX "printable non-space" class. That is
 # deliberately NOT an enumeration of what a parquet_ref may contain: enumerating a
 # charset for a value someone else writes is how a parser silently NARROWS when the
-# producer changes (deploy#589). Here the token is whatever sits between two spaces;
-# an unexpected character is still captured, still compared, and still refused on
-# mismatch. Fail-closed, not fail-blind.
+# producer changes (deploy#589). `[[:graph:]]` is the WIDEST printable class, so the token
+# is effectively whatever sits between two spaces; an unexpected character is still
+# captured, still compared, and still refused on mismatch. Fail-closed, not fail-blind.
+#
+# It must be the POSIX CLASS, not the byte RANGE `[!-~]`. GNU sed evaluates a range by the
+# locale's COLLATION order, and under a glibc language locale such as en_US.UTF-8 — the
+# locale on every deploy VPS — the collated span `!`..`~` excludes ordinary ref bytes
+# (`/`, `-`, `.`), so `parquet_ref=staged/narrator-resolve/<date>-<sha>` extracted to EMPTY
+# and `verify` false-refused a correctly-stamped graph with "NO stamp" (deploy#601). C /
+# C.UTF-8 use codepoint order and hid it — same locale trap as the sibling `verify_prune_
+# provenance.sh` matcher (deploy#599).
 #
 # NO PIPE INTO AN EARLY-EXITING CONSUMER. `... | head -n1` would make the producer
 # take SIGPIPE, and `pipefail` promotes that 141 to the pipeline's rc EVEN WHEN THE
@@ -176,7 +184,7 @@ validate_parquet_ref() {
 # line is taken with a parameter expansion instead.
 # ---------------------------------------------------------------------------
 token_value() {
-    _tv_out="$(tr ' ' '\n' <<<"$1" | sed -n "s/^$2=\\([!-~][!-~]*\\)\$/\\1/p")"
+    _tv_out="$(tr ' ' '\n' <<<"$1" | sed -n "s/^$2=\\([[:graph:]][[:graph:]]*\\)\$/\\1/p")"
     printf '%s\n' "${_tv_out%%$'\n'*}"
 }
 
