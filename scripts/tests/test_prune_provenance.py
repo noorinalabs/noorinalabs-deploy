@@ -286,3 +286,78 @@ def test_no_environment_variable_can_unlock_a_provenance_less_artifact(
         f"env {bypass} unlocked a keep-set with no provenance — the gate must have no "
         "environment-variable escape hatch"
     )
+
+
+# ---------------------------------------------------------------------------
+# Locale robustness — the file= matcher must not depend on collation order.
+# ---------------------------------------------------------------------------
+# The manifest line for OUR parquet is found by extracting the `file=` token and
+# comparing it to the parquet name. That extraction was written with the bracket
+# RANGE `[!-~]`. GNU sed evaluates a range by the locale's COLLATION order, not by
+# codepoint order: under a glibc language locale such as en_US.UTF-8 — the locale
+# on every deploy VPS — the collated span `!`..`~` excludes ordinary filename bytes
+# (`.`, `_`), the match returns empty, `manifest_line` finds nothing, and the gate
+# false-refuses a valid keep-set with "has no md5". No node is deleted (it fails
+# closed), but the prune silently never runs (deploy#599). C / C.UTF-8 use codepoint
+# order and do NOT reproduce it — which is exactly why CI and local runs stayed green
+# while the VPS refused. The fix uses the POSIX class `[[:graph:]]`, which is
+# locale-independent.
+_QUIRK_LOCALE_CANDIDATES = (
+    "en_US.UTF-8",
+    "en_US.utf8",
+    "en_GB.UTF-8",
+    "de_DE.UTF-8",
+    "fr_FR.UTF-8",
+    "es_ES.UTF-8",
+)
+
+
+def _locale_reproducing_the_range_quirk() -> str | None:
+    """First installed locale under which sed's ``[!-~]`` FAILS to match a filename.
+
+    This is an INSTRUMENT CHECK, not a formality. A green assertion under a locale that
+    does not reproduce the quirk (C / C.UTF-8) would prove nothing about the fix, so the
+    test below refuses to run under one. An *uninstalled* locale makes glibc fall back to
+    C — where ``[!-~]`` matches — so the probe rejects it too. The locale we accept is one
+    demonstrated, right here, to break the old range on ordinary filename bytes.
+    """
+    probe = "a.b_c\n"  # letters plus '.' and '_' — the bytes the collated range drops
+    for loc in _QUIRK_LOCALE_CANDIDATES:
+        env = {**os.environ, "LC_ALL": loc, "LC_COLLATE": loc, "LANG": loc}
+        try:
+            r = subprocess.run(  # noqa: S603
+                ["sed", "-n", r"s/^\([!-~][!-~]*\)$/HIT/p"],  # noqa: S607
+                input=probe,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        if r.returncode == 0 and "HIT" not in r.stdout:
+            return loc
+    return None
+
+
+def test_honest_artifact_is_accepted_under_a_collation_quirk_locale(tmp_path: Path) -> None:
+    """The gate must accept a valid keep-set regardless of the VPS's locale (deploy#599).
+
+    Runs the real gate under a locale proven above to break the old ``[!-~]`` range.
+    Before the ``[[:graph:]]`` fix this returns rc=1 "has no md5"; after it, rc=0.
+    """
+    loc = _locale_reproducing_the_range_quirk()
+    if loc is None:
+        pytest.skip(
+            "no installed locale reproduces the [!-~] collation quirk "
+            "(C / C.UTF-8 use codepoint order); cannot exercise deploy#599 here"
+        )
+    # pytest.skip() is NoReturn, but CI runs mypy with --ignore-missing-imports, under
+    # which pytest is untyped and mypy cannot see that — so narrow loc to str explicitly.
+    assert loc is not None
+    r = _run(_curated(tmp_path), LC_ALL=loc, LC_COLLATE=loc, LANG=loc, LC_CTYPE=loc)
+    assert r.returncode == 0, (
+        f"the gate rejected an honest artifact under {loc}: the file= matcher is "
+        f"locale-collation-sensitive (deploy#599).\n{r.stderr}"
+    )
+    assert f"PRUNE_PROVENANCE canonical_ids={GOOD_COUNT}" in r.stdout
