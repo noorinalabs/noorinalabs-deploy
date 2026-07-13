@@ -135,10 +135,15 @@ explain_b2_state() {
         PROBE_FAILED)
             echo "The B2 preflight could not RUN its capability probes. It therefore has NO evidence about the credential."
             echo "This is NOT a verdict on the key: do not rotate, revoke, or re-provision anything on the strength of it."
-            echo "Cause: no writable scratch directory (BACKUP_DIR=${BACKUP_DIR:-<unset>}). The probes need one to capture rclone's output."
-            echo "Under systemd, isnad-backup.service runs ProtectSystem=strict with no PrivateTmp (deploy#121 Bug A), so /tmp is READ-ONLY;"
-            echo "the scratch dir must therefore live under BACKUP_DIR, which the unit grants via ReadWritePaths."
-            echo "Remediation: ensure BACKUP_DIR is set, exists, is writable by the unit, and is listed in the unit's ReadWritePaths; then check for a full disk."
+            echo "Cause: ${PROBE_FAILED_CAUSE:-the probes could not be executed}."
+            echo "Scratch parent actually used: ${SCRATCH_PARENT_USED:-<none>} (BACKUP_DIR=${BACKUP_DIR:-<unset>}, TMPDIR=${TMPDIR:-<unset>})."
+            echo "Two things commonly do this. (1) A read-only scratch parent: under systemd, isnad-backup.service runs"
+            echo "ProtectSystem=strict with no PrivateTmp (deploy#121 Bug A), so /tmp is READ-ONLY and the scratch dir must live"
+            echo "under BACKUP_DIR, which the unit grants via ReadWritePaths. (2) A FULL DISK: BACKUP_DIR is the volume the dumps"
+            echo "themselves fill, so ENOSPC there is an expected fault -- and it can let a directory be created while a file"
+            echo "written into it stays empty."
+            echo "Remediation: check free space on the scratch parent first (df), then confirm BACKUP_DIR is set, exists, is"
+            echo "writable by the unit, and is listed in the unit's ReadWritePaths."
             ;;
         KEY_INVALID)
             echo "B2 key cannot list buckets. It is invalid, revoked, or lacks the listBuckets capability."
@@ -190,34 +195,76 @@ preflight_b2() {
         return 1
     fi
 
+    # A probe that could not run yields NO evidence about the key. Every such route -- and
+    # there are four -- funnels through here, so none of them can drift back into a
+    # credential verdict the way the unchecked mktemp did (deploy#613, Lucas/Nino review).
+    probe_failed() {
+        PROBE_FAILED_CAUSE="$1"
+        SCRATCH_PARENT_USED="$scratch_parent"
+        verdict="$(classify_b2_state skip unknown skip skip)"
+        echo "[preflight] scratch_parent=${scratch_parent} probe_failed=${1}"
+        echo "[preflight] lsd_rc=skip bucket_visible=unknown write_rc=skip delete_rc=skip"
+        echo "[preflight] verdict=${verdict}"
+        explain_b2_state "$verdict"
+    }
+
+    # rclone absent is a probe that cannot run, not a bad key: `rclone lsd` would exit 127
+    # and 127 is a number, so it would sail past PROBE_FAILED into KEY_INVALID. backup.sh
+    # pre-checks rclone, but the standalone and `source` invocations this file documents do
+    # not -- and standalone is precisely what an operator reaches for to double-check a
+    # KEY_INVALID they do not believe.
+    if ! command -v rclone > /dev/null 2>&1; then
+        scratch_parent="${BACKUP_DIR:-${TMPDIR:-/tmp}}"
+        probe_failed "rclone is not installed or not executable on PATH"
+        return 1
+    fi
+
     # Scratch space for the probes' output. NOT /tmp: read-only under the backup unit's
     # ProtectSystem=strict (deploy#613, see header). BACKUP_DIR is what the unit grants in
-    # ReadWritePaths and what backup.sh already stages its dumps into, so a scratch dir we
-    # can allocate there is a scratch dir the probes can actually use. Falling back to
+    # ReadWritePaths and what backup.sh already stages its dumps into. Falling back to
     # TMPDIR, then /tmp, keeps standalone and CI invocation (no BACKUP_DIR) working.
     scratch_parent="${BACKUP_DIR:-${TMPDIR:-/tmp}}"
     tmp=""
     mkdir -p "$scratch_parent" 2>/dev/null
 
     # FATAL, and never a credential verdict. An unchecked mktemp is what turned a read-only
-    # /tmp into "your B2 key is invalid" on every backup this project ever ran. mktemp's
-    # own diagnostic goes to stderr, which backup.sh captures and tees to the journal.
+    # /tmp into "your B2 key is invalid" on every backup this project ever ran.
     if ! tmp="$(mktemp -d -p "$scratch_parent" b2-preflight-XXXXXX)" \
         || [[ -z "$tmp" || ! -d "$tmp" ]]; then
         tmp=""
-        verdict="$(classify_b2_state skip unknown skip skip)"
-        echo "[preflight] scratch_parent=${scratch_parent} scratch_dir=FAILED"
-        echo "[preflight] lsd_rc=skip bucket_visible=unknown write_rc=skip delete_rc=skip"
-        echo "[preflight] verdict=${verdict}"
-        explain_b2_state "$verdict"
+        probe_failed "the scratch directory could not be created under ${scratch_parent}"
         return 1
     fi
 
-    # shellcheck disable=SC2064  # expand tmp now, on purpose
-    trap "rm -rf '$tmp'" RETURN
+    # Single-quoted so $tmp expands when the trap FIRES, not when it is set. The previous
+    # form interpolated the path into a string that bash re-parses at return time, so a
+    # single quote anywhere in BACKUP_DIR broke the quoting of an `rm -rf` in a ROOT-run
+    # unit. `rm -rf ''` stays unreachable either way -- the trap is installed only after the
+    # [[ -z "$tmp" || ! -d "$tmp" ]] guard above has already returned.
+    trap 'rm -rf -- "$tmp"' RETURN
+
+    # The directory EXISTS. That is not the same as being able to put a file in it, and the
+    # difference is the whole bug one layer down: if the redirect below cannot create its
+    # target, bash never execs rclone, $? is 1, and 1 is a number -- so it would sail past
+    # PROBE_FAILED straight into KEY_INVALID, condemning a key that was never consulted.
+    #
+    # This is not a theoretical fault, and moving scratch onto BACKUP_DIR RAISES it: that is
+    # the one volume that fills with multi-GB dumps under a 7-daily/4-weekly retention, so
+    # ENOSPC is its single most expected failure. Under ENOSPC the creat() can succeed while
+    # the write fails, leaving a 0-byte file -- so testing the redirect's exit status alone
+    # is not enough. -s (non-empty) is what actually catches it.
+    if ! printf 'preflight-writable\n' > "${tmp}/.rw" 2>/dev/null || [[ ! -s "${tmp}/.rw" ]]; then
+        probe_failed "the scratch directory ${tmp} exists but cannot hold a file (full disk, quota, or read-only filesystem)"
+        return 1
+    fi
+    rm -f -- "${tmp}/.rw"
 
     # 1. Can the key enumerate buckets, and is ours among them?
     lsd_out="${tmp}/lsd.out"
+    if ! : > "$lsd_out" 2>/dev/null; then
+        probe_failed "the scratch directory ${tmp} would not accept the probe's output file"
+        return 1
+    fi
     rclone lsd "${remote}:" > "$lsd_out" 2>&1
     lsd_rc=$?
 
@@ -233,7 +280,18 @@ preflight_b2() {
     delete_rc="skip"
     if [[ "$bucket_visible" == "yes" ]]; then
         canary=".backup-preflight/canary-$(date -u +%Y%m%d-%H%M%S)-$$"
-        printf 'noorinalabs backup preflight canary\n' > "${tmp}/canary"
+
+        # An unchecked local write here is the WORST of this family, because its downstream
+        # verdict is actively harmful. A failed/empty canary makes `rclone copyto` fail,
+        # which classifies as KEY_READ_ONLY -- whose remediation text says "rotate
+        # BACKUP_B2_APP_KEY to the write-capable key". So a FULL DISK would hand the
+        # operator a written instruction to re-provision a perfectly good credential with
+        # MORE capability than it needs. That is the exact door PROBE_FAILED exists to shut.
+        if ! printf 'noorinalabs backup preflight canary\n' > "${tmp}/canary" 2>/dev/null \
+            || [[ ! -s "${tmp}/canary" ]]; then
+            probe_failed "the canary file could not be written to ${tmp} (full disk, quota, or read-only filesystem)"
+            return 1
+        fi
 
         rclone copyto "${tmp}/canary" "${remote}:${B2_BUCKET}/${canary}" > "${tmp}/write.out" 2>&1
         write_rc=$?

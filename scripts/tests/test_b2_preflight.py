@@ -335,23 +335,56 @@ exit "$rc"
 """
 
 
+# The three states the probes' scratch space can be in. "unwritable" is the one that
+# reopened this bug in review (deploy#614, Lucas Ferreira + Nino Kavtaradze, independently):
+# the original fix keyed on `mktemp`'s exit status and `[[ -d "$tmp" ]]`, both of which say
+# the directory EXISTS — neither of which says a file can be created in it. A scratch dir
+# that allocates and then refuses a write made the redirect fail, so bash never exec'd
+# rclone, `$?` was 1, and 1 is a NUMBER: it sailed straight past PROBE_FAILED into
+# KEY_INVALID. Same conflation as #613, one layer down.
+#
+# This is not exotic. The fix deliberately moves scratch onto BACKUP_DIR — the one volume
+# that fills with multi-GB dumps under a 7-daily/4-weekly retention — so ENOSPC there is the
+# single most expected fault on a backup host.
+SCRATCH_USABLE = "usable"
+SCRATCH_UNALLOCATABLE = "unallocatable"  # mktemp -d itself fails (read-only /tmp: #613)
+SCRATCH_UNWRITABLE = "unwritable"  # mkdir succeeds, file creation does not (ENOSPC: #614)
+SCRATCH_STATES = (SCRATCH_USABLE, SCRATCH_UNALLOCATABLE, SCRATCH_UNWRITABLE)
+
+# A directory that demonstrably exists and into which no file can be created — for uid 0
+# as well, which is the point: a root CI runner must not be able to turn this class green.
+# procfs refuses creat() outright, so it models "allocated but unwritable" without needing
+# a loopback mount or a real full disk. Same reasoning as the ENOTDIR choice above.
+_MKTEMP_STUB_RETURNING_UNWRITABLE_DIR = """#!/bin/sh
+# Ignore the args; hand back a real directory that cannot hold a file.
+echo /proc/self
+"""
+
+
 def _run_preflight(
     tmp_path: Path,
     *,
     key_is_good: bool,
-    scratch_usable: bool,
+    scratch: str,
 ) -> subprocess.CompletedProcess[str]:
     """Drive the real preflight, exactly as backup.sh drives it.
 
-    Two independent factors, so the four cells can be compared:
-      key_is_good     — whether the stubbed rclone behaves like a valid, write-capable key
-      scratch_usable  — whether the preflight can allocate its scratch directory at all
+    Two independent factors, so the six cells can be compared:
+      key_is_good  — whether the stubbed rclone behaves like a valid, write-capable key
+      scratch      — one of SCRATCH_STATES; how the probes' scratch space misbehaves
     """
+    assert scratch in SCRATCH_STATES, f"unknown scratch state {scratch!r}"
+
     tmp_path.mkdir(parents=True, exist_ok=True)  # each matrix cell gets its own sandbox
     stub = tmp_path / "stub"
     stub.mkdir()
     (stub / "rclone").write_text(GOOD_RCLONE if key_is_good else BAD_RCLONE)
     (stub / "rclone").chmod(0o755)
+
+    if scratch == SCRATCH_UNWRITABLE:
+        # Intercept mktemp so it "succeeds" and returns a dir that refuses file creation.
+        (stub / "mktemp").write_text(_MKTEMP_STUB_RETURNING_UNWRITABLE_DIR)
+        (stub / "mktemp").chmod(0o755)
 
     # An ENOTDIR parent: `not-a-dir` is a regular file, so both `mkdir -p` and
     # `mktemp -d -p` fail on any path beneath it — for root as well as for us.
@@ -368,7 +401,9 @@ def _run_preflight(
         B2_KEY_ID="fake-key-id",
         B2_APP_KEY="fake-app-key",
         B2_BUCKET="noorinalabs-backups",
-        BACKUP_DIR=str(usable) if scratch_usable else unusable,
+        # UNWRITABLE keeps a perfectly good parent: the fault is inside the scratch dir the
+        # mktemp stub hands back, which is exactly the case existence-checks cannot see.
+        BACKUP_DIR=unusable if scratch == SCRATCH_UNALLOCATABLE else str(usable),
     )
     env.pop("RCLONE_DUMP", None)
 
@@ -388,46 +423,64 @@ def _verdict_of(proc: subprocess.CompletedProcess[str]) -> str:
 def test_the_preflight_separates_its_own_breakage_from_a_bad_key(tmp_path: Path) -> None:
     """THE test. One instrument, two failure classes, and it must not conflate them.
 
-    Read the matrix as a 2x2: the verdict has to move with BOTH factors. If the preflight
-    answered KEY_INVALID down the whole `scratch_usable=False` column — which is precisely
-    what it did before deploy#613 — the key column would be doing no work at all, and the
+    Read it as a 2x3: the verdict has to move with BOTH factors. If the preflight answered
+    KEY_INVALID down a whole broken-scratch column — which is precisely what it did before
+    deploy#613, and what it STILL did for the `unwritable` column at the first cut of the
+    fix (deploy#614 review) — the key column would be doing no work at all, and the
     "detector" would just be a constant wearing a credential's name.
+
+    The `unwritable` column is the one that matters most now: `mktemp` succeeding proves the
+    scratch dir EXISTS, never that a file can be put in it, and the fix moved scratch onto
+    the very volume that fills with dumps. A full disk must not be able to speak as a
+    credential.
     """
     verdicts = {
-        (key_is_good, scratch_usable): _verdict_of(
+        (key_is_good, scratch): _verdict_of(
             _run_preflight(
-                tmp_path / f"k{int(key_is_good)}s{int(scratch_usable)}",
+                tmp_path / f"k{int(key_is_good)}-{scratch}",
                 key_is_good=key_is_good,
-                scratch_usable=scratch_usable,
+                scratch=scratch,
             )
         )
         for key_is_good in (True, False)
-        for scratch_usable in (True, False)
+        for scratch in SCRATCH_STATES
     }
 
     # Calibration first: with a working scratch dir the instrument demonstrably WORKS —
     # it tells a good key from a bad one. Without this cell, PROBE_FAILED below could be
     # an artefact of the stub rather than a real discrimination.
-    assert verdicts[(True, True)] == "OK", "a good key with usable scratch must verify"
-    assert verdicts[(False, True)] == "KEY_INVALID", (
+    assert verdicts[(True, SCRATCH_USABLE)] == "OK", "a good key with usable scratch must verify"
+    assert verdicts[(False, SCRATCH_USABLE)] == "KEY_INVALID", (
         "a key that genuinely cannot list buckets is still KEY_INVALID — the fix must not "
         "have blunted the real diagnosis"
     )
 
-    # And now the bug: a broken scratch dir is the PROBE's failure, never the key's.
-    assert verdicts[(True, False)] == "PROBE_FAILED", (
-        "a good key + unusable scratch was reported as KEY_INVALID before deploy#613. "
-        "The probe never ran; it holds no evidence about the credential and must say so."
-    )
-    assert verdicts[(False, False)] == "PROBE_FAILED", (
-        "even when the key IS bad, a preflight that could not run has not LEARNED that. "
-        "Reporting KEY_INVALID here would be right by accident — and it is the same "
-        "accident that condemned a good key on every scheduled run."
-    )
+    # And now the bug, in both of its shapes. A scratch dir that cannot be ALLOCATED (#613,
+    # read-only /tmp) and one that allocates but cannot be WRITTEN TO (#614, ENOSPC on
+    # BACKUP_DIR) are both a probe that did not run. Neither is evidence about the key.
+    for scratch in (SCRATCH_UNALLOCATABLE, SCRATCH_UNWRITABLE):
+        assert verdicts[(True, scratch)] == "PROBE_FAILED", (
+            f"a GOOD key + {scratch} scratch must be PROBE_FAILED. Before the fix this was "
+            "KEY_INVALID: the probe never ran, held no evidence about the credential, and "
+            "condemned it anyway."
+        )
+        assert verdicts[(False, scratch)] == "PROBE_FAILED", (
+            f"even when the key IS bad, a {scratch} preflight has not LEARNED that. "
+            "Reporting KEY_INVALID here would be right by accident — and it is the same "
+            "accident that condemned a good key on every scheduled run."
+        )
 
-    # The separation, stated as the property rather than as four literals: the verdict
-    # under a broken scratch dir must not be a credential verdict at all.
-    broken = {verdicts[(True, False)], verdicts[(False, False)]}
+    # The separation, stated as the property rather than as literals: under ANY broken
+    # scratch state the verdict must not be a credential verdict at all. KEY_READ_ONLY is in
+    # this set deliberately — its remediation text says "rotate BACKUP_B2_APP_KEY to the
+    # write-capable key", so a full disk reaching it would hand the operator a written
+    # instruction to re-provision a key that was never at fault, with MORE capability than
+    # it needs.
+    broken = {
+        verdicts[(key_is_good, scratch)]
+        for key_is_good in (True, False)
+        for scratch in (SCRATCH_UNALLOCATABLE, SCRATCH_UNWRITABLE)
+    }
     assert broken.isdisjoint({"OK", "KEY_INVALID", "BUCKET_UNREACHABLE", "KEY_READ_ONLY"}), (
         f"a probe that could not run emitted a verdict about the credential: {broken}"
     )
@@ -484,13 +537,55 @@ def test_a_good_key_verifies_when_tmp_is_unusable_but_backup_dir_is_writable(
     assert "KEY_INVALID" not in combined
 
 
+def test_a_full_disk_never_tells_the_operator_to_rotate_the_key(tmp_path: Path) -> None:
+    """The most harmful cell in the matrix, called out on its own (deploy#614 review).
+
+    An unchecked local canary write does not merely produce a wrong verdict — it produces
+    an ACTIVELY DANGEROUS one. A scratch dir that cannot hold a file leaves the canary
+    absent or empty, `rclone copyto` fails, and that classifies as KEY_READ_ONLY, whose
+    remediation reads "rotate BACKUP_B2_APP_KEY to the write-capable key (writeFiles +
+    deleteFiles)". So a FULL DISK would hand the operator a written instruction to
+    re-provision a perfectly good credential with MORE capability than it needs — the
+    over-privileging door that PROBE_FAILED exists to shut.
+
+    A good key + a disk that cannot take a byte must never emit a credential verdict, and
+    must never print the word "rotate".
+    """
+    proc = _run_preflight(tmp_path, key_is_good=True, scratch=SCRATCH_UNWRITABLE)
+    combined = proc.stdout + proc.stderr
+
+    assert _verdict_of(proc) == "PROBE_FAILED"
+    assert proc.returncode != 0
+
+    for credential_verdict in ("KEY_READ_ONLY", "KEY_INVALID", "BUCKET_UNREACHABLE"):
+        assert credential_verdict not in combined, (
+            f"a full disk was reported as {credential_verdict} — the probe could not write a "
+            "single byte locally, so it learned NOTHING about the key's capabilities"
+        )
+    # Ban the INSTRUCTION, not the word. A bare `"rotate" not in ...` is the wrong
+    # assertion and fails against correct code: PROBE_FAILED's own text contains "do not
+    # rotate, revoke, or re-provision anything on the strength of it" — the sentence that
+    # FORBIDS the action. What must never appear is the KEY_READ_ONLY remediation that
+    # PRESCRIBES it.
+    assert "rotate BACKUP_B2_APP_KEY" not in combined, (
+        "a local disk fault instructed the operator to rotate the key — that is how a good "
+        "credential gets churned and re-provisioned with more capability than it needs"
+    )
+    assert "do not rotate, revoke, or re-provision" in combined, (
+        "the diagnosis must explicitly disown the credential, not merely decline to accuse it"
+    )
+    assert "full disk" in combined.lower(), (
+        "the diagnosis must name the actual cause so the operator checks df, not Backblaze"
+    )
+
+
 def test_scratch_failure_is_fatal_and_leaves_no_scratch_behind(tmp_path: Path) -> None:
     """A scratch failure must abort — never fall through into a credential verdict."""
-    proc = _run_preflight(tmp_path, key_is_good=True, scratch_usable=False)
+    proc = _run_preflight(tmp_path, key_is_good=True, scratch=SCRATCH_UNALLOCATABLE)
     combined = proc.stdout + proc.stderr
 
     assert proc.returncode != 0, "an unrunnable preflight must fail, not pass by default"
-    assert "scratch_dir=FAILED" in combined, "the operator must be told WHICH thing broke"
+    assert "probe_failed=" in combined, "the operator must be told WHICH thing broke"
     assert "NOT a verdict on the key" in combined, (
         "the diagnosis must explicitly disown the credential, or the next operator rotates "
         "a perfectly good key — which is exactly what deploy#612 nearly did"
