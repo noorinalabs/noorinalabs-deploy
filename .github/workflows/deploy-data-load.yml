@@ -573,6 +573,19 @@ jobs:
               'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "MATCH (h:Hadith) RETURN h.source_corpus AS source_corpus, count(*) AS hadiths ORDER BY hadiths DESC"' \
               || echo "    WARNING: [${ENV_NAME}] post-load read-back query failed (non-fatal)." >&2
 
+            # --- transport observability (deploy#603): the over_merged Narrator
+            #     property (da#447) rides the loader passthrough — this workflow pulls
+            #     the WHOLE narrators_canonical.parquet and enumerates no node-property
+            #     allow-list, so the new columns land as node properties with no change
+            #     here. This read-back is the PROOF the property survived the reload:
+            #     it reports how many Narrator nodes carry over_merged=true. Non-fatal,
+            #     same OR-arm idiom as above. A durable reload should show the same
+            #     count graph-flag-over-merged.yml flags on the live graph. ---
+            echo "==> [${ENV_NAME}] post-load read-back: over_merged Narrator count (deploy#603 transport check)"
+            ${COMPOSE} exec -T neo4j sh -c \
+              'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "MATCH (n:Narrator) WHERE n.over_merged = true RETURN count(n) AS over_merged_narrators"' \
+              || echo "    WARNING: [${ENV_NAME}] over_merged read-back query failed (non-fatal)." >&2
+
             echo "==> [${ENV_NAME}] batch load '${LOAD_ARGS}' complete — graph committed (loader rc=${RC})."
 
       - name: Report
