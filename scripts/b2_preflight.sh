@@ -32,6 +32,24 @@
 # Each probe's outcome is a fact. The error text is used only to enrich the human-facing
 # diagnosis, never to decide it.
 #
+# A PROBE THAT COULD NOT RUN IS NOT EVIDENCE ABOUT THE KEY (deploy#613)
+#
+# The probes need somewhere to capture rclone's output. `mktemp -d` defaults to /tmp, and
+# /tmp is READ-ONLY inside systemd/isnad-backup.service: it runs ProtectSystem=strict with
+# PrivateTmp deliberately unset (deploy#121 Bug A), and /tmp is not in ReadWritePaths. The
+# scratch allocation therefore failed on every scheduled run, its status went unchecked,
+# the redirect to `${tmp}/lsd.out` degraded to `/lsd.out` on the read-only root, lsd_rc
+# came back 1 -- and lsd_rc != 0 was read as "the key cannot list buckets", i.e.
+# KEY_INVALID. That verdict is key-INDEPENDENT: the same freshly-provisioned,
+# write-capable key that produced KEY_INVALID under the unit produced OK when run by hand
+# with a writable /tmp (stg, 2026-07-13). Every backup this project has ever attempted
+# died there, blaming a credential that was fine.
+#
+# So: scratch lives under BACKUP_DIR (which the unit DOES grant, and which the unit's own
+# comment already assumed backup.sh would use), a failure to allocate it is FATAL, and
+# "the probe never ran" is its own verdict -- PROBE_FAILED -- which can never be mistaken
+# for a statement about the credential.
+#
 # NEVER set RCLONE_DUMP (or any equivalent). An ambient `RCLONE_DUMP=auth` once leaked
 # base64 credentials past GitHub's log masking in a PUBLIC repo. This script prints no
 # credential material: it reports presence and length only.
@@ -48,18 +66,32 @@ RCLONE_REMOTE="${RCLONE_REMOTE:-isnad}"
 # Pure classifier. No I/O, no network -- takes probe outcomes, returns a verdict code.
 # Kept side-effect free so it can be unit-tested against the real captured outcomes.
 #
-#   $1 lsd_rc          exit status of `rclone lsd <remote>:`
+#   $1 lsd_rc          exit status of `rclone lsd <remote>:` ("skip" if it never ran)
 #   $2 bucket_visible  "yes" | "no"  -- was B2_BUCKET in the lsd listing
 #   $3 write_rc        exit status of the canary write ("skip" if not attempted)
 #   $4 delete_rc       exit status of the canary delete ("skip" if not attempted)
 #
 # Echoes one of:
-#   OK | KEY_INVALID | BUCKET_UNREACHABLE | KEY_READ_ONLY | KEY_CANNOT_DELETE
+#   OK | PROBE_FAILED | KEY_INVALID | BUCKET_UNREACHABLE | KEY_READ_ONLY | KEY_CANNOT_DELETE
 # ---------------------------------------------------------------------------
 classify_b2_state() {
     local lsd_rc="$1" bucket_visible="$2" write_rc="$3" delete_rc="$4"
 
-    # The key cannot even enumerate buckets: it is invalid, revoked, or lacks
+    # The probe never ran, so we hold no evidence about the key. `lsd_rc` is an exit
+    # status; anything that is not a number is not one. "skip" is the sentinel preflight_b2
+    # passes when it could not allocate the scratch directory the probes write into -- the
+    # same "skip" vocabulary write_rc/delete_rc already use for "not attempted".
+    #
+    # This branch MUST precede the KEY_INVALID one. Until deploy#613 it did not exist: a
+    # preflight that could not run at all fell straight through into "lsd_rc != 0" and
+    # condemned the credential. Absence of evidence was rendered as evidence of absence,
+    # and it was wrong every single time -- see the header.
+    if [[ ! "$lsd_rc" =~ ^[0-9]+$ ]]; then
+        echo "PROBE_FAILED"
+        return
+    fi
+
+    # The probe RAN and the key cannot enumerate buckets: it is invalid, revoked, or lacks
     # listBuckets. Nothing downstream is meaningful.
     if [[ "$lsd_rc" != "0" ]]; then
         echo "KEY_INVALID"
@@ -100,6 +132,14 @@ explain_b2_state() {
         OK)
             echo "B2 credentials verified: bucket reachable, writable, and prunable."
             ;;
+        PROBE_FAILED)
+            echo "The B2 preflight could not RUN its capability probes. It therefore has NO evidence about the credential."
+            echo "This is NOT a verdict on the key: do not rotate, revoke, or re-provision anything on the strength of it."
+            echo "Cause: no writable scratch directory (BACKUP_DIR=${BACKUP_DIR:-<unset>}). The probes need one to capture rclone's output."
+            echo "Under systemd, isnad-backup.service runs ProtectSystem=strict with no PrivateTmp (deploy#121 Bug A), so /tmp is READ-ONLY;"
+            echo "the scratch dir must therefore live under BACKUP_DIR, which the unit grants via ReadWritePaths."
+            echo "Remediation: ensure BACKUP_DIR is set, exists, is writable by the unit, and is listed in the unit's ReadWritePaths; then check for a full disk."
+            ;;
         KEY_INVALID)
             echo "B2 key cannot list buckets. It is invalid, revoked, or lacks the listBuckets capability."
             ;;
@@ -132,7 +172,7 @@ explain_b2_state() {
 # ---------------------------------------------------------------------------
 preflight_b2() {
     local remote="${RCLONE_REMOTE}"
-    local tmp lsd_out lsd_rc bucket_visible write_rc delete_rc verdict canary
+    local tmp scratch_parent lsd_out lsd_rc bucket_visible write_rc delete_rc verdict canary
 
     # Every probe below is EXPECTED to fail sometimes -- that is the entire point, and a
     # probe's non-zero exit is data, not an error. A caller running under `set -e` with
@@ -150,7 +190,29 @@ preflight_b2() {
         return 1
     fi
 
-    tmp="$(mktemp -d)"
+    # Scratch space for the probes' output. NOT /tmp: read-only under the backup unit's
+    # ProtectSystem=strict (deploy#613, see header). BACKUP_DIR is what the unit grants in
+    # ReadWritePaths and what backup.sh already stages its dumps into, so a scratch dir we
+    # can allocate there is a scratch dir the probes can actually use. Falling back to
+    # TMPDIR, then /tmp, keeps standalone and CI invocation (no BACKUP_DIR) working.
+    scratch_parent="${BACKUP_DIR:-${TMPDIR:-/tmp}}"
+    tmp=""
+    mkdir -p "$scratch_parent" 2>/dev/null
+
+    # FATAL, and never a credential verdict. An unchecked mktemp is what turned a read-only
+    # /tmp into "your B2 key is invalid" on every backup this project ever ran. mktemp's
+    # own diagnostic goes to stderr, which backup.sh captures and tees to the journal.
+    if ! tmp="$(mktemp -d -p "$scratch_parent" b2-preflight-XXXXXX)" \
+        || [[ -z "$tmp" || ! -d "$tmp" ]]; then
+        tmp=""
+        verdict="$(classify_b2_state skip unknown skip skip)"
+        echo "[preflight] scratch_parent=${scratch_parent} scratch_dir=FAILED"
+        echo "[preflight] lsd_rc=skip bucket_visible=unknown write_rc=skip delete_rc=skip"
+        echo "[preflight] verdict=${verdict}"
+        explain_b2_state "$verdict"
+        return 1
+    fi
+
     # shellcheck disable=SC2064  # expand tmp now, on purpose
     trap "rm -rf '$tmp'" RETURN
 
