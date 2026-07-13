@@ -1,0 +1,34 @@
+[
+  {
+    "id": "nar:9b793066-94f6-5f99-ae1c-b2636515fa9b",
+    "note": "Bare theophoric ism; betweenness #1 on the stg leaderboard. The #337 spike ran the context splitter on this node and it did NOT separate (51 communities > SPLIT_MAX_PEEL=50 -> abstains; the largest community is a ~30% mega-blob of attested dates spanning -44 -> 805 AH, welded by the collectors' shared late teachers). Over-merged by construction: hundreds of distinct Abd Allahs collapse on the bare name."
+  },
+  {
+    "id": "nar:afc30d02-f7ed-5d09-bc3b-4535a27dc0fb",
+    "note": "Bare ism; betweenness #2. A known fusion of at least two major transmitters, Sufyan al-Thawri (d.161) and Sufyan b. Uyayna (d.198) (da#248 mononym registry). Self-contradictory bio metadata on the fused node (marked a Companion AND d.278 AH) is the signature of an over-merge, not one person."
+  },
+  {
+    "id": "nar:5b41b11e-b18a-5c18-b6e9-2091cb7d3cdf",
+    "note": "Bare kunya (\"father of Abd Allah\"), among the most common kunyas, borne by many distinct narrators across generations. Top-of-leaderboard betweenness; neighbour diffuseness 0.40 (well above the genuine-hub band). Over-merged by construction."
+  },
+  {
+    "id": "nar:cb879ada-0dac-575a-a071-ffe2d265129c",
+    "note": "Bare kunya borne by many distinct narrators across generations. Neighbour diffuseness 0.35. Over-merged by construction; annotation only, no split."
+  },
+  {
+    "id": "nar:0806983d-8571-5a6f-b22e-62647a71cd4c",
+    "note": "Bare ism; the single most common Arabic given name, under which thousands of distinct narrators collapse. Neighbour diffuseness 0.50. Over-merged by construction."
+  },
+  {
+    "id": "nar:3f7c1e28-2632-5214-bbec-c17ac5c021a9",
+    "note": "Bare ism borne by very many distinct narrators. Neighbour diffuseness 0.55. Over-merged by construction."
+  },
+  {
+    "id": "nar:49618f4b-7a1b-5c35-8c95-5b837b965857",
+    "note": "Bare theophoric ism spanning generations. Neighbour diffuseness 0.31. Over-merged by construction."
+  },
+  {
+    "id": "nar:cf44624b-1f1b-5c9e-b498-625d55191fd2",
+    "note": "Bare kunya borne by many traditionists (e.g. Abu Bakr b. Abi Shayba, Abu Bakr b. Ayyash) across generations; neighbour diffuseness 0.39; over-merged by construction. Companion-adjacent: this bare kunya is a DISTINCT canonical node from the Companion Abu Bakr al-Siddiq (who carries a nasab), so the flag does not touch the Companion. Annotation only, no split."
+  }
+]

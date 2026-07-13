@@ -2,41 +2,43 @@ name: Graph flag over-merged narrators (live-graph annotate)
 
 # Repeatable, observable, env-gated Neo4j annotate op: set `over_merged=true` +
 # `over_merge_note` on the canonical Narrator nodes the producer resolved from the
-# curated over-merge seed (da#447) — the immediate "flag-NOW" leg of the honest-
-# leaderboard work (deploy#603 / main#928 / main#958 / da#443).
+# curated over-merge seed (da#447/da#448) — the immediate "flag-NOW" leg of the
+# honest-leaderboard work (deploy#603 / main#928 / main#958 / da#443).
 #
 # WHY THIS EXISTS ALONGSIDE THE RELOAD.
-# da#447 made `over_merged` a durable Narrator property, and deploy-data-load.yml
-# carries it into Neo4j on every reload (the durable TRANSPORT leg of deploy#603).
-# But a full reload is ~7.5h. `over_merged=true` means a canonical node FUSES
-# multiple distinct narrators, so its betweenness/centrality is inflated and it
-# must not be read as one transmitter — and we want that flag visible on stg NOW,
-# without waiting on a reload. This workflow writes exactly that annotation to the
-# live graph. A later reload from a parquet that carries the same property simply
-# re-asserts it (idempotent, self-reconciling).
+# da#447 made `over_merged` (+ `over_merge_note`) durable Narrator properties, and
+# deploy-data-load.yml carries them into Neo4j on every reload (the durable
+# TRANSPORT leg of deploy#603). But a full reload is ~7.5h. `over_merged=true`
+# means a canonical node FUSES multiple distinct narrators, so its betweenness is
+# inflated and it must not be read as one transmitter — and we want that flag (and
+# its explanatory note, which the ig#1183 choke-point UI surfaces) visible on stg
+# NOW. This workflow writes exactly that annotation to the live graph. A later
+# reload from a parquet carrying the same properties re-asserts it, byte-identical
+# (idempotent, self-reconciling).
 #
 # NEO4J-ONLY (no loader image). Pure Cypher via cypher-shell in the live neo4j
-# container — the same run_cypher credential helper graph-ops.yml / graph-prune-
-# narrators.yml use (password from the container's own NEO4J_AUTH, never on argv,
-# never over the GH transport — CWE-214). So this path has no GHCR login and no
-# image pull. Shape mirrors graph-ops.yml's prune-orphans path (SSH to the VPS as
-# `deploy`, refresh the /opt checkout, cypher-shell pre-count -> op -> post-verify).
+# container — the same credential pattern graph-ops.yml / graph-prune-narrators.yml
+# use (password from the container's own NEO4J_AUTH, never on argv, never over the
+# GH transport — CWE-214). Shape mirrors graph-ops.yml's prune-orphans path (SSH as
+# `deploy`, refresh the /opt checkout, cypher-shell pre-check -> SET -> post-verify).
 #
-# INJECTION-SAFE + PARAMETERIZED. The statements are parameterized on `$ids` /
-# `$note`; the `:param` value literals are BUILT by scripts/flag_over_merged_
-# narrators.sh under a charset whitelist (a `'` or `\` cannot reach a statement
-# with graph-write access). That script is shellcheck-linted and unit-tested
-# (scripts/tests/test_flag_over_merged_narrators.py) — an ssh `with: script:` body
-# is neither (deploy#555). cypher-shell 5.x removed `:auto`; a non-interactive
-# cypher-shell auto-commits each stdin statement, which is the implicit tx a plain
-# SET needs — so no client-command prefix is used (deploy#540).
+# INJECTION-SAFE + PARAMETERIZED. The statements are parameterized on `$rows` (a
+# `[{id, note}]` list). The `:param` value literals are BUILT by
+# scripts/flag_over_merged_narrators.py: ids are whitelisted to `nar:<uuid>` and
+# interpolated directly; notes are ESCAPED into single-quoted Cypher literals
+# (a `'` becomes `\'`) so they land BYTE-IDENTICAL to the durable reload while a
+# quote can never break out of a graph-write statement. That builder is
+# ruff/mypy-linted and behaviourally unit-tested (scripts/tests/…); an ssh
+# `with: script:` body is neither (deploy#555). cypher-shell 5.x removed `:auto`;
+# a non-interactive cypher-shell auto-commits each stdin statement, the implicit tx
+# a plain UNWIND/SET needs — so no client-command prefix (deploy#540).
 #
-# THE ID SET is scripts/over_merged_narrator_ids.txt — the producer's AUTHORITATIVE
-# resolved canonical ids (da#447). It is NOT re-derived from names here (canonical
-# ids drift across resolve runs, da#371/#376). The op REFUSES on a real run unless
-# every configured id is present in the live graph (a mismatch means the seed is
-# stale against the loaded resolve run — reconcile it, do not flag a subset). The
-# file ships as a placeholder, so the op is inert until the real ids are wired in.
+# THE FLAG SET is scripts/over_merged_narrator_flags.json — the producer's
+# AUTHORITATIVE resolved {id, note} rows (da#448), NOT re-derived from names here
+# (canonical ids drift across resolve runs, da#371/#376). The op REFUSES on a real
+# run unless EVERY configured id resolves to a live node, and it NAMES any id that
+# matched 0 (silent-zero discipline) — a mismatch means the seed is stale against
+# the loaded resolve run, reconcile it, do not flag a subset.
 #
 # stg-gated + PROD HELD. This wave the op runs on stg ONLY. Prod flagging is held
 # behind an explicit owner go-ahead AND a verified-green backup (main#928); the
@@ -47,19 +49,10 @@ on:
   workflow_dispatch:
     inputs:
       env:
-        description: "Target env — stg (prod is HELD this wave; see below)"
+        description: "Target env — stg (prod is HELD this wave; see workflow header)"
         required: true
         type: choice
         options: [stg, prod]
-      note:
-        description: "over_merge_note text set on each flagged node (safe charset only)"
-        required: false
-        type: string
-        default: >-
-          Over-merged canonical narrator: this node fuses multiple distinct
-          transmitters, so its betweenness/centrality is inflated; flagged pending
-          an external-evidence split (main#928 / main#958 / da#443). Do not read as
-          a single historical narrator.
       dry_run:
         description: "Plan/read only — report the would-flag count; write NOTHING"
         required: false
@@ -96,7 +89,6 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           ENV_NAME: ${{ inputs.env }}
-          NOTE: ${{ inputs.note }}
           DRY_RUN: ${{ inputs.dry_run }}
         with:
           host: ${{ vars.VPS_HOST }}
@@ -107,7 +99,7 @@ jobs:
           command_timeout: 10m
           key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
           capture_stdout: true
-          envs: ENV_NAME,NOTE,DRY_RUN
+          envs: ENV_NAME,DRY_RUN
           script: |
             set -uo pipefail
 
@@ -123,9 +115,9 @@ jobs:
 
             cd /opt/noorinalabs-deploy
 
-            # Refresh the on-box checkout to origin/main BEFORE reading the id file or
-            # the builder script, exactly as graph-ops.yml / deploy-data-load.yml do,
-            # so both are the current committed versions. Guarded (this script runs
+            # Refresh the on-box checkout to origin/main BEFORE reading the data file or
+            # the builder script, exactly as graph-ops.yml / deploy-data-load.yml do, so
+            # both are the current committed versions. Guarded (this script runs
             # `set -uo pipefail`, no -e): an unguarded fetch failure would let the
             # following reset succeed against a STALE remote-tracking ref.
             echo "==> Pulling latest deploy config..."
@@ -133,6 +125,11 @@ jobs:
               || { echo "ERROR: [${ENV_NAME}] git fetch origin main failed — refusing to run against a stale checkout." >&2; exit 1; }
             git reset --hard origin/main \
               || { echo "ERROR: [${ENV_NAME}] git reset --hard origin/main failed." >&2; exit 1; }
+
+            # The builder is python (robust JSON parse + Cypher escaping of verbatim
+            # notes). Fail loud if python3 is absent rather than silently skip.
+            command -v python3 >/dev/null 2>&1 \
+              || { echo "ERROR: [${ENV_NAME}] python3 not found on the VPS — required to build the flag Cypher." >&2; exit 1; }
 
             # .env on the VPS (mode 600, written by the deploy workflow) is the single
             # source of truth for NEO4J credentials — compose interpolates the service
@@ -144,15 +141,14 @@ jobs:
 
             COMPOSE="docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env"
 
-            # run_phase <precount|flag|postcount>: build the cypher-shell stdin stream
-            # for the phase (the :param line(s) + the statement) with the tested
+            # run_phase <precheck|flag|postcount>: build the cypher-shell stdin stream
+            # for the phase (the :param rows line + the statement) with the tested
             # builder, then feed it to cypher-shell INSIDE the live neo4j container.
-            # The builder reads NOTE (flag phase) and scripts/over_merged_narrator_ids.txt.
             run_phase() {
               _phase="$1"
               _built=""
-              _built="$(bash scripts/flag_over_merged_narrators.sh stdin "${_phase}")" \
-                || { echo "ERROR: [${ENV_NAME}] builder refused for phase '${_phase}' — check the wired ids in scripts/over_merged_narrator_ids.txt and the note charset." >&2; return 1; }
+              _built="$(python3 scripts/flag_over_merged_narrators.py stdin "${_phase}")" \
+                || { echo "ERROR: [${ENV_NAME}] builder refused for phase '${_phase}' — check scripts/over_merged_narrator_flags.json." >&2; return 1; }
               # SC2016: the ${NEO4J_AUTH#neo4j/} expands INSIDE the neo4j container's
               # sh -c (reading that container's own NEO4J_AUTH), not on the VPS host.
               # shellcheck disable=SC2016
@@ -160,61 +156,85 @@ jobs:
                 'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain'
             }
 
-            # extract_int <cypher-plain-output>: the sole all-digits line (the count).
-            # cypher-shell --format plain renders an integer column value unquoted, so
-            # the result row is a bare number; the header (`matched`/`flagged`) is not.
+            # extract_int <cypher-plain-output>: the sole all-digits line (a count).
+            # cypher-shell --format plain renders an integer column value UNQUOTED, so
+            # the result row is a bare number; the header and any :param echo are not.
             # `|| true` keeps a no-match from tripping pipefail — the caller HARD-FAILS
             # on an empty result, so a missing reading is a stop, never a silent zero.
             extract_int() {
-              printf '%s\n' "$1" | grep -oE '^[0-9]+$' | tail -n1 || true
+              printf '%s\n' "$1" | grep -E '^[0-9]+$' | tail -n1 || true
             }
 
-            # --- expected count: how many ids are configured (builder refuses 0) ---
+            # --- expected count: how many rows are configured (builder refuses 0) ---
             EXPECTED=""
-            EXPECTED="$(bash scripts/flag_over_merged_narrators.sh id-count)" \
-              || { echo "ERROR: [${ENV_NAME}] could not read the configured id count." >&2; exit 1; }
+            EXPECTED="$(python3 scripts/flag_over_merged_narrators.py count)" \
+              || { echo "ERROR: [${ENV_NAME}] could not read the configured row count from scripts/over_merged_narrator_flags.json." >&2; exit 1; }
             if [ "${EXPECTED:-0}" -le 0 ]; then
-              echo "ERROR: [${ENV_NAME}] no canonical ids configured in scripts/over_merged_narrator_ids.txt — the flag set is empty (fail-safe). Wire in the producer's resolved ids (da#447) before dispatching." >&2
+              echo "ERROR: [${ENV_NAME}] no rows configured in scripts/over_merged_narrator_flags.json (fail-safe)." >&2
               exit 1
             fi
-            echo "==> [${ENV_NAME}] flag-over-merged — configured ids: ${EXPECTED} | dry_run=${DRY_RUN}"
+            echo "==> [${ENV_NAME}] flag-over-merged — configured rows: ${EXPECTED} | dry_run=${DRY_RUN}"
 
-            # --- pre-count: how many of the configured ids exist in the live graph ---
-            echo "==> [${ENV_NAME}] pre-count: configured ids present in the graph"
+            # --- pre-check: which configured ids resolve in the live graph. One row
+            #     per id ("<id> matched=<n>"), so a miss is NAMED, never summed away. ---
+            echo "==> [${ENV_NAME}] pre-check: resolve each configured id against the graph"
             PRE_OUT=""
-            PRE_OUT="$(run_phase precount)" \
-              || { echo "ERROR: [${ENV_NAME}] pre-count query failed to execute." >&2; exit 1; }
-            MATCHED="$(extract_int "${PRE_OUT}")"
-            if [ -z "${MATCHED}" ]; then
-              echo "ERROR: [${ENV_NAME}] could not parse the matched count from cypher output:" >&2
-              printf '%s\n' "${PRE_OUT}" >&2
-              exit 1
-            fi
-            echo "    configured: ${EXPECTED} | present in graph: ${MATCHED}"
+            PRE_OUT="$(run_phase precheck)" \
+              || { echo "ERROR: [${ENV_NAME}] pre-check query failed to execute." >&2; exit 1; }
 
-            # --- FAIL-SAFE DRY RUN. Tested as != "false" (fails safe: anything not
-            #     explicitly "false" is a plan). ---
+            # Parse via a temp file (not a pipe — a pipe runs the while-loop in a
+            # subshell and loses MATCHED/MISSING; not a heredoc — its closing delimiter
+            # cannot sit at column 0 under this YAML block scalar's indentation).
+            PRE_TMP="$(mktemp)" \
+              || { echo "ERROR: [${ENV_NAME}] could not create a temp file for the pre-check parse." >&2; exit 1; }
+            printf '%s\n' "${PRE_OUT}" > "${PRE_TMP}"
+            MATCHED=0
+            MISSING=""
+            while IFS= read -r _line; do
+              case "${_line}" in
+                '' | idmatch) continue ;;
+              esac
+              # cypher-shell quotes the string column — strip one leading/trailing quote.
+              _line="${_line#\"}"
+              _line="${_line%\"}"
+              _cnt="${_line##* matched=}"
+              _id="${_line% matched=*}"
+              if [ "${_cnt}" = "0" ]; then
+                MISSING="${MISSING} ${_id}"
+              else
+                MATCHED=$((MATCHED + 1))
+              fi
+            done < "${PRE_TMP}"
+            rm -f "${PRE_TMP}"
+
+            echo "    configured: ${EXPECTED} | resolved in graph: ${MATCHED}"
+            if [ -n "${MISSING}" ]; then
+              echo "    ids that matched 0 nodes:${MISSING}"
+            fi
+
+            # --- FAIL-SAFE DRY RUN. Tested as != "false" (anything not explicitly
+            #     "false" is a plan). ---
             if [ "${DRY_RUN}" != "false" ]; then
               if [ "${DRY_RUN}" != "true" ]; then
                 echo "WARNING: [${ENV_NAME}] dry_run='${DRY_RUN}' is not 'true'/'false' — treating as a DRY RUN, writing nothing." >&2
               fi
               echo "==> [${ENV_NAME}] DRY RUN — would SET over_merged=true + over_merge_note on ${MATCHED} node(s); NO write issued."
               if [ "${MATCHED}" -ne "${EXPECTED}" ]; then
-                echo "    NOTE: ${MATCHED} of ${EXPECTED} configured ids are present — a REAL run would REFUSE (the seed does not match the loaded graph; reconcile scripts/over_merged_narrator_ids.txt against the producer's resolve run)."
+                echo "    NOTE: only ${MATCHED} of ${EXPECTED} configured ids resolve — a REAL run would REFUSE (seed stale vs the loaded graph; reconcile scripts/over_merged_narrator_flags.json against the producer's resolve run)."
               fi
               echo "FLAG_RESULT outcome=dry-run configured=${EXPECTED} matched=${MATCHED} flagged=0"
               echo "==> [${ENV_NAME}] dry run complete (exit 0)."
               exit 0
             fi
 
-            # --- real run: refuse unless EVERY configured id is present. Flagging a
+            # --- real run: refuse unless EVERY configured id resolves. Flagging a
             #     subset would silently annotate a graph the seed no longer describes. ---
             if [ "${MATCHED}" -ne "${EXPECTED}" ]; then
-              echo "ERROR: [${ENV_NAME}] refusing to flag — only ${MATCHED} of ${EXPECTED} configured ids exist in the live graph. The curated seed does not match the loaded resolve run (canonical-id drift, da#371/#376, or wrong env). Reconcile scripts/over_merged_narrator_ids.txt with the producer before flagging." >&2
+              echo "ERROR: [${ENV_NAME}] refusing to flag — only ${MATCHED} of ${EXPECTED} configured ids resolve in the live graph (missing:${MISSING}). The curated seed does not match the loaded resolve run (canonical-id drift, da#371/#376, or wrong env). Reconcile scripts/over_merged_narrator_flags.json with the producer before flagging." >&2
               exit 1
             fi
 
-            echo "==> [${ENV_NAME}] flag: SET over_merged=true + over_merge_note on ${EXPECTED} node(s)"
+            echo "==> [${ENV_NAME}] flag: UNWIND rows -> SET over_merged=true + over_merge_note on ${EXPECTED} node(s)"
             FLAG_OUT=""
             FLAG_OUT="$(run_phase flag)" \
               || { echo "ERROR: [${ENV_NAME}] flag SET failed to execute." >&2; exit 1; }
@@ -224,12 +244,14 @@ jobs:
               printf '%s\n' "${FLAG_OUT}" >&2
               exit 1
             fi
+            # Read-back assertion (silent-zero discipline): rc=0 is NOT proof the SET
+            # touched the expected nodes — the SET's own count(n) must equal EXPECTED.
             if [ "${FLAGGED}" -ne "${EXPECTED}" ]; then
               echo "ERROR: [${ENV_NAME}] SET reported ${FLAGGED} nodes flagged but ${EXPECTED} were expected." >&2
               exit 1
             fi
 
-            # --- post-verify: exactly the configured ids now carry over_merged=true ---
+            # --- post-verify: EXACTLY the configured ids now carry over_merged=true ---
             echo "==> [${ENV_NAME}] verify: configured ids now carry over_merged=true"
             POST_OUT=""
             POST_OUT="$(run_phase postcount)" \
@@ -283,8 +305,8 @@ jobs:
               echo "| | |"
               echo "|---|---|"
               echo "| Outcome | \`${R_OUTCOME}\` |"
-              echo "| Configured ids (keep-set) | ${R_CONFIGURED} |"
-              echo "| Present in graph | ${R_MATCHED} |"
+              echo "| Configured rows (keep-set) | ${R_CONFIGURED} |"
+              echo "| Resolved in graph | ${R_MATCHED} |"
               if [ "${R_OUTCOME}" = "dry-run" ]; then
                 echo "| Would flag | ${R_MATCHED} |"
               else
@@ -296,7 +318,7 @@ jobs:
               echo "to establish the graph's state before re-running."
               echo ""
             fi
-            echo "Sets \`over_merged=true\` + \`over_merge_note\` on the producer's curated canonical ids"
-            echo "(da#447). Durable transport is deploy-data-load.yml; a later reload re-asserts the flag."
+            echo "Sets \`over_merged=true\` + verbatim \`over_merge_note\` on the producer's resolved canonical"
+            echo "ids (da#448). Durable transport is deploy-data-load.yml; a later reload re-asserts the flag."
             echo "stg-gated: prod flagging is HELD this wave behind owner go-ahead + verified backup (main#928)."
           } >> "$GITHUB_STEP_SUMMARY"
