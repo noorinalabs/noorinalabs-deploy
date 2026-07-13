@@ -96,7 +96,14 @@ def test_fully_capable_key_passes() -> None:
 
 
 def test_every_verdict_has_a_distinct_explanation() -> None:
-    verdicts = ["OK", "KEY_INVALID", "BUCKET_UNREACHABLE", "KEY_READ_ONLY", "KEY_CANNOT_DELETE"]
+    verdicts = [
+        "OK",
+        "PROBE_FAILED",
+        "KEY_INVALID",
+        "BUCKET_UNREACHABLE",
+        "KEY_READ_ONLY",
+        "KEY_CANNOT_DELETE",
+    ]
     texts = {v: explain(v).strip() for v in verdicts}
     assert len(set(texts.values())) == len(verdicts), "verdicts must not share a diagnosis"
     for v, t in texts.items():
@@ -271,3 +278,425 @@ def test_failing_preflight_stops_before_any_dump(tmp_path: Path) -> None:
     assert "refusing to dump databases we cannot upload" in combined
     # backup.sh logs this immediately before it stops Neo4j.
     assert "Stopping Neo4j" not in combined, "the preflight must abort before Neo4j is stopped"
+
+
+# --------------------------------------------------------------------------
+# deploy#613 — the probe must not blame the key for its OWN breakage
+# --------------------------------------------------------------------------
+#
+# `mktemp -d` defaults to /tmp, and /tmp is READ-ONLY under the backup unit
+# (ProtectSystem=strict, PrivateTmp deliberately unset — deploy#121 Bug A). The scratch
+# allocation failed, its status went unchecked, the redirect to `${tmp}/lsd.out` degraded
+# to `/lsd.out` on the read-only root, `lsd_rc` came back 1 — and `lsd_rc != 0` meant
+# KEY_INVALID. Every backup this project ever ran died there, blaming a key that was fine:
+# the SAME freshly-provisioned write-capable key yielded KEY_INVALID under systemd and OK
+# by hand with a writable /tmp (stg, 2026-07-13).
+#
+# WHY THE OBVIOUS TEST IS WORTHLESS HERE
+#
+# `assert classify("1", "no", "skip", "skip") == "KEY_INVALID"` passed throughout. It
+# still does. It cannot fail, because it asserts the very conflation that IS the bug: it
+# is handed the *symptom* (lsd_rc=1) and asked whether the code draws the conclusion the
+# code draws. An instrument that returns KEY_INVALID for both a bad key and a broken probe
+# has not measured anything, and a test that only ever feeds it one class cannot tell.
+# So these tests run the preflight on BOTH classes and require it to SEPARATE them —
+# same harness, same stub, one factor varied at a time. Cf. the org memory
+# `feedback_silent_zero_is_not_a_measurement`.
+#
+# Unusable scratch is simulated with an ENOTDIR parent (a *file* standing where a
+# directory must be), not with chmod: chmod is a no-op against uid 0, so a root CI runner
+# would quietly turn the whole class into a passing OK. ENOTDIR fails for root too.
+
+GOOD_RCLONE = """#!/usr/bin/env bash
+# A write-capable, correctly-scoped key: lists the bucket, writes, deletes.
+case "$1" in
+    lsd) echo "         -1 2026-07-13 00:00:00        -1 ${B2_BUCKET}" ;;
+esac
+exit 0
+"""
+
+BAD_RCLONE = """#!/usr/bin/env bash
+# A revoked / wrongly-scoped key: cannot even enumerate buckets.
+echo 'CRITICAL: you must use bucket(s) [...] with this application key' >&2
+exit 1
+"""
+
+# backup.sh's own invocation form, verbatim (scripts/backup.sh § Preflight checks):
+# `set -euo pipefail` + the `|| RC=$?` condition-context guard. A harness under a weaker
+# `set -…` is not running production's code — deploy#563/#584 were both found this way.
+_PRODUCTION_INVOCATION = """
+set -euo pipefail
+shopt -s inherit_errexit
+source "{preflight}"
+rc=0
+out="$(set +e; preflight_b2 2>&1)" || rc=$?
+printf '%s\\n' "$out"
+exit "$rc"
+"""
+
+
+# The three states the probes' scratch space can be in. "unwritable" is the one that
+# reopened this bug in review (deploy#614, Lucas Ferreira + Nino Kavtaradze, independently):
+# the original fix keyed on `mktemp`'s exit status and `[[ -d "$tmp" ]]`, both of which say
+# the directory EXISTS — neither of which says a file can be created in it. A scratch dir
+# that allocates and then refuses a write made the redirect fail, so bash never exec'd
+# rclone, `$?` was 1, and 1 is a NUMBER: it sailed straight past PROBE_FAILED into
+# KEY_INVALID. Same conflation as #613, one layer down.
+#
+# This is not exotic. The fix deliberately moves scratch onto BACKUP_DIR — the one volume
+# that fills with multi-GB dumps under a 7-daily/4-weekly retention — so ENOSPC there is the
+# single most expected fault on a backup host.
+SCRATCH_USABLE = "usable"
+SCRATCH_UNALLOCATABLE = "unallocatable"  # mktemp -d itself fails (read-only /tmp: #613)
+SCRATCH_UNWRITABLE = "unwritable"  # mkdir succeeds, file creation does not (ENOSPC: #614)
+SCRATCH_STATES = (SCRATCH_USABLE, SCRATCH_UNALLOCATABLE, SCRATCH_UNWRITABLE)
+
+# A directory that demonstrably exists and into which no file can be created — for uid 0
+# as well, which is the point: a root CI runner must not be able to turn this class green.
+# procfs refuses creat() outright, so it models "allocated but unwritable" without needing
+# a loopback mount or a real full disk. Same reasoning as the ENOTDIR choice above.
+_MKTEMP_STUB_RETURNING_UNWRITABLE_DIR = """#!/bin/sh
+# Ignore the args; hand back a real directory that cannot hold a file.
+echo /proc/self
+"""
+
+
+def _run_preflight(
+    tmp_path: Path,
+    *,
+    key_is_good: bool,
+    scratch: str,
+) -> subprocess.CompletedProcess[str]:
+    """Drive the real preflight, exactly as backup.sh drives it.
+
+    Two independent factors, so the six cells can be compared:
+      key_is_good  — whether the stubbed rclone behaves like a valid, write-capable key
+      scratch      — one of SCRATCH_STATES; how the probes' scratch space misbehaves
+    """
+    assert scratch in SCRATCH_STATES, f"unknown scratch state {scratch!r}"
+
+    tmp_path.mkdir(parents=True, exist_ok=True)  # each matrix cell gets its own sandbox
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "rclone").write_text(GOOD_RCLONE if key_is_good else BAD_RCLONE)
+    (stub / "rclone").chmod(0o755)
+
+    if scratch == SCRATCH_UNWRITABLE:
+        # Intercept mktemp so it "succeeds" and returns a dir that refuses file creation.
+        (stub / "mktemp").write_text(_MKTEMP_STUB_RETURNING_UNWRITABLE_DIR)
+        (stub / "mktemp").chmod(0o755)
+
+    # An ENOTDIR parent: `not-a-dir` is a regular file, so both `mkdir -p` and
+    # `mktemp -d -p` fail on any path beneath it — for root as well as for us.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    unusable = str(blocker / "scratch")
+
+    usable = tmp_path / "backups"
+    usable.mkdir()
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    env.update(
+        B2_KEY_ID="fake-key-id",
+        B2_APP_KEY="fake-app-key",
+        B2_BUCKET="noorinalabs-backups",
+        # UNWRITABLE keeps a perfectly good parent: the fault is inside the scratch dir the
+        # mktemp stub hands back, which is exactly the case existence-checks cannot see.
+        BACKUP_DIR=unusable if scratch == SCRATCH_UNALLOCATABLE else str(usable),
+    )
+    env.pop("RCLONE_DUMP", None)
+
+    script = _PRODUCTION_INVOCATION.format(preflight=PREFLIGHT)
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=env, timeout=120
+    )
+
+
+def _verdict_of(proc: subprocess.CompletedProcess[str]) -> str:
+    for line in (proc.stdout + proc.stderr).splitlines():
+        if line.startswith("[preflight] verdict="):
+            return line.split("=", 1)[1].strip()
+    raise AssertionError(f"the preflight printed no verdict at all:\n{proc.stdout}{proc.stderr}")
+
+
+def test_the_preflight_separates_its_own_breakage_from_a_bad_key(tmp_path: Path) -> None:
+    """THE test. One instrument, two failure classes, and it must not conflate them.
+
+    Read it as a 2x3: the verdict has to move with BOTH factors. If the preflight answered
+    KEY_INVALID down a whole broken-scratch column — which is precisely what it did before
+    deploy#613, and what it STILL did for the `unwritable` column at the first cut of the
+    fix (deploy#614 review) — the key column would be doing no work at all, and the
+    "detector" would just be a constant wearing a credential's name.
+
+    The `unwritable` column is the one that matters most now: `mktemp` succeeding proves the
+    scratch dir EXISTS, never that a file can be put in it, and the fix moved scratch onto
+    the very volume that fills with dumps. A full disk must not be able to speak as a
+    credential.
+    """
+    verdicts = {
+        (key_is_good, scratch): _verdict_of(
+            _run_preflight(
+                tmp_path / f"k{int(key_is_good)}-{scratch}",
+                key_is_good=key_is_good,
+                scratch=scratch,
+            )
+        )
+        for key_is_good in (True, False)
+        for scratch in SCRATCH_STATES
+    }
+
+    # Calibration first: with a working scratch dir the instrument demonstrably WORKS —
+    # it tells a good key from a bad one. Without this cell, PROBE_FAILED below could be
+    # an artefact of the stub rather than a real discrimination.
+    assert verdicts[(True, SCRATCH_USABLE)] == "OK", "a good key with usable scratch must verify"
+    assert verdicts[(False, SCRATCH_USABLE)] == "KEY_INVALID", (
+        "a key that genuinely cannot list buckets is still KEY_INVALID — the fix must not "
+        "have blunted the real diagnosis"
+    )
+
+    # And now the bug, in both of its shapes. A scratch dir that cannot be ALLOCATED (#613,
+    # read-only /tmp) and one that allocates but cannot be WRITTEN TO (#614, ENOSPC on
+    # BACKUP_DIR) are both a probe that did not run. Neither is evidence about the key.
+    for scratch in (SCRATCH_UNALLOCATABLE, SCRATCH_UNWRITABLE):
+        assert verdicts[(True, scratch)] == "PROBE_FAILED", (
+            f"a GOOD key + {scratch} scratch must be PROBE_FAILED. Before the fix this was "
+            "KEY_INVALID: the probe never ran, held no evidence about the credential, and "
+            "condemned it anyway."
+        )
+        assert verdicts[(False, scratch)] == "PROBE_FAILED", (
+            f"even when the key IS bad, a {scratch} preflight has not LEARNED that. "
+            "Reporting KEY_INVALID here would be right by accident — and it is the same "
+            "accident that condemned a good key on every scheduled run."
+        )
+
+    # The separation, stated as the property rather than as literals: under ANY broken
+    # scratch state the verdict must not be a credential verdict at all. KEY_READ_ONLY is in
+    # this set deliberately — its remediation text says "rotate BACKUP_B2_APP_KEY to the
+    # write-capable key", so a full disk reaching it would hand the operator a written
+    # instruction to re-provision a key that was never at fault, with MORE capability than
+    # it needs.
+    broken = {
+        verdicts[(key_is_good, scratch)]
+        for key_is_good in (True, False)
+        for scratch in (SCRATCH_UNALLOCATABLE, SCRATCH_UNWRITABLE)
+    }
+    assert broken.isdisjoint({"OK", "KEY_INVALID", "BUCKET_UNREACHABLE", "KEY_READ_ONLY"}), (
+        f"a probe that could not run emitted a verdict about the credential: {broken}"
+    )
+
+
+def test_a_good_key_verifies_when_tmp_is_unusable_but_backup_dir_is_writable(
+    tmp_path: Path,
+) -> None:
+    """The regression test: production's exact namespace, reproduced without systemd.
+
+    Under the unit, /tmp is read-only and BACKUP_DIR (/var/lib/noorinalabs-backups) is
+    writable via ReadWritePaths. `mktemp -d` honours TMPDIR, so pointing TMPDIR at an
+    ENOTDIR path reproduces the read-only /tmp the unit imposes, exactly, in CI.
+
+    Against the pre-fix tree this run yields KEY_INVALID — the stg failure, reproduced.
+    After the fix the scratch dir comes from BACKUP_DIR and the same key verifies OK.
+    """
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "rclone").write_text(GOOD_RCLONE)
+    (stub / "rclone").chmod(0o755)
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    env.update(
+        B2_KEY_ID="fake-key-id",
+        B2_APP_KEY="fake-app-key",
+        B2_BUCKET="noorinalabs-backups",
+        BACKUP_DIR=str(backup_dir),
+        TMPDIR=str(blocker / "tmp"),  # stands in for the unit's read-only /tmp
+    )
+    env.pop("RCLONE_DUMP", None)
+
+    proc = subprocess.run(
+        ["bash", "-c", _PRODUCTION_INVOCATION.format(preflight=PREFLIGHT)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    combined = proc.stdout + proc.stderr
+
+    assert _verdict_of(proc) == "OK", (
+        "a valid key must verify with an unusable /tmp, because the scratch dir belongs "
+        "under BACKUP_DIR — which the unit grants in ReadWritePaths. This is the stg "
+        "failure of deploy#613: same key, KEY_INVALID under systemd, OK by hand."
+    )
+    assert proc.returncode == 0
+    assert "KEY_INVALID" not in combined
+
+
+def test_a_full_disk_never_tells_the_operator_to_rotate_the_key(tmp_path: Path) -> None:
+    """The most harmful cell in the matrix, called out on its own (deploy#614 review).
+
+    An unchecked local canary write does not merely produce a wrong verdict — it produces
+    an ACTIVELY DANGEROUS one. A scratch dir that cannot hold a file leaves the canary
+    absent or empty, `rclone copyto` fails, and that classifies as KEY_READ_ONLY, whose
+    remediation reads "rotate BACKUP_B2_APP_KEY to the write-capable key (writeFiles +
+    deleteFiles)". So a FULL DISK would hand the operator a written instruction to
+    re-provision a perfectly good credential with MORE capability than it needs — the
+    over-privileging door that PROBE_FAILED exists to shut.
+
+    A good key + a disk that cannot take a byte must never emit a credential verdict, and
+    must never print the word "rotate".
+    """
+    proc = _run_preflight(tmp_path, key_is_good=True, scratch=SCRATCH_UNWRITABLE)
+    combined = proc.stdout + proc.stderr
+
+    assert _verdict_of(proc) == "PROBE_FAILED"
+    assert proc.returncode != 0
+
+    for credential_verdict in ("KEY_READ_ONLY", "KEY_INVALID", "BUCKET_UNREACHABLE"):
+        assert credential_verdict not in combined, (
+            f"a full disk was reported as {credential_verdict} — the probe could not write a "
+            "single byte locally, so it learned NOTHING about the key's capabilities"
+        )
+    # Ban the INSTRUCTION, not the word. A bare `"rotate" not in ...` is the wrong
+    # assertion and fails against correct code: PROBE_FAILED's own text contains "do not
+    # rotate, revoke, or re-provision anything on the strength of it" — the sentence that
+    # FORBIDS the action. What must never appear is the KEY_READ_ONLY remediation that
+    # PRESCRIBES it.
+    assert "rotate BACKUP_B2_APP_KEY" not in combined, (
+        "a local disk fault instructed the operator to rotate the key — that is how a good "
+        "credential gets churned and re-provisioned with more capability than it needs"
+    )
+    assert "do not rotate, revoke, or re-provision" in combined, (
+        "the diagnosis must explicitly disown the credential, not merely decline to accuse it"
+    )
+    assert "full disk" in combined.lower(), (
+        "the diagnosis must name the actual cause so the operator checks df, not Backblaze"
+    )
+
+
+def test_scratch_failure_is_fatal_and_leaves_no_scratch_behind(tmp_path: Path) -> None:
+    """A scratch failure must abort — never fall through into a credential verdict."""
+    proc = _run_preflight(tmp_path, key_is_good=True, scratch=SCRATCH_UNALLOCATABLE)
+    combined = proc.stdout + proc.stderr
+
+    assert proc.returncode != 0, "an unrunnable preflight must fail, not pass by default"
+    assert "probe_failed=" in combined, "the operator must be told WHICH thing broke"
+    assert "NOT a verdict on the key" in combined, (
+        "the diagnosis must explicitly disown the credential, or the next operator rotates "
+        "a perfectly good key — which is exactly what deploy#612 nearly did"
+    )
+    assert "ReadWritePaths" in combined and "BACKUP_DIR" in combined, (
+        "the remediation must name the systemd knob that actually governs this"
+    )
+
+
+def test_standalone_invocation_also_refuses_rather_than_blaming_the_key(tmp_path: Path) -> None:
+    """`./scripts/b2_preflight.sh` is the form an operator runs on the host by hand."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "rclone").write_text(GOOD_RCLONE)
+    (stub / "rclone").chmod(0o755)
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    env.update(
+        B2_KEY_ID="fake-key-id",
+        B2_APP_KEY="fake-app-key",
+        B2_BUCKET="noorinalabs-backups",
+        TMPDIR=str(blocker / "tmp"),  # BACKUP_DIR unset: the fallback must break safely too
+    )
+    env.pop("BACKUP_DIR", None)
+    env.pop("RCLONE_DUMP", None)
+
+    proc = subprocess.run(
+        ["bash", str(PREFLIGHT)], capture_output=True, text=True, env=env, timeout=120
+    )
+    combined = proc.stdout + proc.stderr
+
+    assert proc.returncode != 0
+    assert _verdict_of(proc) == "PROBE_FAILED"
+    assert "KEY_INVALID" not in combined
+
+
+def test_backup_never_blames_the_key_when_its_staging_dir_is_unwritable(tmp_path: Path) -> None:
+    """End-to-end through backup.sh, which stages into BACKUP_DIR before it ever probes.
+
+    If BACKUP_DIR is unusable, backup.sh now cannot reach the preflight at all (it dies at
+    its own `mkdir -p`). That is fine — what must NEVER happen, by any path, is that an
+    infrastructure fault at the host presents itself to the operator as a bad credential.
+    """
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    for name in ("docker", "zstd"):
+        (stub / name).write_text("#!/usr/bin/env bash\nexit 0\n")
+    (stub / "rclone").write_text(GOOD_RCLONE)
+    for f in stub.iterdir():
+        f.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    env.update(
+        B2_KEY_ID="fake-key-id",
+        B2_APP_KEY="fake-app-key",
+        B2_BUCKET="noorinalabs-backups",
+        BACKUP_DIR=str(blocker / "scratch"),
+        COMPOSE_FILE="/dev/null",
+    )
+    env.pop("RCLONE_DUMP", None)
+
+    proc = subprocess.run(
+        ["bash", str(BACKUP)], capture_output=True, text=True, env=env, timeout=120
+    )
+    combined = proc.stdout + proc.stderr
+
+    assert proc.returncode != 0
+    assert "KEY_INVALID" not in combined, (
+        "a host-side storage fault must not be rendered as a credential verdict"
+    )
+    assert "Stopping Neo4j" not in combined, "and it must not take an outage on the way"
+
+
+# --------------------------------------------------------------------------
+# The classifier's own contract for a probe that never ran
+# --------------------------------------------------------------------------
+
+
+def test_a_probe_that_never_ran_is_not_an_invalid_key() -> None:
+    """`lsd_rc` is an exit status. "skip" is not one — it means the probe never ran."""
+    assert classify("skip", "unknown", "skip", "skip") == "PROBE_FAILED"
+    # It stays PROBE_FAILED whatever the other probes claim: they cannot have run either.
+    assert classify("skip", "yes", "0", "0") == "PROBE_FAILED"
+
+
+def test_a_missing_exit_status_is_never_read_as_evidence() -> None:
+    """The original defect in one line: `tmp=""` → no probe → a status that isn't one.
+
+    Anything non-numeric reaching `lsd_rc` means no probe produced it, so it can carry no
+    information about the key. Guarding only the literal "skip" would re-open the hole for
+    the next caller that passes an empty string, exactly as `tmp=""` once did.
+    """
+    for not_a_status in ("", "unknown", "null", "skip"):
+        assert classify(f"'{not_a_status}'", "no", "skip", "skip") == "PROBE_FAILED", (
+            f"lsd_rc={not_a_status!r} is not an exit status; it must not condemn the key"
+        )
+
+
+def test_probe_failed_diagnosis_disowns_the_credential() -> None:
+    text = explain("PROBE_FAILED")
+    assert "NOT a verdict on the key" in text
+    assert "do not rotate" in text.lower()
+    assert "ProtectSystem=strict" in text and "ReadWritePaths" in text, (
+        "name the systemd hardening that causes this, or the next operator spends the "
+        "afternoon on the key instead of on /tmp"
+    )
