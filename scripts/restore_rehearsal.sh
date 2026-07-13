@@ -87,6 +87,21 @@ guard() {
         exit 1
     fi
 
+    # Same refusal for the PROJECT, and for the same reason. COMPOSE_FILE names the file;
+    # COMPOSE_PROJECT names the stack the calls actually land on, and it is the one that
+    # decides whether a `--overwrite-destination` load hits the rehearsal's scratch volume
+    # or production's (deploy#617). run_restore() sets it explicitly per invocation, so an
+    # ambient value cannot reach restore.sh — but a bare compose call added to this file
+    # later would inherit one, and the failure would be silent and unrecoverable.
+    local var
+    for var in COMPOSE_PROJECT COMPOSE_PROJECT_NAME; do
+        if [[ -n "${!var:-}" && "${!var}" != "$PROJECT" ]]; then
+            log "ERROR" "Refusing to run with an inherited ${var}=${!var}"
+            log "ERROR" "The rehearsal only ever drives the '${PROJECT}' compose project"
+            exit 1
+        fi
+    done
+
     if [[ ! -f "$REHEARSAL_COMPOSE" ]]; then
         log "ERROR" "Rehearsal compose file not found: ${REHEARSAL_COMPOSE}"
         exit 1
@@ -295,7 +310,26 @@ run_restore() {
     local src="$1" logfile="$2"
     (
         cd "$REPO_ROOT"
+        # ---------------------------------------------------------------------
+        # COMPOSE_PROJECT IS NOT OPTIONAL HERE. IT AIMS THE RESTORE. (deploy#617)
+        # ---------------------------------------------------------------------
+        # restore.sh now passes an explicit `-p "$COMPOSE_PROJECT"` on every compose call,
+        # and a FLAG BEATS COMPOSE_PROJECT_NAME. Drop this line and every restore below
+        # runs against `noorinalabs` — THE REAL STACK — while every safety guard in this
+        # file (the ENVIRONMENT check, the COMPOSE_FILE refusal, assert_volume_isolation)
+        # goes on inspecting the rehearsal project and reports all-clear. guard() refuses
+        # an inherited COMPOSE_PROJECT for the same reason.
+        #
+        # And note what this line's ABSENCE used to mean, because it is the whole of
+        # deploy#617: restore.sh had no `-p` at all, so COMPOSE_PROJECT_NAME was the ONLY
+        # thing aiming it — and this rehearsal SET it. Production does not: the systemd
+        # unit's EnvironmentFile has no such variable, so on stg and prod the same script
+        # silently addressed the project `compose`, which contains nothing. The rehearsal
+        # passed, every time, precisely because the harness supplied the one thing
+        # production omits. A fixture that hands the code under test the missing input is
+        # not exercising the code under test.
         COMPOSE_FILE="$REHEARSAL_COMPOSE" \
+        COMPOSE_PROJECT="$PROJECT" \
         COMPOSE_PROJECT_NAME="$PROJECT" \
         RESTORE_LOCAL_DIR="$src" \
         RESTORE_DIR="${WORK}/stage-$(basename "$src")" \

@@ -16,6 +16,13 @@
 #                     resolved relative to /opt/noorinalabs-deploy/ — MUST match
 #                     backup.sh so a restore rolls back the same stack backup captured;
 #                     see deploy#498)
+#   COMPOSE_PROJECT — Docker Compose PROJECT the stack runs in (default: noorinalabs).
+#                     `-f` names the FILE, not the PROJECT: with neither this nor
+#                     COMPOSE_PROJECT_NAME set, Compose infers the project from the compose
+#                     file's DIRECTORY (`compose`) and every call lands on a project with no
+#                     containers in it. A RESTORE aimed at the wrong project is worse than a
+#                     backup that reads from one — it writes. See scripts/compose_project.sh
+#                     (deploy#617).
 #   RESTORE_DIR     — Local restore staging directory (default: /tmp/isnad-restore)
 #   RESTORE_LOCAL_DIR — Restore from a backup directory already on disk instead of
 #                     downloading from B2. Checksum verification and every restore
@@ -80,6 +87,26 @@ log() {
     shift
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [${level}] $*"
 }
+
+# ---------------------------------------------------------------------------
+# Compose project scoping (deploy#617)
+# ---------------------------------------------------------------------------
+# Sourced AFTER log(): the library's guards report through it. Provides COMPOSE_PROJECT,
+# dc(), assert_stack_present() and neo4j_start(). Every compose call below goes through
+# dc(). This script had the SAME defect backup.sh did — no `-p` anywhere — and it is the
+# more dangerous half: a backup addressing a phantom project READS nothing, a restore
+# addressing one WRITES. Once a stray neo4j exists in project `compose` (backup.sh's `up`
+# created exactly that on stg), `ps -aq neo4j` RESOLVES it, restore.sh's "refusing to
+# guess" volume guard is satisfied, and `neo4j-admin database load --overwrite-destination`
+# loads the backup into the STRAY volume — reporting "Neo4j restore complete" while the
+# real graph is untouched and the operator believes they have recovered.
+COMPOSE_PROJECT_LIB="$(dirname "${BASH_SOURCE[0]}")/compose_project.sh"
+if [[ ! -f "$COMPOSE_PROJECT_LIB" ]]; then
+    log "ERROR" "Missing ${COMPOSE_PROJECT_LIB} — cannot resolve the compose project to restore into"
+    exit 1
+fi
+# shellcheck source=scripts/compose_project.sh
+source "$COMPOSE_PROJECT_LIB"
 
 # ---------------------------------------------------------------------------
 # Cleanup
@@ -694,7 +721,7 @@ verify_checksums() {
 terminate_pg_connections() {
     local service="$1" pg_user="$2" pg_db="$3"
     log "INFO" "Terminating active PostgreSQL connections to ${pg_db} (service=${service})..."
-    docker compose -f "$COMPOSE_FILE" exec -T "$service" \
+    dc exec -T "$service" \
         psql -U "$pg_user" -d postgres -c \
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${pg_db}' AND pid <> pg_backend_pid();" \
         2>/dev/null || true
@@ -724,7 +751,7 @@ restore_postgres() {
     # was unreadable. Verified: restoring a truncated dump printed
     # "could not read from input file: end of file", restored zero rows, and the
     # script reported "PostgreSQL: restored / === Restore complete ===" with exit 0.
-    if docker compose -f "$COMPOSE_FILE" exec -T "$service" \
+    if dc exec -T "$service" \
         pg_restore -U "$pg_user" -d "$pg_db" --clean --if-exists \
         < "$dump_file" > "$out" 2>&1; then
         rc=0
@@ -768,7 +795,7 @@ restore_neo4j() {
     fi
 
     log "INFO" "Stopping Neo4j for restore..."
-    docker compose -f "$COMPOSE_FILE" stop neo4j
+    dc stop neo4j
 
     # Wait for Neo4j to stop.
     #
@@ -778,10 +805,10 @@ restore_neo4j() {
     # is ENVIRONMENT-BOUNDED, not artifact content — see "WHY THE OTHER EARLY-EXIT PIPELINES IN
     # THIS FILE ARE LEFT ALONE" above before copying this shape somewhere it is not.
     local max_wait=30 waited=0
-    while docker compose -f "$COMPOSE_FILE" ps --format '{{.Service}}:{{.State}}' 2>/dev/null | grep -q "neo4j:running"; do
+    while dc ps --format '{{.Service}}:{{.State}}' 2>/dev/null | grep -q "neo4j:running"; do
         if [[ $waited -ge $max_wait ]]; then
             log "ERROR" "Neo4j did not stop within ${max_wait}s"
-            docker compose -f "$COMPOSE_FILE" up -d neo4j
+            neo4j_start || log "ERROR" "  ...and it could not be restarted either — check manually"
             return 1
         fi
         sleep 1
@@ -803,10 +830,10 @@ restore_neo4j() {
     # container-id list is environment-bounded and fits the pipe buffer, so nothing is still
     # writing when `head` quits.
     local neo4j_cid
-    neo4j_cid=$(docker compose -f "$COMPOSE_FILE" ps -aq neo4j 2>/dev/null | head -1)
+    neo4j_cid=$(dc ps -aq neo4j 2>/dev/null | head -1)
     if [[ -z "$neo4j_cid" ]]; then
-        log "ERROR" "Cannot resolve a neo4j container for ${COMPOSE_FILE} — refusing to guess a data volume"
-        docker compose -f "$COMPOSE_FILE" up -d neo4j
+        log "ERROR" "Cannot resolve a neo4j container in project '${COMPOSE_PROJECT}' (${COMPOSE_FILE}) — refusing to guess a data volume"
+        neo4j_start || log "ERROR" "  ...and there is no neo4j container to start in that project either (deploy#617)"
         return 1
     fi
 
@@ -815,10 +842,10 @@ restore_neo4j() {
         "$neo4j_cid")
     if [[ -z "$NEO4J_VOLUME" ]]; then
         log "ERROR" "neo4j container ${neo4j_cid} has no named volume mounted at /data"
-        docker compose -f "$COMPOSE_FILE" up -d neo4j
+        neo4j_start || log "ERROR" "  ...and neo4j could not be restarted — check manually"
         return 1
     fi
-    log "INFO" "Resolved Neo4j data volume: ${NEO4J_VOLUME} (from ${COMPOSE_FILE})"
+    log "INFO" "Resolved Neo4j data volume: ${NEO4J_VOLUME} (project ${COMPOSE_PROJECT}, ${COMPOSE_FILE})"
 
     # `neo4j-admin database load <db> --from-path=DIR` locates the archive by NAME:
     # it looks for DIR/<db>.dump, i.e. DIR/neo4j.dump. backup.sh stores the archive as
@@ -853,17 +880,24 @@ restore_neo4j() {
         log "INFO" "Neo4j restore complete"
     else
         log "ERROR" "Neo4j restore failed"
-        docker compose -f "$COMPOSE_FILE" up -d neo4j
+        neo4j_start || log "ERROR" "  ...and neo4j could not be restarted — check manually"
         return 1
     fi
 
+    # `start`, never `up`. `up` CREATES a container when the project has none, and in THIS
+    # function that is not merely untidy: the container it would invent is the one whose
+    # volume the load above targets. Restoring into a project you accidentally created is
+    # how a restore reports success while the real graph sits untouched (deploy#617).
     log "INFO" "Restarting Neo4j..."
-    docker compose -f "$COMPOSE_FILE" up -d neo4j
+    if ! neo4j_start; then
+        log "ERROR" "Neo4j restored but could NOT be restarted — the graph is DOWN, check manually"
+        return 1
+    fi
 
     # Wait for healthy. Same early-exit pipeline, same environment-bounded producer, safe for
     # the same reason as the stop-loop above.
     local max_health=120 health_waited=0
-    while ! docker compose -f "$COMPOSE_FILE" ps --format '{{.Service}}:{{.Health}}' 2>/dev/null | grep -q "neo4j:healthy"; do
+    while ! dc ps --format '{{.Service}}:{{.Health}}' 2>/dev/null | grep -q "neo4j:healthy"; do
         if [[ $health_waited -ge $max_health ]]; then
             # The dump loaded; Neo4j not coming back healthy is a separate, real
             # failure. Report it as one rather than falling off the end with success.
@@ -921,6 +955,23 @@ done
 if [[ -z "$BACKUP_PATH" ]]; then
     echo "Usage: $0 [--force] [--allow-partial] [--list] <backup-path|latest>"
     echo "Run '$0 --list' to see available backups."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Assert the stack we are about to restore INTO is actually there (deploy#617)
+# ---------------------------------------------------------------------------
+# Before we resolve anything, download gigabytes, or overwrite a single byte. A restore
+# aimed at a project with no containers does not fail cleanly: `exec` has nothing to feed
+# the dump to, and the Neo4j leg — absent this check and the `up`->`start` change — would
+# CREATE a container and load the dump into ITS fresh volume, then report success.
+#
+# Deliberately AFTER `--list` and `--help` (which need no stack) and BEFORE the
+# confirmation prompt: an operator who is about to type YES should already know the target
+# exists. `--list` still works on a box where the stack is down, which is a real DR case.
+if ! assert_stack_present postgres user-postgres neo4j; then
+    log "ERROR" "Refusing to restore into a stack that is not present."
+    log "ERROR" "  Nothing has been downloaded and nothing has been written."
     exit 1
 fi
 
