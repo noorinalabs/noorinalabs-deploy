@@ -1171,6 +1171,25 @@ self_test() {
         rc=1
     fi
 
+    # --- Case 2c: the reltype histogram MUST also see a REMOVED RELATIONSHIP -
+    # Case 2b proved the LABEL histogram can go red — but nar:7 (the narrator Case 2
+    # deletes) owns no relationships, so CY_REL_HIST reads identically before and
+    # after that mutation and Case 2b never exercises this reader's DIFFER side. A
+    # histogram proven bidirectional on one axis and MATCH-only on the other is
+    # exactly the gap that erases a class rather than merely under-counting it:
+    # prove the reltype reader separates on a mutation of its OWN class (a
+    # relationship), not a sibling's (feedback_drop_gate_bidirectional_ab,
+    # feedback_silent_zero_is_not_a_measurement).
+    _st_cypher "$RV_PROJECT" \
+        "MATCH (:Narrator {id:'nar:1'})-[e:NARRATED_TO]->(:Narrator {id:'nar:2'}) DELETE e;" >/dev/null
+    sub_rel_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_REL_HIST")" || sub_rel_hist=""
+    if st_fp_differs "$ref_rel_hist" "$sub_rel_hist"; then
+        pass "self-test DIFFER: removing ONE relationship changed the reltype histogram (ref=${ref_rel_hist} sub=${sub_rel_hist})"
+    else
+        fail "self-test DIFFER: the reltype histogram is INERT or a reading was EMPTY — cannot see a missing relationship (ref=${ref_rel_hist} sub=${sub_rel_hist})"
+        rc=1
+    fi
+
     # --- Case 3: same cardinality, corrupted CONTENT, MUST differ ------------
     # Restore the count, but with a different name. A comparator that only counted would
     # go green here — which is the whole reason the fingerprint sums the text.
