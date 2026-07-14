@@ -930,7 +930,13 @@ def _backup_is_complete(root: Path, path: str) -> int:
         "set -euo pipefail\n"
         'log() { shift; echo "$*" >&2; }\n'
         'RCLONE_REMOTE=":local"\n'
-        f'B2_BUCKET="{root}"\n' + helpers + "\n" + fn + "\n"
+        # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
+        # path in restore.sh is built from it. B2_BUCKET deliberately points at a
+        # path with NO fixtures under it, so a function that rebuilds a raw bucket
+        # path — reaching outside its environment, which IS the deploy#632 bug —
+        # finds nothing and this harness goes RED instead of quietly passing.
+        f'B2_BUCKET="{root}/__unprefixed__"\n'
+        f'REMOTE_ROOT=":local:{root}"\n' + helpers + "\n" + fn + "\n"
         'backup_is_complete "$1"\n'
     )
     return subprocess.run(  # noqa: S603
@@ -1761,7 +1767,13 @@ def _backup_is_complete_err(root: Path, path: str) -> tuple[int, str]:
         "set -euo pipefail\n"
         'log() { shift; echo "$*" >&2; }\n'
         'RCLONE_REMOTE=":local"\n'
-        f'B2_BUCKET="{root}"\n' + helpers + "\n" + fn + "\n"
+        # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
+        # path in restore.sh is built from it. B2_BUCKET deliberately points at a
+        # path with NO fixtures under it, so a function that rebuilds a raw bucket
+        # path — reaching outside its environment, which IS the deploy#632 bug —
+        # finds nothing and this harness goes RED instead of quietly passing.
+        f'B2_BUCKET="{root}/__unprefixed__"\n'
+        f'REMOTE_ROOT=":local:{root}"\n' + helpers + "\n" + fn + "\n"
         'backup_is_complete "$1"\n'
     )
     r = subprocess.run(  # noqa: S603

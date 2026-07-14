@@ -8,6 +8,15 @@
 #   B2_KEY_ID       — Backblaze B2 application key ID
 #   B2_APP_KEY      — Backblaze B2 application key
 #   B2_BUCKET       — Backblaze B2 bucket name
+#   BACKUP_PREFIX   — Environment namespace for the REMOTE path ("stg" | "prod").
+#                     stg and prod share one bucket (BACKUP_B2_BUCKET is a single
+#                     repo-level secret), so without this both write into
+#                     `daily/<date>/` and prod's retention purge DELETES stg's
+#                     backups — and vice versa. Deliberately has NO DEFAULT: an
+#                     empty default silently restores the shared prefix, and a
+#                     default of "prod" would be catastrophic on stg. An
+#                     un-deployed host must fail LOUDLY, not collide quietly.
+#                     Injected by the deploy workflows via `extra_env`. deploy#632.
 #
 # Optional environment variables:
 #   POSTGRES_USER      — isnad PostgreSQL user (default: isnad)
@@ -86,6 +95,21 @@ RCLONE_REMOTE="isnad"
 : "${B2_KEY_ID:?B2_KEY_ID must be set}"
 : "${B2_APP_KEY:?B2_APP_KEY must be set}"
 : "${B2_BUCKET:?B2_BUCKET must be set}"
+: "${BACKUP_PREFIX:?BACKUP_PREFIX must be set (stg|prod) — the B2 remote path is namespaced per environment so that prod cannot purge the stg backups. See deploy#632.}"
+
+# A prefix carrying a slash or a `..` would escape its namespace and reach into the
+# other environment — the exact thing the prefix exists to prevent. Refuse rather
+# than sanitize: there is no legitimate value outside this charset.
+if [[ ! "$BACKUP_PREFIX" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    echo "FATAL: BACKUP_PREFIX='${BACKUP_PREFIX}' is not a bare name ([a-z0-9][a-z0-9-]*)." >&2
+    echo "       A prefix containing '/' or '..' escapes its environment namespace." >&2
+    exit 1
+fi
+
+# The REMOTE path is namespaced; the LOCAL one is not. BACKUP_DIR is already
+# per-host, so a prefix there would buy nothing and would churn restore.sh's
+# local-run selection for no reason. Only the shared bucket needs the namespace.
+REMOTE_SUBDIR="${BACKUP_PREFIX}/${BACKUP_SUBDIR}"
 
 # Export rclone native env vars for credential-safe operation (no CLI flags)
 export RCLONE_CONFIG_ISNAD_TYPE="b2"
@@ -300,7 +324,7 @@ fi
 log "INFO" "=== Backup started (${BACKUP_CATEGORY}) ==="
 log "INFO" "Timestamp: ${TIMESTAMP}"
 log "INFO" "Local staging: ${LOCAL_BACKUP_PATH}"
-log "INFO" "Remote target: ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}"
+log "INFO" "Remote target: ${RCLONE_REMOTE}:${B2_BUCKET}/${REMOTE_SUBDIR}"
 
 PG_OK=false
 USER_PG_OK=false
@@ -655,8 +679,8 @@ if [[ "$USER_PG_OK" == "false" ]]; then
     log "ERROR" "user-postgres dump FAILED — accounts, sessions and audit_log are NOT in this backup"
 fi
 
-log "INFO" "Uploading to B2: ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}/"
-if rclone copy "$LOCAL_BACKUP_PATH" "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}/" \
+log "INFO" "Uploading to B2: ${RCLONE_REMOTE}:${B2_BUCKET}/${REMOTE_SUBDIR}/"
+if rclone copy "$LOCAL_BACKUP_PATH" "${RCLONE_REMOTE}:${B2_BUCKET}/${REMOTE_SUBDIR}/" \
     --log-level INFO 2>>"$LOG_FILE"; then
     log "INFO" "Upload complete"
 else
@@ -676,9 +700,15 @@ prune_old_backups() {
     cutoff_epoch=$(date -u -d "${retain_days} days ago" +%s 2>/dev/null) || \
     cutoff_epoch=$(date -u -v-"${retain_days}"d +%s 2>/dev/null)
 
-    # List date-stamped directories under the category
+    # List date-stamped directories under the category — SCOPED TO THIS ENVIRONMENT.
+    #
+    # This is the destructive one (deploy#632). Unprefixed, it listed every date dir
+    # in a bucket SHARED by stg and prod, and the `rclone purge` below deleted any
+    # older than the cutoff — so prod's nightly retention would have deleted STG's
+    # backups, and stg's would have deleted PROD's. Each environment can now only
+    # ever see, and therefore only ever delete, its own.
     local dirs
-    dirs=$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>/dev/null || true)
+    dirs=$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}/${category}/" --dirs-only 2>/dev/null || true)
 
     while IFS= read -r dir; do
         [[ -z "$dir" ]] && continue
@@ -693,11 +723,11 @@ prune_old_backups() {
 
             if [[ "$dir_epoch" -lt "$cutoff_epoch" ]]; then
                 if [[ "$DRY_RUN" == "true" ]]; then
-                    log "INFO" "[DRY RUN] Would prune: ${category}/${dir}/"
+                    log "INFO" "[DRY RUN] Would prune: ${BACKUP_PREFIX}/${category}/${dir}/"
                 else
-                    log "INFO" "Pruning: ${category}/${dir}/"
-                    rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/" 2>>"$LOG_FILE" || \
-                        log "WARNING" "Failed to prune ${category}/${dir}/"
+                    log "INFO" "Pruning: ${BACKUP_PREFIX}/${category}/${dir}/"
+                    rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}/${category}/${dir}/" 2>>"$LOG_FILE" || \
+                        log "WARNING" "Failed to prune ${BACKUP_PREFIX}/${category}/${dir}/"
                 fi
             fi
         fi
@@ -715,7 +745,7 @@ log "INFO" "PostgreSQL (isnad):        $(if $PG_OK; then echo "OK"; else echo "F
 log "INFO" "PostgreSQL (user-service): $(if $USER_PG_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "Neo4j:                     $(if $NEO4J_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "Category:   ${BACKUP_CATEGORY}"
-log "INFO" "Remote:     ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_SUBDIR}/"
+log "INFO" "Remote:     ${RCLONE_REMOTE}:${B2_BUCKET}/${REMOTE_SUBDIR}/"
 log "INFO" "=== Backup finished ==="
 
 # A partial backup is a failed backup: exit non-zero WITHOUT emitting the

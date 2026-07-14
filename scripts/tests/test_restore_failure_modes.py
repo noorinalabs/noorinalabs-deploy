@@ -331,7 +331,14 @@ def _resolve_latest(root: Path) -> str:
         # resolve_latest's STDOUT is its return value, so diagnostics must not land there.
         'log() { shift; echo "$*" >&2; }\n'
         'RCLONE_REMOTE=":local"\n'
-        f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
+        'BACKUP_PREFIX="stg"\n'
+        # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
+        # path in restore.sh is built from it. B2_BUCKET deliberately points at a
+        # path with NO fixtures under it, so a function that rebuilds a raw bucket
+        # path — reaching outside its environment, which IS the deploy#632 bug —
+        # finds nothing and this harness goes RED instead of quietly passing.
+        f'B2_BUCKET="{root}/__unprefixed__"\n'
+        f'REMOTE_ROOT=":local:{root}"\n' + fns + "\nresolve_latest\n"
     )
     r = subprocess.run(  # noqa: S603
         ["bash", "-c", script],  # noqa: S607
@@ -681,7 +688,14 @@ def _resolve_latest_rc(root: str) -> tuple[int, str]:
         "set -euo pipefail\n"
         'log() { shift; echo "$*"; }\n'
         'RCLONE_REMOTE=":local"\n'
-        f'B2_BUCKET="{root}"\n' + fns + "\nresolve_latest\n"
+        'BACKUP_PREFIX="stg"\n'
+        # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
+        # path in restore.sh is built from it. B2_BUCKET deliberately points at a
+        # path with NO fixtures under it, so a function that rebuilds a raw bucket
+        # path — reaching outside its environment, which IS the deploy#632 bug —
+        # finds nothing and this harness goes RED instead of quietly passing.
+        f'B2_BUCKET="{root}/__unprefixed__"\n'
+        f'REMOTE_ROOT=":local:{root}"\n' + fns + "\nresolve_latest\n"
     )
     r = subprocess.run(  # noqa: S603
         ["bash", "-c", script],  # noqa: S607
@@ -769,7 +783,9 @@ def test_list_backups_does_not_report_a_failed_listing_as_none() -> None:
         "set -uo pipefail\n"
         'log() { shift; echo "$*"; }\n'
         'RCLONE_REMOTE=":local"\n'
-        'B2_BUCKET="/nonexistent/bucket/path"\n' + fns + "\nlist_backups\n"
+        'BACKUP_PREFIX="stg"\n'
+        'B2_BUCKET="/nonexistent/bucket/path"\n'
+        'REMOTE_ROOT=":local:/nonexistent/bucket/path"\n' + fns + "\nlist_backups\n"
     )
     r = subprocess.run(  # noqa: S603
         ["bash", "-c", script],  # noqa: S607
@@ -833,7 +849,9 @@ def test_resolve_latest_does_not_read_rclone_stderr_as_a_backup_directory(tmp_pa
         "set -euo pipefail\n"
         'log() { shift; echo "$*"; }\n'
         'RCLONE_REMOTE=":local"\n'
-        f'B2_BUCKET="{tmp_path}"\n' + fns + "\nresolve_latest\n"
+        'BACKUP_PREFIX="stg"\n'
+        f'B2_BUCKET="{tmp_path}/__unprefixed__"\n'
+        f'REMOTE_ROOT=":local:{tmp_path}"\n' + fns + "\nresolve_latest\n"
     )
     r = subprocess.run(  # noqa: S603
         ["bash", "-c", script],  # noqa: S607
@@ -866,7 +884,9 @@ def test_list_backups_does_not_print_rclone_stderr_as_a_backup_name(tmp_path: Pa
         "set -uo pipefail\n"
         'log() { shift; echo "$*"; }\n'
         'RCLONE_REMOTE=":local"\n'
-        f'B2_BUCKET="{tmp_path}"\n' + fns + "\nlist_backups\n"
+        'BACKUP_PREFIX="stg"\n'
+        f'B2_BUCKET="{tmp_path}/__unprefixed__"\n'
+        f'REMOTE_ROOT=":local:{tmp_path}"\n' + fns + "\nlist_backups\n"
     )
     r = subprocess.run(  # noqa: S603
         ["bash", "-c", script],  # noqa: S607

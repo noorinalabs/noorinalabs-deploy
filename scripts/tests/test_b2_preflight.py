@@ -236,6 +236,9 @@ def _run_backup_with_failing_rclone(tmp_path: Path) -> subprocess.CompletedProce
         B2_KEY_ID="fake-key-id",
         B2_APP_KEY="fake-app-key",
         B2_BUCKET="noorinalabs-backups",
+        # backup.sh hard-requires this — stg and prod share a bucket and the remote
+        # path must name its environment (deploy#632). No default exists, by design.
+        BACKUP_PREFIX="stg",
         BACKUP_DIR=str(tmp_path / "backups"),
         COMPOSE_FILE="/dev/null",
     )

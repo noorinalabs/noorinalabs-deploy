@@ -8,6 +8,12 @@
 #   B2_KEY_ID       — Backblaze B2 application key ID
 #   B2_APP_KEY      — Backblaze B2 application key
 #   B2_BUCKET       — Backblaze B2 bucket name
+#   BACKUP_PREFIX   — Environment namespace ("stg" | "prod"). SELECTS WHICH
+#                     ENVIRONMENT'S BACKUPS YOU RESTORE. stg and prod share one
+#                     bucket, so this prefix is the only thing separating them; an
+#                     unprefixed `latest` would resolve across both and could load
+#                     stg's graph into prod. No default, and not needed when
+#                     RESTORE_LOCAL_DIR is set (nothing is read from B2). deploy#632.
 #
 # Optional environment variables:
 #   POSTGRES_USER   — PostgreSQL user (default: isnad)
@@ -59,6 +65,12 @@ RESTORE_LOCAL_DIR="${RESTORE_LOCAL_DIR:-}"
 
 RCLONE_REMOTE="isnad"
 
+# Every remote path in this script is built from REMOTE_ROOT, which CARRIES THE
+# ENVIRONMENT NAMESPACE (deploy#632). Do not reconstruct a path from B2_BUCKET
+# directly — that is how a prod restore reaches stg's artifact. stg and prod share
+# one bucket, so the prefix is the only thing separating them.
+REMOTE_ROOT=""
+
 # B2 credentials are only needed when the artifact is fetched from B2. A local-dir
 # restore must not require them — demanding credentials to read a file already on
 # disk would push the rehearsal back onto the B2 dependency it exists to avoid.
@@ -66,6 +78,17 @@ if [[ -z "$RESTORE_LOCAL_DIR" ]]; then
     : "${B2_KEY_ID:?B2_KEY_ID must be set (or set RESTORE_LOCAL_DIR to restore from disk)}"
     : "${B2_APP_KEY:?B2_APP_KEY must be set (or set RESTORE_LOCAL_DIR to restore from disk)}"
     : "${B2_BUCKET:?B2_BUCKET must be set (or set RESTORE_LOCAL_DIR to restore from disk)}"
+    : "${BACKUP_PREFIX:?BACKUP_PREFIX must be set (stg|prod) — it selects WHICH ENVIRONMENT you restore from. See deploy#632.}"
+
+    # Same refusal as backup.sh: a prefix with a slash or `..` escapes its namespace
+    # and reaches into the other environment. On the RESTORE side that is not merely
+    # untidy — it is how you load the stg graph into prod.
+    if [[ ! "$BACKUP_PREFIX" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        echo "FATAL: BACKUP_PREFIX='${BACKUP_PREFIX}' is not a bare name ([a-z0-9][a-z0-9-]*)." >&2
+        exit 1
+    fi
+
+    REMOTE_ROOT="${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}"
 
     export RCLONE_CONFIG_ISNAD_TYPE="b2"
     export RCLONE_CONFIG_ISNAD_ACCOUNT="${B2_KEY_ID}"
@@ -175,7 +198,7 @@ done
 list_category() {
     local category="$1" out rc=0 err
     err="$(mktemp)"
-    out="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$err")" || rc=$?
+    out="$(rclone lsf "${REMOTE_ROOT}/${category}/" --dirs-only 2>"$err")" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         log "ERROR" "Could not LIST ${category} (rclone rc=${rc}):"
         sed 's/^/    /' "$err" >&2
@@ -364,7 +387,10 @@ run_dumps_arrived() {
 # answer is yes, or you cannot say, do not use an early-exit consumer: use a herestring.
 
 list_backups() {
-    log "INFO" "Available backups in ${B2_BUCKET}:"
+    # Name the PREFIX, not just the bucket. Both environments live in one bucket, so
+    # "Available backups in noorinalabs-backups" invites an operator to assume they are
+    # seeing everything — including the other environment's — when they are not.
+    log "INFO" "Available backups in ${B2_BUCKET}/${BACKUP_PREFIX} (environment: ${BACKUP_PREFIX}):"
     local failed=0
     echo ""
     echo "=== Daily ==="
@@ -420,7 +446,7 @@ backup_is_complete() {
     # is the same disagreement measured in verify_b2_backup_artifact.sh. Anything else means
     # WE COULD NOT LOOK, which is a third outcome and not a value of the predicate.
     lerr="$(mktemp)"
-    listing="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/" 2>"$lerr")" || lrc=$?
+    listing="$(rclone lsf "${REMOTE_ROOT}/${path}/" 2>"$lerr")" || lrc=$?
     if [[ "$lrc" -ne 0 && "$lrc" -ne 3 ]]; then
         log "ERROR" "Could not LIST ${path} (rclone rc=${lrc}):" >&2
         sed 's/^/    /' "$lerr" >&2
@@ -479,7 +505,7 @@ backup_is_complete() {
         [[ -z "$ts" ]] && continue
 
         mrc=0
-        manifest="$(rclone cat "${RCLONE_REMOTE}:${B2_BUCKET}/${path}/_backup_manifest-${ts}.txt" 2>/dev/null)" || mrc=$?
+        manifest="$(rclone cat "${REMOTE_ROOT}/${path}/_backup_manifest-${ts}.txt" 2>/dev/null)" || mrc=$?
         if [[ "$mrc" -ne 0 && "$mrc" -ne 3 ]]; then
             # "I COULD NOT READ IT" IS NOT "IT DOES NOT ATTEST". A transient 401, a throttle or
             # a network blip on the manifest object must NOT collapse into "incomplete" — that
@@ -587,7 +613,7 @@ resolve_latest() {
     for category in daily weekly; do
         local dirs lrc=0 lerr
         lerr="$(mktemp)"
-        dirs="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$lerr")" || lrc=$?
+        dirs="$(rclone lsf "${REMOTE_ROOT}/${category}/" --dirs-only 2>"$lerr")" || lrc=$?
         if [[ "$lrc" -ne 0 ]]; then
             log "ERROR" "Cannot resolve 'latest': could not LIST ${category} (rclone rc=${lrc}):" >&2
             sed 's/^/    /' "$lerr" >&2
@@ -1010,7 +1036,7 @@ if [[ "$FORCE" == "false" ]]; then
     echo "========================================================"
     echo "  WARNING: This will OVERWRITE the current databases."
     echo ""
-    echo "  Backup source: $(if [[ -n "$RESTORE_LOCAL_DIR" ]]; then echo "${RESTORE_LOCAL_DIR} (local dir)"; else echo "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PATH}/"; fi)"
+    echo "  Backup source: $(if [[ -n "$RESTORE_LOCAL_DIR" ]]; then echo "${RESTORE_LOCAL_DIR} (local dir)"; else echo "${REMOTE_ROOT}/${BACKUP_PATH}/"; fi)"
     echo "  Compose file:  ${COMPOSE_FILE}"
     echo "  PostgreSQL DB: ${POSTGRES_DB}"
     echo "  Neo4j:         will be stopped and restored"
@@ -1042,8 +1068,8 @@ if [[ -n "$RESTORE_LOCAL_DIR" ]]; then
     log "INFO" "Using local backup artifact: ${RESTORE_LOCAL_DIR} (B2 download skipped)"
     cp -a "$RESTORE_LOCAL_DIR"/. "$RESTORE_DIR"/
 else
-    log "INFO" "Downloading backup from ${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PATH}/..."
-    if ! rclone copy "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PATH}/" "$RESTORE_DIR/" --log-level INFO; then
+    log "INFO" "Downloading backup from ${REMOTE_ROOT}/${BACKUP_PATH}/..."
+    if ! rclone copy "${REMOTE_ROOT}/${BACKUP_PATH}/" "$RESTORE_DIR/" --log-level INFO; then
         log "ERROR" "Failed to download backup from B2"
         exit 1
     fi
@@ -1278,7 +1304,7 @@ if [[ "$FAILED" -eq 1 ]]; then
 else
     log "INFO" "=== Restore complete ==="
 fi
-log "INFO" "Source: $(if [[ -n "$RESTORE_LOCAL_DIR" ]]; then echo "$RESTORE_LOCAL_DIR (local)"; else echo "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PATH}/"; fi)"
+log "INFO" "Source: $(if [[ -n "$RESTORE_LOCAL_DIR" ]]; then echo "$RESTORE_LOCAL_DIR (local)"; else echo "${REMOTE_ROOT}/${BACKUP_PATH}/"; fi)"
 log "INFO" "PostgreSQL (isnad):        ${PG_RESULT}"
 log "INFO" "PostgreSQL (user-service): ${USER_PG_RESULT}"
 log "INFO" "Neo4j:                     ${NEO4J_RESULT}"
