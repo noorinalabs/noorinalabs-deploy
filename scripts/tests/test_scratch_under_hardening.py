@@ -40,6 +40,28 @@ The unusable parent is ``/proc/self`` — a real directory that exists and refus
 **for uid 0 as well**. ``chmod`` would be a no-op against root, so a root CI runner would
 quietly turn this whole class green; procfs does not care who you are. Same reasoning as the
 ``ENOTDIR`` fixture in ``test_b2_preflight.py``.
+
+WHAT A GREEN RUN MEANS — AND WHAT IT DOES NOT
+---------------------------------------------
+Say it in the narrow words, because the wide words are how deploy#613 shipped inside the fix
+for deploy#617, past a green suite: **a green run of this module means the scripts behave
+honestly when a scratch allocation fails, and no ``mktemp`` in them defaults to /tmp.** It
+does **not** mean the backup path is safe under hardening.
+
+The property that actually matters is *"writes nothing outside ``ReadWritePaths=``"*, and that
+is a runtime property of a process under a namespace. It is not decidable by reading source
+text, and ``mktemp`` is merely where it has bitten us twice. ``> /tmp/foo``, a ``cd /tmp``, a
+config read under ``ProtectHome=yes``, a ``python -c`` calling ``tempfile.mkstemp()`` — each
+fails identically under the unit and none of them is a ``mktemp`` line. (``rclone`` escapes
+``ProtectHome=yes`` today only because ``backup.sh`` configures it entirely through
+``RCLONE_CONFIG_ISNAD_*`` env vars rather than a config file. Nothing tests that, and it is one
+refactor away from being the next defect. — Nino Kavtaradze, #624 review.)
+
+The real gate is **deploy#626**: run the entry points under the hardening *read out of the unit
+file itself*, so the test cannot disagree with production about what production permits. A
+hand-written "read-only /tmp" job would just be a third place to encode the same assumption,
+stale the moment someone edits ``ReadWritePaths=``. This module is the cheap, deterministic
+stopgap that closes the known proxy and buys the time to build that. It is not the answer.
 """
 
 from __future__ import annotations
@@ -95,9 +117,14 @@ def unit_reachable_scripts() -> set[Path]:
     #
     # So this DELIBERATELY OVER-APPROXIMATES: any sibling *.sh whose basename is mentioned
     # anywhere in a unit-reachable script is treated as reachable. Over-inclusion only WIDENS
-    # the scan — it can produce a false red (someone merely names a script in a comment-free
-    # string), never a false green. For a guard against a bug that has shipped twice, that is
-    # the correct direction to be wrong in.
+    # the set of files scanned, so THE RESOLVER can produce a false red (someone merely names
+    # a script in a comment-free string) but not a false green. For a guard against a bug that
+    # has shipped twice, that is the correct direction to be wrong in.
+    #
+    # Read that claim narrowly: it is a property of the RESOLVER, not of the module. Scanning
+    # the right files says nothing about whether the pattern applied to them is sound, and it
+    # says nothing about the writes that are not `mktemp` calls at all. See the module
+    # docstring, "WHAT A GREEN RUN MEANS".
     seen: set[Path] = set()
     pending = list(entry)
     siblings = sorted(SCRIPTS_DIR.glob("*.sh"))
@@ -127,6 +154,27 @@ def unit_reachable_scripts() -> set[Path]:
 # separator.
 _MKTEMP_CALL = re.compile(r"\bmktemp\b([^|;&)`\n]*)")
 
+# ONE rule, no exemptions: in a hardened script, every `mktemp` NAMES ITS PARENT.
+#
+# The first cut accepted a template carrying a `$` or a `/` as proof the call had chosen its
+# own directory. It is not proof, and Nino Kavtaradze broke it three ways (#624 review):
+#
+#   mktemp -t "${X}.XXXXXX"    `-t` puts it in $TMPDIR-or-/tmp. The `${` vouched for it.
+#   mktemp --tmpdir            No `=DIR` means $TMPDIR-or-/tmp. The prefix-match vouched for it.
+#   MUT="$(mktemp)"  # ${BACKUP_DIR}   ...and the bare call passes if a `$` shares the line.
+#
+# The third is the one that matters: this PR's own convention is to write `${BACKUP_DIR}`, so
+# the codebase actively selects for the line that disarms the guard. An escape hatch inside a
+# guard against a bug that has now shipped twice is not a convenience, it is the hole.
+#
+# So the hatch is REMOVED, not narrowed. A call is exempt only if it says where the file goes:
+# `-p <val>` or `--tmpdir=<val>`. Bare `--tmpdir` and `-t` both resolve to $TMPDIR-or-/tmp, so
+# neither is an exemption; `${` is never one. The two legitimate sites in the closure
+# (backup.sh, emit-backup-failure-marker.sh) were converted to `-p` to meet it — same landing
+# directory, now checkable. Cost: `mktemp "$dir/x.XXXXXX"` is a false RED. That is the correct
+# direction to be wrong in, and it is one flag to fix.
+_HAS_PARENT = re.compile(r'(-p\s*["$\w/]|--tmpdir=)')
+
 
 def _mktemp_invocations(line: str) -> list[str]:
     """The argument text of every `mktemp` call on this line, each judged on its own."""
@@ -134,19 +182,8 @@ def _mktemp_invocations(line: str) -> list[str]:
 
 
 def _names_its_parent(args: str) -> bool:
-    """Did THIS mktemp call choose where its file lands, rather than defaulting to /tmp?
-
-    Accepts an explicit parent (`-p DIR`, `--tmpdir=DIR`) or a template carrying a directory
-    (`mktemp "${SUCCESS_TEXTFILE}.XXXXXX"` — lands wherever that variable points, which is the
-    author's choice and is checked elsewhere). A bare `mktemp` / `mktemp -d` chooses /tmp for
-    you, and /tmp is read-only under the unit.
-    """
-    tokens = args.split()
-    if any(t == "-p" or t.startswith("-p") or t.startswith("--tmpdir") for t in tokens):
-        return True
-    # A template argument (non-flag) that contains a path separator or a variable expansion
-    # names its own directory.
-    return any(not t.startswith("-") and ("/" in t or "$" in t) for t in tokens)
+    """Did THIS mktemp call say where its file lands, rather than defaulting to /tmp?"""
+    return _HAS_PARENT.search(args) is not None
 
 
 # A directory that EXISTS and into which no file can be created — for root too.
@@ -317,6 +354,59 @@ def test_neo4j_start_does_not_claim_the_graph_failed_when_scratch_is_unwritable(
         f"the backup has just stopped it — is the worst possible false claim here.\n\n{combined}"
     )
     assert "could not RUN" in combined and "NO evidence" in combined
+
+
+def test_the_offender_filter_itself_separates_tmp_from_not_tmp() -> None:
+    """Calibrate the guard before trusting the guard.
+
+    `test_no_bare_mktemp_survives_in_the_library` reports "0 offenders" over the closure. That
+    number is worth exactly what the filter behind it is worth — and the previous filter was
+    worth nothing against three spellings that all land in /tmp (Nino Kavtaradze, #624 review).
+    An oracle that only ever says CLEAN proves every line clean
+    (cf. `feedback_calibrate_the_mutation_before_counting_it`).
+
+    So: run the filter over both classes and require it to SEPARATE them. Every LANDS_IN_TMP
+    line must be flagged, every NAMES_ITS_PARENT line must not. Anyone who loosens the pattern
+    to wave a line through fails here first, with the reason spelled out.
+    """
+    # Each of these resolves to $TMPDIR-or-/tmp, which is READ-ONLY under the unit.
+    lands_in_tmp = [
+        'tmp="$(mktemp)"',
+        'tmp="$(mktemp -d)"',
+        'tmp="$(mktemp -t probe.XXXXXX)"',
+        'tmp="$(mktemp --tmpdir probe.XXXXXX)"',
+        # `-t` with an expansion in the template: the `${` used to vouch for it.
+        'tmp="$(mktemp -t "${PREFIX}.XXXXXX")"',
+        # A bare call with an unrelated expansion elsewhere on the line. This PR's own
+        # convention is to write ${BACKUP_DIR}, so the codebase SELECTS for this line.
+        'mkdir -p "${BACKUP_DIR}" && tmp="$(mktemp)"',
+        # An unrelated `-p` belonging to some other command on the line.
+        'grep -p foo bar || true; tmp="$(mktemp)"',
+    ]
+    # Each of these says where the file goes. These are the real forms in the closure.
+    names_its_parent = [
+        'tmp="$(mktemp -p "$parent" compose-project-XXXXXX)"',
+        'tmp="$(mktemp -d -p "$scratch_parent" b2-preflight-XXXXXX)"',
+        'TMP="$(mktemp -p "$TEXTFILE_DIR" isnad_backup_failure.prom.XXXXXX)"',
+        'tmp="$(mktemp --tmpdir=/var/lib/x probe.XXXXXX)"',
+    ]
+
+    for line in lands_in_tmp:
+        calls = _mktemp_invocations(line)
+        assert calls, f"the filter did not even SEE a mktemp call in: {line}"
+        assert not all(_names_its_parent(a) for a in calls), (
+            f"FALSE GREEN: this lands in /tmp and the filter waves it through:\n    {line}\n"
+            "Under ProtectSystem=strict /tmp is read-only, so this is deploy#613 again. Only "
+            "an explicit `-p <val>` / `--tmpdir=<val>` is an exemption — not `-t`, not a bare "
+            "`--tmpdir`, and never a `${...}` sharing the line."
+        )
+
+    for line in names_its_parent:
+        calls = _mktemp_invocations(line)
+        assert calls, f"the filter did not even SEE a mktemp call in: {line}"
+        assert all(_names_its_parent(a) for a in calls), (
+            f"FALSE RED: this names its parent and the filter flags it anyway:\n    {line}"
+        )
 
 
 def test_no_bare_mktemp_survives_in_the_library() -> None:

@@ -160,7 +160,14 @@ emit_success_metric() {
     # Atomic write: temp + rename, so Prometheus never scrapes a half-written
     # file. The mktemp suffix means the temp name does NOT end in `.prom`, so
     # the collector ignores it until the rename lands.
-    tmp="$(mktemp "${SUCCESS_TEXTFILE}.XXXXXX")"
+    #
+    # The parent is named EXPLICITLY (`-p`), not implied by a template that
+    # happens to carry a path. Both land in the same directory, but only one of
+    # them is checkable: in a hardened script every mktemp names its parent, so
+    # the guard in test_scratch_under_hardening.py needs no escape hatch to let
+    # this line through — and an escape hatch is exactly what let deploy#613
+    # back in (#624 review, Nino Kavtaradze).
+    tmp="$(mktemp -p "$(dirname "$SUCCESS_TEXTFILE")" "$(basename "$SUCCESS_TEXTFILE").XXXXXX")"
     cat > "$tmp" <<EOF
 # HELP isnad_backup_last_success_timestamp_seconds Unix timestamp of the most recent fully-successful isnad-backup run.
 # TYPE isnad_backup_last_success_timestamp_seconds gauge
