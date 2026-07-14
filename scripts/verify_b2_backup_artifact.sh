@@ -155,6 +155,24 @@ QUIET_ERRORS=false
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [$1] ${*:2}" >&2; }
 
+# Scratch allocation (deploy#625/#628). Sourced AFTER log(), which it reports through.
+#
+# This script does NOT source compose_project.sh — it has no compose concern — which is why
+# the allocator was lifted out of that file into its own. It ran on a bare `mktemp` until now
+# and got away with it only because GitHub Actions hands it a writable /tmp: safe BY ACCIDENT,
+# NOT BY CONSTRUCTION. The scratch parent falls back BACKUP_DIR -> TMPDIR -> /tmp, so on
+# Actions (no BACKUP_DIR) it still resolves, and under a hardened unit it does not reach /tmp.
+VERIFY_SCRATCH_LIB="$(dirname "${BASH_SOURCE[0]}")/scratch.sh"
+if [[ ! -f "$VERIFY_SCRATCH_LIB" ]]; then
+    log "ERROR" "Missing ${VERIFY_SCRATCH_LIB} — no scratch allocator, cannot run safely"
+    exit 1
+fi
+# shellcheck source=scripts/scratch.sh
+source "$VERIFY_SCRATCH_LIB"
+
+# The registry is drained on EXIT — the only trap that runs on SIGTERM (deploy#629).
+trap scratch_cleanup_all EXIT
+
 # One machine-readable line. `status` is set explicitly on every path — it is never
 # inferred from an absence of output, which is the whole point of this script.
 # `undersized` is reported UNCONDITIONALLY. It used to be consulted only when `dumps == 0`,
@@ -244,19 +262,27 @@ scan() {
     # that cannot say WHY it could not look is a diminished version of the third state this
     # whole script is built around. The credential cannot reach this output: it travels via
     # RCLONE_CONFIG_* env, never argv, and RCLONE_DUMP is refused above.
+    # A scratch failure IS an instrument_error — this script's whole design is that "I could
+    # not look" is a distinct outcome from "there is nothing there", and an unallocatable
+    # capture file is the purest possible case of the former. Reporting it as anything else
+    # would be deploy#613 inside the very script built to refuse that mistake. (deploy#628)
     local err
-    err="$(mktemp)"
+    if ! err="$(scratch_file)"; then
+        scratch_failed "The bucket scan" "the bucket, the key, or your backups"
+        result instrument_error scratch_unwritable 0 -1 -1 0 0 -
+        return $EXIT_INSTRUMENT
+    fi
     bucket_listing="$(rclone lsf --recursive --log-level NOTICE "$root" 2>"$err")" || rc=$?
     if [[ $rc -ne 0 ]]; then
         if [[ "$QUIET_ERRORS" != "true" ]]; then
             log ERROR "rclone could not list ${root} (rc=${rc}). Its stderr follows:"
             sed 's/^/    /' "$err" >&2
         fi
-        rm -f "$err"
+        scratch_release "$err"
         result instrument_error unreachable 0 -1 -1 0 0 -
         return $EXIT_INSTRUMENT
     fi
-    rm -f "$err"
+    scratch_release "$err"
     bucket_objects="$(printf '%s' "$bucket_listing" | grep -c . || true)"
 
     # --- 2. Scan the prefix we actually care about. -------------------------
@@ -265,18 +291,25 @@ scan() {
     local base="$root"
     [[ -n "$prefix" ]] && base="${root}/${prefix}"
     rc=0
-    err="$(mktemp)"
+    # `err` is REUSED here, so this is released explicitly rather than by a `trap … RETURN`: a
+    # RETURN trap closes over the variable, not the value, and would free only whatever `$err`
+    # held LAST — leaking every earlier allocation. The EXIT trap backstops the rest.
+    if ! err="$(scratch_file)"; then
+        scratch_failed "The prefix scan" "the bucket, the key, or your backups"
+        result instrument_error scratch_unwritable 0 -1 "$bucket_objects" 0 0 -
+        return $EXIT_INSTRUMENT
+    fi
     listing="$(rclone lsf --recursive --format tsp --separator ';' --log-level NOTICE "$base" 2>"$err")" || rc=$?
     if [[ $rc -ne 0 ]]; then
         if [[ "$QUIET_ERRORS" != "true" ]]; then
             log ERROR "rclone could not list ${base} (rc=${rc}). Its stderr follows:"
             sed 's/^/    /' "$err" >&2
         fi
-        rm -f "$err"
+        scratch_release "$err"
         result instrument_error unreachable 0 -1 "$bucket_objects" 0 0 -
         return $EXIT_INSTRUMENT
     fi
-    rm -f "$err"
+    scratch_release "$err"
 
     # --- 3. Group by RUN, and ask each RUN whether it is restorable.
     #
@@ -475,7 +508,13 @@ scan() {
         # So: 0 => read it (empty on B2 means absent); 3 => local not-found, absent;
         # anything else => we could not look, and we must say so.
         local manifest mrc=0 merr
-        merr="$(mktemp)"
+        # "Could not allocate a capture file" ≠ "the manifest does not attest". Same distinction
+        # this whole block exists to preserve for a 401 or a throttle. (deploy#628)
+        if ! merr="$(scratch_file)"; then
+            scratch_failed "The manifest read for run ${rts}" "whether that run is complete"
+            result instrument_error scratch_unwritable "${run_dumps["$key"]:-0}" -1 "$bucket_objects" "$undersized_total" "$torn_count" "${dir:-/}"
+            return $EXIT_INSTRUMENT
+        fi
         manifest="$(rclone cat --log-level NOTICE "${mpath}/_backup_manifest-${rts}.txt" 2>"$merr")" || mrc=$?
         if [[ "$mrc" -ne 0 && "$mrc" -ne 3 ]]; then
             if [[ "$QUIET_ERRORS" != "true" ]]; then
@@ -483,11 +522,11 @@ scan() {
                 sed 's/^/    /' "$merr" >&2
                 log ERROR "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look."
             fi
-            rm -f "$merr"
+            scratch_release "$merr"
             result instrument_error manifest_unreadable "${run_dumps["$key"]:-0}" -1 "$bucket_objects" "$undersized_total" "$torn_count" "${dir:-/}"
             return $EXIT_INSTRUMENT
         fi
-        rm -f "$merr"
+        scratch_release "$merr"
 
         # Whole-TOKEN match on the FIRST manifest line, with NO EARLY-EXIT PIPELINE — see
         # `manifest_attests_complete` above for why the pipeline form could report a COMPLETE,
@@ -639,9 +678,22 @@ scan() {
 self_test() {
     local tmp fails=0 out status rc
     QUIET_ERRORS=true
-    tmp="$(mktemp -d)"
-    # shellcheck disable=SC2064  # expand $tmp now, deliberately
-    trap "rm -rf '$tmp'" RETURN
+    # scratch_dir, not `mktemp -d` (deploy#628). The self-test's fixture tree is the largest
+    # thing this script writes, and a DIRECTORY THAT EXISTS IS NOT ONE YOU CAN WRITE INTO —
+    # scratch_dir proves the write before handing it back, so a fixture build cannot fail
+    # halfway and be read as a scanner defect.
+    if ! tmp="$(scratch_dir)"; then
+        scratch_failed "The self-test" "the scanner, the bucket, or your backups"
+        return 1
+    fi
+    # NO `trap … RETURN`. The one that used to be here interpolated the path into a string bash
+    # re-parses at return time (`trap "rm -rf '$tmp'" RETURN`), so a quote in the scratch parent
+    # broke the `rm -rf` — the hazard b2_preflight.sh:244 already carries a comment about. But
+    # the single-quoted form is not the fix either: a RETURN trap is GLOBAL, stays armed after
+    # the function returns, and re-fires on the next function's return with `$tmp` out of scope
+    # (`set -u` -> unbound variable -> the script dies). The EXIT trap installed at the top of
+    # this file drains everything this process allocated, by PID tag, on every exit path
+    # including a SIGTERM — so no per-function trap is needed at all. (deploy#629)
 
     _expect() { # <label> <root> <prefix> <want-status> <want-rc> [max-age-hours] [want-torn]
         local label="$1" root="$2" prefix="$3" want="$4" want_rc="$5" want_age="${6:-}"

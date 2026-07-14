@@ -135,6 +135,11 @@ source "$COMPOSE_PROJECT_LIB"
 # Cleanup
 # ---------------------------------------------------------------------------
 cleanup() {
+    # Drain any scratch still held. The `trap … RETURN` at each call site covers the ordinary
+    # routes; it does NOT fire on a signal (measured — deploy#629). The EXIT trap DOES run on
+    # SIGTERM, so this is the only place a killed run gets cleaned up at all. SIGKILL is
+    # untrappable by construction and is handled by scratch_reap_stale instead.
+    scratch_cleanup_all
     if [[ -d "$RESTORE_DIR" ]]; then
         rm -rf "$RESTORE_DIR"
         log "INFO" "Cleaned up restore staging directory"
@@ -197,16 +202,28 @@ done
 # is the path nobody tests as hard. Found by both reviewers independently.
 list_category() {
     local category="$1" out rc=0 err
-    err="$(mktemp)"
+    # scratch_file, not `mktemp` (deploy#628). A bare mktemp lands in /tmp, and this script is
+    # about to be run from a workflow (deploy#640) rather than only by an operator with a
+    # writable one. A failed allocation must announce ITSELF — never arrive here as an
+    # ambiguous redirect that gets reported as "Could not LIST" (that is deploy#613/#623).
+    if ! err="$(scratch_file)"; then
+        scratch_failed "The ${category} listing" "your backups"
+        return 1
+    fi
+
+    # Explicit release, NOT a `trap … RETURN` — a RETURN trap stays armed after this function
+    # returns and re-fires on the next one, where `$err` is out of scope (`set -u` -> unbound
+    # variable -> the script dies). See compose_project.sh:running_services. The EXIT drain in
+    # cleanup() is the backstop for a kill or a branch added later. (deploy#629)
     out="$(rclone lsf "${REMOTE_ROOT}/${category}/" --dirs-only 2>"$err")" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         log "ERROR" "Could not LIST ${category} (rclone rc=${rc}):"
         sed 's/^/    /' "$err" >&2
         log "ERROR" "  This is an INSTRUMENT failure — NOT a claim that you have no backups."
-        rm -f "$err"
+        scratch_release "$err"
         return 1
     fi
-    rm -f "$err"
+    scratch_release "$err"
     if [[ -z "$out" ]]; then
         echo "  (none)"
     else
@@ -445,16 +462,24 @@ backup_is_complete() {
     # EMPTY output. Neither is an instrument failure — the backends simply disagree, and this
     # is the same disagreement measured in verify_b2_backup_artifact.sh. Anything else means
     # WE COULD NOT LOOK, which is a third outcome and not a value of the predicate.
-    lerr="$(mktemp)"
+    # A scratch failure is the THIRD outcome this function already models — "I could not look"
+    # (rc=2), never "the backup is incomplete" (rc=1). Routing it anywhere else would turn a
+    # read-only /tmp into a verdict on somebody's backup, mid-restore (deploy#628).
+    if ! lerr="$(scratch_file)"; then
+        scratch_failed "The completeness check for ${path}" "whether that backup is complete" >&2
+        return 2
+    fi
+
+    # Explicit release — see list_category on why a `trap … RETURN` here kills the script.
     listing="$(rclone lsf "${REMOTE_ROOT}/${path}/" 2>"$lerr")" || lrc=$?
     if [[ "$lrc" -ne 0 && "$lrc" -ne 3 ]]; then
         log "ERROR" "Could not LIST ${path} (rclone rc=${lrc}):" >&2
         sed 's/^/    /' "$lerr" >&2
         log "ERROR" "  This is NOT a claim that the backup is incomplete — it is a claim that I could not look." >&2
-        rm -f "$lerr"
+        scratch_release "$lerr"
         return 2
     fi
-    rm -f "$lerr"
+    scratch_release "$lerr"
 
     # A directory with NO run manifests is an ordinary artifact — every pre-deploy#559 backup
     # predates the manifest entirely.
@@ -612,17 +637,24 @@ resolve_latest() {
     # which is why the scanner's step-1 probe captures this rc and this one did not.
     for category in daily weekly; do
         local dirs lrc=0 lerr
-        lerr="$(mktemp)"
+        # Released explicitly per iteration rather than by a `trap … RETURN`: the allocation is
+        # inside the loop, and a RETURN trap fires once, on the way out of resolve_latest — so
+        # it would free only the LAST iteration's file and leak every earlier one. The EXIT trap
+        # (cleanup -> scratch_cleanup_all) is what backstops the `exit 1` below. (deploy#629)
+        if ! lerr="$(scratch_file)"; then
+            scratch_failed "Resolving 'latest'" "your backups" >&2
+            exit 1
+        fi
+
         dirs="$(rclone lsf "${REMOTE_ROOT}/${category}/" --dirs-only 2>"$lerr")" || lrc=$?
         if [[ "$lrc" -ne 0 ]]; then
             log "ERROR" "Cannot resolve 'latest': could not LIST ${category} (rclone rc=${lrc}):" >&2
             sed 's/^/    /' "$lerr" >&2
             log "ERROR" "  This is an INSTRUMENT failure, NOT a verdict on your backups." >&2
             log "ERROR" "  Check credentials/connectivity and retry, or name a backup explicitly." >&2
-            rm -f "$lerr"
             exit 1
         fi
-        rm -f "$lerr"
+        scratch_release "$lerr"
         while IFS= read -r dir; do
             [[ -z "$dir" ]] && continue
             dir="${dir%/}"
@@ -761,7 +793,15 @@ restore_postgres() {
 
     terminate_pg_connections "$service" "$pg_user" "$pg_db"
 
-    out="$(mktemp)"
+    # This one is not a stderr capture — it holds pg_restore's whole output, and the restore is
+    # driven THROUGH it (`> "$out" 2>&1`). An unallocatable scratch here would make the redirect
+    # die, and bash would never exec pg_restore at all: rc=1, reported as a FAILED RESTORE of a
+    # dump that was never opened. That is the deploy#613 shape in the most expensive possible
+    # place — an operator mid-incident, told their backup will not restore. (deploy#628)
+    if ! out="$(scratch_file)"; then
+        scratch_failed "The ${label} restore" "the dump, the database, or the restore"
+        return 1
+    fi
 
     # `--exit-on-error` is deliberately NOT passed: without it pg_restore keeps going
     # past a failing object and still exits non-zero, so an operator mid-incident
@@ -788,9 +828,15 @@ restore_postgres() {
     # Surface pg_restore's own diagnostics regardless of outcome.
     sed 's/^/    /' "$out"
 
+    # Released per branch, as before. A `trap … RETURN` would be the tidier-looking way to cover
+    # all three at once, and it is the thing deploy#629 asked for — but it stays armed after this
+    # function returns and re-fires on the next one with `$out` out of scope, which under `set -u`
+    # kills the restore mid-incident (see compose_project.sh:running_services). The branch nobody
+    # has written yet is covered by cleanup()'s scratch_cleanup_all, which sweeps by PID tag and
+    # therefore does not need to know which branch leaked.
     if [[ $rc -ne 0 ]]; then
         log "ERROR" "${label}: pg_restore FAILED (exit ${rc}) — the database may be partially restored"
-        rm -f "$out"
+        scratch_release "$out"
         return 1
     fi
 
@@ -800,11 +846,11 @@ restore_postgres() {
         local ignored
         ignored=$(grep -oE 'errors ignored on restore: [0-9]+' "$out" | grep -oE '[0-9]+$' | tail -1)
         log "ERROR" "${label}: pg_restore ignored ${ignored} error(s) — treating as a failed restore"
-        rm -f "$out"
+        scratch_release "$out"
         return 1
     fi
 
-    rm -f "$out"
+    scratch_release "$out"
     log "INFO" "${label} restore complete"
     return 0
 }

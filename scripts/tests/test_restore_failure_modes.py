@@ -42,6 +42,7 @@ from manifest_fixture import build_manifest, manifest_filename
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = SCRIPTS_DIR.parent
 RESTORE = SCRIPTS_DIR / "restore.sh"
+SCRATCH_LIB = SCRIPTS_DIR / "scratch.sh"
 REHEARSAL = SCRIPTS_DIR / "restore_rehearsal.sh"
 REHEARSAL_COMPOSE = REPO_ROOT / "compose" / "docker-compose.rehearsal.yml"
 
@@ -330,6 +331,8 @@ def _resolve_latest(root: Path) -> str:
         "set -euo pipefail\n"
         # resolve_latest's STDOUT is its return value, so diagnostics must not land there.
         'log() { shift; echo "$*" >&2; }\n'
+        # See the note in the other builders: restore.sh sources this, so the harness must too.
+        f'source "{SCRATCH_LIB}"\n'
         'RCLONE_REMOTE=":local"\n'
         'BACKUP_PREFIX="stg"\n'
         # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
@@ -687,6 +690,14 @@ def _resolve_latest_rc(root: str) -> tuple[int, str]:
         # is exactly the operation that can legitimately match nothing.
         "set -euo pipefail\n"
         'log() { shift; echo "$*"; }\n'
+        # restore.sh SOURCES the scratch library (deploy#625/#628), so a harness that slices its
+        # functions out must source it too. Without this the sliced code calls `scratch_file`
+        # into a void: bash says "command not found", the allocation appears to FAIL, and the
+        # function under test takes an error path for a reason production would never have —
+        # while the assertion that was actually being made goes untested. A harness running
+        # production code in an environment production does not have is not running production
+        # code (same lesson as the missing `-e`, documented in `_resolve_latest`).
+        f'source "{SCRATCH_LIB}"\n'
         'RCLONE_REMOTE=":local"\n'
         'BACKUP_PREFIX="stg"\n'
         # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
@@ -782,6 +793,14 @@ def test_list_backups_does_not_report_a_failed_listing_as_none() -> None:
     script = (
         "set -uo pipefail\n"
         'log() { shift; echo "$*"; }\n'
+        # restore.sh SOURCES the scratch library (deploy#625/#628), so a harness that slices its
+        # functions out must source it too. Without this the sliced code calls `scratch_file`
+        # into a void: bash says "command not found", the allocation appears to FAIL, and the
+        # function under test takes an error path for a reason production would never have —
+        # while the assertion that was actually being made goes untested. A harness running
+        # production code in an environment production does not have is not running production
+        # code (same lesson as the missing `-e`, documented in `_resolve_latest`).
+        f'source "{SCRATCH_LIB}"\n'
         'RCLONE_REMOTE=":local"\n'
         'BACKUP_PREFIX="stg"\n'
         'B2_BUCKET="/nonexistent/bucket/path"\n'
@@ -848,6 +867,14 @@ def test_resolve_latest_does_not_read_rclone_stderr_as_a_backup_directory(tmp_pa
     script = (
         "set -euo pipefail\n"
         'log() { shift; echo "$*"; }\n'
+        # restore.sh SOURCES the scratch library (deploy#625/#628), so a harness that slices its
+        # functions out must source it too. Without this the sliced code calls `scratch_file`
+        # into a void: bash says "command not found", the allocation appears to FAIL, and the
+        # function under test takes an error path for a reason production would never have —
+        # while the assertion that was actually being made goes untested. A harness running
+        # production code in an environment production does not have is not running production
+        # code (same lesson as the missing `-e`, documented in `_resolve_latest`).
+        f'source "{SCRATCH_LIB}"\n'
         'RCLONE_REMOTE=":local"\n'
         'BACKUP_PREFIX="stg"\n'
         f'B2_BUCKET="{tmp_path}/__unprefixed__"\n'
@@ -883,6 +910,14 @@ def test_list_backups_does_not_print_rclone_stderr_as_a_backup_name(tmp_path: Pa
     script = (
         "set -uo pipefail\n"
         'log() { shift; echo "$*"; }\n'
+        # restore.sh SOURCES the scratch library (deploy#625/#628), so a harness that slices its
+        # functions out must source it too. Without this the sliced code calls `scratch_file`
+        # into a void: bash says "command not found", the allocation appears to FAIL, and the
+        # function under test takes an error path for a reason production would never have —
+        # while the assertion that was actually being made goes untested. A harness running
+        # production code in an environment production does not have is not running production
+        # code (same lesson as the missing `-e`, documented in `_resolve_latest`).
+        f'source "{SCRATCH_LIB}"\n'
         'RCLONE_REMOTE=":local"\n'
         'BACKUP_PREFIX="stg"\n'
         f'B2_BUCKET="{tmp_path}/__unprefixed__"\n'

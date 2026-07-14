@@ -20,6 +20,20 @@ SyslogIdentifier=BACKUP_FAILURE
 # script. See deploy#121 Bug E.
 ExecStart=/opt/noorinalabs-deploy/scripts/emit-backup-failure-marker.sh
 
+# THE SCRATCH PARENT, AND WHY THIS UNIT NEEDED IT MOST. (deploy#666)
+#
+# This unit grants ONLY /var/lib/node_exporter. It sets no BACKUP_DIR and no TMPDIR, and
+# ProtectSystem=strict makes /tmp READ-ONLY — so scratch.sh's old
+# `BACKUP_DIR -> TMPDIR -> /tmp` chain had EVERY LINK UNWRITABLE here, and terminated on the
+# very read-only /tmp that caused deploy#613 and deploy#623. Even BACKUP_DIR would not have
+# helped: /var/lib/noorinalabs-backups is not granted to this unit either.
+#
+# This is the OnFailure= handler. A scratch failure here means THE FAILURE SIGNAL ITSELF NEVER
+# LANDS — and it could only ever manifest on a night when something else had already broken.
+#
+# So the parent is declared, and it is inside ReadWritePaths= below by construction.
+Environment=SCRATCH_PARENT=/var/lib/node_exporter
+
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
