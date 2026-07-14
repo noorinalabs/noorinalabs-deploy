@@ -44,6 +44,7 @@ is not. Saying so in the narrow words, because the wide words are how deploy#613
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -54,7 +55,11 @@ BACKUP_SH = REPO_ROOT / "scripts" / "backup.sh"
 DEPLOY_STG = REPO_ROOT / ".github" / "workflows" / "deploy-stg.yml"
 DEPLOY_PROD = REPO_ROOT / ".github" / "workflows" / "deploy-prod.yml"
 
-BUCKET = "isnad-graph-backups"
+# The REAL bucket, matching the fixtures in test_b2_preflight.py and
+# test_compose_project_scoping.py. Not `isnad-graph-backups` — that is a legacy, EMPTY bucket
+# that nothing writes to, and naming it in a fixture would quietly teach the next reader the
+# same wrong thing the runbook did (deploy#636).
+BUCKET = "noorinalabs-backups"
 
 # The words rclone's stub writes to STDERR when the listing fails. The point of the fix is
 # that THESE WORDS REACH THE OPERATOR — the pre-fix `2>/dev/null` ate them. An assertion on a
@@ -613,11 +618,121 @@ def test_an_unknown_host_WARNS_and_does_not_testify(tmp_path: Path) -> None:
 
 
 def _workflow_prefix(workflow: Path) -> str:
-    import re
-
     m = re.search(r"^\s*BACKUP_PREFIX=(\S+)", workflow.read_text(), re.MULTILINE)
     assert m, f"{workflow.name} does not inject BACKUP_PREFIX at all"
     return m.group(1)
+
+
+# ---------------------------------------------------------------------------
+# deploy#636 — an operator-facing example must not be a loaded gun.
+# ---------------------------------------------------------------------------
+
+RUNBOOK = REPO_ROOT / "RUNBOOK.md"
+VERIFY_SH = REPO_ROOT / "scripts" / "verify_b2_backup_artifact.sh"
+
+# The legacy bucket. It EXISTS in B2 and it is EMPTY — nothing writes to it. Measured
+# 2026-07-14: `isnad-graph-backups` = 0 objects, `noorinalabs-backups` = 27 (9 stg + 18 prod).
+EMPTY_LEGACY_BUCKET = "isnad-graph-backups"
+LIVE_BUCKET = "noorinalabs-backups"
+
+# An rclone path into the backups remote, as it appears in a RUNNABLE example.
+_RCLONE_PATH = re.compile(r"isnad:(?P<bucket>[a-z0-9-]+)(?P<rest>/\S*)?")
+
+# The environment must appear immediately under the bucket. `${B2_BUCKET}/${{ matrix.env }}`
+# and a literal `stg`/`prod` both qualify; a bare bucket root does not.
+_HAS_ENV = re.compile(r"^/(?:stg|prod|\$)")
+
+
+def _runnable_rclone_paths() -> list[tuple[str, str]]:
+    """Every rclone backups path an operator could COPY AND RUN, as (source, line).
+
+    Prose that *names* the empty bucket in order to warn about it is not a runnable example
+    and must not be flagged — otherwise the only way to satisfy this guard would be to delete
+    the warning, which is the one thing that must survive. So this reads exactly two things:
+
+      * fenced ```bash blocks in RUNBOOK.md  — what an operator copies
+      * `#   B2_ROOT="isnad:…` usage lines   — the shell scripts' copy-paste examples
+
+    The blockquote warning in RUNBOOK.md and the explanatory comments in the scripts are
+    neither, and are correctly invisible here.
+    """
+    out: list[tuple[str, str]] = []
+
+    in_bash = False
+    for line in RUNBOOK.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_bash = stripped.startswith("```bash")
+            continue
+        if in_bash and "isnad:" in line:
+            out.append((RUNBOOK.name, line.strip()))
+
+    for line in VERIFY_SH.read_text().splitlines():
+        if re.match(r'^#\s+B2_ROOT="isnad:', line.strip()):
+            out.append((VERIFY_SH.name, line.strip()))
+
+    return out
+
+
+def test_the_detector_sees_a_runnable_example_and_ignores_the_warning() -> None:
+    """Calibrate before reading. A guard that flags nothing is not a guard, and one that
+    flags the WARNING would force someone to delete the warning to get green."""
+    found = _runnable_rclone_paths()
+    assert found, (
+        "the detector found NO runnable rclone examples at all — it is inert, and every "
+        "assertion below it is worthless."
+    )
+    # It must be reading the real examples, not the prose that merely mentions the bucket.
+    joined = " ".join(line for _, line in found)
+    assert LIVE_BUCKET in joined, f"the detector is not seeing the real examples: {found}"
+
+
+def test_no_operator_example_names_the_EMPTY_bucket() -> None:
+    """RUNBOOK.md:346 named `isnad-graph-backups` — a bucket that exists and holds NOTHING.
+
+    This is not a stale-doc nit. An operator doing a DR restore follows the line, runs
+    `rclone lsf isnad:isnad-graph-backups/`, gets a clean and confident ZERO, and concludes
+    THE BACKUPS DO NOT EXIST — while 27 objects sit in `noorinalabs-backups`. A silent zero is
+    not a measurement, and this one was pre-baked into the document you only ever read when
+    you are already in trouble.
+    """
+    offenders = [
+        f"{src}: {line}" for src, line in _runnable_rclone_paths() if EMPTY_LEGACY_BUCKET in line
+    ]
+    assert not offenders, (
+        f"a runnable example names the EMPTY legacy bucket `{EMPTY_LEGACY_BUCKET}`. Copy-pasted "
+        f"during an incident it returns zero objects and reads as 'there are no backups':\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_every_operator_example_names_its_environment() -> None:
+    """stg and prod share one bucket. A path at the ROOT reads both environments as one pool,
+    so a prod check reports healthy on the strength of a staging backup (deploy#632/#633).
+
+    THE ENVIRONMENT HAS TWO LEGAL SPELLINGS, and a gate that knows only one of them is a gate
+    that blocks the correct fix. `verify_b2_backup_artifact.sh` accepts the environment either
+    baked into B2_ROOT (`isnad:<bucket>/prod`) or carried alongside it (`B2_PREFIX="prod"`), and
+    both are correct. The first cut of this detector matched only the path form and went RED on
+    the script's own documented B2_PREFIX example — a line-scan gate must match EVERY syntactic
+    form, not the one the author happened to write first
+    (`feedback_lint_gate_cover_all_syntactic_forms`).
+    """
+    offenders = []
+    for src, line in _runnable_rclone_paths():
+        # The environment may be supplied out-of-band on the same line.
+        if re.search(r'B2_PREFIX="?(?:stg|prod|\$)', line):
+            continue
+        for m in _RCLONE_PATH.finditer(line):
+            rest = m.group("rest") or ""
+            if not _HAS_ENV.match(rest):
+                offenders.append(f"{src}: {line}")
+
+    assert not offenders, (
+        "a runnable example reaches into the backups bucket without naming an environment. "
+        "stg and prod share it, so this scans BOTH and reports fresh on whichever it finds:\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 def test_each_deploy_workflow_injects_ITS_OWN_environment() -> None:

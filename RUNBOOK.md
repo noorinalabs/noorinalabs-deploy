@@ -343,19 +343,38 @@ hand-edited file on the box.
 
 | Path | GH secret names (env scope) | VPS env-var names | Bucket | Consumer |
 |---|---|---|---|---|
-| Backups | `BACKUP_B2_KEY_ID`, `BACKUP_B2_APP_KEY`, `BACKUP_B2_BUCKET` | `B2_KEY_ID`, `B2_APP_KEY`, `B2_BUCKET` | `isnad-graph-backups` | `scripts/backup.sh`, `scripts/restore.sh` (rclone-native via `RCLONE_CONFIG_ISNAD_*` exports inside the script) |
+| Backups | `BACKUP_B2_KEY_ID`, `BACKUP_B2_APP_KEY`, `BACKUP_B2_BUCKET` | `B2_KEY_ID`, `B2_APP_KEY`, `B2_BUCKET` | `noorinalabs-backups` | `scripts/backup.sh`, `scripts/restore.sh` (rclone-native via `RCLONE_CONFIG_ISNAD_*` exports inside the script) |
 | Terraform state | `TF_STATE_B2_KEY_ID`, `TF_STATE_B2_APP_KEY` (also exposed as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` to the S3-protocol backend) | n/a (Actions only) | `noorinalabs-terraform-state` | `terraform.yml` |
 | Pipeline ingest | `PIPELINE_B2_KEY_ID`, `PIPELINE_B2_KEY` | `PIPELINE_B2_KEY_ID`, `PIPELINE_B2_KEY` | (declared in data-acquisition repo) | data-acquisition / ingest workers |
 
-Rotating one path does not affect the others. The local FS path
-`/var/lib/noorinalabs-backups` is the staging directory `backup.sh`
-writes to before the rclone upload — it is **not** a B2 bucket name and
-does not need rotation.
+Rotating one path does not affect the others.
+
+> ### ⚠️ Two similar names. One of them is a trap. (deploy#636)
+>
+> | Name | What it is |
+> |---|---|
+> | **`noorinalabs-backups`** | the **B2 bucket** — every real backup lives here |
+> | **`/var/lib/noorinalabs-backups`** | a **local directory** on the VPS — the staging area `backup.sh` writes to before the rclone upload. **Not** a bucket. Does not need rotation. |
+> | **`isnad-graph-backups`** | a **legacy, EMPTY B2 bucket**. Nothing writes to it and nothing ever will. |
+>
+> This table used to name `isnad-graph-backups` as the backup bucket, and that
+> is worse than a stale doc: an operator mid-incident copies the line, runs
+> `rclone lsf isnad:isnad-graph-backups/`, gets **zero objects**, and concludes
+> **the backups do not exist**. Measured 2026-07-14: `isnad-graph-backups` = 0
+> objects, `noorinalabs-backups` = 27 (9 `stg/` + 18 `prod/`). A silent zero is
+> not a measurement — least of all in the document someone reads when they are
+> already in trouble.
+>
+> **Always name the environment prefix too.** stg and prod share this one
+> bucket, namespaced as `noorinalabs-backups/stg/…` and
+> `noorinalabs-backups/prod/…` (deploy#632). A path at the bucket **root**
+> reads both environments' objects as one pool, so a prod check can report
+> healthy on the strength of a staging backup.
 
 **Rotation procedure (backup path — most common):**
 
 1. Generate a new B2 application key in the Backblaze console scoped to
-   the `isnad-graph-backups` bucket only (read+write+delete).
+   the `noorinalabs-backups` bucket only (read+write+delete).
 2. Update the env-scoped GH secrets:
    ```bash
    gh secret set BACKUP_B2_KEY_ID  --env staging    --body "$NEW_KEY_ID"
@@ -375,7 +394,15 @@ does not need rotation.
    sudo journalctl -u isnad-backup.service -n 200
    ```
    Confirm the rclone upload step exits 0 and a new dated subdirectory
-   appears in the B2 bucket.
+   appears under **that host's own prefix** — never at the bucket root:
+   ```bash
+   rclone lsf isnad:noorinalabs-backups/stg/daily/    # on stg
+   rclone lsf isnad:noorinalabs-backups/prod/daily/   # on prod
+   ```
+   An empty result here is **not** proof the backup is missing: a key that
+   is not permitted to list a prefix returns `rc=0` and an empty listing,
+   not an error (deploy#634/#638). Check `isnad_backup_retention_ok` and the
+   journal before concluding anything from a zero.
 5. Revoke the old keys in the Backblaze console only after step 4 has
    passed on **both** stg and prod.
 

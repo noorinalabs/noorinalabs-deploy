@@ -74,25 +74,32 @@
 # shown to return all four cannot be believed when it returns one.
 #
 # Usage:
-#   # ALWAYS NAME THE ENVIRONMENT. (deploy#636)
+#   # NAME THE REAL BUCKET, AND ALWAYS NAME THE ENVIRONMENT. (deploy#636)
 #   #
-#   # This example used to read `B2_ROOT="isnad:isnad-graph-backups"` — the BUCKET ROOT, with
-#   # no environment in it. stg and prod SHARE one bucket, so that scans BOTH environments'
-#   # objects at once and reports `fresh` on whichever it happens to find. It is the exact
-#   # cross-environment false-green that deploy#633 removed from verify-backup-artifact.yml —
-#   # where the prod leg of the [stg, prod] matrix would have reported healthy on the strength
-#   # of STAGING's backup, on the one check that exists because every other signal can lie.
+#   # This example used to read `B2_ROOT="isnad:isnad-graph-backups"`, and it was wrong TWICE
+#   # over — each wrong in a way that fails toward "you have no backups":
 #   #
-#   # It survived here as a copy-pasteable line in a runbook comment, which is worse than it
-#   # sounds: this is a file an operator reaches for DURING AN INCIDENT, when they are least
-#   # likely to notice the missing path segment.
+#   #   1. WRONG BUCKET. `isnad-graph-backups` is a legacy bucket and it is EMPTY. The live
+#   #      bucket is `noorinalabs-backups` (measured 2026-07-14: 0 objects vs 27). An operator
+#   #      who copies the old line gets a clean, confident ZERO and concludes the backups do
+#   #      not exist — a silent zero pre-baked into the one document you read mid-incident.
+#   #      (Do not confuse it with `/var/lib/noorinalabs-backups`, which is the LOCAL staging
+#   #      directory on the VPS and not a bucket at all. The names really are that close.)
+#   #
+#   #   2. BUCKET ROOT, NO ENVIRONMENT. stg and prod SHARE one bucket (deploy#632), so a root
+#   #      path scans BOTH environments' objects and reports `fresh` on whichever it finds
+#   #      first. That is the cross-environment false-green deploy#633 removed from
+#   #      verify-backup-artifact.yml, where the PROD leg would have reported healthy on the
+#   #      strength of STAGING's backup — on the one check that exists precisely because every
+#   #      other backup signal can lie.
 #   #
 #   # The workflow itself invokes it correctly — B2_ROOT="isnad:${B2_BUCKET}/${{ matrix.env }}"
 #   # (.github/workflows/verify-backup-artifact.yml) — so this is the form to copy:
-#   B2_ROOT="isnad:isnad-graph-backups/prod" ./scripts/verify_b2_backup_artifact.sh
+#   B2_ROOT="isnad:noorinalabs-backups/prod" ./scripts/verify_b2_backup_artifact.sh
+#   B2_ROOT="isnad:noorinalabs-backups/stg"  ./scripts/verify_b2_backup_artifact.sh
 #
 #   # Equivalently, via the sub-path variable:
-#   B2_ROOT="isnad:isnad-graph-backups" B2_PREFIX="prod" ./scripts/verify_b2_backup_artifact.sh
+#   B2_ROOT="isnad:noorinalabs-backups" B2_PREFIX="prod" ./scripts/verify_b2_backup_artifact.sh
 #
 #   ./scripts/verify_b2_backup_artifact.sh --self-test
 #
