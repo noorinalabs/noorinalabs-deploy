@@ -105,8 +105,19 @@ jobs:
 
           # The script self-tests before it reads, and refuses to report a verdict from an
           # uncalibrated scanner. Its exit codes: 0 fresh, 1 alert, 2 instrument error.
+          #
+          # SCAN THIS ENVIRONMENT'S PREFIX, NOT THE WHOLE BUCKET (deploy#632).
+          #
+          # stg and prod share one bucket. Scanning the bucket ROOT meant both matrix legs
+          # read the SAME objects, so THE PROD LEG WOULD HAVE REPORTED `fresh` ON THE
+          # STRENGTH OF STAGING'S BACKUP — a false green on the one check that exists
+          # precisely because every other backup signal can lie. It was invisible only
+          # because the bucket had never held a single object; the first successful stg
+          # backup (2026-07-14) is what would have armed it.
+          #
+          # `matrix.env` is already exactly the prefix name backup.sh writes under.
           set +e
-          OUT="$(B2_ROOT="isnad:${B2_BUCKET}" bash scripts/verify_b2_backup_artifact.sh 2>&1)"
+          OUT="$(B2_ROOT="isnad:${B2_BUCKET}/${{ matrix.env }}" bash scripts/verify_b2_backup_artifact.sh 2>&1)"
           RC=$?
           set -e
           printf '%s\n' "${OUT}"

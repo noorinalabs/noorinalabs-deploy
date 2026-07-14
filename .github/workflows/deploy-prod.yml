@@ -253,6 +253,7 @@ jobs:
             SLACK_WEBHOOK_FILE=slack_webhook_url.secret
             SMTP_PASSWORD_FILE=smtp_password.secret
             HEALTHCHECKS_URL_FILE=healthchecks_url.secret
+            BACKUP_PREFIX=prod
           base_domain: noorinalabs.com
           # Tiered prod rollout (deploy#429). Only the app+edge tier is health-
           # gated (`up -d --wait`); the Kafka pipeline tier comes up NON-gating so
