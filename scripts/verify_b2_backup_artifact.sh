@@ -74,38 +74,59 @@
 # shown to return all four cannot be believed when it returns one.
 #
 # Usage:
-#   # NAME THE REAL BUCKET, AND ALWAYS NAME THE ENVIRONMENT. (deploy#636)
+#   # NEVER HARDCODE THE BUCKET. NAME THE ENVIRONMENT. (deploy#636)
 #   #
-#   # This example used to read `B2_ROOT="isnad:isnad-graph-backups"`, and it was wrong TWICE
-#   # over — each wrong in a way that fails toward "you have no backups":
-#   #
-#   #   1. WRONG BUCKET. `isnad-graph-backups` is a legacy bucket and it is EMPTY. The live
-#   #      bucket is `noorinalabs-backups` (measured 2026-07-14: 0 objects vs 27). An operator
-#   #      who copies the old line gets a clean, confident ZERO and concludes the backups do
-#   #      not exist — a silent zero pre-baked into the one document you read mid-incident.
-#   #      (Do not confuse it with `/var/lib/noorinalabs-backups`, which is the LOCAL staging
-#   #      directory on the VPS and not a bucket at all. The names really are that close.)
-#   #
-#   #   2. BUCKET ROOT, NO ENVIRONMENT. stg and prod SHARE one bucket (deploy#632), so a root
-#   #      path scans BOTH environments' objects and reports `fresh` on whichever it finds
-#   #      first. That is the cross-environment false-green deploy#633 removed from
-#   #      verify-backup-artifact.yml, where the PROD leg would have reported healthy on the
-#   #      strength of STAGING's backup — on the one check that exists precisely because every
-#   #      other backup signal can lie.
-#   #
-#   # The workflow itself invokes it correctly — B2_ROOT="isnad:${B2_BUCKET}/${{ matrix.env }}"
-#   # (.github/workflows/verify-backup-artifact.yml) — so this is the form to copy:
-#   B2_ROOT="isnad:noorinalabs-backups/prod" ./scripts/verify_b2_backup_artifact.sh
-#   B2_ROOT="isnad:noorinalabs-backups/stg"  ./scripts/verify_b2_backup_artifact.sh
+#   # Export the B2 credentials FIRST — this script, unlike backup.sh, does NOT configure
+#   # rclone for you. backup.sh sets RCLONE_CONFIG_ISNAD_{TYPE,ACCOUNT,KEY} itself; this one
+#   # inherits them. Run it from a bare shell without them and rclone dies with
+#   # "didn't find section in config file", which names neither the bucket nor the key and
+#   # sends you looking for an rclone.conf that does not exist (Bereket Tadesse, #644 review).
+#   export RCLONE_CONFIG_ISNAD_TYPE=b2
+#   export RCLONE_CONFIG_ISNAD_ACCOUNT="$B2_KEY_ID"
+#   export RCLONE_CONFIG_ISNAD_KEY="$B2_APP_KEY"
 #
-#   # Equivalently, via the sub-path variable:
-#   B2_ROOT="isnad:noorinalabs-backups" B2_PREFIX="prod" ./scripts/verify_b2_backup_artifact.sh
+#   B2_ROOT="isnad:${B2_BUCKET}/prod" ./scripts/verify_b2_backup_artifact.sh   # production
+#   B2_ROOT="isnad:${B2_BUCKET}/stg"  ./scripts/verify_b2_backup_artifact.sh   # staging
 #
 #   ./scripts/verify_b2_backup_artifact.sh --self-test
 #
+#   # ---------------------------------------------------------------------------------------
+#   # WHY `${B2_BUCKET}` AND NOT A LITERAL. Both halves of this line have already been wrong.
+#   # ---------------------------------------------------------------------------------------
+#   # It once read `B2_ROOT="isnad:isnad-graph-backups"`, and each half failed toward the same
+#   # sentence — "you have no backups" — which is the sentence that changes what a human does
+#   # next, and mid-incident is the worst possible place to be handed it.
+#   #
+#   #   1. WRONG BUCKET. `isnad-graph-backups` is a REAL bucket and it is EMPTY; nothing has
+#   #      ever written to it. Run the scanner against it and you get status=absent, dumps=0,
+#   #      bucket_objects=0 — a clean, confident zero, from the one check that reads B2 rather
+#   #      than a host-local gauge. Measured against stg at the same moment (#644 review):
+#   #
+#   #          isnad:isnad-graph-backups/prod  -> status=absent dumps=0  objects=0
+#   #          isnad:${B2_BUCKET}/prod         -> status=fresh  dumps=3  objects=20  age=5h
+#   #
+#   #      A false RED, and it STICKS, because an empty bucket lists rc=0 with nothing in it —
+#   #      byte-for-byte the signature deploy#635 exists to teach us not to trust.
+#   #
+#   #   2. BUCKET ROOT, NO ENVIRONMENT. stg and prod SHARE one bucket (deploy#632), so a root
+#   #      path scans BOTH environments' objects and reports `fresh` on whichever it finds
+#   #      first. That is the cross-environment false-GREEN deploy#633 removed from
+#   #      verify-backup-artifact.yml, where the PROD leg would have reported healthy on the
+#   #      strength of STAGING's backup.
+#   #
+#   # `${B2_BUCKET}` is immune to BOTH, and to the next rename: it resolves to whatever the
+#   # BACKUP_B2_BUCKET secret actually says, which is the only thing that is true by
+#   # construction. A hardcoded bucket in a usage example is a stale artifact waiting to
+#   # happen — and it is exactly how the last person was misled. Same form the workflow uses
+#   # (B2_ROOT="isnad:${B2_BUCKET}/${{ matrix.env }}") and docs/runbooks/backup-alerts.md.
+#
 # Env:
+#   RCLONE_CONFIG_ISNAD_TYPE/ACCOUNT/KEY
+#                    REQUIRED, and NOT set by this script (backup.sh sets its own). Without
+#                    them rclone fails with "didn't find section in config file".
 #   B2_ROOT          rclone path to the bucket AND the environment prefix under it
-#                    (reachability probe + scan root). NEVER the bare bucket: see above.
+#                    (reachability probe + scan root). Use `isnad:${B2_BUCKET}/<env>`; never a
+#                    literal bucket name, and never the bare bucket root. See above.
 #   B2_PREFIX        optional sub-path under B2_ROOT to scan. Either this or a prefix baked
 #                    into B2_ROOT must name the environment — scanning the bare bucket reads
 #                    stg's and prod's objects as one pool (deploy#632/#633/#636).

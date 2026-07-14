@@ -586,6 +586,135 @@ def test_each_host_accepts_exactly_its_own_prefix(tmp_path: Path, domain: str) -
     )
 
 
+# Domains that are NOT stg and NOT prod — but which a careless matcher would happily call one.
+#
+# Every one of these CONTAINS `noorinalabs.com` as a substring. That is the whole point: the
+# anchored `case` arms cannot substring-match, but a globbed arm (`*noorinalabs.com*`) can, and
+# would classify each of these as **prod**. A restore-drill box, a new environment, a lookalike
+# domain — each silently declared production, and then permitted to write into `prod/` and to
+# run `rclone purge` against PRODUCTION'S BACKUPS.
+UNRECOGNISED_DOMAINS = [
+    "restore.noorinalabs.com",  # a restore-drill / rehearsal box
+    "dev.noorinalabs.com",  # a future environment nobody told backup.sh about
+    "noorinalabs.com.attacker.test",  # a lookalike; suffix-anchored matching also fails here
+    "foo.example.com",  # unrelated entirely — the easy case, kept as the control
+]
+
+
+@pytest.mark.parametrize("domain", UNRECOGNISED_DOMAINS)
+@pytest.mark.parametrize("prefix", ["stg", "prod"])
+def test_a_PRESENT_but_unrecognised_host_warns_and_is_never_classified(
+    tmp_path: Path, domain: str, prefix: str
+) -> None:
+    """deploy#653 — the hole Nino Kavtaradze found: ABSENT was tested, PRESENT-BUT-UNKNOWN was not.
+
+    The code is correct — an anchored `case` cannot substring-match — but nothing PINNED it, and
+    "correct today" is not the property we need. The property is that it cannot silently STOP
+    being correct. A `*noorinalabs.com*` glob would pass every other test in this file (the arms
+    are ordered stg-first, so both KNOWN hosts still resolve correctly) and would quietly
+    classify every domain above as **prod**.
+
+    Read what that buys on a restore-drill box called `restore.noorinalabs.com`:
+
+        BACKUP_PREFIX=prod  ->  HOST_ENV=prod  ->  MATCH  ->  ALLOWED
+                            ->  it writes into prod/ and PURGES PRODUCTION'S BACKUPS
+
+    That is the single catastrophic direction, and it is the entire reason deploy#636 exists.
+
+    So this asserts the honest outcome for BOTH prefixes: an unrecognised host is not stg and is
+    not prod — it is UNKNOWN. Warn, proceed, and testify to nothing. The `prefix` axis is what
+    makes the mutant unable to hide: under the glob it is silently ALLOWED for `prod` (no
+    warning) and wrongly REFUSED for `stg` (a contradiction that does not exist).
+    """
+    proc, _ = _run_backup(tmp_path, prefix=prefix, base_domain=domain, lsf_mode="ok_old")
+    combined = proc.stdout + proc.stderr
+
+    assert "cannot verify BACKUP_PREFIX" in combined, (
+        f"BASE_DOMAIN={domain!r} is neither stg nor prod, but the run did not warn that it "
+        f"could not verify the prefix — so it CLASSIFIED this host as something. A matcher that "
+        f"substring-matches would call this 'prod', and a prod-prefixed backup here would purge "
+        f"production's backups:\n{combined[-2000:]}"
+    )
+    assert _CONTRADICTION not in combined, (
+        f"BASE_DOMAIN={domain!r} was treated as a KNOWN host and found to CONTRADICT "
+        f"BACKUP_PREFIX={prefix!r}. It contradicts nothing — it is unrecognised, and the check "
+        f"has no business having an opinion about it:\n{combined[-2000:]}"
+    )
+    assert proc.returncode == 0, (
+        f"an unrecognised host refused the run outright:\n{combined[-2000:]}"
+    )
+
+
+def test_the_substring_glob_mutant_is_KILLED(tmp_path: Path) -> None:
+    """Calibrate the fixtures above by reintroducing the exact defect they exist to catch.
+
+    Nino Kavtaradze (#644 review, deploy#653): "the unknown-host branch is only tested ABSENT,
+    never present-but-unrecognised — a substring-glob mutant survives the suite." It did. This
+    kills it.
+
+    Note the arms stay in the SAME ORDER. The mutant is not a reordering trick — `stg` is still
+    matched first, so both KNOWN hosts still resolve correctly and every other assertion in this
+    module still passes. That is precisely what made it survive: it is invisible everywhere
+    except on a host that is neither, which is the case nothing tested.
+    """
+    body = BACKUP_SH.read_text()
+
+    anchored = (
+        'case "${BASE_DOMAIN:-}" in\n'
+        '    stg.noorinalabs.com) HOST_ENV="stg" ;;\n'
+        '    noorinalabs.com)     HOST_ENV="prod" ;;\n'
+        '    *)                   HOST_ENV="" ;;\n'
+        "esac"
+    )
+    assert anchored in body, (
+        "backup.sh no longer has the anchored `case` this mutation targets — the mutation would "
+        "be a no-op and this calibration would be vacuous."
+    )
+
+    globbed = (
+        'case "${BASE_DOMAIN:-}" in\n'
+        '    *stg.noorinalabs.com*) HOST_ENV="stg" ;;\n'
+        '    *noorinalabs.com*)     HOST_ENV="prod" ;;\n'
+        '    *)                     HOST_ENV="" ;;\n'
+        "esac"
+    )
+    mutant_dir = tmp_path / "scripts"
+    mutant_dir.mkdir(parents=True)
+    for lib in ("compose_project.sh", "b2_preflight.sh"):
+        (mutant_dir / lib).write_bytes((REPO_ROOT / "scripts" / lib).read_bytes())
+    mutant = mutant_dir / "backup.sh"
+    mutant.write_text(body.replace(anchored, globbed))
+
+    # THE MUTANT MUST STILL BE CORRECT ON THE KNOWN HOSTS. If it broke those, it would be caught
+    # by tests that already exist, it would not be the bug Nino described, and this calibration
+    # would be proving something else entirely.
+    ok, _ = _run_backup(
+        tmp_path / "known", prefix="stg", base_domain="stg.noorinalabs.com", script=mutant
+    )
+    assert _CONTRADICTION not in (ok.stdout + ok.stderr), (
+        "the mutant is not the bug under test — it broke a KNOWN host, so the existing tests "
+        "would catch it and it demonstrates nothing about the unknown-host hole."
+    )
+
+    # AND IT MUST MISCLASSIFY THE UNKNOWN ONE. `restore.noorinalabs.com` contains
+    # `noorinalabs.com`, so the globbed arm calls it PROD — and a prod-prefixed backup on that
+    # box is then ALLOWED to purge production's backups. Silently. No warning.
+    bad, _ = _run_backup(
+        tmp_path / "unknown",
+        prefix="prod",
+        base_domain="restore.noorinalabs.com",
+        script=mutant,
+    )
+    combined = bad.stdout + bad.stderr
+    assert "Running retention pruning" in combined, (
+        f"the mutant never reached retention, so its silence proves nothing:\n{combined[-2000:]}"
+    )
+    assert "cannot verify BACKUP_PREFIX" not in combined, (
+        "the substring-glob mutant still WARNED on an unrecognised host — it is not reproducing "
+        "deploy#653, so it calibrates nothing."
+    )
+
+
 def test_an_unknown_host_WARNS_and_does_not_testify(tmp_path: Path) -> None:
     """A check that cannot run must say so — and must NOT convert its own blindness into a
     verdict about the system it was checking.
@@ -635,11 +764,16 @@ VERIFY_SH = REPO_ROOT / "scripts" / "verify_b2_backup_artifact.sh"
 EMPTY_LEGACY_BUCKET = "isnad-graph-backups"
 LIVE_BUCKET = "noorinalabs-backups"
 
-# An rclone path into the backups remote, as it appears in a RUNNABLE example.
-_RCLONE_PATH = re.compile(r"isnad:(?P<bucket>[a-z0-9-]+)(?P<rest>/\S*)?")
+# An rclone path into the backups remote, as it appears in a RUNNABLE example. The bucket is
+# either a `${B2_BUCKET}`-style expansion (correct) or a hardcoded literal (never correct).
+# `[A-Z0-9_]+`, not `[A-Z_]+`: the variable is `B2_BUCKET` and it has a DIGIT in it. The first
+# cut stopped at `${B`, left `2_BUCKET}/prod` as the "rest", and duly reported the correct line
+# as missing its environment — a detector that cannot spell the name of the thing it is looking
+# for will fail the fix and pass the bug.
+_RCLONE_PATH = re.compile(r"isnad:(?P<bucket>\$\{?[A-Z0-9_]+\}?|[a-z0-9-]+)(?P<rest>/\S*)?")
 
-# The environment must appear immediately under the bucket. `${B2_BUCKET}/${{ matrix.env }}`
-# and a literal `stg`/`prod` both qualify; a bare bucket root does not.
+# The environment must appear immediately under the bucket. A literal `stg`/`prod` and an
+# expansion (`${{ matrix.env }}`) both qualify; a bare bucket root does not.
 _HAS_ENV = re.compile(r"^/(?:stg|prod|\$)")
 
 
@@ -682,19 +816,61 @@ def test_the_detector_sees_a_runnable_example_and_ignores_the_warning() -> None:
         "the detector found NO runnable rclone examples at all — it is inert, and every "
         "assertion below it is worthless."
     )
-    # It must be reading the real examples, not the prose that merely mentions the bucket.
-    joined = " ".join(line for _, line in found)
-    assert LIVE_BUCKET in joined, f"the detector is not seeing the real examples: {found}"
+    # It must be READING the examples, not merely finding lines: every one it returns must parse
+    # into a bucket + path. A detector that matched the lines but extracted nothing from them
+    # would pass every assertion below by vacuity.
+    parsed = [m for _, line in found for m in _RCLONE_PATH.finditer(line)]
+    assert parsed, f"the detector found lines but could not PARSE a single rclone path: {found}"
+    assert any(m.group("bucket").startswith("$") for m in parsed), (
+        f"the detector cannot see the `${{B2_BUCKET}}` form at all — the very form it is meant "
+        f"to require. It would report every correct example as an offender: {found}"
+    )
+    # And it must be reading the runnable examples, not the blockquote prose that mentions the
+    # legacy bucket in order to WARN about it. That warning must survive this guard.
+    assert not any(EMPTY_LEGACY_BUCKET in line for _, line in found), (
+        f"the detector is picking up the prose warning as if it were a runnable example. It "
+        f"would force someone to DELETE the warning to go green: {found}"
+    )
+
+
+def test_no_operator_example_HARDCODES_a_bucket_name() -> None:
+    """The property is not "name the right bucket". It is "never name a bucket at all".
+
+    `RUNBOOK.md:346` hardcoded `isnad-graph-backups` — a bucket that exists and holds NOTHING —
+    and it did so confidently, for months. An operator doing a DR restore follows the line, gets
+    `status=absent dumps=0 bucket_objects=0` from the one check that reads B2 rather than a
+    host-local gauge, and concludes THE BACKUPS DO NOT EXIST. Meanwhile the real bucket holds a
+    healthy five-hour-old backup.
+
+    The first fix was to swap in the correct literal. That is not enough, and Bereket Tadesse was
+    right to block on it: a hardcoded bucket is a stale artifact waiting to happen, and it is
+    exactly how the previous one went wrong. `${B2_BUCKET}` resolves to whatever the
+    BACKUP_B2_BUCKET secret actually says, which is the only thing that is true BY CONSTRUCTION —
+    immune to this entire class of error and to the next rename.
+
+    So the guard forbids ANY literal, including today's correct one. A test that only banned the
+    known-bad name would be a blocklist of one, and the next wrong bucket would sail past it.
+    """
+    offenders = []
+    for src, line in _runnable_rclone_paths():
+        for m in _RCLONE_PATH.finditer(line):
+            if not m.group("bucket").startswith("$"):
+                offenders.append(f"{src}: {line}")
+
+    assert not offenders, (
+        "a runnable example HARDCODES a bucket name. Use `isnad:${B2_BUCKET}/<env>` — a literal "
+        "is a stale artifact waiting to happen, and the last one named an EMPTY bucket, which "
+        "reads as 'there are no backups' when copy-pasted during an incident:\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 def test_no_operator_example_names_the_EMPTY_bucket() -> None:
-    """RUNBOOK.md:346 named `isnad-graph-backups` — a bucket that exists and holds NOTHING.
+    """Belt and braces on the one literal we KNOW is a loaded gun.
 
-    This is not a stale-doc nit. An operator doing a DR restore follows the line, runs
-    `rclone lsf isnad:isnad-graph-backups/`, gets a clean and confident ZERO, and concludes
-    THE BACKUPS DO NOT EXIST — while 27 objects sit in `noorinalabs-backups`. A silent zero is
-    not a measurement, and this one was pre-baked into the document you only ever read when
-    you are already in trouble.
+    Subsumed by the hardcoding ban above, and kept anyway: this is the specific name that cost
+    real time in review, and it names its own failure mode in the assertion message. If someone
+    ever relaxes the general rule, this is the line that must still hold.
     """
     offenders = [
         f"{src}: {line}" for src, line in _runnable_rclone_paths() if EMPTY_LEGACY_BUCKET in line
