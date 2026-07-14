@@ -393,7 +393,38 @@ NEO4J_COMPRESSED="${NEO4J_DUMP_FILE}.zst"
 # `restore.sh` refuses that artifact without `--allow-partial`, and the run exits non-zero so
 # the systemd OnFailure marker fires and BackupStale keeps counting from the last COMPLETE
 # backup. Nothing here silently forgives a missing store.
-if service_is_running neo4j; then
+# `|| NEO4J_PROBE_RC=$?`, never a bare `if service_is_running neo4j`: we need to tell rc=1
+# (the graph is genuinely down) from rc=2 (we could not find out) — see compose_project.sh.
+# The `||` also keeps errexit off our backs; a bare assignment from a failing command would
+# abort the run here (deploy#563).
+NEO4J_PROBE_RC=0
+service_is_running neo4j || NEO4J_PROBE_RC=$?
+
+if [[ "$NEO4J_PROBE_RC" -eq 2 ]]; then
+    # THE INSTRUMENT FAILED — WE KNOW NOTHING ABOUT THE GRAPH. (deploy#624 review)
+    #
+    # running_services() has already printed the honest diagnostic (no writable scratch;
+    # check ProtectSystem=strict and free disk). Do NOT talk over it with a claim about
+    # Neo4j. The old code did exactly that — it said "Neo4j is NOT running — Start Neo4j and
+    # re-run", while the graph was UP and the disk was FULL, which makes re-running the one
+    # action that makes things worse.
+    #
+    # This is reachable precisely BECAUSE the scratch now lives on BACKUP_DIR: the gate above
+    # runs before the Postgres dumps, this runs after them, and the volume they just filled is
+    # the volume the scratch needs.
+    NEO4J_OK=false
+    log "ERROR" "Could not determine whether Neo4j is running — the check itself failed (see above)."
+    log "ERROR" "  This says NOTHING about the graph: do not start, stop, or re-run on the"
+    log "ERROR" "  strength of it. Fix the scratch problem named above (free disk first)."
+    log "ERROR" "  The Neo4j leg is SKIPPED; the Postgres stores are still dumped."
+elif [[ "$NEO4J_PROBE_RC" -ne 0 ]]; then
+    log "ERROR" "Neo4j is NOT running in project '${COMPOSE_PROJECT}' — SKIPPING the Neo4j dump."
+    log "ERROR" "  The graph leg of this backup will be MISSING and the run will exit non-zero."
+    log "ERROR" "  The Postgres stores are still dumped: a partial backup beats none, and"
+    log "ERROR" "  user-postgres cannot be rebuilt from any artifact (deploy#559)."
+    log "ERROR" "  Start Neo4j and re-run to get a COMPLETE backup."
+    NEO4J_OK=false
+else
     log "INFO" "Stopping Neo4j for offline dump..."
     dc stop neo4j 2>>"$LOG_FILE"
 
@@ -519,13 +550,6 @@ if service_is_running neo4j; then
     else
         log "WARNING" "Skipped Neo4j dump due to stop timeout"
     fi
-else
-    log "ERROR" "Neo4j is NOT running in project '${COMPOSE_PROJECT}' — SKIPPING the Neo4j dump."
-    log "ERROR" "  The graph leg of this backup will be MISSING and the run will exit non-zero."
-    log "ERROR" "  The Postgres stores are still dumped: a partial backup beats none, and"
-    log "ERROR" "  user-postgres cannot be rebuilt from any artifact (deploy#559)."
-    log "ERROR" "  Start Neo4j and re-run to get a COMPLETE backup."
-    NEO4J_OK=false
 fi
 
 # ---------------------------------------------------------------------------

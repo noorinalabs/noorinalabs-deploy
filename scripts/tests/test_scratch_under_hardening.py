@@ -45,6 +45,7 @@ quietly turn this whole class green; procfs does not care who you are. Same reas
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -112,6 +113,40 @@ def unit_reachable_scripts() -> set[Path]:
             if sibling != script and sibling.name in body and sibling not in seen:
                 pending.append(sibling)
     return seen
+
+
+# The ANCHOR IS THE INVOCATION, NOT THE LINE. (deploy#624 review — Lucas Ferreira)
+#
+# The first cut asked `"-p " not in ln`, i.e. it judged the whole LINE. Any unrelated `-p `
+# elsewhere on the line — a `grep -p`, a comment fragment, a second command — vouched for a
+# bare `mktemp` sitting next to it. Lucas mutated a bare `mktemp` back in on such a line and
+# the pin stayed GREEN. A guard whose anchor is bigger than the thing it guards is not a
+# guard; it is a coincidence detector (cf. feedback_lint_gate_cover_all_syntactic_forms).
+#
+# So: find each `mktemp` occurrence and read only ITS OWN arguments, up to the next shell
+# separator.
+_MKTEMP_CALL = re.compile(r"\bmktemp\b([^|;&)`\n]*)")
+
+
+def _mktemp_invocations(line: str) -> list[str]:
+    """The argument text of every `mktemp` call on this line, each judged on its own."""
+    return [m.group(1) for m in _MKTEMP_CALL.finditer(line)]
+
+
+def _names_its_parent(args: str) -> bool:
+    """Did THIS mktemp call choose where its file lands, rather than defaulting to /tmp?
+
+    Accepts an explicit parent (`-p DIR`, `--tmpdir=DIR`) or a template carrying a directory
+    (`mktemp "${SUCCESS_TEXTFILE}.XXXXXX"` — lands wherever that variable points, which is the
+    author's choice and is checked elsewhere). A bare `mktemp` / `mktemp -d` chooses /tmp for
+    you, and /tmp is read-only under the unit.
+    """
+    tokens = args.split()
+    if any(t == "-p" or t.startswith("-p") or t.startswith("--tmpdir") for t in tokens):
+        return True
+    # A template argument (non-flag) that contains a path separator or a variable expansion
+    # names its own directory.
+    return any(not t.startswith("-") and ("/" in t or "$" in t) for t in tokens)
 
 
 # A directory that EXISTS and into which no file can be created — for root too.
@@ -320,10 +355,9 @@ def test_no_bare_mktemp_survives_in_the_library() -> None:
             stripped = ln.lstrip()
             if stripped.startswith("#") or "mktemp" not in ln:
                 continue
-            # An explicit parent (-p / --tmpdir) or a template with a directory in it means
-            # the author chose where it lands. A bare `mktemp` chooses /tmp for them.
-            if "-p " not in ln and '-p"' not in ln and "--tmpdir" not in ln and "${" not in ln:
-                offenders.append(f"{script.name}: {ln.strip()}")
+            for args in _mktemp_invocations(ln):
+                if not _names_its_parent(args):
+                    offenders.append(f"{script.name}: {ln.strip()}")
 
     assert not offenders, (
         "bare mktemp in a script the hardened units EXECUTE — it defaults to /tmp, which is "
@@ -331,4 +365,57 @@ def test_no_bare_mktemp_survives_in_the_library() -> None:
         "TWICE (#613 in b2_preflight.sh, #623 in compose_project.sh). Allocate under a path "
         "the unit grants — scratch_file() in compose_project.sh does this.\n  "
         + "\n  ".join(offenders)
+    )
+
+
+def test_service_is_running_separates_not_running_from_could_not_find_out(tmp_path: Path) -> None:
+    """THE THIRD CALL SITE — and deploy#624 is what made it reachable. (Lucas Ferreira)
+
+    `service_is_running` used to collapse "the service is not running" and "I could not take
+    the listing" into a single `return 1`. The comment justifying that said the two "collapse
+    harmlessly", and while scratch lived on /tmp it was true — **because /tmp never fills.**
+
+    deploy#623's fix moves scratch onto BACKUP_DIR: the volume the dumps themselves fill. And
+    the ordering is against us — backup.sh gates on assert_stack_present BEFORE the Postgres
+    dumps and asks `service_is_running neo4j` AFTER them, so the disk that was fine at the
+    gate can be full by the time we ask.
+
+    Collapsed, that produces a lie with a dangerous remedy attached: scratch fails, this
+    returns 1, and backup.sh prints "Neo4j is NOT running — Start Neo4j and re-run." The graph
+    is UP. The disk is FULL. Re-running is the one action that makes it worse.
+
+    So: rc=1 is a fact about the STACK; rc=2 is a fact about US.
+    """
+    # Docker is healthy and reports neo4j:running. Only the scratch is broken.
+    proc = _run(
+        # `|| rc=$?` — the exact form backup.sh uses. A bare call under `set -e` would abort
+        # the driver before the echo, and the test would be measuring errexit, not the code.
+        "rc=0; service_is_running neo4j || rc=$?; echo RC=$rc",
+        backup_dir=UNWRITABLE_PARENT,
+        with_docker=True,
+        tmp_path=tmp_path,
+    )
+    combined = proc.stdout + proc.stderr
+
+    assert "RC=2" in combined, (
+        "a scratch failure returned the NOT-RUNNING code. The graph is up and the docker stub "
+        "says so; the only thing that failed is a temp file. Collapsing 'I could not find out' "
+        f"into 'it is not running' is what tells an operator with a FULL DISK to re-run the "
+        f"backup — the single action that makes it worse.\n\n{combined}"
+    )
+    assert "RC=1" not in combined
+
+    # Positive control: with a writable scratch, the SAME function must still be able to say
+    # "not running" — otherwise rc=2 is just the new constant and nothing is distinguished.
+    good = tmp_path / "backups"
+    good.mkdir()
+    proc_ok = _run(
+        "rc=0; service_is_running redis || rc=$?; echo RC=$rc",  # stub lists only pg/user-pg/neo4j
+        backup_dir=str(good),
+        with_docker=True,
+        tmp_path=tmp_path,
+    )
+    assert "RC=1" in (proc_ok.stdout + proc_ok.stderr), (
+        "with a WORKING scratch, a genuinely absent service must still return 1. If it does "
+        "not, the fix has simply replaced one constant with another and distinguishes nothing."
     )

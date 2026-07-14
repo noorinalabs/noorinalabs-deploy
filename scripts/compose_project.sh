@@ -277,13 +277,43 @@ assert_stack_present() {
 # daemon is reachable and the project is real, so at that point the two collapse harmlessly:
 # either way the leg cannot be dumped and must be recorded as failed rather than skipped
 # silently.
+# service_is_running <svc>
+#
+#   0 — the service IS running
+#   1 — the service is NOT running          (a fact about the stack)
+#   2 — WE COULD NOT FIND OUT               (a fact about us)
+#
+# THE THIRD CALL SITE, AND deploy#624 IS WHAT MADE IT REACHABLE. (review — Lucas Ferreira)
+#
+# This used to collapse 1 and 2 into a single `return 1`, and the comment justifying that
+# said the two "collapse harmlessly" because callers only reach here after
+# assert_stack_present has already established the project. That was true while scratch lived
+# on /tmp — **because /tmp never fills.**
+#
+# deploy#623's fix moves scratch onto BACKUP_DIR: the volume the dumps themselves fill. It
+# knows this — the ENOSPC `-s` check in scratch_file() exists for exactly that reason. And the
+# ordering is against us: backup.sh calls assert_stack_present BEFORE the Postgres dumps and
+# `service_is_running neo4j` AFTER them, so the disk that was fine at the gate can be full by
+# the time we ask this question.
+#
+# Collapsed, the outcome is a lie with a dangerous remedy attached: scratch fails, this
+# returns 1, and backup.sh prints "Neo4j is NOT running — Start Neo4j and re-run." The graph
+# is UP. The disk is FULL. Re-running is the single action that makes it worse. Reproduced on
+# the head tree with a healthy docker reporting neo4j:running.
+#
+# So the instrument failure gets its own code. A caller that cannot tell "the thing is broken"
+# from "I am broken" will always eventually blame the thing.
 service_is_running() {
     local svc="$1" states rc=0
 
     states="$(running_services)" || rc=$?
-    [[ "$rc" -eq 0 ]] || return 1
+    # running_services has already printed the honest scratch diagnostic. Do NOT overwrite it
+    # with a claim about the service — return the "I could not find out" code and let the
+    # caller stay silent about the stack.
+    [[ "$rc" -eq 0 ]] || return 2
 
-    grep -qx -- "${svc}:running" <<< "$states"
+    grep -qx -- "${svc}:running" <<< "$states" || return 1
+    return 0
 }
 
 # Start the neo4j container we STOPPED. Never create one.
