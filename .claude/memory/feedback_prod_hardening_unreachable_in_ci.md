@@ -14,13 +14,41 @@ dev box all have a writable `/tmp`.** So the entire test surface — including t
 drive the real `backup.sh` — runs in an environment where this class of bug **cannot occur**.
 The tests were never weak. They were *structurally incapable of failing*.
 
-**Why:** this is why backups NEVER once succeeded in this project's history, and why the same
-bug shipped twice past green CI and four reviewers. Each instance was **a check that could not
-run, reporting its own breakage as a fact about the system it was checking** — pointing the
-operator at the wrong subsystem every time:
+**Why:** this is why the same bug **shipped twice past green CI and four reviewers**, and why it
+would still have blocked backups *after* the credentials and the timer were fixed. It is the
+cause that **survived every check**.
+
+**It is NOT "why backups never once succeeded" — do not let this file tell you that.** The
+outage had **three independent causes**, and this class is only the third (deploy#612, measured
+on both hosts 2026-07-13):
+
+1. **prod: `isnad-backup.timer` was never installed.** Backups there did not fail — they never
+   *ran*. No `/tmp`, no preflight, no `mktemp`; the code never executed.
+2. **stg: every firing died in ~75 ms** at `backup.sh: line 62: B2_KEY_ID: B2_KEY_ID must be set`
+   → `status=1/FAILURE` (journal: 07-10, 07-11, 07-12 — the `:?` guard on a credential that had
+   genuinely never been provisioned to the host env). That is **upstream of `b2_preflight.sh`
+   entirely**; the read-only `/tmp` was never reached.
+3. **this class** — which is what you hit *once a working key exists*, and the only one that no
+   test, no reviewer, and no green CI run could catch.
+
+The monocausal version is seductive because this cause is the interesting one. It is also the
+error this file exists to name: **a check that could not run, testifying about a system it never
+touched.** The `/tmp` class could not run on prod at all — the timer wasn't installed — so it
+cannot be the explanation for prod's history. Correcting this cost nothing and the lesson is
+*stronger* without the overclaim: three independent causes, and only one of them survived every
+green check. (deploy#613's own body makes the same leap — "this, **not missing credentials**, is
+why zero backups have ever succeeded" — so this file inherited it honestly. The memory is the
+artifact that gets auto-loaded into every future session, so the memory is the one that has to be
+right. Caught by Nino Kavtaradze reviewing deploy#631.)
+
+Each instance below was **a check that could not run, reporting its own breakage as a fact about
+the system it was checking** — pointing the operator at the wrong subsystem every time:
 
 * **deploy#613** — `b2_preflight.sh` couldn't allocate scratch → `verdict=KEY_INVALID`. The B2
-  key was perfectly good. Every backup ever attempted died here, blaming a credential.
+  key was perfectly good. Every backup attempted **once a key had been provisioned** died here,
+  blaming that freshly-provisioned credential. (The distinction is the whole point of this file:
+  before 2026-07-13 there was no key to blame, and the run died at line 62 long before reaching
+  this code.)
 * **deploy#617** — `backup.sh` addressed a phantom compose project (no `-p`; the *directory
   basename* decides). `restore.sh` had it too: a restore would have loaded into a **stray
   volume** and reported **success**. The rehearsal could never catch it — it supplied
