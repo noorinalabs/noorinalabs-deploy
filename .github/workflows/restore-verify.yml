@@ -84,6 +84,37 @@ jobs:
           chmod +x scripts/restore_verify.sh
           ./scripts/restore_verify.sh --self-test 2>&1 | tee "${RUNNER_TEMP}/self-test.txt"
 
+      # AN ORTHOGONAL WITNESS. The script prints its own "no stray objects remain" verdict —
+      # and a verification script must not be the only witness to its own cleanliness
+      # (deploy#632/#641: three instrument failures in one night, every one of them a script
+      # testifying about itself). This step asks DOCKER, not the script.
+      #
+      # `if: always()` is the entire point: it must run when the self-test FAILED, because a
+      # failing run is exactly when a teardown gets skipped and a stack is left behind. A
+      # leaked scratch volume on the real host holds a full copy of production.
+      - name: Independently verify the self-test left nothing behind
+        if: always()
+        run: |
+          set -uo pipefail
+          STRAY=0
+          for p in isnad-rv-selftest-ref isnad-rv-selftest-sub; do
+            for kind in "ps -a" "volume ls" "network ls"; do
+              # shellcheck disable=SC2086
+              OUT="$(docker $kind --filter "label=com.docker.compose.project=${p}" -q)"
+              if [ -n "${OUT}" ]; then
+                echo "::error::STRAY ${kind} in project ${p} — the teardown leaked:"
+                echo "${OUT}"
+                STRAY=1
+              fi
+            done
+          done
+          if [ "${STRAY}" -ne 0 ]; then
+            echo "::error::The self-test left objects behind. On the real host these hold a full"
+            echo "  copy of the production database. This fails the job even if the comparator passed."
+            exit 1
+          fi
+          echo "Docker confirms: no containers, volumes or networks remain for either self-test project."
+
       - name: Summary
         if: always()
         run: |

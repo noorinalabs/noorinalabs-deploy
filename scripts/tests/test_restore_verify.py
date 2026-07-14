@@ -262,9 +262,54 @@ if argv[0] == "info":
     # different fault than the one under test.
     print(os.environ["FAKE_DOCKER_ROOT"]); sys.exit(0)
 
+def _project_of_filter():
+    for a in argv:
+        if a.startswith("label=com.docker.compose.project="):
+            return a.split("=", 2)[2]
+    return None
+
+# The leak model. `leaks` names the projects whose objects SURVIVE `down -v`; `unremovable`
+# names the ones whose objects also survive the direct sweep. Without a fixture that can
+# express a leak, every "no stray objects" assertion would be vacuous.
+LEAKS = set(world.get("leaks", []))
+UNREMOVABLE = set(world.get("unremovable", []))
+SWEPT = os.environ["FAKE_SWEPT"]
+
+def _still_present(project):
+    if project not in LEAKS:
+        return False
+    if project in UNREMOVABLE:
+        return True                       # the sweep cannot remove it
+    return not os.path.exists(SWEPT)      # gone once the sweep has run
+
 if argv[0] == "volume":
     if argv[1] == "inspect":
         sys.exit(1)   # absent -> nothing leaked
+    if argv[1] == "ls":
+        p = _project_of_filter()
+        if p and _still_present(p):
+            print("vol-" + p)
+        sys.exit(0)
+    if argv[1] == "rm":
+        target = argv[-1]
+        if any(u in target for u in UNREMOVABLE):
+            print("Error: volume is in use", file=sys.stderr)
+            sys.exit(1)
+        open(SWEPT, "a").close()
+        sys.exit(0)
+    sys.exit(0)
+
+if argv[0] == "network":
+    if argv[1] == "ls":
+        sys.exit(0)   # networks modelled as always cleaned
+    if argv[1] == "rm":
+        sys.exit(0)
+    sys.exit(0)
+
+if argv[0] == "ps":
+    sys.exit(0)       # no stray containers modelled
+
+if argv[0] == "rm":
     sys.exit(0)
 
 if argv[0] == "inspect":
@@ -378,13 +423,17 @@ EMPTY_WORLD = {
 }
 
 
-def _world(live=None, restored=None, empty=None, volumes=None) -> dict:
+def _world(
+    live=None, restored=None, empty=None, volumes=None, leaks=None, unremovable=None
+) -> dict:
     return {
         "live": {**LIVE_WORLD, **(live or {})},
         # By default the restore reproduces live exactly.
         "restored": {**LIVE_WORLD, **(restored or {})},
         "empty": {**EMPTY_WORLD, **(empty or {})},
         "volumes": volumes or {RV_PROJECT: f"{RV_PROJECT}_rv_neo4j_data"},
+        "leaks": leaks or [],
+        "unremovable": unremovable or [],
     }
 
 
@@ -450,6 +499,7 @@ class Harness:
             "FAKE_WORLD": str(self.world_file),
             "FAKE_CALLS": str(self.calls),
             "FAKE_DOCKER_ROOT": str(self.tmp),
+            "FAKE_SWEPT": str(self.tmp / "swept"),
             "RESTORE_MARKER": str(self.marker),
             "LIVE_PROJECT": LIVE_PROJECT,
             "RV_PROJECT": RV_PROJECT,
@@ -666,6 +716,117 @@ def test_it_refuses_when_the_scratch_stores_are_not_empty(harness) -> None:
     assert r.returncode == RC_INSTRUMENT
     assert "already holds" in r.stdout
     assert not h.restore_was_invoked
+
+
+# ---------------------------------------------------------------------------
+# TEARDOWN: it must run on EVERY exit path, and it must never speak for the verdict
+# ---------------------------------------------------------------------------
+# A teardown that dies partway is how volumes leak, and a leaked scratch volume holds a full
+# copy of production. The hand-run leaked exactly this way when compose's `${POSTGRES_USER:?}`
+# guard aborted `down -v`, and the self-test leaked again on its first CI run when its EXIT
+# trap read a function-local.
+def _torn_down(h: Harness, project: str = RV_PROJECT) -> bool:
+    """Did the TEARDOWN run — as opposed to merely some `down -v`?
+
+    NOT `any("down -v" in c)`. `start_stack()` issues a PRE-CLEAN `down -v` before `up`, and it
+    is textually identical to the teardown's. A helper that matched on `down -v` alone returned
+    True even when the EXIT trap never fired at all — and a mutation that deleted the teardown
+    entirely left `test_teardown_runs_when_the_restore_itself_FAILS` GREEN.
+
+    The teardown is the only caller of `leak_audit()`, and `leak_audit()` is the only thing that
+    enumerates by compose's project LABEL. So that enumeration is the signature that cannot be
+    forged by the pre-clean.
+
+    Third time this session that a helper shared the blind spot of the thing it was measuring
+    (feedback_measurement_is_the_thing_that_breaks). Only the mutation showed it.
+    """
+    calls = h.calls.read_text().splitlines()
+    audited = any(f"label=com.docker.compose.project={project}" in c and "ls" in c for c in calls)
+    downed = any(f"-p {project}" in c and "down" in c and "-v" in c for c in calls)
+    return audited and downed
+
+
+def test_teardown_runs_when_the_comparator_PASSES(harness) -> None:
+    h = harness()
+    r = h.run()
+    assert r.returncode == RC_VERIFIED
+    assert _torn_down(h), "the stack was left up after a passing run"
+    assert "no stray containers, volumes or networks remain" in r.stdout
+
+
+def test_teardown_runs_when_the_comparator_FAILS(harness) -> None:
+    """The path that actually matters. A failing run is exactly when an author stops paying
+    attention — and it is the run most likely to leave a stack up.
+    """
+    h = harness(_world(restored={**LIVE_WORLD, "nodes": "1"}))
+    r = h.run()
+    assert r.returncode == RC_FAILED
+    assert _torn_down(h), "the stack was left up after a FAILING run — this is the leak"
+    assert "no stray containers, volumes or networks remain" in r.stdout
+
+
+def test_teardown_runs_when_the_restore_itself_FAILS(harness) -> None:
+    h = harness(FAKE_RESTORE_RC="1")
+    r = h.run()
+    assert r.returncode == RC_FAILED
+    assert _torn_down(h)
+    assert "no stray containers, volumes or networks remain" in r.stdout
+
+
+def test_the_teardown_calibration_fixture_can_actually_express_a_leak(harness) -> None:
+    """Calibrate the three assertions above. If the harness could not model a stack that
+    SURVIVES `down -v`, then "no stray objects" would be true by construction and every
+    teardown assertion here would be vacuous — the exact shape of a guard that cannot go red.
+    """
+    h = harness(_world(leaks=[RV_PROJECT], unremovable=[RV_PROJECT]))
+    r = h.run()
+    assert "STRAY OBJECTS REMAIN" in r.stdout, (
+        "the fixture cannot express a leak, so the clean-teardown assertions prove nothing"
+    )
+
+
+def test_a_leak_on_a_GREEN_run_does_not_exit_zero(harness) -> None:
+    """The restore verified, but the box is not clean: a scratch volume holding a full copy of
+    production is still sitting there. That must not exit 0. It is an INSTRUMENT fault (2), and
+    it is reported as exactly what it is — the comparator passed AND the teardown leaked.
+    """
+    h = harness(_world(leaks=[RV_PROJECT], unremovable=[RV_PROJECT]))
+    r = h.run()
+    assert r.returncode == RC_INSTRUMENT, f"a leak must not pass as green\n{r.stdout}"
+    assert "The comparator PASSED, but the teardown LEAKED" in r.stdout
+
+
+def test_a_leak_CANNOT_overwrite_a_failing_verdict(harness) -> None:
+    """THE rule. A cleanup fault must never overwrite a failing comparator result — in either
+    direction. Here the comparator FAILED (rc=1) and the teardown ALSO leaked; the run must
+    still exit 1, because "the artifact does not restore" is the more important fact and it is
+    the one an operator acts on. If the leak re-wrote this to 2, a real negative would be
+    reported as a broken instrument and the backup would look merely unverified.
+    """
+    h = harness(
+        _world(
+            restored={**LIVE_WORLD, "nodes": "1"},  # a real negative
+            leaks=[RV_PROJECT],
+            unremovable=[RV_PROJECT],  # and a leaking teardown on top of it
+        )
+    )
+    r = h.run()
+    assert r.returncode == RC_FAILED, (
+        f"the teardown's fault overwrote the comparator's verdict (got {r.returncode}, want 1)"
+    )
+    assert "*** MISMATCH ***" in r.stdout
+    assert "STRAY OBJECTS REMAIN" in r.stdout, "the leak must still be REPORTED, just not obeyed"
+
+
+def test_a_recoverable_leak_is_swept_and_the_run_stays_green(harness) -> None:
+    """`down -v` left the volume behind, the direct sweep removed it. That is a clean box, and
+    a green run — not an alarm. The distinction is what stops this check from crying wolf.
+    """
+    h = harness(_world(leaks=[RV_PROJECT]))  # leaks, but IS removable by the sweep
+    r = h.run()
+    assert r.returncode == RC_VERIFIED
+    assert "survived 'down -v'" in r.stdout, "the sweep never actually ran"
+    assert "no stray containers, volumes or networks remain" in r.stdout
 
 
 # ---------------------------------------------------------------------------
