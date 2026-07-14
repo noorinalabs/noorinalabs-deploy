@@ -1,0 +1,83 @@
+# Run the backup path under the BACKUP UNIT'S OWN HARDENING. (deploy#626 / deploy#627)
+#
+# deploy#613 and deploy#623 are the same bug, shipped twice, past a full green CI and four
+# reviewers: a script under isnad-backup.service allocated scratch in /tmp, which is READ-ONLY
+# there (ProtectSystem=strict, PrivateTmp deliberately unset — deploy#121 Bug A), and then
+# reported its own broken instrument as a fact about the subsystem it was meant to check.
+#
+# It got through because EVERY OTHER CHECK WE HAVE RUNS WHERE THE BUG CANNOT HAPPEN. GitHub
+# runners, the rehearsal containers and the dev box all have a writable /tmp. The tests were not
+# weak; they were structurally incapable of failing.
+#
+# This job is the one place that is not true. It builds a mount namespace FROM THE DIRECTIVES IN
+# systemd/*.service — ProtectSystem=, ReadWritePaths=, ProtectHome=, PrivateTmp= — and runs the
+# real ExecStart inside it, with docker/rclone/zstd stubbed. The constraint is READ OUT OF THE
+# UNIT, never re-typed here: a hand-written "read-only /tmp" step would be a third place to
+# encode the same assumption and would go stale the moment somebody edited ReadWritePaths=.
+#
+# Exit codes from scripts/tests/unit_hardening.py, and the middle one is the point:
+#   0  the entry point ran clean under its own unit's hardening
+#   1  it FAILED under the hardening — a finding
+#   2  WE COULD NOT FIND OUT (no namespace, a directive we cannot emulate). NEVER green.
+name: Backup hardening
+
+# The trigger paths are spelled out on both events rather than shared via a YAML anchor:
+# actionlint rejects an alias node for `paths` ("must be sequence node but got alias node").
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "systemd/**"
+      - ".github/workflows/backup-hardening.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "systemd/**"
+      - ".github/workflows/backup-hardening.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  backup-under-unit-hardening:
+    name: backup.sh under systemd hardening
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which blocks the
+      # rootless user namespace the harness prefers (the one a developer gets from pre-commit
+      # with no sudo). Lift it if it is set.
+      #
+      # `|| true` is deliberate and it is NOT a swallowed failure: this step only makes the
+      # ROOTLESS backend available. If it does nothing, the harness probes its backends, finds
+      # none, and exits 2 — loudly, as an instrument failure. The gate does not depend on this
+      # step succeeding; it depends on the harness being honest when it cannot run, which is
+      # asserted by test_the_harness_refuses_to_testify_when_it_cannot_build_the_sandbox.
+      - name: Allow rootless user namespaces (Ubuntu 24.04 AppArmor)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # THE GATE. The real scripts/backup.sh and scripts/emit-backup-failure-marker.sh, driven
+      # end to end, inside a namespace built from their own units. Units are DISCOVERED from
+      # systemd/*.service — add one tomorrow and it is gated from that moment, with nobody
+      # remembering to edit this file.
+      - name: Run every hardened unit's ExecStart under its own hardening
+        run: python3 scripts/tests/unit_hardening.py
+
+      # The calibration. The gate above is worth exactly what its ability to FAIL is worth, and
+      # the previous suite's was zero. These tests put the defect back — a bare mktemp, a
+      # `> /tmp/…` redirect that no mktemp-scan can see, a $HOME write under ProtectHome=, and
+      # deploy#613 itself — and assert the harness goes RED for each. They also prove the sandbox
+      # is DERIVED: the same write passes or fails according to what ReadWritePaths= says.
+      #
+      # A harness that has not been shown to fail is not evidence. It is decoration.
+      - name: Calibration — prove the harness can actually fail
+        run: python3 -m pytest scripts/tests/test_backup_under_unit_hardening.py -v

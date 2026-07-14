@@ -15,6 +15,7 @@
 #   * actionlint (workflow lint) ...... lint-workflows.yml + docs.yml
 #   * ruff lint + format, mypy ........ hooks-lint.yml (over .claude/hooks/)
 #   * gitleaks (secret detection) ..... stricter-local (no CI gate yet; kept)
+#   * backup under unit hardening ..... backup-hardening.yml (deploy#626/#627)
 #
 # Stage split (fail-fast, cheapest first):
 #   pre-commit (every commit) — terraform fmt/validate, gitleaks, actionlint,
@@ -155,6 +156,32 @@ repos:
       - id: pytest-scripts
         name: pytest-scripts (pre-push)
         entry: python3 -m pytest scripts/tests -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      # The backup path under the BACKUP UNIT'S OWN HARDENING (mirrors backup-hardening.yml,
+      # deploy#626/#627). Runs scripts/backup.sh and scripts/emit-backup-failure-marker.sh
+      # inside a mount namespace built from the ProtectSystem=/ReadWritePaths=/ProtectHome=
+      # directives in systemd/*.service, with docker/rclone/zstd stubbed.
+      #
+      # THIS IS MIRRORED LOCALLY BECAUSE IT CAN BE (main#684 — full local<->CI parity). The
+      # sandbox is rootless (`unshare --user --map-root-user --mount`), so a developer gets the
+      # gate from `pre-commit` with no sudo and no ceremony. That matters more than usual here:
+      # deploy#613 shipped TWICE, and the second time was inside the fix for the first, because
+      # nothing anyone could run locally could express the defect. Now they can.
+      #
+      # Exits 2 — never 0 — if it cannot build the namespace. A check that cannot run must say
+      # so and must NOT testify; on Ubuntu 24.04 that may need
+      # `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. Heavier, so pre-push.
+      #
+      # The CALIBRATION half (scripts/tests/test_backup_under_unit_hardening.py — the mutations
+      # that prove this harness can actually FAIL) is already carried by pytest-scripts above,
+      # which runs the whole scripts/tests suite.
+      - id: backup-under-unit-hardening
+        name: backup-under-unit-hardening (pre-push)
+        entry: python3 scripts/tests/unit_hardening.py
         language: system
         pass_filenames: false
         always_run: true
