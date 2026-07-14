@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -107,6 +108,86 @@ def test_the_scan_can_actually_see_an_unflagged_call(evasion: str) -> None:
 def test_the_scan_does_not_false_positive_on_a_comment() -> None:
     """The other direction: prose about the rule must not fail the build."""
     assert not _unflagged_compose_calls("# every `docker compose` here carries -p")
+
+
+# ---------------------------------------------------------------------------
+# CALIBRATE THE CALIBRATOR (deploy#677)
+# ---------------------------------------------------------------------------
+# The self-test's own DIFFER cases must not pass on an EMPTY reading — that is the
+# "a both-sides-zero is not a match" doctrine, and it was sitting inside the very comparator
+# that `needs: self-test` gates the real restore-verify run on. The predicates were extracted
+# from self_test() precisely so they can be exercised here with an injected empty reading,
+# without the two real Neo4j stacks the full self-test needs. `main` in restore_verify.sh is
+# guarded (`if [[ "${BASH_SOURCE[0]}" == "${0}" ]]`) so the file can be sourced for this.
+def _predicate_rc(func: str, *args: str) -> int:
+    """Source restore_verify.sh and call one of its extracted DIFFER predicates, returning its
+    exit code. Exercises the REAL predicate, not a paraphrase of it."""
+    quoted = " ".join(shlex.quote(a) for a in args)
+    snippet = f"source {shlex.quote(str(RESTORE_VERIFY))}; {func} {quoted}"
+    return subprocess.run(["bash", "-c", snippet], capture_output=True, text=True).returncode
+
+
+@pytest.mark.parametrize(
+    ("ref_fp", "sub_fp", "should_pass"),
+    [
+        ("50/300/450/350", "49/290/440/345", True),  # a genuine difference — the real case
+        ("50/300/450/350", "50/300/450/350", False),  # identical — not a difference
+        ("50/300/450/350", "", False),  # THE BUG: empty sub reading must NOT read as "differs"
+        ("", "49/290/440/345", False),  # empty ref
+        ("", "", False),  # both empty
+    ],
+)
+def test_st_fp_differs_rejects_empty_readings(ref_fp, sub_fp, should_pass) -> None:
+    """Case 2's predicate. Under the old bare `!=`, an empty sub_fp trivially "differed" from a
+    populated ref_fp and the DIFFER case PASSED — certifying the comparator on an instrument
+    failure. It must now FAIL on any empty reading, and still PASS on a genuine difference (so
+    it is a discriminator, not an unconditional refusal). (deploy#677)
+    """
+    rc = _predicate_rc("st_fp_differs", ref_fp, sub_fp)
+    want = "pass" if should_pass else "fail"
+    assert (rc == 0) == should_pass, (
+        f"st_fp_differs({ref_fp!r},{sub_fp!r}) rc={rc}, expected {want}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("ref_count", "sub_count", "ref_fp", "sub_fp", "should_pass"),
+    [
+        ("50", "50", "fpA", "fpB", True),  # same count, different content — the real case
+        ("50", "50", "fpA", "fpA", False),  # same content — no difference
+        ("50", "49", "fpA", "fpB", False),  # different count
+        ("", "", "fpA", "fpB", False),  # THE BUG: two empty counts compare EQUAL under ==
+        ("50", "50", "fpA", "", False),  # empty sub fingerprint
+        ("50", "50", "", "", False),  # both fingerprints empty
+    ],
+)
+def test_st_same_count_content_differs_rejects_empty_readings(
+    ref_count, sub_count, ref_fp, sub_fp, should_pass
+) -> None:
+    """Case 3's predicate. Under the old form, a pair of empty counts compared EQUAL and an
+    empty sub_fp trivially "differed", so the case PASSED on nothing. It must now FAIL unless
+    every reading is non-empty. (deploy#677)
+    """
+    rc = _predicate_rc("st_same_count_content_differs", ref_count, sub_count, ref_fp, sub_fp)
+    assert (rc == 0) == should_pass, (
+        f"st_same_count_content_differs({ref_count!r},{sub_count!r},{ref_fp!r},{sub_fp!r}) "
+        f"rc={rc}, expected {'pass' if should_pass else 'fail'}"
+    )
+
+
+def test_the_selftest_wait_does_not_crash_on_a_missing_container() -> None:
+    """Item 2: the self-test health-wait must not `set -e`-crash when `ps -q` finds no container
+    yet (the normal first-pass state). Static check that the crash-prone bare assignment form is
+    gone from the wait loop — the same shape start_stack() already guards. (deploy#677)"""
+    src = _source()
+    m = re.search(r"^self_test\(\) \{(.*?)^\}", src, re.S | re.M)
+    assert m, "could not locate self_test()"
+    body = m.group(1)
+    assert 'cid="$(_st_dc "$p" ps -q neo4j | head -1)" || cid=""' in body, (
+        'the self-test wait\'s `cid=$(… ps -q …)` is not guarded with `|| cid=""`; under set -e '
+        "a missing container (the normal first-pass state) crashes the wait loop before the "
+        "stack can come up"
+    )
 
 
 def _run_restore_body(text: str) -> str:
