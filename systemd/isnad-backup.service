@@ -10,6 +10,11 @@ Type=oneshot
 WorkingDirectory=/opt/noorinalabs-deploy
 EnvironmentFile=/opt/noorinalabs-deploy/.env
 Environment=BACKUP_DIR=/var/lib/noorinalabs-backups
+# Where scripts/scratch.sh allocates capture files. DECLARED HERE, next to the ReadWritePaths=
+# that makes it writable, rather than guessed by a fallback chain in the library (deploy#666).
+# It must be inside ReadWritePaths= below — test_every_hardened_unit_declares_a_writable_
+# scratch_parent proves that, from this file, for every hardened unit.
+Environment=SCRATCH_PARENT=/var/lib/noorinalabs-backups
 Environment=COMPOSE_FILE=compose/docker-compose.prod.yml
 ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh
 StandardOutput=journal

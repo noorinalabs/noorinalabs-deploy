@@ -711,6 +711,15 @@ def test_stale_dump_from_an_earlier_run_does_not_satisfy_the_attested_run(tmp_pa
 # ---------------------------------------------------------------------------
 RESTORE_SH = SCRIPTS_DIR / "restore.sh"
 
+# restore.sh SOURCES the scratch library (deploy#625/#628), so every harness below that slices
+# its functions out must source it too. Without this the sliced code calls `scratch_file` into a
+# void: bash reports "command not found" (rc=127), the allocation looks like it FAILED, and the
+# function under test takes an error path production would never take — while the assertion the
+# test was actually making goes unexercised. A harness that runs production code in an
+# environment production does not have is not running production code.
+SCRATCH_SH = SCRIPTS_DIR / "scratch.sh"
+SCRATCH_SOURCE = f'source "{SCRATCH_SH}"\n'
+
 
 def _shipped_predicate() -> str:
     """The SHIPPED text of `manifest_attests_complete` — never a retyped copy of it."""
@@ -771,7 +780,13 @@ def _select(restore_dir: Path) -> dict[str, str]:
         # are NOT discarded. A `log() { :; }` stub would hide the refusal text this suite
         # asserts on, which is the same "the fixture cannot express the condition" trap one
         # level out: an assertion on a message a stub swallowed can never fail.
-        'log() { shift; echo "$*" >&2; }\n' + helpers + "\n" + 'RESTORE_DIR="$1"\n' + region + "\n"
+        'log() { shift; echo "$*" >&2; }\n'
+        + SCRATCH_SOURCE
+        + helpers
+        + "\n"
+        + 'RESTORE_DIR="$1"\n'
+        + region
+        + "\n"
         'printf "PG=%s\\n" "$(basename "${PG_DUMP:-}")"\n'
         'printf "USER_PG=%s\\n" "$(basename "${USER_PG_DUMP:-}")"\n'
         'printf "NEO4J=%s\\n" "$(basename "${NEO4J_DUMP:-}")"\n'
@@ -928,8 +943,7 @@ def _backup_is_complete(root: Path, path: str) -> int:
     fn = body[body.index("backup_is_complete() {") : body.index("\nresolve_latest()")]
     script = (
         "set -euo pipefail\n"
-        'log() { shift; echo "$*" >&2; }\n'
-        'RCLONE_REMOTE=":local"\n'
+        'log() { shift; echo "$*" >&2; }\n' + SCRATCH_SOURCE + 'RCLONE_REMOTE=":local"\n'
         # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
         # path in restore.sh is built from it. B2_BUCKET deliberately points at a
         # path with NO fixtures under it, so a function that rebuilds a raw bucket
@@ -1765,8 +1779,7 @@ def _backup_is_complete_err(root: Path, path: str) -> tuple[int, str]:
     fn = body[body.index("backup_is_complete() {") : body.index("\nresolve_latest()")]
     script = (
         "set -euo pipefail\n"
-        'log() { shift; echo "$*" >&2; }\n'
-        'RCLONE_REMOTE=":local"\n'
+        'log() { shift; echo "$*" >&2; }\n' + SCRATCH_SOURCE + 'RCLONE_REMOTE=":local"\n'
         # REMOTE_ROOT carries the environment namespace (deploy#632); every remote
         # path in restore.sh is built from it. B2_BUCKET deliberately points at a
         # path with NO fixtures under it, so a function that rebuilds a raw bucket

@@ -216,6 +216,16 @@ EOF
 # ---------------------------------------------------------------------------
 cleanup() {
     local exit_code=$?
+
+    # Drain any scratch still held (deploy#629). This is the ONLY hook this change puts in
+    # backup.sh, and it has to be here: the `trap … RETURN` at each allocation site does not
+    # fire on a signal (measured), while the EXIT trap DOES run on SIGTERM — so if the unit is
+    # stopped or times out mid-`dc ps`, this line is the only thing that removes the capture
+    # file. It would otherwise land at the BACKUP_DIR ROOT, which — unlike /tmp — has no
+    # reaper: retention purges the REMOTE, and the cleanup below covers LOCAL_BACKUP_PATH, the
+    # per-run subdirectory, not the root above it. Runs FIRST, before the log lines below,
+    # because it must not depend on anything this function does afterwards.
+    scratch_cleanup_all
     # Order matters: emit our last log lines BEFORE rm-ing the directory the
     # log file lives in, otherwise tee fails silently with "No such file or
     # directory" and we lose the cleanup confirmation.
