@@ -62,3 +62,11 @@ ontology/structural/
 # parent org repo; this repo had drifted, and a draft reached a branch bound for main
 # (deploy#574 review). Never a build input.
 .claude/scratch/
+
+# Worktrees — local-only agent/wave isolation dirs, never tracked. Same drift as
+# .claude/scratch/ above: the parent org repo ignores these, this repo did not. The
+# consequence is worse than untidiness — an unignored worktree is a nested git repo, so
+# `git add -A` stages it as an EMBEDDED REPOSITORY (a bare gitlink), and a clone of this
+# repo then gets a directory it cannot populate. It nearly rode along on deploy#631.
+.worktrees/
+.claude/worktrees/
