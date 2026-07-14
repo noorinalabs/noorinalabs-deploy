@@ -164,16 +164,29 @@ def test_script_refuses_to_run_without_a_prefix(script: Path) -> None:
 _REFUSAL = "not a bare name"
 
 
-def _run_with_prefix(script: Path, prefix: str) -> subprocess.CompletedProcess[str]:
+def _run_with_prefix(
+    script: Path, prefix: str, backup_dir: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the real script with a given BACKUP_PREFIX and nothing else it can succeed at.
+
+    BACKUP_DIR is pointed at a writable tmp dir so that the un-writable
+    `/var/lib/noorinalabs-backups` mkdir is not a CONFOUND — it is the ambient failure that
+    made the original assertion a tautology, and a test whose signal has to be untangled
+    from an unrelated crash is one nobody will trust at 3am (#633 review, Nino Kavtaradze).
+    PATH stays minimal so no real rclone/docker call can leave the sandbox.
+    """
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "B2_KEY_ID": "x",
+        "B2_APP_KEY": "x",
+        "B2_BUCKET": "x",
+        "BACKUP_PREFIX": prefix,
+    }
+    if backup_dir is not None:
+        env["BACKUP_DIR"] = str(backup_dir)
     return subprocess.run(
         ["bash", str(script)],
-        env={
-            "PATH": "/usr/bin:/bin",
-            "B2_KEY_ID": "x",
-            "B2_APP_KEY": "x",
-            "B2_BUCKET": "x",
-            "BACKUP_PREFIX": prefix,
-        },
+        env=env,
         capture_output=True,
         text=True,
         timeout=60,
@@ -181,7 +194,9 @@ def _run_with_prefix(script: Path, prefix: str) -> subprocess.CompletedProcess[s
 
 
 @pytest.mark.parametrize("script", [BACKUP_SH, RESTORE_SH], ids=lambda p: p.name)
-def test_a_prefix_that_escapes_its_namespace_is_refused_AS_SUCH(script: Path) -> None:
+def test_a_prefix_that_escapes_its_namespace_is_refused_AS_SUCH(
+    script: Path, tmp_path: Path
+) -> None:
     """A prefix carrying `/` or `..` climbs out of its own namespace into the other's.
 
     ATTRIBUTE THE REFUSAL. The first cut asserted only `returncode != 0` and claimed that
@@ -206,8 +221,20 @@ def test_a_prefix_that_escapes_its_namespace_is_refused_AS_SUCH(script: Path) ->
     guard had NO test executing it at all — on the restore side, an escaping prefix is how
     you load the stg graph into prod.
     """
-    for hostile in ("../prod", "stg/../prod", "/prod", "PROD", "-prod", ""):
-        proc = _run_with_prefix(script, hostile)
+    for hostile in (
+        "../prod",
+        "stg/../prod",
+        "/prod",
+        "PROD",
+        "-prod",  # leading `-`: option injection into rclone, were it ever argv[0]
+        "--config=/tmp/evil",
+        "",
+        "stg\n../prod",  # newline smuggling — bash =~ has no REG_NEWLINE, so `$` is end-of-STRING
+        "stg; rm -rf /",
+        "$(touch /tmp/pwned)",
+        "рrod",  # Cyrillic homoglyph
+    ):
+        proc = _run_with_prefix(script, hostile, backup_dir=tmp_path)
         assert proc.returncode != 0, (
             f"{script.name} ACCEPTED BACKUP_PREFIX={hostile!r} — that prefix escapes its "
             f"namespace and can reach the other environment's backups."
@@ -224,7 +251,7 @@ def test_a_prefix_that_escapes_its_namespace_is_refused_AS_SUCH(script: Path) ->
 
 
 @pytest.mark.parametrize("script", [BACKUP_SH, RESTORE_SH], ids=lambda p: p.name)
-def test_a_legal_prefix_is_not_refused(script: Path) -> None:
+def test_a_legal_prefix_is_not_refused(script: Path, tmp_path: Path) -> None:
     """The positive control for the test above.
 
     Without it, "the refusal message appeared" could be true of EVERY input — including the
@@ -234,7 +261,7 @@ def test_a_legal_prefix_is_not_refused(script: Path) -> None:
     The script will still fail here (no docker, no real B2) — that is fine and expected. What
     must NOT appear is the charset refusal.
     """
-    proc = _run_with_prefix(script, "stg")
+    proc = _run_with_prefix(script, "stg", backup_dir=tmp_path)
     combined = proc.stderr + proc.stdout
     assert _REFUSAL not in combined, (
         f"{script.name} REFUSED the legal prefix 'stg' as malformed. The charset guard is "
