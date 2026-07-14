@@ -525,43 +525,119 @@ resource_gate() {
 }
 
 # =============================================================================
+# Leak audit — and the rc discipline that goes with it
+# =============================================================================
+# A teardown that dies partway is how volumes leak, and a leaked scratch volume holds a FULL
+# COPY OF THE PRODUCTION DATABASE. `docker compose down -v` is not sufficient evidence that it
+# is gone: the compose file's `${POSTGRES_USER:?}` guards interpolate on `down` too, so a
+# teardown run without those vars ABORTS. That is not hypothetical — it is what the hand-run
+# did, and recovery was `docker rm -f` + `docker volume rm` + `docker network rm` by hand.
+#
+# So we do not trust `down -v`. We ENUMERATE what is left, using compose's own project label
+# (the same label compose itself uses to decide what `down` owns), sweep it, and re-enumerate.
+#
+# THE EXIT-CODE RULE, which is the whole point:
+#
+#   * The comparator's verdict is captured BEFORE any teardown runs and is NEVER overwritten
+#     by a teardown outcome. A cleanup fault cannot turn a FAILING comparator into a passing
+#     run — a real negative always survives to the exit code.
+#
+#   * A leak on an otherwise-GREEN run is still a fault, and it exits 2 (INSTRUMENT), not 0.
+#     It is reported as exactly what it is: "the comparator PASSED; the teardown LEAKED."
+#     Those are two different facts and collapsing them would hide a live copy of production
+#     sitting on the box.
+#
+# Verdict-before-cleanup, and cleanup never speaks for the verdict
+# (feedback_your_own_verification_script_must_not_testify: on the hand-run, cleanup ran BEFORE
+# the verdict and destroyed the evidence).
+leak_audit() { # leak_audit <verdict_rc> <project>...
+    local verdict="$1"
+    shift
+    local projects=("$@")
+    local p kind leaked=0 found
+
+    for p in "${projects[@]}"; do
+        for kind in container volume network; do
+            case "$kind" in
+                container) found="$(docker ps -aq --filter "label=com.docker.compose.project=${p}")" || found="" ;;
+                volume) found="$(docker volume ls -q --filter "label=com.docker.compose.project=${p}")" || found="" ;;
+                network) found="$(docker network ls -q --filter "label=com.docker.compose.project=${p}")" || found="" ;;
+            esac
+            [[ -z "$found" ]] && continue
+
+            local id
+            while IFS= read -r id; do
+                [[ -z "$id" ]] && continue
+                log "WARN" "leak: ${kind} ${id} survived 'down -v' in project ${p} — removing it directly"
+                case "$kind" in
+                    container) docker rm -f "$id" >/dev/null || leaked=1 ;;
+                    volume) docker volume rm -f "$id" >/dev/null || leaked=1 ;;
+                    network) docker network rm "$id" >/dev/null || leaked=1 ;;
+                esac
+            done <<<"$found"
+        done
+    done
+
+    # Re-enumerate. The sweep's own exit code is not evidence that the object is gone.
+    local still=0
+    for p in "${projects[@]}"; do
+        found="$(docker ps -aq --filter "label=com.docker.compose.project=${p}")" || found=""
+        [[ -n "$found" ]] && still=1
+        found="$(docker volume ls -q --filter "label=com.docker.compose.project=${p}")" || found=""
+        [[ -n "$found" ]] && still=1
+        found="$(docker network ls -q --filter "label=com.docker.compose.project=${p}")" || found=""
+        [[ -n "$found" ]] && still=1
+    done
+
+    if [[ "$still" -eq 0 && "$leaked" -eq 0 ]]; then
+        pass "teardown audit: no stray containers, volumes or networks remain"
+    else
+        fail "teardown audit: STRAY OBJECTS REMAIN after the sweep — a scratch volume may hold a"
+        log "ERROR" "  full copy of the ${BACKUP_PREFIX:-target} database. Remove it by hand NOW:"
+        log "ERROR" "    docker ps -a  --filter label=com.docker.compose.project=${projects[0]}"
+        log "ERROR" "    docker volume ls --filter label=com.docker.compose.project=${projects[0]}"
+        # A leak must not silently pass. But it must ALSO not overwrite a real negative: if the
+        # comparator already failed, that verdict is the more important fact and it stands.
+        if [[ "$verdict" -eq 0 ]]; then
+            log "ERROR" "The comparator PASSED, but the teardown LEAKED. Exiting ${RC_INSTRUMENT}"
+            log "ERROR" "(INSTRUMENT), not 0: the restore verified, but the box is not clean."
+            exit "$RC_INSTRUMENT"
+        fi
+    fi
+
+    exit "$verdict"
+}
+
+# =============================================================================
 # Stack lifecycle
 # =============================================================================
 teardown() {
-    local rc=$?
+    # THE VERDICT, captured first and never recomputed. See leak_audit() for the rule.
+    local verdict=$?
 
     if [[ "$KEEP_STACK" == "true" ]]; then
         log "WARN" "KEEP_STACK=true — leaving project '${RV_PROJECT}' UP. Volumes are NOT removed."
         log "WARN" "  Tear down with: docker compose -p ${RV_PROJECT} -f ${RV_COMPOSE} down -v"
-        exit "$rc"
+        exit "$verdict"
     fi
     if [[ "$STACK_STARTED" != "true" ]]; then
-        exit "$rc"
+        exit "$verdict"
     fi
 
     # The compose file's `${POSTGRES_USER:?}` guards interpolate on `down` too. Run this
     # without those vars in the environment and compose ABORTS — leaking the volumes,
     # which is exactly what happened on the hand-run (recovery was `docker rm -f` +
     # `docker volume rm` + `docker network rm`, by hand). We sourced the env-file before
-    # installing this trap, so they are present; the sweep below is the belt to that brace.
-    log "INFO" "Tearing down the throwaway stack (project ${RV_PROJECT})..."
-    _dc rv down -v --remove-orphans || log "WARN" "compose down returned non-zero; sweeping volumes directly"
-
-    local v full leaked=0
-    for v in rv_pg_data rv_user_pg_data rv_neo4j_data; do
-        full="${RV_PROJECT}_${v}"
-        if docker volume inspect "$full" >/dev/null 2>&1; then
-            log "WARN" "volume ${full} survived 'down -v' — removing it directly"
-            docker volume rm -f "$full" >/dev/null || leaked=1
-        fi
-    done
-    if [[ "$leaked" -eq 1 ]]; then
-        log "ERROR" "A scratch volume could not be removed. It holds a full copy of the"
-        log "ERROR" "${BACKUP_PREFIX:-?} database. Remove it by hand before it is forgotten."
-    fi
+    # installing this trap, so they are present; leak_audit is the belt to that brace.
+    log "INFO" "Tearing down the throwaway stack (project ${RV_PROJECT}, verdict rc=${verdict})..."
+    _dc rv down -v --remove-orphans ||
+        log "WARN" "compose down returned non-zero — the audit below is what stops a leak"
 
     rm -rf "$RESTORE_STAGING_DIR"
-    exit "$rc"
+
+    # Enumerates containers/volumes/networks by compose's own project label, sweeps them,
+    # re-enumerates, and exits with the VERDICT — never with the teardown's own outcome.
+    leak_audit "$verdict" "$RV_PROJECT"
 }
 
 start_stack() {
@@ -805,11 +881,20 @@ self_test() {
     }
 
     _st_cleanup() {
-        local r=$?
-        log "INFO" "self-test: tearing down both stacks"
-        _st_dc "$ST_REF_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
-        _st_dc "$RV_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
-        exit "$r"
+        # THE VERDICT. Captured on the first line, before anything here can clobber `$?`,
+        # and never recomputed. Everything below may fail freely without changing it.
+        local verdict=$?
+        log "INFO" "self-test: tearing down both stacks (comparator verdict rc=${verdict})"
+
+        local p
+        for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
+            # NOT `>/dev/null 2>&1 || true`. If a teardown fails, its own message is the only
+            # thing that will explain the leak it just caused.
+            _st_dc "$p" down -v --remove-orphans ||
+                log "WARN" "compose down failed for ${p} — the sweep below is what stops a leak"
+        done
+
+        leak_audit "$verdict" "$ST_REF_PROJECT" "$RV_PROJECT"
     }
     trap _st_cleanup EXIT
 
