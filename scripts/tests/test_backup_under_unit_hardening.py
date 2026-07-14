@@ -123,6 +123,19 @@ FALSE_CLAIMS = (
     "Cannot reach Docker Compose",
     "Could not START neo4j",
     "Neo4j is NOT running",
+    # A scratch allocation that failed — reported by compose_project.sh's scratch_failed(). This
+    # is deploy#675, and it is the SEAM between two individually-correct decisions, not a bug in
+    # either. deploy#635 makes a retention (prune_old_backups) scratch failure DELIBERATELY
+    # NON-FATAL: a listing failure must not convert a storage-cost problem into a total backup
+    # outage. deploy#654 asserts the run exits 0 with its success gauge. Compose them and a
+    # scratch_file() regression on the retention path — exactly what deploy#661 routes — logs
+    # this, leaves rc==0 AND the gauge in place, and sails through BOTH halves of the oracle.
+    # docker/rclone are HEALTHY here by construction and BACKUP_DIR is granted, so the ONLY way
+    # this string appears is a scratch write landing somewhere the unit forbids — the #613 class,
+    # on the one path rc-and-gauge structurally cannot see. Adding it is a THIRD observation, NOT
+    # a coupling: retention stays non-fatal (see the calibration below, which asserts rc==0 AND
+    # the gauge survive), we just stop being BLIND to the failure. deploy#675.
+    "no writable scratch file",
 )
 
 
@@ -520,6 +533,76 @@ def test_calibration_deploy613_itself_restored_goes_red(tmp_path: Path) -> None:
     assert "verdict=KEY_INVALID" not in res.output, (
         "THE PREFLIGHT BLAMED THE KEY. The key is fine — the harness's rclone stub is a healthy, "
         f"write-capable key by construction. This is deploy#613's lie, verbatim.\n{res.output}"
+    )
+
+
+@needs_namespace
+def test_calibration_a_retention_path_scratch_failure_goes_red(tmp_path: Path) -> None:
+    """(5) deploy#675: THE SEAM. A scratch failure the gate was BUILT to catch, on the one path
+    it could not see — and neither composing decision is wrong.
+
+    deploy#635 makes a retention (prune_old_backups) scratch failure DELIBERATELY NON-FATAL: a
+    listing failure must not convert a storage-cost problem into a total backup outage. deploy#654
+    (this harness) asserts the run exits 0 with its success gauge. Both are correct in isolation.
+    Compose them and a scratch_file() regression on the retention path — exactly what deploy#661
+    routes — logs "no writable scratch file", sets RETENTION_OK=false, and returns WITHOUT failing
+    the run. The exit code stays 0. The success gauge is still emitted. rc-and-gauge, the entire
+    oracle this harness had, are BOTH still satisfied — so the one gate built specifically to catch
+    a scratch failure under hardening passed straight over one. (Aisha Idrissi, deploy#675.)
+
+    The mutation is that regression, faithfully: a bare scratch that lands in the READ-ONLY /tmp
+    (the #613 class), reported by compose_project.sh's own scratch_failed(), NON-FATAL exactly as
+    deploy#635 mandates. BACKUP_DIR is granted, so the real scratch_file() would SUCCEED here — the
+    defect is precisely routing scratch OFF the library and onto /tmp.
+
+    The fix is a THIRD observation, not a coupling. This test pins BOTH sides of that:
+
+      * retention MUST still not fail the run  -> rc == 0, exec_rc == 0, success gauge present.
+        Coupling the scratch failure to the exit code would "fix" the blind spot by regressing
+        deploy#635 into a total-outage-on-a-listing-failure. That is not the fix.
+      * the failure MUST now be SEEN            -> the FALSE_CLAIMS oracle — the SAME loop the
+        positive control applies to the real run — now finds "no writable scratch file", where
+        before deploy#675 it could not, because the string was not in the tuple.
+    """
+    repo = _stage(tmp_path)
+    # A scratch_file() regression on the retention path: scratch routed to the read-only /tmp
+    # instead of via the library (which uses the granted BACKUP_DIR). Reported by the library's
+    # own scratch_failed(); NON-FATAL, per deploy#635 — the run continues, retention degraded.
+    mutation = (
+        'if ! _HARNESS_RET_SCRATCH="$(mktemp /tmp/retention-XXXXXX 2>/dev/null)"; then\n'
+        "        scratch_failed || true  # deploy#635: a retention scratch failure is NON-FATAL\n"
+        "    fi"
+    )
+    _mutate(repo, "backup.sh", 'local category="$1"', mutation)
+
+    res = _run(repo)
+
+    # (a) deploy#635 is NOT regressed. The retention scratch failure did NOT fail the run: the
+    #     backup artifact is complete and the success gauge is emitted. This is the whole reason
+    #     rc-and-gauge could not see the defect — and the reason the fix must NOT couple them.
+    assert res.rc == 0, (
+        f"THE RETENTION SCRATCH FAILURE FAILED THE RUN. deploy#635 makes it deliberately "
+        f"non-fatal — a listing failure must not become a total backup outage. If this is red, "
+        f"the fix regressed #635 by coupling retention to the exit code.\n{res.output}"
+    )
+    assert res.exec_rc == 0
+    assert_gauge_is_scraped(res, SUCCESS_GAUGE)
+
+    # (b) The mutation actually fired — otherwise this calibration is inert (deploy#574).
+    assert "no writable scratch file" in res.output, (
+        "the injected retention scratch regression did not emit its diagnostic — the mutation is "
+        f"inert and this calibration proves nothing.\n{res.output}"
+    )
+
+    # (c) THE BLIND SPOT, MADE EXPLICIT. rc-and-gauge are both green (asserted above), so the only
+    #     thing standing between this real scratch regression and a PASS is FALSE_CLAIMS. Run the
+    #     positive control's exact oracle and require it to FIRE on this string — where, before
+    #     deploy#675, the string was not in the tuple and the gate went green over the defect.
+    offending = [claim for claim in FALSE_CLAIMS if claim in res.output]
+    assert "no writable scratch file" in offending, (
+        "deploy#675: the retention-path scratch failure is INVISIBLE to the gate. rc==0 and the "
+        "success gauge is present, so the only oracle that can catch it is FALSE_CLAIMS — and it "
+        f"does not. Add 'no writable scratch file' to FALSE_CLAIMS.\nFALSE_CLAIMS={FALSE_CLAIMS}"
     )
 
 
