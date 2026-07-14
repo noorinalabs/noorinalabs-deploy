@@ -97,7 +97,9 @@ SCRATCH_LIB = SCRIPTS_DIR / "scratch.sh"
 _EXEC_DIRECTIVE = re.compile(r"^Exec[A-Za-z]*\s*=\s*(.*)$")
 
 
-def unit_reachable_scripts() -> set[Path]:
+def unit_reachable_scripts(
+    systemd_dir: Path = SYSTEMD_DIR, scripts_dir: Path = SCRIPTS_DIR
+) -> set[Path]:
     """Every script a HARDENED systemd unit can execute, resolved from the units themselves.
 
     Every `Exec*=` directive gives the entry points — a unit may legally carry SEVERAL, and all
@@ -108,12 +110,16 @@ def unit_reachable_scripts() -> set[Path]:
 
     Scoped to units that are actually hardened: an unhardened unit has a writable /tmp and a
     bare `mktemp` in it is not a bug.
+
+    `systemd_dir`/`scripts_dir` default to the real repo layout. They are parameters ONLY so a
+    test can point the resolver at a FIXTURE TREE under `tmp_path` — the pin must never mutate
+    the deployable `systemd/` unit files to exercise itself (deploy#674).
     """
     entry: set[Path] = set()
-    for unit in sorted(SYSTEMD_DIR.glob("*.service")):
+    for unit in sorted(systemd_dir.glob("*.service")):
         if "ProtectSystem=strict" not in unit.read_text():
             continue
-        entry |= _entry_points_of_unit(unit)
+        entry |= _entry_points_of_unit(unit, scripts_dir)
 
     # Transitive closure over the `source` graph — but matched on BASENAME ANYWHERE in the
     # script, not on the `source` line itself.
@@ -138,10 +144,10 @@ def unit_reachable_scripts() -> set[Path]:
     # the right files says nothing about whether the pattern applied to them is sound, and it
     # says nothing about the writes that are not `mktemp` calls at all. See the module
     # docstring, "WHAT A GREEN RUN MEANS".
-    return _close_over_source_graph(entry)
+    return _close_over_source_graph(entry, scripts_dir)
 
 
-def _entry_points_of_unit(unit: Path) -> set[Path]:
+def _entry_points_of_unit(unit: Path, scripts_dir: Path = SCRIPTS_DIR) -> set[Path]:
     """Every script THIS unit can execute, across ALL of its `Exec*=` directives.
 
     A `Type=oneshot` unit legally carries SEVERAL `ExecStart=` lines and runs them in sequence,
@@ -158,22 +164,22 @@ def _entry_points_of_unit(unit: Path) -> set[Path]:
         # `-@+!:` exec prefixes are stripped rather than hiding the path behind them.
         for token in m.group(1).split():
             name = Path(token.lstrip("-@+!:")).name
-            candidate = SCRIPTS_DIR / name
+            candidate = scripts_dir / name
             if candidate.is_file() and candidate.suffix == ".sh":
                 entry.add(candidate)
     return entry
 
 
-def _closure_of_unit(unit: Path) -> set[Path]:
+def _closure_of_unit(unit: Path, scripts_dir: Path = SCRIPTS_DIR) -> set[Path]:
     """Everything THIS unit can execute, plus everything those scripts source."""
-    return _close_over_source_graph(_entry_points_of_unit(unit))
+    return _close_over_source_graph(_entry_points_of_unit(unit, scripts_dir), scripts_dir)
 
 
-def _close_over_source_graph(entry: set[Path]) -> set[Path]:
+def _close_over_source_graph(entry: set[Path], scripts_dir: Path = SCRIPTS_DIR) -> set[Path]:
     """Transitive closure of `entry` over the `source` graph, matched on BASENAME."""
     seen: set[Path] = set()
     pending = list(entry)
-    siblings = sorted(SCRIPTS_DIR.glob("*.sh"))
+    siblings = sorted(scripts_dir.glob("*.sh"))
     while pending:
         script = pending.pop()
         if script in seen:
@@ -1030,50 +1036,111 @@ def test_the_pin_sees_every_exec_directive(tmp_path: Path) -> None:
     (Same species as Nurul's finding on the #654 harness, where `Unit.one()` took the LAST
     `ExecStart=` and a `Type=oneshot` unit's FIRST one — carrying this very defect — was never
     run. A resolver that reads a subset of the directives is a scan looking at the wrong thing.)
-    """
-    scripts_dir = SCRIPTS_DIR
-    unit = SYSTEMD_DIR / "isnad-backup.service"
-    original = unit.read_text()
-    assert "ProtectSystem=strict" in original, "fixture assumes a hardened unit"
 
-    helper = scripts_dir / "_exec_pre_probe.sh"
-    # No `source`, no mention of scratch.sh, no scratch_file/scratch_dir call: the ADOPTER rule
-    # cannot see this file. Only the unit graph can. That isolation is the whole point.
-    helper.write_text(
+    THE FIXTURE TREE IS BUILT UNDER `tmp_path`, NEVER IN THE REAL REPO. (deploy#674, Bereket
+    Tadesse.) The first version of this test rewrote the deployable `systemd/isnad-backup.service`
+    on disk four times and dropped a bare-`mktemp` helper into the live `scripts/` directory,
+    restoring in a `finally`. `finally` does not cover a SIGKILL, an OOM, or a CI timeout — so an
+    interrupted run could leave a mutated PRODUCTION UNIT and a planted bad script behind. Worse,
+    it planted that script in the exact directory `test_no_bare_mktemp_survives_in_the_library`
+    scans, so under `pytest-xdist` the two tests could observe each other and false-RED on a
+    `mktemp` the suite planted itself. A test that edits deployable files to exercise itself is
+    the very "measurement mutating the thing it measures" this PR exists to stop. So the resolver
+    now takes `systemd_dir`/`scripts_dir`, and everything below lives under `tmp_path`.
+    """
+    systemd_dir = tmp_path / "systemd"
+    scripts_dir = tmp_path / "scripts"
+    systemd_dir.mkdir()
+    scripts_dir.mkdir()
+
+    # A real entry point, so the closure is non-empty and the resolver has something to anchor on.
+    (scripts_dir / "backup.sh").write_text("#!/usr/bin/env bash\n:\n")
+    # The probe: no `source`, no mention of scratch.sh, no scratch_file/scratch_dir call — so the
+    # ADOPTER rule is structurally incapable of seeing it. If it is caught, the UNIT graph caught
+    # it. That isolation is the whole point (see the calibration-passed-for-the-wrong-reason note).
+    (scripts_dir / "helper.sh").write_text(
         '#!/usr/bin/env bash\nset -euo pipefail\nstaging="$(mktemp -d)"\necho "$staging"\n'
     )
-    try:
-        for directive in ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecCondition"):
-            unit.write_text(
-                original.replace(
-                    "ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh",
-                    f"{directive}=/opt/noorinalabs-deploy/scripts/{helper.name}\n"
-                    "ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh",
-                    1,
-                )
-            )
-            reachable = {p.name for p in unit_reachable_scripts()}
-            assert helper.name in reachable, (
-                f"a script the unit runs via `{directive}=` is NOT in the unit-reachable "
-                f"closure. systemd executes it under the SAME ProtectSystem=strict sandbox as "
-                f"ExecStart=, so a bare mktemp in it is deploy#613 — and the pin cannot see it. "
-                f"Resolve EVERY Exec* directive, not just ExecStart=.\nFound: {sorted(reachable)}"
-            )
-    finally:
-        unit.write_text(original)
-        helper.unlink(missing_ok=True)
 
-    # Calibration: the resolver must not simply return every script in the directory. If it did,
-    # the assertion above would hold for a file no unit mentions at all, and it would be inert.
-    stray = scripts_dir / "_never_referenced_probe.sh"
-    stray.write_text("#!/usr/bin/env bash\n:\n")
-    try:
-        assert stray.name not in {p.name for p in unit_reachable_scripts()}, (
-            "the resolver returned a script that NO unit references and nothing sources — it is "
-            "just globbing the directory, so its 'yes' above meant nothing."
+    base = "[Service]\nType=oneshot\nProtectSystem=strict\nReadWritePaths=/var/lib/node_exporter\n"
+    for directive in ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecCondition"):
+        (systemd_dir / "probe.service").write_text(
+            base
+            + f"{directive}=/opt/noorinalabs-deploy/scripts/helper.sh\n"
+            + "ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh\n"
         )
-    finally:
-        stray.unlink(missing_ok=True)
+        reachable = {p.name for p in unit_reachable_scripts(systemd_dir, scripts_dir)}
+        assert "helper.sh" in reachable, (
+            f"a script the unit runs via `{directive}=` is NOT in the unit-reachable closure. "
+            f"systemd executes it under the SAME ProtectSystem=strict sandbox as ExecStart=, so "
+            f"a bare mktemp in it is deploy#613 — and the pin cannot see it. Resolve EVERY Exec* "
+            f"directive, not just ExecStart=.\nFound: {sorted(reachable)}"
+        )
+
+    # A Type=oneshot unit legally carries MULTIPLE ExecStart= lines, run in sequence. The defect
+    # in the FIRST one must be caught even though a real entry point follows it (Nurul, #654).
+    (systemd_dir / "probe.service").write_text(
+        base
+        + "ExecStart=/opt/noorinalabs-deploy/scripts/helper.sh\n"
+        + "ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh\n"
+    )
+    reachable = {p.name for p in unit_reachable_scripts(systemd_dir, scripts_dir)}
+    assert "helper.sh" in reachable, (
+        "a defect in the FIRST of several ExecStart= lines was missed — a resolver that takes "
+        f"only one line is Nurul's #654 finding. Found: {sorted(reachable)}"
+    )
+
+    # Calibration: the resolver must not simply return every script in the directory. A script no
+    # unit references and nothing sources must NOT appear, or the assertions above are inert.
+    (scripts_dir / "never_referenced.sh").write_text("#!/usr/bin/env bash\n:\n")
+    reachable = {p.name for p in unit_reachable_scripts(systemd_dir, scripts_dir)}
+    assert "never_referenced.sh" not in reachable, (
+        "the resolver returned a script that NO unit references and nothing sources — it is just "
+        "globbing the directory, so every 'yes' above meant nothing."
+    )
+
+    # THE SOURCE-GRAPH CLOSURE MUST READ THE FIXTURE TREE, NOT THE REAL ONE. (Weronika Zielinska,
+    # #678 review.) `unit_reachable_scripts` forwarded `scripts_dir` to the ENTRY-POINT step but
+    # not to `_close_over_source_graph`, so the source-graph closure silently globbed the REAL
+    # `scripts/`. A helper reachable ONLY through `source` — the exact form the closure exists to
+    # follow — was therefore invisible in a fixture, resolving to `['backup.sh']` only. That is
+    # the #674 fidelity trap (a test reading the real tree) reintroduced one function over, and it
+    # made the globbing calibration above partially inert. This is the fixture that catches it.
+    (scripts_dir / "backup.sh").write_text(
+        '#!/usr/bin/env bash\nLIB="$(dirname "$0")/sourced_helper.sh"\nsource "$LIB"\n'
+    )
+    (scripts_dir / "sourced_helper.sh").write_text("#!/usr/bin/env bash\n:\n")
+    (systemd_dir / "probe.service").write_text(
+        base + "ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh\n"
+    )
+    reachable = {p.name for p in unit_reachable_scripts(systemd_dir, scripts_dir)}
+    assert "sourced_helper.sh" in reachable, (
+        "a helper reachable ONLY through the `source` graph, under tmp_path, was NOT resolved — "
+        "so the closure step scanned the REAL scripts/ dir, not the fixture. This is the #674 "
+        f"fidelity trap one function over. Found: {sorted(reachable)}"
+    )
+
+    # And the consequence that matters: a bare `mktemp` in that source-reached helper must be a
+    # findable offender. This is the offender scan of `test_no_bare_mktemp_survives_in_the_library`
+    # run over the FIXTURE closure — it proves the closure not only lists the helper but that the
+    # bare-mktemp rule then reaches it. Before the line-147 fix this found NOTHING, because the
+    # helper was never in the closure to begin with.
+    (scripts_dir / "sourced_helper.sh").write_text(
+        '#!/usr/bin/env bash\nerr="$(mktemp)"\necho "$err"\n'
+    )
+    offenders = [
+        f"{script.name}: {ln.strip()}"
+        for script in unit_reachable_scripts(systemd_dir, scripts_dir)
+        for ln in script.read_text().splitlines()
+        if not ln.lstrip().startswith("#") and "mktemp" in ln
+        for args in _mktemp_invocations(ln)
+        if not _names_its_parent(args)
+    ]
+    assert any("sourced_helper.sh" in o for o in offenders), (
+        "a bare `mktemp` in a helper reached THROUGH the source graph was not flagged. Either "
+        "the closure did not follow `source` into the fixture, or it followed it into the real "
+        f"tree where the bare mktemp does not exist. Offenders seen: {offenders}"
+    )
 
 
 def test_the_allocators_own_words_reach_the_caller(tmp_path: Path) -> None:
