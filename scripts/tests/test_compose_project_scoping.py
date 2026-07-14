@@ -47,9 +47,38 @@ BACKUP = SCRIPTS_DIR / "backup.sh"
 RESTORE = SCRIPTS_DIR / "restore.sh"
 REHEARSAL = SCRIPTS_DIR / "restore_rehearsal.sh"
 
+BOOTSTRAP = SCRIPTS_DIR / "bootstrap-vps.sh"
+PROD_COMPOSE = REPO_ROOT / "compose" / "docker-compose.prod.yml"
+
 # The scripts that talk to the LIVE stack. restore_rehearsal.sh is in scope because it
 # drives restore.sh: it is the one caller that must NOT resolve to `noorinalabs`.
 SCANNED = (LIB, BACKUP, RESTORE, REHEARSAL)
+
+
+# The whole EXECUTABLE surface that can address the prod stack (deploy#618 review). The
+# original scan stopped at the four files above, and the class was still live in three
+# places it could not see: `bootstrap-vps.sh` PRINTED an unflagged `up -d` as the repo's own
+# fresh-VPS bring-up instruction, and deploy-prod.yml / deploy-isnad-graph.yml each ran an
+# unflagged `logs --tail=50 api` in their api_health FAILURE branch — so on a failed PROD
+# deploy the one diagnostic the operator got was EMPTY.
+#
+# Docs are deliberately NOT scanned. ~40 lines under docs/runbooks/** run
+# `docker compose -f compose/docker-compose.prod.yml exec|logs|ps …` by hand, and the fix for
+# those is not a flag in each one — it is `name: noorinalabs` in the compose file itself,
+# which makes the DERIVED project correct for every caller, including an operator typing one
+# of them at 3am. test_the_compose_file_pins_the_project_name pins that.
+def _executable_surface() -> list[Path]:
+    paths = sorted(SCRIPTS_DIR.glob("*.sh"))
+    paths += sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+    paths += sorted((REPO_ROOT / ".github" / "actions").rglob("*.yml"))
+    paths.append(REPO_ROOT / ".pre-commit-config.yaml")
+    return [p for p in paths if p.is_file()]
+
+
+# Subcommands that do NOT resolve a project, so a missing `-p` cannot misaddress anything.
+# `config` parses the file; `version` asks the binary. Everything else — ps, exec, logs, up,
+# stop, start, pull, run, cp, restart, down — operates on a project's containers.
+PROJECT_AGNOSTIC_SUBCOMMANDS = {"config", "version"}
 
 PROJECT_FLAGS = {"-p", "--project-name"}
 # Compose top-level flags that consume the following token as their value.
@@ -174,6 +203,51 @@ def test_the_library_defaults_to_the_project_the_stack_is_deployed_into() -> Non
     )
 
 
+def test_the_compose_file_pins_the_project_name() -> None:
+    """The single source of truth, and the only fix that reaches the runbooks.
+
+    Compose precedence: `-p` > COMPOSE_PROJECT_NAME > compose-file `name:` > the file's
+    DIRECTORY. Without `name:`, that last rung applied — and this file lives in `compose/`,
+    so every caller passing `-f compose/docker-compose.prod.yml` with no `-p` addressed a
+    project literally called `compose`, which nothing ever deployed into. `name:` makes the
+    DERIVED project correct by construction for every caller the scan cannot reach: the ~40
+    hand-run `docker compose -f compose/docker-compose.prod.yml exec|logs|ps` lines in
+    docs/runbooks/**, and the operator typing one of them mid-incident.
+    """
+    text = PROD_COMPOSE.read_text()
+    assert re.search(rf"^name:\s*{CANONICAL_PROJECT}\s*$", text, re.MULTILINE), (
+        f"compose/docker-compose.prod.yml has no top-level `name: {CANONICAL_PROJECT}` — the "
+        f"project a caller without `-p` derives falls back to the file's DIRECTORY "
+        f"(`compose`), which is deploy#617"
+    )
+
+
+def test_no_unflagged_project_scoped_call_against_the_prod_stack() -> None:
+    """The sweep. Every compose call naming the prod stack file, anywhere in the executable
+    surface, must carry `-p` — `config`/`version` excepted, since they resolve no project.
+
+    FAILS on origin/main in three places the original 4-file scan could not see:
+    bootstrap-vps.sh's printed `pull`/`up -d`, and the api_health `logs` in deploy-prod.yml
+    and deploy-isnad-graph.yml.
+    """
+    offenders = []
+    for path in _executable_surface():
+        for line, flags, subcommand in _compose_invocations(path):
+            if "docker-compose.prod.yml" not in line:
+                continue
+            if subcommand in PROJECT_AGNOSTIC_SUBCOMMANDS:
+                continue
+            if PROJECT_FLAGS & set(flags):
+                continue
+            offenders.append(f"{path.relative_to(REPO_ROOT)}: {line}  (subcommand={subcommand})")
+
+    assert not offenders, (
+        "project-scoped `docker compose` call(s) against the prod stack with no `-p` — each "
+        "addresses the project derived from the compose file's DIRECTORY (`compose`), not "
+        "the one the stack runs in (deploy#617):\n  " + "\n  ".join(offenders)
+    )
+
+
 def test_the_canonical_project_matches_what_the_deploy_path_actually_uses() -> None:
     """Anchor the default in the deploy path itself, so a rename of the project on the
     deploy side cannot leave backup/restore quietly pointing at the old one."""
@@ -208,10 +282,19 @@ def test_the_backup_and_restore_path_never_uses_compose_up() -> None:
 
 
 def test_the_rehearsal_names_its_own_project_when_driving_restore() -> None:
-    """restore.sh now passes an explicit `-p`, and a FLAG BEATS COMPOSE_PROJECT_NAME. If the
-    rehearsal does not set COMPOSE_PROJECT, every restore it runs — including the
-    `--overwrite-destination` Neo4j load — lands on `noorinalabs`, THE REAL STACK, while
-    assert_volume_isolation goes on inspecting the rehearsal project and reports all-clear."""
+    """The rehearsal names the project it drives restore.sh against — defence in depth.
+
+    An earlier version of this docstring claimed that WITHOUT this line the rehearsal would
+    restore into the real `noorinalabs` stack. That is FALSE, and compose_project.sh disproves
+    it: `COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}"`, and
+    run_restore() also exports COMPOSE_PROJECT_NAME, so the fallback still resolves to the
+    rehearsal project (deploy#618 review, Weronika Zielinska).
+
+    What this pins is real but narrower: the rehearsal must not depend on ANOTHER file's
+    fallback rung — a detail of compose_project.sh, free to change — to stay aimed at the
+    scratch stack. guard()'s refusal of an inherited project name is the actual protection,
+    and test_the_rehearsal_refuses_an_inherited_project pins that.
+    """
     body = re.search(
         r"^run_restore\(\) \{\n(.*?)^\}", REHEARSAL.read_text(), re.MULTILINE | re.DOTALL
     )
@@ -396,7 +479,7 @@ def test_stack_presence_guard_refuses_a_project_with_no_containers(tmp_path: Pat
     """The replacement for the vacuous `ps` guard, against the exact project an unflagged
     call resolves to."""
     run = _run_with_fake_docker(
-        "assert_stack_present postgres user-postgres neo4j",
+        "assert_stack_present postgres user-postgres",
         project="compose",
         tmp_path=tmp_path,
     )
@@ -409,7 +492,7 @@ def test_stack_presence_guard_refuses_a_project_with_no_containers(tmp_path: Pat
     # It must name what is missing, not merely refuse: an operator mid-incident reads the
     # last line, and "the stack is not there" and "you asked the wrong project" are
     # different problems with different fixes.
-    for service in ("postgres", "user-postgres", "neo4j"):
+    for service in ("postgres", "user-postgres"):
         assert service in run.output
 
 
@@ -419,7 +502,7 @@ def test_stack_presence_guard_passes_against_the_project_the_stack_runs_in(
     """The positive control. A guard that only ever refuses proves nothing: it must
     SEPARATE the two classes, not merely go red on one of them."""
     run = _run_with_fake_docker(
-        "assert_stack_present postgres user-postgres neo4j",
+        "assert_stack_present postgres user-postgres",
         project=CANONICAL_PROJECT,
         tmp_path=tmp_path,
     )
@@ -466,3 +549,265 @@ def test_the_library_addresses_the_project_it_was_given_on_every_call(tmp_path: 
     assert calls, "no compose calls reached docker"
     for call in calls:
         assert f"-p {CANONICAL_PROJECT}" in call, f"compose call with no project: {call}"
+
+
+def test_the_rehearsal_refuses_an_inherited_project() -> None:
+    """guard() is the ACTUAL protection against a wrongly-aimed rehearsal (deploy#618 review).
+
+    The explicit COMPOSE_PROJECT in run_restore() is defence in depth; this refusal is what
+    stops an ambient project name from steering a `--overwrite-destination` Neo4j load at a
+    stack the rehearsal does not own. It is the exact shape of the file's existing
+    COMPOSE_FILE refusal, which exists for the same reason one layer up.
+    """
+    code = "\n".join(
+        ln for ln in REHEARSAL.read_text().splitlines() if not ln.lstrip().startswith("#")
+    )
+    for var in ("COMPOSE_PROJECT", "COMPOSE_PROJECT_NAME"):
+        assert var in code, f"restore_rehearsal.sh does not guard an inherited {var}"
+    assert "Refusing to run with an inherited ${var}" in code, (
+        "restore_rehearsal.sh's guard() does not refuse an inherited project name — an "
+        "ambient COMPOSE_PROJECT could aim the rehearsal's restores at another stack"
+    )
+
+
+# --------------------------------------------------------------------------
+# End-to-end: the partial-backup contract (deploy#618 review)
+# --------------------------------------------------------------------------
+# The first version of this PR gated backup.sh on `postgres user-postgres neo4j` — all three
+# running — and that SILENTLY REPEALED the script's oldest contract, 270 lines below the
+# gate: upload what you got, attest `complete=false`, exit non-zero. "A partial backup beats
+# none." On any night Neo4j was down, the gate would have taken ZERO backups instead of two,
+# and one of the two it discarded is `user-postgres` — the only store here that no artifact
+# can rebuild (deploy#559). backup.sh can even leave Neo4j stopped ITSELF (the neo4j_start
+# failure branch), so one bad night would have disarmed every backup after it.
+#
+# These tests run the REAL backup.sh, under its real `set -euo pipefail`, with docker and
+# rclone stubbed — the same shape as test_b2_preflight.py's end-to-end harness, and for the
+# same reason: a harness running production code under a weaker `set -...` is not running
+# production code. The fake rclone COPIES the staging directory to an inspectable path, so
+# the assertions are made against WHAT WAS ACTUALLY UPLOADED — not against a log line
+# claiming it was.
+
+FAKE_DOCKER_E2E = r"""#!/usr/bin/env bash
+set -u
+REAL_PROJECT="noorinalabs"
+
+printf '%s\n' "$*" >> "$DOCKER_ARGV_LOG"
+
+[[ "${1:-}" == "compose" ]] || exit 0
+shift
+
+project=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -p|--project-name) project="$2"; shift 2 ;;
+        -f|--file|--env-file|--profile) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+# No -p: Compose derives the project from the compose file's directory.
+[[ -n "$project" ]] || project="compose"
+
+sub="${1:-}"
+shift || true
+
+# Anything addressed to a project we never deployed into is EMPTY — and `ps` says so with a
+# ZERO, which is the whole of deploy#617.
+[[ "$project" == "$REAL_PROJECT" ]] || {
+    case "$sub" in
+        ps) exit 0 ;;
+        *)  echo "no such service in project ${project}" >&2; exit 1 ;;
+    esac
+}
+
+case "$sub" in
+    ps)
+        for s in $FAKE_RUNNING; do printf '%s:running\n' "$s"; done
+        exit 0
+        ;;
+    exec)
+        while [[ $# -gt 0 && "$1" == -* ]]; do shift; done
+        svc="${1:-}"
+        for s in $FAKE_RUNNING; do
+            if [[ "$s" == "$svc" ]]; then
+                # A plausible, non-empty pg_dump. backup.sh rejects a zero-byte dump.
+                printf 'PGDMP-fake-dump-of-%s\n' "$svc"
+                head -c 2048 /dev/zero | tr '\0' 'x'
+                exit 0
+            fi
+        done
+        echo "service \"${svc}\" is not running" >&2
+        exit 1
+        ;;
+    stop|start) exit 0 ;;
+    up)
+        printf 'CREATED %s in project %s\n' "$*" "$project" >> "$DOCKER_CREATED_LOG"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+"""
+
+# Enough rclone to drive the B2 preflight to verdict=OK and to capture the upload.
+FAKE_RCLONE_E2E = r"""#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+    lsd)
+        # b2_preflight greps the LAST field of each line for $B2_BUCKET.
+        printf '          -1 2026-01-01 00:00:00        -1 %s\n' "$B2_BUCKET"
+        exit 0
+        ;;
+    copyto|deletefile|purge) exit 0 ;;
+    copy)
+        # $2 = local staging dir, $3 = remote. Capture what would have been uploaded —
+        # backup.sh's EXIT trap deletes the staging dir, so this is the only chance to see it.
+        mkdir -p "$UPLOAD_DIR"
+        cp -a "$2"/. "$UPLOAD_DIR"/ 2>/dev/null || true
+        exit 0
+        ;;
+    lsf) exit 0 ;;
+    *) exit 0 ;;
+esac
+"""
+
+
+class BackupRun:
+    def __init__(
+        self, proc: subprocess.CompletedProcess[str], upload: Path, argv: str, created: str
+    ) -> None:
+        self.rc = proc.returncode
+        self.output = proc.stdout + proc.stderr
+        self.upload = upload
+        self.argv = argv
+        self.created = created
+
+    def uploaded(self) -> list[str]:
+        if not self.upload.is_dir():
+            return []
+        return sorted(p.name for p in self.upload.iterdir())
+
+    def manifest(self) -> str:
+        return "".join(
+            p.read_text()
+            for p in self.upload.glob("_backup_manifest-*.txt")
+            if self.upload.is_dir()
+        )
+
+
+def _run_backup(running: str, tmp_path: Path, project: str = CANONICAL_PROJECT) -> BackupRun:
+    """Run the REAL backup.sh with `running` as the set of services actually up."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "docker").write_text(FAKE_DOCKER_E2E)
+    (stub / "rclone").write_text(FAKE_RCLONE_E2E)
+    # backup.sh's command preflight requires zstd on PATH before it does anything else. It is
+    # only ever INVOKED on the Neo4j leg, which neither of these scenarios reaches — but the
+    # preflight does not know that, and a missing binary would abort the run before the gate
+    # under test ever fired, i.e. the test would pass or fail for a reason unrelated to what
+    # it asserts.
+    (stub / "zstd").write_text("#!/usr/bin/env bash\nexit 0\n")
+    for f in stub.iterdir():
+        f.chmod(0o755)
+
+    upload = tmp_path / "uploaded"
+    argv_log = tmp_path / "argv.log"
+    created_log = tmp_path / "created.log"
+    argv_log.write_text("")
+
+    env = dict(os.environ)
+    env.pop("COMPOSE_PROJECT_NAME", None)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    env.update(
+        B2_KEY_ID="fake-key-id",
+        B2_APP_KEY="fake-app-key",
+        B2_BUCKET="noorinalabs-backups",
+        BACKUP_DIR=str(tmp_path / "backups"),
+        COMPOSE_FILE="compose/docker-compose.prod.yml",
+        COMPOSE_PROJECT=project,
+        FAKE_RUNNING=running,
+        UPLOAD_DIR=str(upload),
+        DOCKER_ARGV_LOG=str(argv_log),
+        DOCKER_CREATED_LOG=str(created_log),
+    )
+
+    proc = subprocess.run(
+        ["bash", str(BACKUP)],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=REPO_ROOT,
+        timeout=180,
+    )
+    return BackupRun(
+        proc,
+        upload,
+        argv_log.read_text(),
+        created_log.read_text() if created_log.exists() else "",
+    )
+
+
+def test_neo4j_down_still_backs_up_both_postgres_stores(tmp_path: Path) -> None:
+    """THE PARTIAL-BACKUP CONTRACT. A Neo4j outage must cost the Neo4j leg, not the run.
+
+    `user-postgres` holds accounts, sessions and audit_log, and no pipeline artifact can
+    rebuild it. An all-three presence gate would have thrown it away on every night the graph
+    was down — including a night backup.sh's own failed restart caused.
+    """
+    run = _run_backup("postgres user-postgres", tmp_path)
+    uploaded = run.uploaded()
+
+    pg = [f for f in uploaded if f.startswith("isnad-pg-") and f.endswith(".dump")]
+    userpg = [f for f in uploaded if f.startswith("isnad-userpg-") and f.endswith(".dump")]
+    neo = [f for f in uploaded if f.startswith("isnad-neo4j-")]
+
+    assert pg, f"the isnad Postgres dump was NOT uploaded — a partial backup beats none: {uploaded}"
+    assert userpg, (
+        f"the user-postgres dump was NOT uploaded. It holds accounts, sessions and audit_log, "
+        f"and NOTHING can rebuild it (deploy#559) — a Neo4j outage must not discard it: {uploaded}"
+    )
+    assert not neo, f"a Neo4j dump appeared with Neo4j down: {uploaded}"
+
+    # Both dumps are real bytes, not empty files that happen to exist.
+    for name in pg + userpg:
+        assert (run.upload / name).stat().st_size > 0, f"{name} uploaded EMPTY"
+
+    assert "complete=false" in run.manifest(), (
+        f"the run must ATTEST its incompleteness — restore.sh refuses a partial artifact "
+        f"without --allow-partial, and that refusal is driven by this manifest: "
+        f"{run.manifest()!r}"
+    )
+    assert "SKIPPING the Neo4j dump" in run.output
+    assert run.rc != 0, "a partial backup is a FAILED backup: it must exit non-zero so the "
+    "systemd OnFailure marker fires and the success gauge is not advanced (deploy#565)"
+
+    # And it must not have conjured the database it could not find.
+    assert run.created == "", f"backup.sh CREATED a container: {run.created!r}"
+
+
+def test_a_stray_neo4j_alone_does_not_satisfy_the_project_gate(tmp_path: Path) -> None:
+    """The state stg was ACTUALLY found in — and why "refuse only if ZERO services resolve"
+    is not the fix.
+
+    Project `compose` held a stray, running `neo4j` (created by backup.sh's own `up`) and no
+    Postgres at all. A zero-services rule would have passed that: one of three matched. The
+    backup would then have dumped the stray, EMPTY graph, checksummed it, uploaded it, and
+    reported success — the silently-empty success this whole change exists to prevent.
+
+    The Postgres pair is the witness precisely because nothing in this path can create it.
+    """
+    run = _run_backup("neo4j", tmp_path)
+
+    assert run.rc != 0, "a project holding only a stray neo4j must not be backed up"
+    assert "Refusing to back up a stack that is not present" in run.output
+    assert run.uploaded() == [], (
+        f"something was uploaded from a project with no Postgres in it: {run.uploaded()}"
+    )
+    # The gate must fire BEFORE the dumps, not after they fail.
+    assert "pg_dump" not in run.argv, (
+        "a dump was attempted against a project the gate should have refused outright"
+    )
+    assert "Stopping Neo4j" not in run.output, (
+        "the stray, empty graph was about to be dumped — this is exactly the artifact that "
+        "would have checksummed cleanly and restored as an empty database"
+    )

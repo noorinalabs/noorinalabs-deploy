@@ -245,21 +245,40 @@ else
     exit 1
 fi
 
-# Assert the stack we are about to dump is ACTUALLY THERE — every service, running.
+# Assert we are addressing the REAL project and not a phantom one.
 #
 # This REPLACES `docker compose ps --format json &>/dev/null`, which exited 0 on an empty or
 # entirely nonexistent project: it asked whether `ps` RAN, not whether the stack EXISTS.
 # That zero is what waved the deploy#617 run through to the dumps, where both pg_dumps
 # failed against a project with no containers and the Neo4j leg CREATED one.
 #
+# ---------------------------------------------------------------------------
+# WHY `postgres user-postgres` AND NOT ALSO `neo4j`. (deploy#618 review, Weronika Zielinska)
+# ---------------------------------------------------------------------------
+# The first version of this gate demanded all three, and that QUIETLY REPEALED the contract
+# 270 lines below it — "a partial backup beats none" (`:5xx`, which refuses to upload only
+# when ALL THREE dumps fail). On any night Neo4j is down, an all-three gate takes ZERO
+# backups instead of two, and one of the two it discards is `user-postgres`: the only store
+# here that CANNOT be rebuilt from the published pipeline artifact (deploy#559). Worse, this
+# script can itself leave Neo4j stopped (see the `neo4j_start` failure branch), so one bad
+# night would have silently disarmed every backup after it.
+#
+# The Postgres pair is the reliable witness of project identity because NOTHING IN THIS PATH
+# CAN CREATE IT. Only `neo4j` was ever `up`'d, which is why a stray, empty `neo4j` — and no
+# Postgres — is precisely the state stg was found in. A "refuse only when zero services
+# resolve" rule would have passed that state and dumped the stray empty graph, which is the
+# silently-empty success this whole change exists to prevent. Requiring both Postgres
+# services refuses the phantom project in every observed state, stray Neo4j included.
+#
+# A missing Neo4j is a PER-LEG failure, handled at the Neo4j leg: skip the dump, record
+# NEO4J_OK=false, upload the Postgres stores with `complete=false`, exit non-zero.
+#
 # ORDER: after the B2 preflight, before the first dump. The credential check stays the first
 # thing that can stop a run (deploy#559/#613 — "discovering at upload time that the key
 # cannot write means we took an outage for nothing"), and this now stands between it and any
 # destructive step. Nothing has been stopped or dumped at this point; both are pure
 # preflights, and both must pass.
-#
-# The services named here are exactly the stores this script dumps (docs/DATASTORES.md).
-if ! assert_stack_present postgres user-postgres neo4j; then
+if ! assert_stack_present postgres user-postgres; then
     log "ERROR" "Refusing to back up a stack that is not present."
     exit 1
 fi
@@ -326,112 +345,136 @@ fi
 NEO4J_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-neo4j-${TIMESTAMP}.dump"
 NEO4J_COMPRESSED="${NEO4J_DUMP_FILE}.zst"
 
-log "INFO" "Stopping Neo4j for offline dump..."
-dc stop neo4j 2>>"$LOG_FILE"
+# ---------------------------------------------------------------------------
+# IS THERE A NEO4J TO DUMP AT ALL? (deploy#618 review)
+# ---------------------------------------------------------------------------
+# A missing or stopped Neo4j is a PER-LEG failure, not a reason to abandon the run. The
+# project-identity gate above deliberately does not demand `neo4j` — demanding it would take
+# ZERO backups on a night Neo4j is down, instead of the two this script was designed to
+# still take, and one of those two is `user-postgres`, which no artifact can rebuild
+# (deploy#559). "A partial backup beats none" is the contract; an arity choice in a preflight
+# must not silently repeal it.
+#
+# So: skip the leg, record it as FAILED (not skipped-and-forgiven), and let the manifest and
+# the exit code carry the truth. NEO4J_OK stays false, the manifest attests complete=false,
+# `restore.sh` refuses that artifact without `--allow-partial`, and the run exits non-zero so
+# the systemd OnFailure marker fires and BackupStale keeps counting from the last COMPLETE
+# backup. Nothing here silently forgives a missing store.
+if service_is_running neo4j; then
+    log "INFO" "Stopping Neo4j for offline dump..."
+    dc stop neo4j 2>>"$LOG_FILE"
 
-# Wait for Neo4j container to fully stop
-MAX_WAIT=30
-WAITED=0
-while dc ps --format '{{.Service}}:{{.State}}' 2>/dev/null | grep -q "neo4j:running"; do
-    if [[ $WAITED -ge $MAX_WAIT ]]; then
-        log "ERROR" "Neo4j did not stop within ${MAX_WAIT}s"
-        neo4j_start || log "ERROR" "Neo4j restart failed after a stop timeout — check manually"
-        break
-    fi
-    sleep 1
-    WAITED=$((WAITED + 1))
-done
+    # Wait for Neo4j container to fully stop
+    MAX_WAIT=30
+    WAITED=0
+    while dc ps --format '{{.Service}}:{{.State}}' 2>/dev/null | grep -q "neo4j:running"; do
+        if [[ $WAITED -ge $MAX_WAIT ]]; then
+            log "ERROR" "Neo4j did not stop within ${MAX_WAIT}s"
+            neo4j_start || log "ERROR" "Neo4j restart failed after a stop timeout — check manually"
+            break
+        fi
+        sleep 1
+        WAITED=$((WAITED + 1))
+    done
 
-if [[ $WAITED -lt $MAX_WAIT ]]; then
-    log "INFO" "Neo4j stopped (waited ${WAITED}s). Running dump..."
+    if [[ $WAITED -lt $MAX_WAIT ]]; then
+        log "INFO" "Neo4j stopped (waited ${WAITED}s). Running dump..."
 
-    # Resolve the data volume from THIS compose project's neo4j container rather than
-    # by grepping every volume on the host. `docker volume ls | grep neo4j_data` matches
-    # across all compose projects, so on a box running more than one stack the backup
-    # could silently dump a different project's graph and be restored over the real one.
-    # (deploy#559, same resolution as restore.sh restore_neo4j().)
-    NEO4J_CID=$(dc ps -aq neo4j 2>/dev/null | head -1)
-    if [[ -z "$NEO4J_CID" ]]; then
-        NEO4J_VOLUME=""
-    else
-        NEO4J_VOLUME=$(docker inspect \
-            --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' \
-            "$NEO4J_CID")
-    fi
-    if [[ -z "$NEO4J_VOLUME" ]]; then
-        log "ERROR" "Cannot resolve the Neo4j data volume for ${COMPOSE_FILE} — refusing to guess"
-    else
-        log "INFO" "Resolved Neo4j data volume: ${NEO4J_VOLUME}"
-        # Use bare docker run (not compose run) to avoid service config conflicts.
-        #
-        # `--user 0:0 --entrypoint neo4j-admin` is required, not cosmetic. The
-        # neo4j:5-community entrypoint drops privileges to neo4j(7474) even when the
-        # container starts as root. BACKUP_DIR is 0700 root:root (tmpfiles.d), and this
-        # script runs as root under systemd, so the dropped user cannot write the
-        # /backups bind mount: `neo4j-admin` dies with "AccessDeniedException: /backups"
-        # and the Neo4j leg of every backup fails. Measured on neo4j:5-community during
-        # deploy#560: entrypoint path -> uid 7474 -> exit 1; bypass -> uid 0 ->
-        # "Dump completed successfully". Same fix as restore.sh restore_neo4j().
-        if docker run --rm \
-            --user 0:0 \
-            --entrypoint neo4j-admin \
-            -v "${NEO4J_VOLUME}:/data" \
-            -v "${LOCAL_BACKUP_PATH}:/backups" \
-            neo4j:5-community \
-            database dump neo4j --to-path=/backups/ 2>>"$LOG_FILE"; then
+        # Resolve the data volume from THIS compose project's neo4j container rather than
+        # by grepping every volume on the host. `docker volume ls | grep neo4j_data` matches
+        # across all compose projects, so on a box running more than one stack the backup
+        # could silently dump a different project's graph and be restored over the real one.
+        # (deploy#559, same resolution as restore.sh restore_neo4j().)
+        NEO4J_CID=$(dc ps -aq neo4j 2>/dev/null | head -1)
+        if [[ -z "$NEO4J_CID" ]]; then
+            NEO4J_VOLUME=""
+        else
+            NEO4J_VOLUME=$(docker inspect \
+                --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' \
+                "$NEO4J_CID")
+        fi
+        if [[ -z "$NEO4J_VOLUME" ]]; then
+            log "ERROR" "Cannot resolve the Neo4j data volume for ${COMPOSE_FILE} — refusing to guess"
+        else
+            log "INFO" "Resolved Neo4j data volume: ${NEO4J_VOLUME}"
+            # Use bare docker run (not compose run) to avoid service config conflicts.
+            #
+            # `--user 0:0 --entrypoint neo4j-admin` is required, not cosmetic. The
+            # neo4j:5-community entrypoint drops privileges to neo4j(7474) even when the
+            # container starts as root. BACKUP_DIR is 0700 root:root (tmpfiles.d), and this
+            # script runs as root under systemd, so the dropped user cannot write the
+            # /backups bind mount: `neo4j-admin` dies with "AccessDeniedException: /backups"
+            # and the Neo4j leg of every backup fails. Measured on neo4j:5-community during
+            # deploy#560: entrypoint path -> uid 7474 -> exit 1; bypass -> uid 0 ->
+            # "Dump completed successfully". Same fix as restore.sh restore_neo4j().
+            if docker run --rm \
+                --user 0:0 \
+                --entrypoint neo4j-admin \
+                -v "${NEO4J_VOLUME}:/data" \
+                -v "${LOCAL_BACKUP_PATH}:/backups" \
+                neo4j:5-community \
+                database dump neo4j --to-path=/backups/ 2>>"$LOG_FILE"; then
 
-            # The dump command outputs to /backups/neo4j.dump — rename it
-            if [[ -f "${LOCAL_BACKUP_PATH}/neo4j.dump" ]]; then
-                mv "${LOCAL_BACKUP_PATH}/neo4j.dump" "$NEO4J_DUMP_FILE"
-            fi
+                # The dump command outputs to /backups/neo4j.dump — rename it
+                if [[ -f "${LOCAL_BACKUP_PATH}/neo4j.dump" ]]; then
+                    mv "${LOCAL_BACKUP_PATH}/neo4j.dump" "$NEO4J_DUMP_FILE"
+                fi
 
-            if [[ -f "$NEO4J_DUMP_FILE" ]]; then
-                log "INFO" "Neo4j dump complete: $(du -h "$NEO4J_DUMP_FILE" | cut -f1)"
+                if [[ -f "$NEO4J_DUMP_FILE" ]]; then
+                    log "INFO" "Neo4j dump complete: $(du -h "$NEO4J_DUMP_FILE" | cut -f1)"
 
-                # Compress with zstd
-                log "INFO" "Compressing Neo4j dump with zstd..."
-                zstd -3 --rm "$NEO4J_DUMP_FILE" -o "$NEO4J_COMPRESSED" 2>>"$LOG_FILE"
-                log "INFO" "Compressed: $(du -h "$NEO4J_COMPRESSED" | cut -f1)"
-                NEO4J_OK=true
+                    # Compress with zstd
+                    log "INFO" "Compressing Neo4j dump with zstd..."
+                    zstd -3 --rm "$NEO4J_DUMP_FILE" -o "$NEO4J_COMPRESSED" 2>>"$LOG_FILE"
+                    log "INFO" "Compressed: $(du -h "$NEO4J_COMPRESSED" | cut -f1)"
+                    NEO4J_OK=true
+                else
+                    log "ERROR" "Neo4j dump file not found after dump command"
+                fi
             else
-                log "ERROR" "Neo4j dump file not found after dump command"
+                log "ERROR" "Neo4j dump command failed"
+            fi
+        fi
+
+        # Always restart Neo4j — the one we STOPPED. `neo4j_start` uses `start`, never `up`:
+        # `up` would CREATE a neo4j (and fresh, empty volumes) in a project that has none,
+        # which is exactly the stray container the deploy#617 run left on stg. A backup script
+        # must not be able to bring a database into existence.
+        log "INFO" "Restarting Neo4j..."
+        if neo4j_start; then
+            # Wait for Neo4j to become healthy
+            MAX_HEALTH_WAIT=120
+            HEALTH_WAITED=0
+            while ! dc ps --format '{{.Service}}:{{.Health}}' 2>/dev/null | grep -q "neo4j:healthy"; do
+                if [[ $HEALTH_WAITED -ge $MAX_HEALTH_WAIT ]]; then
+                    log "WARNING" "Neo4j did not become healthy within ${MAX_HEALTH_WAIT}s — check manually"
+                    break
+                fi
+                sleep 5
+                HEALTH_WAITED=$((HEALTH_WAITED + 5))
+            done
+
+            if [[ $HEALTH_WAITED -lt $MAX_HEALTH_WAIT ]]; then
+                log "INFO" "Neo4j healthy (waited ${HEALTH_WAITED}s)"
             fi
         else
-            log "ERROR" "Neo4j dump command failed"
-        fi
-    fi
-
-    # Always restart Neo4j — the one we STOPPED. `neo4j_start` uses `start`, never `up`:
-    # `up` would CREATE a neo4j (and fresh, empty volumes) in a project that has none,
-    # which is exactly the stray container the deploy#617 run left on stg. A backup script
-    # must not be able to bring a database into existence.
-    log "INFO" "Restarting Neo4j..."
-    if neo4j_start; then
-        # Wait for Neo4j to become healthy
-        MAX_HEALTH_WAIT=120
-        HEALTH_WAITED=0
-        while ! dc ps --format '{{.Service}}:{{.Health}}' 2>/dev/null | grep -q "neo4j:healthy"; do
-            if [[ $HEALTH_WAITED -ge $MAX_HEALTH_WAIT ]]; then
-                log "WARNING" "Neo4j did not become healthy within ${MAX_HEALTH_WAIT}s — check manually"
-                break
-            fi
-            sleep 5
-            HEALTH_WAITED=$((HEALTH_WAITED + 5))
-        done
-
-        if [[ $HEALTH_WAITED -lt $MAX_HEALTH_WAIT ]]; then
-            log "INFO" "Neo4j healthy (waited ${HEALTH_WAITED}s)"
+            # The health-wait is INSIDE the success branch on purpose. Hung off the end, it
+            # would run its first `ps`, see no healthy neo4j, and — with HEALTH_WAITED still 0 —
+            # fall into `[[ 0 -lt 120 ]]` and log "Neo4j healthy (waited 0s)" over a database
+            # that is not running at all. That is the exact sentence the stg run printed while a
+            # stray, empty container came up beside the real one.
+            log "ERROR" "Neo4j did NOT restart — the graph is DOWN. Start it by hand; do not wait for this script."
         fi
     else
-        # The health-wait is INSIDE the success branch on purpose. Hung off the end, it
-        # would run its first `ps`, see no healthy neo4j, and — with HEALTH_WAITED still 0 —
-        # fall into `[[ 0 -lt 120 ]]` and log "Neo4j healthy (waited 0s)" over a database
-        # that is not running at all. That is the exact sentence the stg run printed while a
-        # stray, empty container came up beside the real one.
-        log "ERROR" "Neo4j did NOT restart — the graph is DOWN. Start it by hand; do not wait for this script."
+        log "WARNING" "Skipped Neo4j dump due to stop timeout"
     fi
 else
-    log "WARNING" "Skipped Neo4j dump due to stop timeout"
+    log "ERROR" "Neo4j is NOT running in project '${COMPOSE_PROJECT}' — SKIPPING the Neo4j dump."
+    log "ERROR" "  The graph leg of this backup will be MISSING and the run will exit non-zero."
+    log "ERROR" "  The Postgres stores are still dumped: a partial backup beats none, and"
+    log "ERROR" "  user-postgres cannot be rebuilt from any artifact (deploy#559)."
+    log "ERROR" "  Start Neo4j and re-run to get a COMPLETE backup."
+    NEO4J_OK=false
 fi
 
 # ---------------------------------------------------------------------------

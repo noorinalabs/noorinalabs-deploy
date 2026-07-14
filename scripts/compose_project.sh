@@ -71,7 +71,38 @@ log_captured_stderr() {
     done < "$1"
 }
 
-# assert_stack_present <service>...
+# The services running in COMPOSE_PROJECT, one `name:state` line each, on STDOUT.
+#
+# An EMPTY result is a legitimate answer — a project with nothing in it. A non-zero rc is
+# NOT: that is an instrument failure, and the two must never collapse into the same empty
+# string (deploy#584: "an empty listing and a failed listing are the same empty string, and
+# only one of them is a measurement").
+#
+# Every diagnostic here goes to STDERR, because this function's STDOUT IS ITS RETURN VALUE.
+# `log()` writes to stdout (backup.sh additionally tees it), so an unredirected log line
+# would be read back by the caller as a service state — the same shape as the rclone NOTICE
+# that became a "backup directory" in deploy#584.
+running_services() {
+    local err states rc=0
+
+    err="$(mktemp)"
+    # `|| rc=$?`, not a bare assignment: under `set -euo pipefail` an assignment whose
+    # command substitution fails IS a failing simple command and errexit fires AT THE
+    # ASSIGNMENT, making the rc check below dead code on every failing path (deploy#563).
+    states="$(dc ps --format '{{.Service}}:{{.State}}' 2>"$err")" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        log "ERROR" "Cannot reach Docker Compose (rc=${rc}) — is the daemon running?" >&2
+        log_captured_stderr "$err" >&2
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+
+    printf '%s\n' "$states"
+    return 0
+}
+
+# assert_stack_present <service>... — THE PROJECT-IDENTITY ASSERTION.
 #
 # THE GUARD THIS REPLACES WAS VACUOUS, AND ITS ZERO IS WHAT LET THE DUMPS RUN.
 #
@@ -82,27 +113,38 @@ log_captured_stderr() {
 # different questions with different answers. It waved the deploy#617 run straight through
 # to the dumps.
 #
-# Reachability and presence are also different questions, and they get different answers
-# here: a docker daemon we cannot talk to is an INSTRUMENT failure; a reachable daemon
-# running none of our services is a real, reportable state. Collapsing them would repeat
-# the deploy#584 lesson (an empty listing and a failed listing are the same empty string,
-# and only one of them is a measurement).
+# ---------------------------------------------------------------------------
+# WHAT TO PASS HERE, AND WHY IT IS NOT "EVERY SERVICE YOU TOUCH". (deploy#618 review)
+# ---------------------------------------------------------------------------
+# The callers pass `postgres user-postgres` — NOT `neo4j`. That is deliberate, and getting
+# it wrong silently repeals backup.sh's oldest contract.
+#
+# This is an assertion about the PROJECT'S IDENTITY: "am I addressing the stack, or a
+# phantom?" It is not a health check on every store. Demanding `neo4j` too would make a
+# Neo4j outage — including one THIS SCRIPT's own failed restart caused — abort the run
+# before it dumped ANYTHING, taking zero backups on a night it could have taken two. And
+# one of those two is `user-postgres`, the only store that cannot be rebuilt from any
+# artifact (deploy#559). backup.sh's design is the opposite: upload what you got, attest
+# `complete=false`, exit non-zero. A partial backup beats none.
+#
+# The two Postgres services are the RELIABLE WITNESS, and the reason is structural: nothing
+# in the backup/restore path can create them. Only `neo4j` was ever `up`'d, so `neo4j` is
+# the one service that can exist in the phantom project WITHOUT the stack being there —
+# which is exactly the state stg was found in (a stray, empty neo4j in project `compose`,
+# no Postgres). A "refuse only if ZERO services resolve" rule would have passed that state
+# and dumped the stray empty graph. The Postgres pair refuses it.
+#
+# A missing `neo4j` is therefore a PER-LEG failure, handled where that leg runs — not a
+# reason to abandon the run.
 assert_stack_present() {
     local want=("$@")
-    local err states rc=0
+    local states rc=0
 
-    err="$(mktemp)"
-    # `|| rc=$?`, not a bare assignment: under `set -euo pipefail` an assignment whose
-    # command substitution fails IS a failing simple command and errexit fires AT THE
-    # ASSIGNMENT, making the rc check below dead code on every failing path (deploy#563).
-    states="$(dc ps --format '{{.Service}}:{{.State}}' 2>"$err")" || rc=$?
+    states="$(running_services)" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
-        log "ERROR" "Cannot reach Docker Compose (rc=${rc}) — is the daemon running?"
-        log_captured_stderr "$err"
-        rm -f "$err"
+        # running_services has already said why, on stderr.
         return 1
     fi
-    rm -f "$err"
 
     local missing=() svc
     for svc in "${want[@]}"; do
@@ -121,6 +163,22 @@ assert_stack_present() {
 
     log "INFO" "Stack present in project '${COMPOSE_PROJECT}': ${want[*]} (all running)"
     return 0
+}
+
+# Is <service> running in COMPOSE_PROJECT? For a PER-LEG decision, not project identity.
+#
+# Returns non-zero both when the service is not running and when the listing could not be
+# taken at all. Callers use this only AFTER assert_stack_present has established that the
+# daemon is reachable and the project is real, so at that point the two collapse harmlessly:
+# either way the leg cannot be dumped and must be recorded as failed rather than skipped
+# silently.
+service_is_running() {
+    local svc="$1" states rc=0
+
+    states="$(running_services)" || rc=$?
+    [[ "$rc" -eq 0 ]] || return 1
+
+    grep -qx -- "${svc}:running" <<< "$states"
 }
 
 # Start the neo4j container we STOPPED. Never create one.

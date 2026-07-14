@@ -969,7 +969,16 @@ fi
 # Deliberately AFTER `--list` and `--help` (which need no stack) and BEFORE the
 # confirmation prompt: an operator who is about to type YES should already know the target
 # exists. `--list` still works on a box where the stack is down, which is a real DR case.
-if ! assert_stack_present postgres user-postgres neo4j; then
+#
+# `postgres user-postgres` — NOT `neo4j`, for the same reason backup.sh does not demand it
+# (deploy#618 review). This asserts the PROJECT'S IDENTITY, and the Postgres pair is the
+# witness that cannot be forged: nothing in this path can create it, whereas a stray `neo4j`
+# in the phantom project is exactly what deploy#617 produced. Demanding a RUNNING neo4j here
+# would also be wrong on its own terms: restore_neo4j() STOPS it before loading, so it needs
+# the container to EXIST, not to be running — and `ps -aq` plus the untouched "refusing to
+# guess" guard already enforce exactly that, in the right project, at the right moment.
+# A DR restore of the Postgres stores must not be blocked because the graph is down.
+if ! assert_stack_present postgres user-postgres; then
     log "ERROR" "Refusing to restore into a stack that is not present."
     log "ERROR" "  Nothing has been downloaded and nothing has been written."
     exit 1

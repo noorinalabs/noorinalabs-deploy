@@ -311,23 +311,38 @@ run_restore() {
     (
         cd "$REPO_ROOT"
         # ---------------------------------------------------------------------
-        # COMPOSE_PROJECT IS NOT OPTIONAL HERE. IT AIMS THE RESTORE. (deploy#617)
+        # NAMING THE PROJECT EXPLICITLY — AND WHAT ACTUALLY PROTECTS THIS. (deploy#617)
         # ---------------------------------------------------------------------
-        # restore.sh now passes an explicit `-p "$COMPOSE_PROJECT"` on every compose call,
-        # and a FLAG BEATS COMPOSE_PROJECT_NAME. Drop this line and every restore below
-        # runs against `noorinalabs` — THE REAL STACK — while every safety guard in this
-        # file (the ENVIRONMENT check, the COMPOSE_FILE refusal, assert_volume_isolation)
-        # goes on inspecting the rehearsal project and reports all-clear. guard() refuses
-        # an inherited COMPOSE_PROJECT for the same reason.
+        # An earlier version of this comment claimed that deleting the COMPOSE_PROJECT line
+        # would send every restore below at `noorinalabs`, the REAL stack. THAT IS FALSE,
+        # and compose_project.sh is what disproves it (deploy#618 review, Weronika
+        # Zielinska):
         #
-        # And note what this line's ABSENCE used to mean, because it is the whole of
+        #   COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}"
+        #
+        # COMPOSE_PROJECT_NAME is set right below, so with the COMPOSE_PROJECT line removed
+        # the fallback still resolves to "$PROJECT" and the restore still lands on the
+        # scratch stack. The counterfactual could not happen. A false load-bearing claim in
+        # the PRODUCT is worse than one in a test — the test would at least stay green while
+        # breaking; a comment just misleads whoever reasons about the fallback chain next
+        # (deploy#589, "a paraphrase in the PRODUCT"). Doubly so in this file, whose own
+        # lesson is that a harness lied about what it exercised.
+        #
+        # What is TRUE:
+        #   * COMPOSE_PROJECT is DEFENCE IN DEPTH — it names the project without depending on
+        #     compose_project.sh keeping its COMPOSE_PROJECT_NAME fallback rung, which is an
+        #     implementation detail of another file and free to change.
+        #   * guard() is the ACTUAL PROTECTION against a wrongly-aimed rehearsal: it refuses
+        #     an inherited COMPOSE_PROJECT / COMPOSE_PROJECT_NAME that is not "$PROJECT".
+        #
+        # And what the ABSENCE of any project name here used to mean — the whole of
         # deploy#617: restore.sh had no `-p` at all, so COMPOSE_PROJECT_NAME was the ONLY
-        # thing aiming it — and this rehearsal SET it. Production does not: the systemd
-        # unit's EnvironmentFile has no such variable, so on stg and prod the same script
+        # thing aiming it, and this rehearsal SET it. Production does not — the systemd
+        # unit's EnvironmentFile has no such variable — so on stg and prod the same script
         # silently addressed the project `compose`, which contains nothing. The rehearsal
-        # passed, every time, precisely because the harness supplied the one thing
-        # production omits. A fixture that hands the code under test the missing input is
-        # not exercising the code under test.
+        # passed every time precisely because the harness supplied the one input production
+        # omits. A fixture that hands the code under test the missing input is not exercising
+        # the code under test.
         COMPOSE_FILE="$REHEARSAL_COMPOSE" \
         COMPOSE_PROJECT="$PROJECT" \
         COMPOSE_PROJECT_NAME="$PROJECT" \
