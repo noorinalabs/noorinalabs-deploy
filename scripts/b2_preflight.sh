@@ -55,8 +55,12 @@
 # credential material: it reports presence and length only.
 #
 # Usage:
-#   ./scripts/b2_preflight.sh              # requires B2_KEY_ID/B2_APP_KEY/B2_BUCKET
+#   ./scripts/b2_preflight.sh              # requires B2_KEY_ID/B2_APP_KEY/B2_BUCKET/BACKUP_PREFIX
 #   source ./scripts/b2_preflight.sh       # to reuse classify_b2_state()
+#
+# BACKUP_PREFIX ("stg"|"prod") is REQUIRED and has no default: the canary is written inside
+# the environment's own namespace, never at the shared bucket root (deploy#638). An unset
+# prefix is a refusal, not a fallback -- see the rationale in preflight_b2().
 # =============================================================================
 set -uo pipefail
 
@@ -189,6 +193,47 @@ preflight_b2() {
 
     : "${B2_BUCKET:?B2_BUCKET must be set}"
 
+    # WHAT THIS PROBE IS ACTUALLY FOR (deploy#638)
+    #
+    # The probe proves write+delete CAPABILITY. It has never proved anything else, and the
+    # capability that matters is write+delete *WITHIN THIS ENVIRONMENT'S PREFIX* -- which is
+    # what it should have been probing from the start. stg and prod share one bucket
+    # (deploy#632); the canary used to be written at the bucket ROOT, outside every prefix.
+    #
+    # That was benign only by accident: the object name carries a UTC timestamp and the PID,
+    # so a run only ever touched its own object and stg/prod canaries could not collide. The
+    # hazard is the cleanup nobody has written yet. `.backup-preflight/` accrues orphans
+    # whenever a run dies between the write and the delete, and the day someone tidies them
+    # with `rclone purge .../.backup-preflight/` they purge a ROOT directory that the OTHER
+    # environment is concurrently writing into.
+    #
+    # It is also the hard blocker on scoping the key (deploy#634): under a `namePrefix=stg/`
+    # key a bucket-root write 401s, and backup.sh runs this preflight BEFORE it dumps
+    # anything and refuses on failure. Scoping the key without moving the canary first would
+    # land as a total backup outage on both hosts, reported as a credential fault -- the
+    # single most misleading verdict this script exists to prevent.
+    #
+    # So BACKUP_PREFIX is REQUIRED here, exactly as backup.sh and restore.sh require it, and
+    # for the same reason: there is no safe default. `""` silently restores the shared root
+    # and `prod` on the stg box is catastrophic, so an unset prefix is a REFUSAL, not a
+    # fallback to a legacy root-scoped path (deploy#633's stance). backup.sh sources this
+    # file and has already required and charset-validated the prefix; the standalone
+    # invocation an operator reaches for to double-check a verdict must not be laxer than
+    # the scheduled one it is checking.
+    # No apostrophes in this message: inside ${VAR:?word} the word undergoes QUOTE REMOVAL,
+    # so a `'` is silently eaten and the operator reads "the environments own namespace".
+    : "${BACKUP_PREFIX:?BACKUP_PREFIX must be set (stg|prod) — the canary is written inside this environment namespace so it cannot collide with, or be purged alongside, the other environment objects. See deploy#638.}"
+
+    # Identical charset guard to backup.sh/restore.sh, and deliberately the same refusal
+    # wording. A prefix carrying '/' or '..' climbs out of its namespace into the other
+    # environment's -- and this script WRITES and DELETES, so it is exactly as dangerous
+    # here as it is there.
+    if [[ ! "$BACKUP_PREFIX" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        echo "FATAL: BACKUP_PREFIX='${BACKUP_PREFIX}' is not a bare name ([a-z0-9][a-z0-9-]*)." >&2
+        echo "       A prefix containing '/' or '..' escapes its environment namespace." >&2
+        return 1
+    fi
+
     # Guard the leak vector explicitly rather than trusting the ambient environment.
     if [[ -n "${RCLONE_DUMP:-}" ]]; then
         echo "[ERROR] RCLONE_DUMP is set (${RCLONE_DUMP:+<redacted>}). It can print credentials into logs. Refusing to run." >&2
@@ -293,11 +338,15 @@ preflight_b2() {
             return 1
         fi
 
-        rclone copyto "${tmp}/canary" "${remote}:${B2_BUCKET}/${canary}" > "${tmp}/write.out" 2>&1
+        # INSIDE the environment's prefix -- never at the bucket root (deploy#638; see the
+        # rationale above the BACKUP_PREFIX guard). The write and the delete must address
+        # the SAME path, or the delete probes an object that was never written and
+        # KEY_CANNOT_DELETE becomes a lie about a key that deletes perfectly well.
+        rclone copyto "${tmp}/canary" "${remote}:${B2_BUCKET}/${BACKUP_PREFIX}/${canary}" > "${tmp}/write.out" 2>&1
         write_rc=$?
 
         if [[ "$write_rc" -eq 0 ]]; then
-            rclone deletefile "${remote}:${B2_BUCKET}/${canary}" > "${tmp}/delete.out" 2>&1
+            rclone deletefile "${remote}:${B2_BUCKET}/${BACKUP_PREFIX}/${canary}" > "${tmp}/delete.out" 2>&1
             delete_rc=$?
         fi
     fi
@@ -316,10 +365,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     : "${B2_KEY_ID:?B2_KEY_ID must be set}"
     : "${B2_APP_KEY:?B2_APP_KEY must be set}"
     : "${B2_BUCKET:?B2_BUCKET must be set}"
+    : "${BACKUP_PREFIX:?BACKUP_PREFIX must be set (stg|prod) — see deploy#638}"
 
-    # Report shape, never value.
-    printf '[preflight] B2_KEY_ID len=%s  B2_APP_KEY len=%s  B2_BUCKET=%s\n' \
-        "${#B2_KEY_ID}" "${#B2_APP_KEY}" "$B2_BUCKET"
+    # Report shape, never value. BACKUP_PREFIX is not a credential: it is a path component
+    # and printing it is what tells the operator WHICH environment they just probed.
+    printf '[preflight] B2_KEY_ID len=%s  B2_APP_KEY len=%s  B2_BUCKET=%s  BACKUP_PREFIX=%s\n' \
+        "${#B2_KEY_ID}" "${#B2_APP_KEY}" "$B2_BUCKET" "$BACKUP_PREFIX"
 
     export RCLONE_CONFIG_ISNAD_TYPE="b2"
     export RCLONE_CONFIG_ISNAD_ACCOUNT="${B2_KEY_ID}"

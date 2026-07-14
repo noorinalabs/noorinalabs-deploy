@@ -404,6 +404,11 @@ def _run_preflight(
         B2_KEY_ID="fake-key-id",
         B2_APP_KEY="fake-app-key",
         B2_BUCKET="noorinalabs-backups",
+        # The preflight hard-requires this: its canary is written INSIDE the environment's
+        # namespace, never at the shared bucket root (deploy#638). No default exists, by
+        # design — `""` silently restores the shared root and `prod` on the stg box is
+        # catastrophic.
+        BACKUP_PREFIX="stg",
         # UNWRITABLE keeps a perfectly good parent: the fault is inside the scratch dir the
         # mktemp stub hands back, which is exactly the case existence-checks cannot see.
         BACKUP_DIR=unusable if scratch == SCRATCH_UNALLOCATABLE else str(usable),
@@ -517,6 +522,7 @@ def test_a_good_key_verifies_when_tmp_is_unusable_but_backup_dir_is_writable(
         B2_KEY_ID="fake-key-id",
         B2_APP_KEY="fake-app-key",
         B2_BUCKET="noorinalabs-backups",
+        BACKUP_PREFIX="stg",  # required since deploy#638 — the canary lives inside it
         BACKUP_DIR=str(backup_dir),
         TMPDIR=str(blocker / "tmp"),  # stands in for the unit's read-only /tmp
     )
@@ -614,6 +620,7 @@ def test_standalone_invocation_also_refuses_rather_than_blaming_the_key(tmp_path
         B2_KEY_ID="fake-key-id",
         B2_APP_KEY="fake-app-key",
         B2_BUCKET="noorinalabs-backups",
+        BACKUP_PREFIX="stg",  # required since deploy#638 — the canary lives inside it
         TMPDIR=str(blocker / "tmp"),  # BACKUP_DIR unset: the fallback must break safely too
     )
     env.pop("BACKUP_DIR", None)
