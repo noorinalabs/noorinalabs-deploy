@@ -998,6 +998,17 @@ self_test() {
             'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "$1"' \
             _ "$q" | tail -n +2 | tr -d ' "\r'
     }
+    # _st_cypher_hist <project> <query> — same flattening as _cypher_hist_raw (multi-row
+    # readings collapse to one line so they compare as scalars). A SEPARATE helper from
+    # _st_cypher because that one strips ALL spaces, which would silently glue
+    # "Hadith=20 Narrator=50" into "Hadith=20Narrator=50" and hide the row boundary.
+    _st_cypher_hist() {
+        local p="$1" q="$2"
+        # shellcheck disable=SC2016
+        _st_dc "$p" exec -T neo4j sh -c \
+            'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "$1"' \
+            _ "$q" | tail -n +2 | tr -d '"\r' | tr '\n' ' '
+    }
 
     _st_cleanup() {
         # THE VERDICT. Captured on the first line, before anything here can clobber `$?`,
@@ -1096,6 +1107,37 @@ self_test() {
         rc=1
     fi
 
+    # --- Case 1b: the HISTOGRAM readers are READABLE at all, and MATCH -------
+    # CY_LABEL_HIST / CY_REL_HIST mix a grouping expression with an aggregate in the
+    # same RETURN — invalid on Neo4j 5.x ("Aggregation column contains implicit
+    # grouping expressions"). Nothing above exercises them (calibrate()/self_test()'s
+    # fingerprint cases only ever touch CY_FP / CY_FP_PARTS), so this was invalid on
+    # every real run and only ever caught by the live comparator dying at exit 2
+    # (deploy#684). An INSTRUMENT FAILURE here — an empty reading from a query the
+    # engine refused — must FAIL the case exactly like an empty fingerprint would.
+    local ref_label_hist sub_label_hist ref_rel_hist sub_rel_hist
+    ref_label_hist="$(_st_cypher_hist "$ST_REF_PROJECT" "$CY_LABEL_HIST")" || ref_label_hist=""
+    sub_label_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_LABEL_HIST")" || sub_label_hist=""
+    log "INFO" "  label histogram (ref): ${ref_label_hist}"
+    log "INFO" "  label histogram (sub): ${sub_label_hist}"
+    if [[ -n "$ref_label_hist" && -n "$sub_label_hist" && "$ref_label_hist" == "$sub_label_hist" ]]; then
+        pass "self-test MATCH: label histogram is READABLE and agrees on identically-seeded stacks (${ref_label_hist})"
+    else
+        fail "self-test MATCH: label histogram is unreadable (invalid Cypher / instrument failure) or disagreed on identical stacks (ref='${ref_label_hist}' sub='${sub_label_hist}')"
+        rc=1
+    fi
+
+    ref_rel_hist="$(_st_cypher_hist "$ST_REF_PROJECT" "$CY_REL_HIST")" || ref_rel_hist=""
+    sub_rel_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_REL_HIST")" || sub_rel_hist=""
+    log "INFO" "  reltype histogram (ref): ${ref_rel_hist}"
+    log "INFO" "  reltype histogram (sub): ${sub_rel_hist}"
+    if [[ -n "$ref_rel_hist" && -n "$sub_rel_hist" && "$ref_rel_hist" == "$sub_rel_hist" ]]; then
+        pass "self-test MATCH: reltype histogram is READABLE and agrees on identically-seeded stacks (${ref_rel_hist})"
+    else
+        fail "self-test MATCH: reltype histogram is unreadable (invalid Cypher / instrument failure) or disagreed on identical stacks (ref='${ref_rel_hist}' sub='${sub_rel_hist}')"
+        rc=1
+    fi
+
     # --- Case 2: minus one narrator MUST differ ------------------------------
     _st_cypher "$RV_PROJECT" "MATCH (n:Narrator {id:'nar:7'}) DETACH DELETE n;" >/dev/null
     sub_fp="$(_st_cypher "$RV_PROJECT" "$CY_FP")"
@@ -1107,6 +1149,18 @@ self_test() {
         pass "self-test DIFFER: removing ONE narrator changed the fingerprint (ref=${ref_fp} sub=${sub_fp})"
     else
         fail "self-test DIFFER: the fingerprint is INERT or a reading was EMPTY — cannot see a missing narrator (ref=${ref_fp} sub=${sub_fp})"
+        rc=1
+    fi
+
+    # --- Case 2b: the label histogram MUST also see the missing narrator -----
+    # A count/label histogram is coarser than the fingerprint, but it must still be
+    # able to go red: it is the ONLY comparator reading in compare() that a narrator's
+    # own properties never reach (deploy#684).
+    sub_label_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_LABEL_HIST")" || sub_label_hist=""
+    if st_fp_differs "$ref_label_hist" "$sub_label_hist"; then
+        pass "self-test DIFFER: removing ONE narrator changed the label histogram (ref=${ref_label_hist} sub=${sub_label_hist})"
+    else
+        fail "self-test DIFFER: the label histogram is INERT or a reading was EMPTY — cannot see a missing narrator (ref=${ref_label_hist} sub=${sub_label_hist})"
         rc=1
     fi
 
