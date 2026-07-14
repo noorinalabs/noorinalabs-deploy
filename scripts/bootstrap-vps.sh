@@ -514,8 +514,14 @@ echo ""
 echo "  2. Start the stack as the deploy user (services are GHCR-only — no local builds):"
 echo "       su - $DEPLOY_USER"
 echo "       cd $INSTALL_DIR"
-echo "       docker compose -f compose/docker-compose.prod.yml --env-file .env pull"
-echo "       docker compose -f compose/docker-compose.prod.yml --env-file .env up -d"
+# `-p noorinalabs` is NOT optional in these printed instructions (deploy#617). Without it,
+# Compose derives the project from the compose file's DIRECTORY — `compose` — so an operator
+# following this on a fresh VPS brings the WHOLE STACK up in a project no deploy path, backup
+# or restore ever addresses. The first CI deploy then creates a SECOND, parallel stack as
+# `-p noorinalabs`, and the operator's data sits in the other one. A documented instruction
+# must not be a documented way to create the phantom project.
+echo "       docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env pull"
+echo "       docker compose -p noorinalabs -f compose/docker-compose.prod.yml --env-file .env up -d"
 echo ""
 echo "  3. Verify: curl http://localhost:8000/health"
 echo ""

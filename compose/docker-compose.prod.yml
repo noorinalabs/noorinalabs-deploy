@@ -12,6 +12,30 @@
 # `logging: *default-logging`, so a per-container log is capped at
 # max-size × max-file = 10m × 5 = ~50MB and coverage cannot drift as new
 # services are added (a service without the alias is an obvious review miss).
+# THE PROJECT THIS STACK RUNS IN. THE SINGLE SOURCE OF TRUTH. (deploy#617)
+#
+# Compose resolves the project name in this order:
+#
+#   -p flag  >  COMPOSE_PROJECT_NAME  >  this `name:` key  >  the compose file's DIRECTORY
+#
+# Without this key, that last rung is what applied — and this file lives in `compose/`, so
+# every caller that passed `-f compose/docker-compose.prod.yml` WITHOUT `-p` addressed a
+# project literally named `compose`: a project no deploy path has ever brought anything up
+# in, containing nothing. That is deploy#617. It made every backup dump fail, and it made
+# `up -d neo4j` CREATE a stray, empty database beside the real one.
+#
+# `name:` makes the DERIVED project correct by construction, for every caller — including
+# the ~40 `docker compose -f compose/docker-compose.prod.yml exec|logs|ps …` lines in
+# docs/runbooks/**, and an operator typing one of them by hand at 3am mid-incident. Those
+# are the callers no static scan reaches and no code review catches.
+#
+# Every existing `-p noorinalabs` still wins, and still names this same value, so nothing
+# changes behaviourally. What changes is that the directory-derived `compose` fallback stops
+# existing. The explicit `-p` flags stay too (greppable, testable, and immune to this key
+# being dropped) — the flag is the per-call fix, this is the per-file one, and the class is
+# only closed by both.
+name: noorinalabs
+
 x-logging: &default-logging
   driver: json-file
   options:

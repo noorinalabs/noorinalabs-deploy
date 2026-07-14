@@ -156,7 +156,7 @@ jobs:
               fi
               if [ "$i" -eq 24 ]; then
                 echo "ERROR: API health check failed after 120 seconds"
-                docker compose -f compose/docker-compose.prod.yml logs --tail=50 api
+                docker compose -p noorinalabs -f compose/docker-compose.prod.yml logs --tail=50 api
                 exit 1
               fi
               sleep 5
