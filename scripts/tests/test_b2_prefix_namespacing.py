@@ -15,8 +15,10 @@ WHAT A GREEN RUN MEANS — AND WHAT IT DOES NOT
 Green here means EXACTLY this, and nothing more:
 
     *No rclone call in the backup-store scripts addresses the bucket outside a sanctioned
-    prefixed root, every bucket root is DEFINED with the environment in it, and every one of
-    those scripts refuses to run without a prefix.*
+    prefixed root — in ANY of its arguments; every bucket root is DEFINED with the
+    environment in it; every rclone token the scanner cannot parse into a checkable call is
+    REFUSED rather than skipped; and every one of those scripts refuses to run without a
+    prefix, hostile prefixes included.*
 
 It does NOT mean "backups are isolated." Isolation is a RUNTIME CAPABILITY property — one
 shared read-write key can still reach across the namespace, and only a prefix-scoped key
@@ -84,12 +86,18 @@ BACKUP_STORE_SCRIPTS = [BACKUP_SH, RESTORE_SH, B2_PREFLIGHT_SH]
 # (`feedback_lint_gate_cover_all_syntactic_forms`). The rule now has two halves, and
 # together they fail CLOSED on anything the guard does not recognise:
 #
-#   1. USAGE  — every `rclone <verb>` call must have at least one argument that is a
-#               SANCTIONED bucket address. A call rooted in a variable this guard has never
-#               heard of is an OFFENDER, not a pass.
+#   1. USAGE — EVERY remote-bearing argument of EVERY `rclone` call must be a SANCTIONED
+#              bucket address, and at least one must be. Not "at least one is enough": a
+#              call can have a fine SOURCE and a catastrophic DESTINATION —
+#              `rclone moveto "${REMOTE_ROOT}/…" "<bucket-root>"` MOVES the environment's
+#              own namespace into the shared root, and an at-least-one check passed it on
+#              the strength of its source (deploy#637 review, Lucas Ferreira). The
+#              at-least-one clause still has to stay, because an EMPTIED root variable makes
+#              a call remote-bearing NOWHERE and would satisfy "every remote arg is
+#              sanctioned" vacuously.
 #   2. DEFINITION — every variable ever ASSIGNED a value containing a remote-spec is a root
-#               variable, discovered from the source rather than from a hardcoded list, and
-#               its definition must itself be a sanctioned address.
+#              variable, discovered from the source rather than from a hardcoded list, and
+#              its definition must itself be a sanctioned address.
 #
 # Half 2 is what makes half 1 sound, and it is the `feedback_a_scan_cannot_see_an_emptied_
 # string` lesson made mechanical: a bulk find/replace once ate `REMOTE_ROOT`'s own
@@ -99,7 +107,13 @@ BACKUP_STORE_SCRIPTS = [BACKUP_SH, RESTORE_SH, B2_PREFLIGHT_SH]
 #
 # We deliberately do NOT enumerate rclone's verbs. A verb list is a denylist wearing a
 # different hat — the day someone reaches for `rcat` or `moveto`, an unlisted verb is a
-# silent hole. Any rclone subcommand in command position is scanned.
+# silent hole. Any rclone subcommand is scanned.
+#
+# And — the lesson that cost this guard a review round — that argument applies with EQUAL
+# force to the COMMAND-PREFIX CONTEXT. The first cut recognised `rclone` only after a fixed
+# set of shell operators and skipped it everywhere else, which is the same denylist one
+# level up: `timeout 300 rclone purge …` walked straight through it. There is no anchor now.
+# See the note above `_RCLONE_VERB`.
 
 # The BACKUP store is the rclone remote `isnad` (backup.sh and restore.sh hardcode it;
 # b2_preflight.sh defaults RCLONE_REMOTE to it).
@@ -141,16 +155,109 @@ _BARE_REMOTE = re.compile(_REMOTE + r":/?$")
 
 _LEADING_VAR = re.compile(r"^\$\{?(\w+)\}?")
 
-# rclone in COMMAND position — start of line, or after `$(`, `if`, `!`, `||`, `&&`, `;`.
-# Anchoring this way keeps the scanner off the PROSE: b2_preflight.sh's own diagnostics say
-# things like `echo "...retention prune uses 'rclone purge' and will fail silently-late"`,
-# and a naive `rclone\s+purge` search would try to parse that sentence as a command.
-_RCLONE_CALL = re.compile(
-    r"(?:^|\$\(|\|\||&&|;|\bif\b|\bthen\b|\belif\b|!)\s*rclone\s+(\w[\w-]*)\s+(.*)$"
-)
+# THE COMMAND-PREFIX ANCHOR WAS A DENYLIST ONE LEVEL UP (deploy#637 review, Lucas Ferreira)
+#
+# The first cut of this guard recognised `rclone` only after `^`, `$(`, `||`, `&&`, `;`,
+# `if`, `then`, `elif`, `!` — and SKIPPED anything else instead of flagging it. Which means
+# I argued, correctly, that a VERB list is a denylist wearing a different hat, and then wrote
+# a CONTEXT list that is the identical mistake one layer up. Lucas put the #632 unscoped
+# purge back into the real backup.sh with nothing in front of it but `timeout 300 ` — a
+# nightly retention job deleting the other environment's backups — and the suite said
+# `23 passed`. `sudo rclone`, `eval rclone`, `for … do rclone`, `| rclone rcat`,
+# `xargs -I{} rclone` and `RC=rclone; $RC purge` all sailed through the same hole.
+#
+# So there is no anchor any more. ANY bare `rclone` token outside a quoted string, on a
+# non-comment logical line, is a call — and if the scanner cannot parse it into a shape it
+# recognises, that is an OFFENDER ("unrecognised call shape"), never a skip. Fail closed on
+# what you cannot read; do not wave it through.
+#
+# The QUOTED-STRING exclusion is what keeps the scanner off the prose, and it does that job
+# without an anchor: b2_preflight.sh's own diagnostics say things like
+# `echo "...retention prune uses 'rclone purge' and will fail silently-late"`, and that
+# `rclone` sits inside a double-quoted string.
+#
+# Command substitution re-enters UNQUOTED context, which matters enormously: every real call
+# in restore.sh is `out="$(rclone lsf …)"` — the token is inside double quotes but inside a
+# `$( )` within them. A naive quote-tracker would skip all four of restore.sh's rclone calls
+# and the file would go green while saying nothing at all.
+_RCLONE_VERB = re.compile(r"rclone\s+(\w[\w-]*)\s*(.*)$", re.DOTALL)
 
 # Shell-ish argument tokens: a double-quoted string, or a bare word.
 _ARG = re.compile(r'"([^"]*)"|(\S+)')
+
+# The two places these scripts NAME rclone without CALLING it. Explicit, reasoned, and
+# checked against the token's own position — not a blanket line pass. Anything else that
+# fails to parse is an offender.
+_NON_CALL_CONTEXTS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"command\s+-v\s+rclone\b"),
+        "PRESENCE CHECK. `command -v rclone` asks whether the binary exists on PATH; it "
+        "invokes nothing and addresses no bucket. b2_preflight.sh uses it so that a missing "
+        "rclone is reported as PROBE_FAILED rather than as a bad credential (deploy#613).",
+    ),
+    (
+        re.compile(r"\bfor\s+cmd\s+in\b[^;]*\brclone\b"),
+        "DEPENDENCY LOOP. backup.sh's `for cmd in docker rclone zstd sha256sum` names rclone "
+        "among the binaries it requires and checks each with `command -v`. It invokes "
+        "nothing.",
+    ),
+    (
+        re.compile(r"\bREQUIRED_CMDS\+?=\([^)]*\brclone\b"),
+        "DEPENDENCY ARRAY. restore.sh appends rclone to REQUIRED_CMDS (only on the B2 path — "
+        "a local-dir restore must not demand it) and then checks each entry with "
+        "`command -v`. It invokes nothing. Found by the fail-closed scanner itself: the "
+        "shape was unparseable, so it was refused rather than skipped, which is the whole "
+        "point of the rewrite.",
+    ),
+]
+
+
+def _rclone_token_positions(line: str) -> list[int]:
+    """Offsets of every bare `rclone` token OUTSIDE a quoted string.
+
+    Tracks single/double quoting, and treats `$( … )` as re-entering unquoted context —
+    without that, restore.sh's `out="$(rclone lsf …)"` calls are invisible and the file goes
+    green by saying nothing.
+    """
+    positions: list[int] = []
+    in_single = in_double = False
+    stack: list[tuple[bool, bool]] = []
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if c == "\\" and not in_single:
+            i += 2
+            continue
+        if not in_single and line.startswith("$(", i):
+            stack.append((in_single, in_double))
+            in_single = in_double = False
+            i += 2
+            continue
+        if c == ")" and stack and not in_single and not in_double:
+            in_single, in_double = stack.pop()
+            i += 1
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double and line.startswith("rclone", i):
+            before = line[i - 1] if i else " "
+            after = line[i + 6] if i + 6 < n else " "
+            # A whole token: not `/usr/bin/rclone`, not `rclone_helper`.
+            if not (before.isalnum() or before in "_-./") and not (
+                after.isalnum() or after in "_-"
+            ):
+                positions.append(i)
+            i += 6
+            continue
+        i += 1
+    return positions
+
 
 # Assignment, including the `local`/`export` forms.
 _ASSIGN = re.compile(r"^\s*(?:local\s+|export\s+|declare\s+)?(\w+)=(.*)$")
@@ -270,11 +377,33 @@ def _rclone_args(rest: str) -> list[str]:
     return args
 
 
+def _is_sanctioned_arg(arg: str, sanctioned: set[str]) -> bool:
+    """Does this argument address the bucket through a sanctioned prefixed root?"""
+    if _SANCTIONED_INLINE.match(arg):
+        return True
+    var = _LEADING_VAR.match(arg)
+    return bool(var and var.group(1) in sanctioned)
+
+
+def _is_remote_bearing(arg: str, roots: dict[str, str]) -> bool:
+    """Does this argument address the BUCKET at all — inline, or through a known root var?"""
+    if _REMOTE_SPEC.search(arg):
+        return True
+    var = _LEADING_VAR.match(arg)
+    return bool(var and var.group(1) in roots)
+
+
 def _offending_rclone_calls(text: str, filename: str) -> list[str]:
     """rclone calls that do not address the bucket through a SANCTIONED prefixed root.
 
-    FAILS CLOSED. A call whose root this guard does not recognise is an offender — it is not
-    quietly passed the way an unrecognised spelling was passed before.
+    FAILS CLOSED, in three directions:
+
+      * an rclone token the scanner cannot parse into a call is an OFFENDER, not a skip
+        (there is no command-prefix anchor — `timeout 300 rclone purge …` is a call);
+      * EVERY remote-bearing argument must be sanctioned, not merely one of them
+        (`rclone moveto "${REMOTE_ROOT}/…" "<bucket-root>"` has a fine source and a
+        catastrophic destination, and "at least one" passed it);
+      * a call rooted in a variable the guard has never heard of is an OFFENDER.
     """
     roots = _root_variables(text)
     sanctioned = _sanctioned_roots(text)
@@ -284,57 +413,79 @@ def _offending_rclone_calls(text: str, filename: str) -> list[str]:
         stripped = line.lstrip()
         if stripped.startswith("#"):
             continue
-        m = _RCLONE_CALL.search(line)
-        if not m:
-            continue
-        verb, rest = m.group(1), m.group(2)
-        args = _rclone_args(rest)
-        exception = _SANCTIONED_EXCEPTIONS.get((filename, verb))
 
-        if exception:
-            # Exempt — but ONLY for the bare-remote shape the reason describes. An exempted
-            # verb that grows a bucket path is an offender again.
-            bad = [a for a in args if _REMOTE_SPEC.search(a) and not _BARE_REMOTE.match(a)]
-            if bad:
-                offenders.append(
-                    f"{lineno}: rclone {verb} is allowlisted ONLY as a bare-remote probe, "
-                    f"but it now addresses a bucket path: {bad!r} — {stripped}"
-                )
-            continue
-
-        # Does any argument address the bucket through a sanctioned prefixed root?
-        rooted = False
-        for a in args:
-            if _SANCTIONED_INLINE.match(a):
-                rooted = True
-                break
-            var = _LEADING_VAR.match(a)
-            if var and var.group(1) in sanctioned:
-                rooted = True
-                break
-
-        if rooted:
-            continue
-
-        # Not rooted. Say WHY, precisely — a guard that only says "no" teaches nothing.
-        detail = ""
-        for a in args:
-            var = _LEADING_VAR.match(a)
-            if _REMOTE_SPEC.search(a):
-                detail = f"argument {a!r} addresses the bucket but does not name the environment"
-                break
-            if var and var.group(1) in roots:
-                detail = (
-                    f"argument {a!r} is rooted in {var.group(1)}={roots[var.group(1)]!r}, "
-                    f"whose DEFINITION does not name the environment"
-                )
-                break
-        if not detail:
-            detail = (
-                "no argument names a sanctioned prefixed root — the guard does not recognise "
-                "where this call points, so it refuses to call it safe"
+        # EVERY rclone token on the line, not just the first. `_RCLONE_CALL.search()` returned
+        # only the first match, so a second `rclone purge` on the same logical line inherited
+        # the first call's sanctioned argument and went green (deploy#637 review).
+        for pos in _rclone_token_positions(line):
+            non_call = next(
+                (
+                    reason
+                    for pat, reason in _NON_CALL_CONTEXTS
+                    if any(m.start() <= pos < m.end() for m in pat.finditer(line))
+                ),
+                None,
             )
-        offenders.append(f"{lineno}: rclone {verb}: {detail} — {stripped}")
+            if non_call:
+                continue
+
+            m = _RCLONE_VERB.match(line, pos)
+            if not m:
+                # UNRECOGNISED CALL SHAPE. `RC=rclone; $RC purge …`, a bare `rclone` with no
+                # verb, anything the parser cannot read. Refuse it — do not wave it through
+                # because it did not fit the shape we happened to anticipate.
+                offenders.append(
+                    f"{lineno}: UNRECOGNISED rclone CALL SHAPE — the guard cannot parse this "
+                    f"into a call it can check, so it refuses to call it safe. If this is not "
+                    f"a call, add it to _NON_CALL_CONTEXTS with a reason — {stripped}"
+                )
+                continue
+
+            verb, rest = m.group(1), m.group(2)
+            args = _rclone_args(rest)
+            exception = _SANCTIONED_EXCEPTIONS.get((filename, verb))
+
+            if exception:
+                # Exempt — but ONLY for the bare-remote shape the reason describes. An
+                # exempted verb that grows a bucket path is an offender again.
+                bad = [a for a in args if _REMOTE_SPEC.search(a) and not _BARE_REMOTE.match(a)]
+                if bad:
+                    offenders.append(
+                        f"{lineno}: rclone {verb} is allowlisted ONLY as a bare-remote probe, "
+                        f"but it now addresses a bucket path: {bad!r} — {stripped}"
+                    )
+                continue
+
+            # (1) EVERY remote-bearing argument must be sanctioned — source AND destination.
+            unsanctioned = [
+                a
+                for a in args
+                if _is_remote_bearing(a, roots) and not _is_sanctioned_arg(a, sanctioned)
+            ]
+            if unsanctioned:
+                for a in unsanctioned:
+                    var = _LEADING_VAR.match(a)
+                    if _REMOTE_SPEC.search(a):
+                        why = "addresses the bucket but does not name the environment"
+                    else:
+                        assert var is not None
+                        why = (
+                            f"is rooted in {var.group(1)}={roots[var.group(1)]!r}, whose "
+                            f"DEFINITION does not name the environment"
+                        )
+                    offenders.append(f"{lineno}: rclone {verb}: argument {a!r} {why} — {stripped}")
+                continue
+
+            # (2) …and at least one argument must actually BE a sanctioned root. Without this,
+            # an emptied root variable (deploy#633) makes the call remote-bearing NOWHERE and
+            # rule (1) passes it vacuously — the file contains no bucket path at all, which is
+            # exactly the emptied-string failure this guard exists to survive.
+            if not any(_is_sanctioned_arg(a, sanctioned) for a in args):
+                offenders.append(
+                    f"{lineno}: rclone {verb}: no argument names a sanctioned prefixed root — "
+                    f"the guard does not recognise where this call points, so it refuses to "
+                    f"call it safe — {stripped}"
+                )
 
     return offenders
 
@@ -436,6 +587,71 @@ rclone purge \\
     "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/" 2>>"$LOG_FILE"
 """,
     ),
+    # -----------------------------------------------------------------------
+    # deploy#637 REVIEW (Lucas Ferreira) — the COMMAND-PREFIX ANCHOR was a denylist one
+    # level up. Every shape below defeated the anchored scanner completely: it recognised
+    # `rclone` only after ^, $(, ||, &&, ;, if, then, elif, ! and SKIPPED everything else.
+    # Lucas put the first one into the real backup.sh and the suite reported `23 passed`.
+    # -----------------------------------------------------------------------
+    (
+        "ANCHOR EVASION — `timeout 300 rclone purge`. Lucas's exhibit: a nightly retention "
+        "job deleting the OTHER environment's backups, and the suite said 23 passed.",
+        '    timeout 300 rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"',
+    ),
+    (
+        "ANCHOR EVASION — `sudo rclone`.",
+        '    sudo rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"',
+    ),
+    (
+        "ANCHOR EVASION — `eval rclone`.",
+        '    eval rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"',
+    ),
+    (
+        "ANCHOR EVASION — inside a `for` body, no separator before the call.",
+        '    for dir in $dirs; do rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"; done',  # noqa: E501
+    ),
+    (
+        "ANCHOR EVASION — the call is a PIPELINE consumer.",
+        '    printf x | rclone rcat "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/note.txt"',
+    ),
+    (
+        "ANCHOR EVASION — `xargs -I{} rclone`.",
+        '    echo "$dirs" | xargs -I{} rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/{}/"',  # noqa: E501
+    ),
+    (
+        "ANCHOR EVASION — the binary is smuggled through a variable: `RC=rclone; $RC purge`. "
+        "There is no parseable call here at all, which is exactly why it must be an "
+        "UNRECOGNISED CALL SHAPE and not a skip.",
+        '    RC=rclone; $RC purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"',
+    ),
+    # -----------------------------------------------------------------------
+    # deploy#637 REVIEW — "at least one sanctioned argument" is NOT "every remote argument
+    # is sanctioned". The rooted check broke on the first sanctioned arg and continued.
+    # -----------------------------------------------------------------------
+    (
+        "TWO-ARG, BAD DESTINATION — a fine SOURCE and a catastrophic DESTINATION. `moveto` "
+        "MOVES: this empties the environment's own namespace into the shared bucket root. "
+        "The old check passed it on the strength of its source argument alone.",
+        """
+REMOTE_ROOT="${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}"
+rclone moveto "${REMOTE_ROOT}/${category}/" "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/"
+""",
+    ),
+    (
+        "TWO CALLS ON ONE LOGICAL LINE, the second unscoped. `_RCLONE_CALL.search()` returned "
+        "only the FIRST match, so the second purge INHERITED the first's sanctioned argument "
+        "and went green. Lucas injected exactly this into the real backup.sh: 23 passed.",
+        '    rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}/${category}/" && rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/"',  # noqa: E501
+    ),
+    (
+        'AN UNSCOPED CALL NESTED IN `"$( )"` — the NON-VACUOUS control for the quote '
+        "tracker. The matching must-NOT-flag fixture cannot prove the tracker SEES these: if "
+        "it wrongly skipped `$( )` tokens the snippet would contain no calls, produce no "
+        "offenders, and pass GREEN anyway. Only an EVASION nested this way can separate 'the "
+        "scanner looked and approved' from 'the scanner never looked' — and every real call "
+        "in restore.sh has this shape.",
+        '    out="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$err")" || rc=$?',  # noqa: E501
+    ),
 ]
 
 POST_FIX_SNIPPETS_MUST_NOT_FLAG: list[tuple[str, str]] = [
@@ -469,6 +685,43 @@ rclone copy "${REMOTE_ROOT}/${BACKUP_PATH}/" "$RESTORE_DIR/" --log-level INFO
 canary=".backup-preflight/canary-$(date -u +%Y%m%d-%H%M%S)-$$"
 rclone copyto "${tmp}/canary" \\
     "${remote}:${B2_BUCKET}/${BACKUP_PREFIX}/${canary}" > "${tmp}/write.out" 2>&1
+""",
+    ),
+    # -----------------------------------------------------------------------
+    # THE FALSE-ALARM SIDE of dropping the command-prefix anchor. Without the anchor the
+    # scanner sees every `rclone` token in the file — including the ones that are PROSE and
+    # the ones that NAME the binary without calling it. A guard that cries wolf on correct
+    # code is a guard someone disables, so these are calibrated as carefully as the reds.
+    # -----------------------------------------------------------------------
+    (
+        "PROSE. b2_preflight.sh's own operator diagnostics talk ABOUT rclone. The token is "
+        "inside a double-quoted string, which is what keeps the scanner off it now that "
+        "there is no command-prefix anchor.",
+        """
+echo "backup.sh's retention prune uses 'rclone purge' and will fail silently-late."
+echo "rclone reports a read-only key's 401 as 'failed to create bucket'. Ignore it."
+""",
+    ),
+    (
+        "PRESENCE CHECK. `command -v rclone` invokes nothing.",
+        "    if ! command -v rclone > /dev/null 2>&1; then",
+    ),
+    (
+        "DEPENDENCY LOOP. backup.sh names rclone among its required binaries.",
+        "for cmd in docker rclone zstd sha256sum; do",
+    ),
+    (
+        "DEPENDENCY ARRAY. restore.sh appends rclone to REQUIRED_CMDS on the B2 path.",
+        "    REQUIRED_CMDS+=(rclone)",
+    ),
+    (
+        "COMMAND SUBSTITUTION INSIDE DOUBLE QUOTES. Every real call in restore.sh is this "
+        'shape — the token sits inside `".."` but inside a `$( )` within them. A naive '
+        "quote-tracker would skip all four of restore.sh's calls and the file would go GREEN "
+        "by saying nothing at all, which is the emptied-string failure wearing a new hat.",
+        """
+REMOTE_ROOT="${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}"
+out="$(rclone lsf "${REMOTE_ROOT}/${category}/" --dirs-only 2>"$err")" || rc=$?
 """,
     ),
 ]
@@ -734,7 +987,7 @@ def _run_with_prefix(
     )
 
 
-@pytest.mark.parametrize("script", [BACKUP_SH, RESTORE_SH], ids=lambda p: p.name)
+@pytest.mark.parametrize("script", BACKUP_STORE_SCRIPTS, ids=lambda p: p.name)
 def test_a_prefix_that_escapes_its_namespace_is_refused_AS_SUCH(
     script: Path, tmp_path: Path
 ) -> None:
@@ -791,7 +1044,7 @@ def test_a_prefix_that_escapes_its_namespace_is_refused_AS_SUCH(
         )
 
 
-@pytest.mark.parametrize("script", [BACKUP_SH, RESTORE_SH], ids=lambda p: p.name)
+@pytest.mark.parametrize("script", BACKUP_STORE_SCRIPTS, ids=lambda p: p.name)
 def test_a_legal_prefix_is_not_refused(script: Path, tmp_path: Path) -> None:
     """The positive control for the test above.
 
