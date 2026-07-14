@@ -121,10 +121,42 @@ def test_success_metric_is_world_readable() -> None:
 
 
 def test_success_metric_written_atomically() -> None:
-    """temp + rename, and the temp name must not end in .prom or the collector
-    will scrape a half-written file."""
+    """temp + rename, the temp lands beside the target, and its name must not end in .prom
+    or the collector will scrape a half-written file.
+
+    Pinned on the PROPERTY, not on the spelling. The previous cut asserted the literal
+    `mktemp "${SUCCESS_TEXTFILE}.XXXXXX"` and went red when deploy#624 converted the call to
+    the explicit-parent form — same directory, same non-.prom suffix, same atomicity, and the
+    test failed anyway. A test that pins the source text instead of the behaviour blocks
+    correct changes and trains people to "fix" it by editing the assertion, which is how an
+    assertion quietly stops meaning anything (cf. `feedback_paraphrase_in_the_product`).
+    """
     body = BACKUP_SH.read_text()
-    assert 'mktemp "${SUCCESS_TEXTFILE}.XXXXXX"' in body
+
+    # Scope to emit_success_metric's own body. A whole-file search would take the FIRST
+    # `mktemp` in backup.sh, which today happens to be this one and tomorrow may not — and
+    # then this test would be vouching for a call in some other function while the one it
+    # names goes unchecked (Lucas Ferreira, #624 review 3).
+    fn = re.search(r"\nemit_success_metric\(\)\s*\{(.*?)\n\}", body, re.DOTALL)
+    assert fn, "emit_success_metric() not found in backup.sh — this test is checking nothing"
+    fn_body = fn.group(1)
+
+    m = re.search(r'tmp="\$\(mktemp\b([^\n]*)\)"', fn_body)
+    assert m, "emit_success_metric no longer allocates its temp file with mktemp"
+    call = m.group(1)
+
+    # It must land beside the target — NOT in /tmp, which is read-only under
+    # ProtectSystem=strict (deploy#613/#623). Naming SUCCESS_TEXTFILE is how it says so.
+    assert "SUCCESS_TEXTFILE" in call, (
+        f"the success-metric temp no longer names its parent via SUCCESS_TEXTFILE, so it may "
+        f"be defaulting to /tmp — read-only under the backup unit. Call: mktemp{call}"
+    )
+    # The random suffix must come LAST, so the temp name does not match the collector's
+    # *.prom glob until the rename lands.
+    assert call.rstrip('" ').endswith(".XXXXXX"), (
+        f"the temp name must end in .XXXXXX, not .prom, or node-exporter scrapes it "
+        f"half-written. Call: mktemp{call}"
+    )
     assert 'mv "$tmp" "$SUCCESS_TEXTFILE"' in body
 
 

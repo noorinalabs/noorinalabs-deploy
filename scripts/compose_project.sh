@@ -82,10 +82,88 @@ log_captured_stderr() {
 # `log()` writes to stdout (backup.sh additionally tees it), so an unredirected log line
 # would be read back by the caller as a service state — the same shape as the rclone NOTICE
 # that became a "backup directory" in deploy#584.
+# scratch_file — a capture file that EXISTS UNDER THE BACKUP UNIT'S HARDENING. (deploy#623)
+#
+# THIS IS deploy#613, AND WE SHIPPED IT TWICE.
+#
+# A bare `mktemp` defaults to /tmp. Under systemd/isnad-backup.service, /tmp is READ-ONLY:
+# the unit runs ProtectSystem=strict with PrivateTmp deliberately unset (deploy#121 Bug A)
+# and grants only BACKUP_DIR, /opt/noorinalabs-deploy and /var/lib/node_exporter. So the
+# allocation failed, $err was empty, the `2>"$err"` redirect died, and running_services()
+# announced:
+#
+#     [ERROR] Cannot reach Docker Compose (rc=1) — is the daemon running?
+#
+# The daemon was running. The SCRATCH WRITE failed. That sentence is the same lie
+# b2_preflight.sh used to tell about the B2 key — a check that could not run, reporting its
+# own breakage as a fact about the system it was supposed to be checking, and pointing the
+# operator at the wrong subsystem entirely. Measured on stg 2026-07-14T01:23:30Z, on the
+# first backup run after the deploy#617 fix merged.
+#
+# Every capture file in this library now comes from here, so there is ONE place to get this
+# right rather than one per call site. Failure to allocate is FATAL and says so in its own
+# words — it must never be rendered as a claim about Docker, the project, or the stack.
+#
+# NOTE FOR ANYONE ADDING A THIRD CALLER: CI cannot catch this. GitHub Actions runners and
+# the rehearsal containers all have a writable /tmp, so the entire test surface — including
+# the e2e tests that drive the real backup.sh — runs where this bug is UNREACHABLE. Only the
+# on-host systemd path is affected, and nothing in CI executes it. That blind spot, not the
+# mktemp, is why this shipped twice. test_scratch_under_hardening.py exists to close it.
+scratch_file() {
+    local parent tmp
+    parent="${BACKUP_DIR:-${TMPDIR:-/tmp}}"
+    mkdir -p "$parent" 2>/dev/null
+
+    if ! tmp="$(mktemp -p "$parent" compose-project-XXXXXX 2>/dev/null)" \
+        || [[ -z "$tmp" || ! -f "$tmp" ]]; then
+        return 1
+    fi
+    # EXISTS is not WRITABLE. Under ENOSPC the creat() succeeds and the write fails, leaving
+    # a 0-byte file — so the -s check, not the redirect's exit status, is what catches a full
+    # disk. Same lesson as deploy#614: prove the scratch is usable, never infer it.
+    if ! printf 'x\n' > "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # The truncation is checked too, and that is not paranoia (deploy#624 review — Nino
+    # Kavtaradze). An UNCHECKED redirect here — inside the one function whose entire purpose
+    # is that there are no unchecked redirects — would hand the caller back a path it had
+    # just failed to write to. The caller's `2>"$err"` then dies and running_services prints
+    # "Cannot reach Docker Compose — is the daemon running?": deploy#623, verbatim,
+    # resurrected inside its own fix.
+    #
+    # ENOSPC does not get you here (truncating FREES space). The way in is the filesystem
+    # going read-only BETWEEN the check above and this line — an ext4 `remount-ro` on I/O
+    # error, which is precisely the failure a backup script exists to survive. Narrow. Real.
+    : > "$tmp" || { rm -f "$tmp"; return 1; }
+
+    printf '%s\n' "$tmp"
+    return 0
+}
+
+# The diagnostic for a scratch failure. Deliberately says what it does NOT know.
+scratch_failed() {
+    log "ERROR" "The compose check could not RUN: no writable scratch file." >&2
+    log "ERROR" "  It therefore has NO evidence about Docker, the project, or the stack —" >&2
+    log "ERROR" "  do not go looking at the daemon on the strength of this message." >&2
+    log "ERROR" "  Scratch parent tried: ${BACKUP_DIR:-${TMPDIR:-/tmp}}" >&2
+    log "ERROR" "  Under systemd, isnad-backup.service runs ProtectSystem=strict with no" >&2
+    log "ERROR" "  PrivateTmp (deploy#121 Bug A), so /tmp is READ-ONLY and scratch must live" >&2
+    log "ERROR" "  under BACKUP_DIR, which the unit grants via ReadWritePaths (deploy#613/#623)." >&2
+    log "ERROR" "  Also check free space: BACKUP_DIR is the volume the dumps themselves fill." >&2
+}
+
 running_services() {
     local err states rc=0
 
-    err="$(mktemp)"
+    # A capture file we could not create is a CHECK THAT DID NOT RUN. It says nothing about
+    # the daemon, and it must not pretend otherwise (deploy#623).
+    if ! err="$(scratch_file)"; then
+        scratch_failed
+        return 1
+    fi
+
     # `|| rc=$?`, not a bare assignment: under `set -euo pipefail` an assignment whose
     # command substitution fails IS a failing simple command and errexit fires AT THE
     # ASSIGNMENT, making the rc check below dead code on every failing path (deploy#563).
@@ -199,13 +277,43 @@ assert_stack_present() {
 # daemon is reachable and the project is real, so at that point the two collapse harmlessly:
 # either way the leg cannot be dumped and must be recorded as failed rather than skipped
 # silently.
+# service_is_running <svc>
+#
+#   0 — the service IS running
+#   1 — the service is NOT running          (a fact about the stack)
+#   2 — WE COULD NOT FIND OUT               (a fact about us)
+#
+# THE THIRD CALL SITE, AND deploy#624 IS WHAT MADE IT REACHABLE. (review — Lucas Ferreira)
+#
+# This used to collapse 1 and 2 into a single `return 1`, and the comment justifying that
+# said the two "collapse harmlessly" because callers only reach here after
+# assert_stack_present has already established the project. That was true while scratch lived
+# on /tmp — **because /tmp never fills.**
+#
+# deploy#623's fix moves scratch onto BACKUP_DIR: the volume the dumps themselves fill. It
+# knows this — the ENOSPC `-s` check in scratch_file() exists for exactly that reason. And the
+# ordering is against us: backup.sh calls assert_stack_present BEFORE the Postgres dumps and
+# `service_is_running neo4j` AFTER them, so the disk that was fine at the gate can be full by
+# the time we ask this question.
+#
+# Collapsed, the outcome is a lie with a dangerous remedy attached: scratch fails, this
+# returns 1, and backup.sh prints "Neo4j is NOT running — Start Neo4j and re-run." The graph
+# is UP. The disk is FULL. Re-running is the single action that makes it worse. Reproduced on
+# the head tree with a healthy docker reporting neo4j:running.
+#
+# So the instrument failure gets its own code. A caller that cannot tell "the thing is broken"
+# from "I am broken" will always eventually blame the thing.
 service_is_running() {
     local svc="$1" states rc=0
 
     states="$(running_services)" || rc=$?
-    [[ "$rc" -eq 0 ]] || return 1
+    # running_services has already printed the honest scratch diagnostic. Do NOT overwrite it
+    # with a claim about the service — return the "I could not find out" code and let the
+    # caller stay silent about the stack.
+    [[ "$rc" -eq 0 ]] || return 2
 
-    grep -qx -- "${svc}:running" <<< "$states"
+    grep -qx -- "${svc}:running" <<< "$states" || return 1
+    return 0
 }
 
 # Start the neo4j container we STOPPED. Never create one.
@@ -220,7 +328,16 @@ service_is_running() {
 # none. That is the entire point: the capability to create is removed, not aimed.
 neo4j_start() {
     local err rc=0
-    err="$(mktemp)"
+
+    # Same trap as running_services (deploy#623). Here it is worse: a scratch failure
+    # rendered as "could not START neo4j" would tell the operator the graph is broken when
+    # in fact the graph was never touched — and this runs in the window where backup.sh has
+    # already STOPPED it.
+    if ! err="$(scratch_file)"; then
+        scratch_failed
+        return 1
+    fi
+
     dc start neo4j 2>"$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         log "ERROR" "Could not START neo4j in project '${COMPOSE_PROJECT}' (rc=${rc}):"

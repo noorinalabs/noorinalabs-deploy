@@ -42,9 +42,11 @@ echo "BACKUP_FAILURE: unit=${FAILED_UNIT} exited non-zero at ${NOW_ISO}" \
     | systemd-cat -t BACKUP_FAILURE -p err
 
 # Textfile-collector metric — atomic write via mktemp + mv so prometheus
-# never observes a half-written file mid-scrape.
+# never observes a half-written file mid-scrape. The parent is named explicitly
+# (`-p`) rather than implied by the template: see the note at backup.sh's
+# emit_success_metric — in a hardened script, every mktemp names its parent.
 install -d -m 0755 "$TEXTFILE_DIR"
-TMP="$(mktemp "${TEXTFILE_DIR}/isnad_backup_failure.prom.XXXXXX")"
+TMP="$(mktemp -p "$TEXTFILE_DIR" isnad_backup_failure.prom.XXXXXX)"
 cat > "$TMP" <<EOF
 # HELP isnad_backup_last_failure_timestamp_seconds Unix timestamp of the most recent isnad-backup failure.
 # TYPE isnad_backup_last_failure_timestamp_seconds gauge
