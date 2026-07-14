@@ -296,10 +296,17 @@ readonly CY_FP_PARTS="MATCH (n:Narrator)
 readonly CY_NODES="MATCH (n) RETURN count(n);"
 readonly CY_RELS="MATCH ()-[r]->() RETURN count(r);"
 # Histograms: a node count can match while the LABELS are wrong.
+# Neo4j 5.x rejects a RETURN that mixes a grouping expression (`l`) with an aggregate
+# (`count(*)`) in the same projection ("Aggregation column contains implicit grouping
+# expressions"). The WITH separates grouping from aggregation before the string is built
+# (deploy#684 — self_test() never exercised these two constants, so this was invalid on
+# every real run and only ever caught by the live comparator dying at exit 2).
 readonly CY_LABEL_HIST="MATCH (n) UNWIND labels(n) AS l
-    RETURN l + '=' + toString(count(*)) AS h ORDER BY h;"
+    WITH l, count(*) AS c
+    RETURN l + '=' + toString(c) AS h ORDER BY h;"
 readonly CY_REL_HIST="MATCH ()-[r]->()
-    RETURN type(r) + '=' + toString(count(r)) AS h ORDER BY h;"
+    WITH type(r) AS t, count(r) AS c
+    RETURN t + '=' + toString(c) AS h ORDER BY h;"
 
 readonly PG_HADITH_COUNT="SELECT count(*) FROM isnad_graph.hadiths;"
 readonly PG_HADITH_MD5="SELECT md5(string_agg(t,'|' ORDER BY t)) FROM (SELECT h::text AS t FROM isnad_graph.hadiths h) s;"
