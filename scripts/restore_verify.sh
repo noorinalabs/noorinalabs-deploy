@@ -944,6 +944,26 @@ compare() {
 #   REFUSE (rc=2) when pointed at a property that does not exist  (the n.name trap)
 #
 # It runs on a plain runner: no B2, no VPS, no secrets, nothing live is reachable.
+
+# The DIFFER predicates, extracted so they can be unit-tested with an INJECTED empty reading
+# (the self-test itself needs two real Neo4j stacks; these do not). An empty reading is an
+# INSTRUMENT FAILURE, never a detected difference — so every reading must be non-empty for the
+# case to pass. Without the `-n` guards, `!=` passes on an empty sub and `==` passes on a pair
+# of empty counts, and the calibrator certifies the comparator on nothing (deploy#677).
+# scripts/tests/test_restore_verify.py drives these with empty inputs and requires them to FAIL.
+
+# st_fp_differs <ref_fp> <sub_fp> — 0 (pass) iff both non-empty AND they differ.
+st_fp_differs() {
+    [[ -n "$1" && -n "$2" && "$1" != "$2" ]]
+}
+
+# st_same_count_content_differs <ref_count> <sub_count> <ref_fp> <sub_fp>
+# 0 (pass) iff counts are non-empty AND equal, AND fingerprints are non-empty AND differ:
+# same cardinality, different CONTENT, on real readings.
+st_same_count_content_differs() {
+    [[ -n "$1" && -n "$2" && "$1" == "$2" && -n "$3" && -n "$4" && "$3" != "$4" ]]
+}
+
 self_test() {
     local rc=0
     log "INFO" "=== SELF-TEST: proving the comparator separates (real engines, no B2) ==="
@@ -1007,9 +1027,15 @@ self_test() {
     for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
         local waited=0 cid health
         while :; do
-            cid="$(_st_dc "$p" ps -q neo4j | head -1)"
+            # A container that does not exist YET is the normal case on the first pass, so a
+            # failing `ps` here is not an error — but `cid="$(… | head -1)"` under `set -e`
+            # is a CRASH on that path, killing the wait loop before the stack can come up.
+            # start_stack() already guards its identical wait this way and its comment says so;
+            # this is the same fix, the copy that was left behind (deploy#677).
+            cid=""
+            cid="$(_st_dc "$p" ps -q neo4j | head -1)" || cid=""
             health="none"
-            [[ -n "$cid" ]] && health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid")"
+            [[ -n "$cid" ]] && { health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid")" || health="none"; }
             [[ "$health" == "healthy" ]] && break
             [[ "$waited" -ge 240 ]] && instrument_fail "self-test: ${p} neo4j never became healthy"
             sleep 3
@@ -1073,10 +1099,14 @@ self_test() {
     # --- Case 2: minus one narrator MUST differ ------------------------------
     _st_cypher "$RV_PROJECT" "MATCH (n:Narrator {id:'nar:7'}) DETACH DELETE n;" >/dev/null
     sub_fp="$(_st_cypher "$RV_PROJECT" "$CY_FP")"
-    if [[ "$ref_fp" != "$sub_fp" ]]; then
+    # `!=` alone PASSES on an empty sub_fp — an empty reading trivially "differs" from a
+    # populated one. That is the "a both-sides-zero is not a match" doctrine violated inside
+    # the calibrator, which is the very thing `needs: self-test` gates the real restore on.
+    # st_fp_differs requires both readings non-empty (deploy#677).
+    if st_fp_differs "$ref_fp" "$sub_fp"; then
         pass "self-test DIFFER: removing ONE narrator changed the fingerprint (ref=${ref_fp} sub=${sub_fp})"
     else
-        fail "self-test DIFFER: the fingerprint is INERT — it cannot see a missing narrator"
+        fail "self-test DIFFER: the fingerprint is INERT or a reading was EMPTY — cannot see a missing narrator (ref=${ref_fp} sub=${sub_fp})"
         rc=1
     fi
 
@@ -1089,11 +1119,14 @@ self_test() {
     ref_count="$(_st_cypher "$ST_REF_PROJECT" "MATCH (n:Narrator) RETURN count(n);")"
     sub_count="$(_st_cypher "$RV_PROJECT" "MATCH (n:Narrator) RETURN count(n);")"
     sub_fp="$(_st_cypher "$RV_PROJECT" "$CY_FP")"
-    if [[ "$ref_count" == "$sub_count" && "$ref_fp" != "$sub_fp" ]]; then
+    # Two empty counts compare EQUAL under `==`, and an empty sub_fp trivially "differs" — so
+    # without the `-n` guards this whole clause PASSES on a pair of empty readings, certifying
+    # the comparator on nothing. st_same_count_content_differs requires every reading non-empty.
+    if st_same_count_content_differs "$ref_count" "$sub_count" "$ref_fp" "$sub_fp"; then
         pass "self-test DIFFER: node COUNT is identical (${ref_count}) yet the fingerprint differs —"
         log "INFO" "        it sees corrupted CONTENT, not just cardinality (ref=${ref_fp} sub=${sub_fp})"
     else
-        fail "self-test DIFFER: a same-count content corruption was NOT detected (count ref=${ref_count} sub=${sub_count}, fp ref=${ref_fp} sub=${sub_fp})"
+        fail "self-test DIFFER: same-count corruption NOT detected or a reading was EMPTY (count ref=${ref_count} sub=${sub_count}, fp ref=${ref_fp} sub=${sub_fp})"
         rc=1
     fi
 
@@ -1153,4 +1186,9 @@ main() {
     return "$RC_VERIFIED"
 }
 
-main "$@"
+# Guard so the file can be SOURCED for unit-testing the extracted predicates (st_fp_differs,
+# st_same_count_content_differs) without running the whole script. When executed directly —
+# which is the only way the workflow ever invokes it — BASH_SOURCE[0] equals $0 and main runs.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
