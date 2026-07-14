@@ -43,7 +43,19 @@ VERIFY_ARTIFACT = REPO_ROOT / ".github" / "workflows" / "verify-backup-artifact.
 # environment prefix appears between the bucket and the rest of the path — either spelled
 # literally (`${BACKUP_PREFIX}/`) or carried by a variable that already includes it
 # (`REMOTE_ROOT`, `REMOTE_SUBDIR`).
-_BUCKET_PATH = re.compile(r"\$\{B2_BUCKET\}/(?P<rest>\S*)")
+#
+# MATCH BOTH SPELLINGS OF THE EXPANSION — `${B2_BUCKET}/` AND BARE `$B2_BUCKET/`.
+# (#633 review, Lucas Ferreira.) The braced-only form missed the bare `$` spelling, which
+# is one character shorter, semantically identical, and idiomatic in these very files
+# (`2>>"$LOG_FILE"`, `"$LOCAL_BACKUP_PATH"`). So this line was invisible and called SAFE:
+#
+#     rclone purge "${RCLONE_REMOTE}:$B2_BUCKET/${category}/${dir}/" 2>>"$LOG_FILE"
+#
+# — deploy#632 restored verbatim, past a green suite. A line-scan gate must match EVERY
+# syntactic form, not the one the author happened to write (`feedback_lint_gate_cover_all_
+# syntactic_forms`); it is the same blind-spot class as #624's `-p` hiding inside the
+# template name `compose-project-XXXXXX`.
+_BUCKET_PATH = re.compile(r"\$\{?B2_BUCKET\}?/(?P<rest>\S*)")
 _SAFE_REST = re.compile(r"^\$\{(?:BACKUP_PREFIX|REMOTE_SUBDIR)\}")
 
 
@@ -82,6 +94,10 @@ PRE_FIX_LINES_MUST_FLAG = [
     # restore.sh — resolve_latest listing, and the download.
     '        dirs="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$lerr")" || lrc=$?',  # noqa: E501
     '    if ! rclone copy "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PATH}/" "$RESTORE_DIR/" --log-level INFO; then',  # noqa: E501
+    # THE BARE-`$` SPELLING. Not a hypothetical: the braced-only detector called this SAFE,
+    # and it is deploy#632 restored verbatim — the unscoped purge that deletes the other
+    # environment's backups (#633 review, Lucas Ferreira).
+    '                    rclone purge "${RCLONE_REMOTE}:$B2_BUCKET/${category}/${dir}/" 2>>"$LOG_FILE" || \\',  # noqa: E501
 ]
 
 POST_FIX_LINES_MUST_NOT_FLAG = [
@@ -145,31 +161,86 @@ def test_script_refuses_to_run_without_a_prefix(script: Path) -> None:
     )
 
 
-def test_backup_refuses_a_prefix_that_escapes_its_namespace() -> None:
+_REFUSAL = "not a bare name"
+
+
+def _run_with_prefix(script: Path, prefix: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(script)],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "B2_KEY_ID": "x",
+            "B2_APP_KEY": "x",
+            "B2_BUCKET": "x",
+            "BACKUP_PREFIX": prefix,
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@pytest.mark.parametrize("script", [BACKUP_SH, RESTORE_SH], ids=lambda p: p.name)
+def test_a_prefix_that_escapes_its_namespace_is_refused_AS_SUCH(script: Path) -> None:
     """A prefix carrying `/` or `..` climbs out of its own namespace into the other's.
 
-    Executed, not grepped: run the real script with a hostile prefix and require a
-    non-zero exit. It must refuse BEFORE it needs Docker or B2, so this is safe to run
-    anywhere — and it asserts the refusal, not the wording.
+    ATTRIBUTE THE REFUSAL. The first cut asserted only `returncode != 0` and claimed that
+    "asserts the refusal, not the wording". It asserted neither — it was a TAUTOLOGY. These
+    scripts exit non-zero in this sandbox no matter what, for reasons having nothing to do
+    with the prefix, and there is no environment where they would not: `backup.sh` exits 0
+    only on a working VPS with docker, rclone and live B2, which is never where a test runs.
+
+    Lucas Ferreira proved it by DELETING the entire hostile-prefix guard from a scratch copy
+    so that `BACKUP_PREFIX=../prod` was ACCEPTED — and the suite still reported `9 passed`.
+    Side by side, same hostile prefix:
+
+        guard present:  FATAL: BACKUP_PREFIX='../prod' is not a bare name ...   rc=1
+        guard DELETED:  mkdir: cannot create '/var/lib/noorinalabs-backups' ... rc=1
+
+    `returncode != 0` cannot separate those. So bind to the message the script itself owns,
+    and pair it with a positive control — without the control, "the refusal message is
+    absent" would be satisfied by any ambient failure and would prove nothing either.
+
+    This is `restore_rehearsal.sh`'s own standard (it asserts non-zero AND that the failure
+    was for the expected reason), and `restore.sh` is parametrized in because its identical
+    guard had NO test executing it at all — on the restore side, an escaping prefix is how
+    you load the stg graph into prod.
     """
-    for hostile in ("../prod", "stg/../prod", "/prod", "PROD"):
-        proc = subprocess.run(
-            ["bash", str(BACKUP_SH)],
-            env={
-                "PATH": "/usr/bin:/bin",
-                "B2_KEY_ID": "x",
-                "B2_APP_KEY": "x",
-                "B2_BUCKET": "x",
-                "BACKUP_PREFIX": hostile,
-            },
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+    for hostile in ("../prod", "stg/../prod", "/prod", "PROD", "-prod", ""):
+        proc = _run_with_prefix(script, hostile)
         assert proc.returncode != 0, (
-            f"backup.sh ACCEPTED BACKUP_PREFIX={hostile!r} — that prefix escapes its "
+            f"{script.name} ACCEPTED BACKUP_PREFIX={hostile!r} — that prefix escapes its "
             f"namespace and can reach the other environment's backups."
         )
+        # An empty prefix dies at the `:?` guard, which has its own wording; every other
+        # hostile value must be refused BY THE CHARSET CHECK, by name.
+        expected = "must be set" if hostile == "" else _REFUSAL
+        combined = proc.stderr + proc.stdout
+        assert expected in combined, (
+            f"{script.name} exited {proc.returncode} on BACKUP_PREFIX={hostile!r}, but NOT "
+            f"because it refused the prefix — so this assertion is being satisfied by an "
+            f"unrelated ambient failure and proves nothing. Output: {combined[-300:]!r}"
+        )
+
+
+@pytest.mark.parametrize("script", [BACKUP_SH, RESTORE_SH], ids=lambda p: p.name)
+def test_a_legal_prefix_is_not_refused(script: Path) -> None:
+    """The positive control for the test above.
+
+    Without it, "the refusal message appeared" could be true of EVERY input — including the
+    legal ones — and the guard would be rejecting valid deploys while the suite stayed green.
+    A one-way oracle proves nothing (deploy#574).
+
+    The script will still fail here (no docker, no real B2) — that is fine and expected. What
+    must NOT appear is the charset refusal.
+    """
+    proc = _run_with_prefix(script, "stg")
+    combined = proc.stderr + proc.stdout
+    assert _REFUSAL not in combined, (
+        f"{script.name} REFUSED the legal prefix 'stg' as malformed. The charset guard is "
+        f"rejecting valid input, so the refusal assertions above are vacuous. "
+        f"Output: {combined[-300:]!r}"
+    )
 
 
 def test_remote_root_is_actually_built_from_remote_bucket_and_prefix() -> None:

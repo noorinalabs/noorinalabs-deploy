@@ -133,6 +133,13 @@ within the last 24 hours and no later success has replaced it.
    - **Missing/invalid B2 credentials.** `backup.sh` requires `B2_KEY_ID`,
      `B2_APP_KEY`, `B2_BUCKET` and fails its preflight without them. See
      deploy#559.
+   - **Missing `BACKUP_PREFIX`.** `backup.sh` also hard-requires `BACKUP_PREFIX`
+     (`stg` | `prod`) and refuses to run without it — it namespaces the remote path
+     so one environment's retention purge cannot delete the other's backups
+     (deploy#632). It has no default *by design*: a default would collide silently,
+     which is the failure this refusal exists to prevent. The deploy workflows inject
+     it via `extra_env`, so **a host that has not been redeployed since #632 will fail
+     here every night until it is.** The fix is to redeploy, not to hand-edit `.env`.
    - Neo4j did not stop within 30s, so the offline dump was skipped.
    - Upload to B2 failed (network, bucket policy, key capability).
    - Partial dump — see `BackupStale` triage step 2.
@@ -282,7 +289,13 @@ exits 2 — an instrument error, not a backup verdict.
 bash scripts/verify_b2_backup_artifact.sh --self-test
 
 # Against a real bucket (needs the read-scoped B2 key in the environment).
-B2_ROOT="isnad:${B2_BUCKET}" bash scripts/verify_b2_backup_artifact.sh
+#
+# NAME THE ENVIRONMENT. stg and prod share one bucket, and each writes under its own
+# prefix (deploy#632). Scanning the bucket ROOT reads BOTH environments' objects into
+# one verdict — so a fresh stg backup can read as a fresh PROD one. That is the exact
+# false green this check exists to prevent, and mid-incident is the worst place to hit it.
+B2_ROOT="isnad:${B2_BUCKET}/prod" bash scripts/verify_b2_backup_artifact.sh   # production
+B2_ROOT="isnad:${B2_BUCKET}/stg"  bash scripts/verify_b2_backup_artifact.sh   # staging
 ```
 
 **Never set `RCLONE_DUMP`.** The script refuses to run with it set, deliberately:
