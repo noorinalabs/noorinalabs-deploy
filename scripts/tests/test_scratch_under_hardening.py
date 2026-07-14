@@ -49,7 +49,70 @@ import subprocess
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = SCRIPTS_DIR.parent
+SYSTEMD_DIR = REPO_ROOT / "systemd"
 LIB = SCRIPTS_DIR / "compose_project.sh"
+
+
+def unit_reachable_scripts() -> set[Path]:
+    """Every script a HARDENED systemd unit can execute, resolved from the units themselves.
+
+    `ExecStart=` gives the entry points; the transitive `source`/`.` graph gives the rest. A
+    hand-typed list would drift the moment someone adds a unit or sources a new helper — and
+    drift in THIS list means a script runs under `ProtectSystem=strict` with nobody checking
+    where its scratch lands, which is the whole of deploy#613/#623.
+
+    Scoped to units that are actually hardened: an unhardened unit has a writable /tmp and a
+    bare `mktemp` in it is not a bug.
+    """
+    entry: set[Path] = set()
+    for unit in sorted(SYSTEMD_DIR.glob("*.service")):
+        text = unit.read_text()
+        if "ProtectSystem=strict" not in text:
+            continue
+        for line in text.splitlines():
+            if not line.startswith("ExecStart="):
+                continue
+            for token in line[len("ExecStart=") :].split():
+                name = Path(token.lstrip("-@+!")).name
+                candidate = SCRIPTS_DIR / name
+                if candidate.is_file() and candidate.suffix == ".sh":
+                    entry.add(candidate)
+
+    # Transitive closure over the `source` graph — but matched on BASENAME ANYWHERE in the
+    # script, not on the `source` line itself.
+    #
+    # The obvious implementation (look only at lines starting with `source`/`.`) finds
+    # NOTHING here, and I know because I wrote it and this module's own closure assertion
+    # caught it. backup.sh sources indirectly:
+    #
+    #     COMPOSE_PROJECT_LIB="$(dirname "${BASH_SOURCE[0]}")/compose_project.sh"
+    #     source "$COMPOSE_PROJECT_LIB"
+    #
+    # The filename is on the ASSIGNMENT line; the `source` line carries only a variable. A
+    # resolver that evaluated the path expression would be guessing at runtime semantics.
+    #
+    # So this DELIBERATELY OVER-APPROXIMATES: any sibling *.sh whose basename is mentioned
+    # anywhere in a unit-reachable script is treated as reachable. Over-inclusion only WIDENS
+    # the scan — it can produce a false red (someone merely names a script in a comment-free
+    # string), never a false green. For a guard against a bug that has shipped twice, that is
+    # the correct direction to be wrong in.
+    seen: set[Path] = set()
+    pending = list(entry)
+    siblings = sorted(SCRIPTS_DIR.glob("*.sh"))
+    while pending:
+        script = pending.pop()
+        if script in seen:
+            continue
+        seen.add(script)
+        body = "\n".join(
+            ln for ln in script.read_text().splitlines() if not ln.lstrip().startswith("#")
+        )
+        for sibling in siblings:
+            if sibling != script and sibling.name in body and sibling not in seen:
+                pending.append(sibling)
+    return seen
+
 
 # A directory that EXISTS and into which no file can be created — for root too.
 UNWRITABLE_PARENT = "/proc/self"
@@ -222,20 +285,50 @@ def test_neo4j_start_does_not_claim_the_graph_failed_when_scratch_is_unwritable(
 
 
 def test_no_bare_mktemp_survives_in_the_library() -> None:
-    """Structural backstop: the next caller must not have to remember any of this.
+    """Structural backstop over EVERY script the hardened units can execute.
 
-    A bare `mktemp` (no `-p`, no explicit parent) resolves to /tmp and is unusable under the
-    unit. Every capture file in this library goes through `scratch_file`; this pins that, so
-    a third instance of deploy#613 cannot be added by hand.
+    The first cut of this test read `compose_project.sh` and nothing else — and
+    `isnad-backup.service` does not ExecStart `compose_project.sh`. It ExecStarts
+    **`backup.sh`**, which *sources* `b2_preflight.sh` and `compose_project.sh`. So a bare
+    `mktemp` added to `backup.sh` tomorrow would be deploy#613 for the THIRD time, under
+    `ProtectSystem=strict`, and this suite would not have said a word. A guard written
+    against "the next caller" that covers one of the three files in the closure is not a
+    guard (deploy#624 review — Nino Kavtaradze).
+
+    The reachable set is RESOLVED FROM THE UNITS — `ExecStart=` plus the transitive `source`
+    graph — never a hand-typed list, so it cannot drift away from what systemd actually runs.
+    Add a script to a unit, or source one from a script a unit runs, and it is scanned from
+    that moment on without anyone remembering to add it here.
     """
-    code = [
-        ln
-        for ln in LIB.read_text().splitlines()
-        if not ln.lstrip().startswith("#") and "mktemp" in ln
-    ]
-    offenders = [ln.strip() for ln in code if "-p " not in ln]
+    reachable = unit_reachable_scripts()
+
+    # The closure must be non-empty AND contain the entry points, or the scan is inert and
+    # every assertion below passes vacuously (cf. calibrate_the_mutation_before_counting_it).
+    names = {p.name for p in reachable}
+    assert "backup.sh" in names, (
+        f"the unit-reachable closure does not contain backup.sh — the resolver is broken and "
+        f"this guard is inert. Found: {sorted(names)}"
+    )
+    assert {"compose_project.sh", "b2_preflight.sh"} <= names, (
+        f"the closure did not follow `source` — backup.sh sources both of these, and both "
+        f"allocate scratch. Found: {sorted(names)}"
+    )
+
+    offenders: list[str] = []
+    for script in sorted(reachable):
+        for ln in script.read_text().splitlines():
+            stripped = ln.lstrip()
+            if stripped.startswith("#") or "mktemp" not in ln:
+                continue
+            # An explicit parent (-p / --tmpdir) or a template with a directory in it means
+            # the author chose where it lands. A bare `mktemp` chooses /tmp for them.
+            if "-p " not in ln and '-p"' not in ln and "--tmpdir" not in ln and "${" not in ln:
+                offenders.append(f"{script.name}: {ln.strip()}")
+
     assert not offenders, (
-        "bare mktemp in compose_project.sh — it defaults to /tmp, which is READ-ONLY under "
-        "isnad-backup.service (ProtectSystem=strict). This is deploy#613, which has now "
-        "shipped twice. Use scratch_file().\n  " + "\n  ".join(offenders)
+        "bare mktemp in a script the hardened units EXECUTE — it defaults to /tmp, which is "
+        "READ-ONLY under ProtectSystem=strict. This is deploy#613, which has now shipped "
+        "TWICE (#613 in b2_preflight.sh, #623 in compose_project.sh). Allocate under a path "
+        "the unit grants — scratch_file() in compose_project.sh does this.\n  "
+        + "\n  ".join(offenders)
     )

@@ -125,7 +125,19 @@ scratch_file() {
         rm -f "$tmp"
         return 1
     fi
-    : > "$tmp"
+
+    # The truncation is checked too, and that is not paranoia (deploy#624 review — Nino
+    # Kavtaradze). An UNCHECKED redirect here — inside the one function whose entire purpose
+    # is that there are no unchecked redirects — would hand the caller back a path it had
+    # just failed to write to. The caller's `2>"$err"` then dies and running_services prints
+    # "Cannot reach Docker Compose — is the daemon running?": deploy#623, verbatim,
+    # resurrected inside its own fix.
+    #
+    # ENOSPC does not get you here (truncating FREES space). The way in is the filesystem
+    # going read-only BETWEEN the check above and this line — an ext4 `remount-ro` on I/O
+    # error, which is precisely the failure a backup script exists to survive. Narrow. Real.
+    : > "$tmp" || { rm -f "$tmp"; return 1; }
+
     printf '%s\n' "$tmp"
     return 0
 }
