@@ -807,38 +807,59 @@ run_restore() {
 
     # VERIFY THE HANDOFF; DO NOT TRUST IT.
     #
-    # restore.sh announces the volume it resolved ("Resolved Neo4j data volume: …") precisely so
-    # this is auditable. Read it back and require it to be OURS. Everything else in this script
-    # asserts rather than assumes; the one hand-off that can destroy production should not be the
-    # exception. This catches the whole class — a dropped export, an inherited COMPOSE_PROJECT, a
-    # future edit to compose_project.sh's fallback — at the only place that sees the truth: what
-    # restore.sh ITSELF says it is about to write to.
-    local resolved=""
-    if ! resolved="$(sed -n 's/.*Resolved Neo4j data volume: \([^ ]*\).*/\1/p' "$out" | head -1)"; then
-        resolved=""
-    fi
+    # restore.sh announces exactly what it is about to write to, on one line:
+    #     Resolved Neo4j data volume: <VOL> (project <PROJECT>, <COMPOSE_FILE>)
+    # Read it back and require ALL THREE to be OURS. Everything else in this script asserts
+    # rather than assumes; the one hand-off that can destroy production should not be the
+    # exception. This catches the whole class at the only place that sees the truth — what
+    # restore.sh ITSELF resolved:
+    #   * VOL      — a dropped COMPOSE_PROJECT export, an inherited value, a future edit to
+    #                compose_project.sh's `noorinalabs` fallback → a non-`rv_` (live) volume;
+    #   * PROJECT  — the same, made explicit;
+    #   * FILE     — a dropped COMPOSE_FILE export. restore.sh:62 defaults COMPOSE_FILE to
+    #                compose/docker-compose.prod.yml (Weronika Zielinska, PR#642 review): the
+    #                SECOND single point of failure of the same class, the line immediately above
+    #                the COMPOSE_PROJECT one. A throwaway run must use the throwaway compose file.
+    local rline=""
+    rline="$(grep -F 'Resolved Neo4j data volume:' "$out" | tail -1)" || rline=""
     rm -f "$out"
 
-    if [[ -z "$resolved" ]]; then
+    if [[ -z "$rline" ]]; then
         instrument_fail "restore.sh never reported which Neo4j volume it resolved.
         Without that line this script CANNOT confirm the load went to the throwaway stack rather
         than the live graph, so it will not certify the restore. (If restore.sh's log wording
         changed, scripts/tests/test_restore_verify.py pins the string and will say so.)"
     fi
-    log "INFO" "restore.sh resolved Neo4j volume: ${resolved}"
 
+    local resolved rproj rfile
+    resolved="${rline##*Resolved Neo4j data volume: }"
+    resolved="${resolved%% *}"
+    rproj="${rline##*(project }"
+    rproj="${rproj%%,*}"
+    rfile="${rline##*, }"
+    rfile="${rfile%)}"
+    log "INFO" "restore.sh resolved: volume='${resolved}' project='${rproj}' compose-file='${rfile}'"
+
+    local violation=""
     case "$resolved" in
-        "${RV_PROJECT}_rv_"*)
-            pass "handoff verified: restore.sh loaded into '${resolved}', the throwaway volume"
-            ;;
-        *)
-            fail "HANDOFF VIOLATION: restore.sh resolved '${resolved}', which is NOT a volume of"
-            log "ERROR" "the throwaway project '${RV_PROJECT}'. It runs neo4j-admin database load"
-            log "ERROR" "with --overwrite-destination. If this names a live volume, the production"
-            log "ERROR" "graph has just been overwritten and it is UNRECOVERABLE."
-            exit "$RC_INSTRUMENT"
-            ;;
+        "${RV_PROJECT}_rv_"*) ;;
+        *) violation="volume '${resolved}' is not a throwaway (${RV_PROJECT}_rv_*) volume" ;;
     esac
+    if [[ -z "$violation" && "$rproj" != "$RV_PROJECT" ]]; then
+        violation="project '${rproj}' is not the throwaway project '${RV_PROJECT}'"
+    fi
+    if [[ -z "$violation" && "$rfile" != "$RV_COMPOSE" ]]; then
+        violation="compose-file '${rfile}' is not the throwaway file '${RV_COMPOSE}'"
+    fi
+
+    if [[ -n "$violation" ]]; then
+        fail "HANDOFF VIOLATION: ${violation}."
+        log "ERROR" "restore.sh runs neo4j-admin database load with --overwrite-destination against"
+        log "ERROR" "what it resolved above. If that is a live target, the production graph has just"
+        log "ERROR" "been overwritten and it is UNRECOVERABLE. Refusing to certify this restore."
+        exit "$RC_INSTRUMENT"
+    fi
+    pass "handoff verified: restore.sh resolved the throwaway volume, project AND compose file"
 
     # rc != 0 IS a real negative: restore.sh treats an ignored pg_restore error as a failed
     # restore, and it is right to. But rc == 0 is NOT a pass — that is what compare() is for.

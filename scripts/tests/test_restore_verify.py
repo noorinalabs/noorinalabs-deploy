@@ -115,55 +115,71 @@ def _run_restore_body(text: str) -> str:
     return m.group(1)
 
 
-def test_run_restore_hands_restore_sh_the_throwaway_project() -> None:
-    """THE line the whole workflow's safety rests on.
+HANDOFF_EXPORTS = {
+    "COMPOSE_PROJECT": (
+        r'COMPOSE_PROJECT="\$(RV_PROJECT|\{RV_PROJECT\})"',
+        "restore.sh resolves its own project and falls back to the LIVE one "
+        "(compose_project.sh: COMPOSE_PROJECT=${COMPOSE_PROJECT:-...:-noorinalabs})",
+    ),
+    "COMPOSE_FILE": (
+        r'COMPOSE_FILE="\$(RV_COMPOSE|\{RV_COMPOSE\})"',
+        "restore.sh:62 defaults COMPOSE_FILE to compose/docker-compose.prod.yml — the second "
+        "single point of failure of the same class, pointing at the same live stack",
+    ),
+}
 
-    `restore.sh` does not take a project argument — it RESOLVES ITS OWN, and the fallback is
-    the LIVE project (scripts/compose_project.sh:48):
 
-        COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}"
+@pytest.mark.parametrize("var", sorted(HANDOFF_EXPORTS))
+def test_run_restore_hands_restore_sh_the_throwaway_target(var) -> None:
+    """THE two lines the whole workflow's safety rests on.
 
-    `restore.sh` is what runs `neo4j-admin database load --overwrite-destination`. So the ONLY
-    thing between a scheduled restore-verify run and `noorinalabs_neo4j_data` is that this
-    export is present. Delete it and the workflow overwrites the production graph, on a cron,
-    unattended — and every other guard in the script still passes, because they all inspect the
-    stack the load will not touch.
+    `restore.sh` takes no project or compose-file argument — it RESOLVES ITS OWN, and BOTH
+    fallbacks point at the live stack. It is the process that runs `neo4j-admin database load
+    --overwrite-destination`. So the ONLY thing between a scheduled restore-verify run and the
+    production graph is that run_restore exports BOTH `COMPOSE_PROJECT="$RV_PROJECT"` and
+    `COMPOSE_FILE="$RV_COMPOSE"`. Drop either and the workflow can address the live stack, on a
+    cron, unattended — and every other guard still passes, because they inspect the stack the
+    load will not touch.
 
     This scan is the same shape as the `-p` scan above, applied to the env handoff instead of
-    the compose argv. It exists because deleting that one line left the whole suite green.
-    (Weronika Zielinska, PR#642 review.)
+    the compose argv. It exists because deleting one of these lines left the whole suite green.
+    (Weronika Zielinska, PR#642 review — both the project and the COMPOSE_FILE sibling.)
     """
+    pattern, why = HANDOFF_EXPORTS[var]
     body = _run_restore_body(_source())
-    assert re.search(r'COMPOSE_PROJECT="\$(RV_PROJECT|\{RV_PROJECT\})"', body), (
-        'run_restore() does not pass COMPOSE_PROJECT="$RV_PROJECT" to restore.sh.\n'
-        "restore.sh will then resolve its own project and FALL BACK TO THE LIVE ONE, and it is\n"
-        "the process that runs `neo4j-admin database load --overwrite-destination`.\n"
-        "This overwrites the PRODUCTION GRAPH. Unrecoverable."
+    assert re.search(pattern, body), (
+        f'run_restore() does not pass {var}="$RV_..." to restore.sh.\n{why}.\n'
+        "It overwrites the PRODUCTION GRAPH. Unrecoverable."
     )
 
 
-def test_the_handoff_scan_can_actually_see_the_missing_export() -> None:
-    """Calibrate the scan above against the EXACT mutation that survived: delete the
-    `COMPOSE_PROJECT="$RV_PROJECT"` line from run_restore's var-prefix.
+@pytest.mark.parametrize("dropped", sorted(HANDOFF_EXPORTS))
+def test_the_handoff_scan_can_actually_see_each_missing_export(dropped) -> None:
+    """Calibrate the scan against the EXACT mutations that must be caught: delete each of the
+    two `RV_` exports from run_restore's var-prefix, one at a time.
 
     Without this, the scan could be a no-op and its silence would mean nothing — which is
-    precisely the state the suite was in when it reported `33 passed` on a tree that would have
+    precisely the state the suite was in when it reported `40 passed` on a tree that would have
     destroyed the production graph.
     """
-    mutated = textwrap.dedent(
-        """\
-        run_restore() {
-            local rc=0
-            COMPOSE_FILE="$RV_COMPOSE" \\
-                RESTORE_DIR="$RESTORE_STAGING_DIR" \\
-                "${SCRIPT_DIR}/restore.sh" --force latest || rc=$?
-        }
-        """
+    lines = {
+        "COMPOSE_PROJECT": '    COMPOSE_PROJECT="$RV_PROJECT" \\\n',
+        "COMPOSE_FILE": '    COMPOSE_FILE="$RV_COMPOSE" \\\n',
+    }
+    kept = "".join(v for k, v in lines.items() if k != dropped)
+    mutated = (
+        "run_restore() {\n"
+        "    local rc=0\n"
+        f"{kept}"
+        '        RESTORE_DIR="$RESTORE_STAGING_DIR" \\\n'
+        '        "${SCRIPT_DIR}/restore.sh" --force latest || rc=$?\n'
+        "}\n"
     )
+    pattern = HANDOFF_EXPORTS[dropped][0]
     body = _run_restore_body(mutated)
-    assert not re.search(r'COMPOSE_PROJECT="\$(RV_PROJECT|\{RV_PROJECT\})"', body), (
-        "the scan cannot see a run_restore() that has DROPPED the COMPOSE_PROJECT export — "
-        "it would not have caught the live-graph-overwrite mutation, so it proves nothing"
+    assert not re.search(pattern, body), (
+        f"the scan cannot see a run_restore() that DROPPED the {dropped} export — "
+        "it would not have caught that overwrite mutation, so it proves nothing"
     )
 
 
@@ -548,26 +564,35 @@ class Harness:
         # the world model could not represent, and the mutation that causes it survived.
         self.restore_project = tmp / "restore_project"
 
-        # THE REAL compose_project.sh, not a paraphrase of it. Its line 48 —
-        #   COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}"
-        # — is the fallback that makes a dropped export catastrophic, and a restatement of it
-        # here would drift from the original and quietly stop modelling the hazard
-        # (feedback_paraphrase_in_the_product). So the fake restore.sh SOURCES the real file and
-        # resolves its project exactly the way the real restore.sh does.
-        shutil.copy(SCRIPTS_DIR / "compose_project.sh", self.scripts / "compose_project.sh")
+        # Which COMPOSE_FILE the restore resolved — the second single point of failure of the
+        # same class (restore.sh:62 defaults COMPOSE_FILE to compose/docker-compose.prod.yml).
+        self.restore_file = tmp / "restore_file"
 
-        # A fake restore.sh that RESOLVES ITS OWN PROJECT the way the real one does, records it,
-        # and announces the volume it would load into — including, when it has been aimed at the
-        # live project, the LIVE volume. Whether it is reached at all is the assertion for every
-        # guard that must abort BEFORE any load.
+        # A fake restore.sh that RESOLVES ITS OWN PROJECT AND COMPOSE_FILE exactly as the real
+        # one does — by reading the REAL definitions, not paraphrasing them
+        # (feedback_paraphrase_in_the_product) — records both, and announces the volume it would
+        # load into, including the LIVE volume when it has been aimed at the live project. Whether
+        # it is reached at all is the assertion for every guard that must abort BEFORE any load.
+        #
+        #   * COMPOSE_PROJECT: source the REAL compose_project.sh BY ABSOLUTE PATH. Its fallback
+        #     (`${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}`) is what makes a dropped
+        #     export catastrophic. Sourcing by absolute path (not a copy) means ITS OWN evolving
+        #     dependencies — e.g. scratch.sh, added in #643 — resolve against the real scripts
+        #     dir. A copy drifts and breaks the harness the next time that file grows a dep; the
+        #     original does not.
+        #   * COMPOSE_FILE: eval the REAL `^COMPOSE_FILE=` default line out of restore.sh, so a
+        #     change to restore.sh's default is reflected here rather than silently diverging.
+        real_cp = SCRIPTS_DIR / "compose_project.sh"
+        real_restore = SCRIPTS_DIR / "restore.sh"
         (self.scripts / "restore.sh").write_text(
             "#!/usr/bin/env bash\n"
             "set -uo pipefail\n"
             'log() { echo "[$1] ${*:2}"; }\n'
-            'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+            f'eval "$(grep -E \'^COMPOSE_FILE=\' "{real_restore}" | head -1)"\n'
             "# shellcheck source=/dev/null\n"
-            'source "${SCRIPT_DIR}/compose_project.sh"\n'
+            f'source "{real_cp}"\n'
             f'printf "%s" "${{COMPOSE_PROJECT}}" > {self.restore_project}\n'
+            f'printf "%s" "${{COMPOSE_FILE}}" > {self.restore_file}\n'
             f"echo RESTORE_INVOKED >> {self.marker}\n"
             # The volume it resolves is the /data volume of the neo4j container in WHATEVER
             # project it was pointed at. Aimed at `noorinalabs`, that is the production graph.
@@ -577,8 +602,9 @@ class Harness:
             '  VOL="${COMPOSE_PROJECT}_rv_neo4j_data"\n'
             "fi\n"
             'VOL="${FAKE_RESOLVED_VOLUME:-$VOL}"\n'
+            'RFILE="${FAKE_RESOLVED_FILE:-${COMPOSE_FILE}}"\n'
             'log "INFO" "Resolved Neo4j data volume: ${VOL}'
-            ' (project ${COMPOSE_PROJECT}, ${COMPOSE_FILE:-})"\n'
+            ' (project ${COMPOSE_PROJECT}, ${RFILE})"\n'
             "exit ${FAKE_RESTORE_RC:-0}\n"
         )
         os.chmod(self.scripts / "restore.sh", 0o755)
@@ -646,6 +672,13 @@ class Harness:
         if not self.restore_project.exists():
             return None
         return self.restore_project.read_text().strip()
+
+    @property
+    def restored_with_file(self) -> str | None:
+        """The COMPOSE_FILE restore.sh actually resolved — the second single point of failure."""
+        if not self.restore_file.exists():
+            return None
+        return self.restore_file.read_text().strip()
 
 
 @pytest.fixture
@@ -837,6 +870,29 @@ def test_a_restore_that_reports_a_live_volume_is_refused(harness) -> None:
     assert r.returncode == RC_INSTRUMENT, f"a live-volume handoff must be refused\n{r.stdout}"
     assert "HANDOFF VIOLATION" in r.stdout
     assert "UNRECOVERABLE" in r.stdout
+
+
+def test_a_restore_that_reports_a_non_throwaway_compose_file_is_refused(harness) -> None:
+    """The COMPOSE_FILE sibling, as a runtime assertion. restore.sh:62 defaults COMPOSE_FILE to
+    `compose/docker-compose.prod.yml`; a throwaway run that resolved the prod compose file is a
+    handoff violation even if the volume happens to look right. Require the reported compose file
+    to be OURS. (Weronika Zielinska, PR#642 review — fix both siblings or neither.)
+    """
+    h = harness(FAKE_RESOLVED_FILE="compose/docker-compose.prod.yml")
+    r = h.run()
+    assert r.returncode == RC_INSTRUMENT, f"a prod-compose-file handoff must be refused\n{r.stdout}"
+    assert "HANDOFF VIOLATION" in r.stdout
+    assert "compose-file" in r.stdout
+
+
+def test_the_restore_uses_the_throwaway_compose_file(harness) -> None:
+    """The positive: restore.sh actually resolved OUR compose file, recorded independently."""
+    h = harness()
+    r = h.run()
+    assert r.returncode == RC_VERIFIED
+    assert h.restored_with_file == str(h.tmp / "compose" / "docker-compose.restore-verify.yml"), (
+        f"restore.sh resolved compose file {h.restored_with_file!r}, not the throwaway one"
+    )
 
 
 def test_the_handoff_check_accepts_our_own_volume(harness) -> None:
