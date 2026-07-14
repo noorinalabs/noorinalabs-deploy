@@ -371,6 +371,20 @@ jobs:
         # bucket, and a suite that quietly tests nothing is the exact defect class this
         # scanner exists to close. Install it instead.
         run: sudo apt-get update && sudo apt-get install -y rclone
+      - name: Allow rootless user namespaces (Ubuntu 24.04 AppArmor)
+        # scripts/tests/test_backup_under_unit_hardening.py builds a mount namespace out of the
+        # directives in systemd/*.service and runs the REAL backup.sh inside it (deploy#626/#627
+        # — the writable-/tmp blind spot that shipped deploy#613 twice). ubuntu-latest is 24.04,
+        # which ships kernel.apparmor_restrict_unprivileged_userns=1 and refuses the rootless
+        # user namespace the harness prefers.
+        #
+        # `|| true` is NOT a swallowed failure. This step only makes the ROOTLESS backend
+        # available; if it does nothing, the harness probes its backends, finds none, and exits
+        # 2 — COULD NOT FIND OUT — so the suite goes RED with the remediation printed rather
+        # than green. That is not a theory: on PR #654 this job failed with exactly that
+        # instrument-failure message before this step existed, which is the behaviour
+        # test_the_harness_refuses_to_testify_when_it_cannot_build_the_sandbox asserts.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Run scripts unit tests
         run: python3 -m pytest scripts/tests -q
 
