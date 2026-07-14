@@ -1,0 +1,184 @@
+# Restore the REAL B2 artifact and prove it reproduces the live database (deploy#640)
+#
+# WHY THIS EXISTS WHEN restore-rehearsal.yml ALREADY DOES
+#
+# `restore-rehearsal.yml` drives restore.sh against SYNTHETIC seed data and a
+# LOCALLY-FABRICATED artifact. It proves the restore CODE PATH works and that restore.sh
+# rejects broken artifacts. It stays.
+#
+# It cannot prove THIS artifact loads, and the difference is not academic: the real backup
+# only became restorable after #613/#617/#623/#632, and the synthetic rehearsal was GREEN
+# through every one of those. It supplies COMPOSE_PROJECT_NAME — the one input production
+# omits — so it could never have caught #617.
+#
+# On 2026-07-14 the real thing was done twice, BY HAND (stg, then prod): an ad-hoc compose
+# file scp'd to /var/tmp, driven by shell written in the moment. That is the evidence
+# deploy#612 was closed on, and it lived nowhere. "Can we restore prod?" was answered by a
+# transcript rather than a green check. This workflow is that procedure, as IaC.
+#
+# THE TWO JOBS ARE DIFFERENT KINDS OF CHECK
+#
+#   self-test  — runs on a plain runner. No B2, no VPS, no secrets, nothing live reachable.
+#                It stands up two REAL Neo4j instances and proves the comparator SEPARATES:
+#                MATCH on identical content, DIFFER on a missing narrator, DIFFER on a
+#                same-count content corruption, and it reproduces the `n.name` trap that
+#                made the first hand-run's checksum read 0 on both sides and "agree".
+#
+#                It runs on PRs because a comparator is a thing that BREAKS, and a unit test
+#                over the query STRING would not notice: the n.name Cypher is perfectly
+#                valid, it just measures nothing (cf. deploy#606/#607 — an invalid-Cypher
+#                precheck passed 32 tests and two reviewers; only a real engine caught it).
+#
+#   verify     — runs ON the host, against the real artifact in B2. Scheduled, because a
+#                restore path rots silently. Never on a PR: it needs the live stack and the
+#                bucket, and a job that cannot see them must not report on them.
+name: Restore verify (real B2 artifact)
+
+on:
+  schedule:
+    # Weekly, Tuesdays 04:40 UTC. Offset off the hour, and off restore-rehearsal.yml's
+    # Monday 04:17 — the two are independent checks and a shared failure window would
+    # make them look like one.
+    - cron: "40 4 * * 2"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Which environment's backup to restore and verify"
+        required: true
+        type: choice
+        options: [stg, prod]
+        default: stg
+  pull_request:
+    paths:
+      - "scripts/restore_verify.sh"
+      - "scripts/restore.sh"
+      - "scripts/tests/test_restore_verify.py"
+      - "compose/docker-compose.restore-verify.yml"
+      - ".github/workflows/restore-verify.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The comparator must be shown able to go RED before any green run is believed.
+  # ---------------------------------------------------------------------------
+  self-test:
+    name: Comparator self-test (real engine, no B2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assert prerequisites are really present
+        run: |
+          set -euo pipefail
+          # A missing tool must fail loudly rather than let the self-test skip a leg and
+          # report a green it did not earn.
+          command -v docker >/dev/null || { echo "::error::missing required command: docker"; exit 1; }
+          docker compose version
+
+      - name: The comparator must separate MATCH from DIFFER
+        run: |
+          set -euo pipefail
+          chmod +x scripts/restore_verify.sh
+          ./scripts/restore_verify.sh --self-test 2>&1 | tee "${RUNNER_TEMP}/self-test.txt"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Comparator self-test — ${{ job.status }}"
+            echo ""
+            echo "Two REAL Neo4j instances, seeded identically, then perturbed. The comparator"
+            echo "must MATCH on identical content and DIFFER on both a missing narrator and a"
+            echo "same-count content corruption — and it must reproduce the \`n.name\` trap, where"
+            echo "a fingerprint over a property that does not exist reads **0 on both sides** and"
+            echo "\"agrees\" perfectly."
+            echo ""
+            echo "> A both-sides-zero is not a match. It is the instrument reading nothing, twice."
+            echo ""
+            if [ -f "${RUNNER_TEMP}/self-test.txt" ]; then
+              echo "### Verdicts"
+              echo ""
+              echo '```'
+              grep -E '\[PASS\]|\[FAIL\]' "${RUNNER_TEMP}/self-test.txt" || echo "(no verdicts recorded — the self-test did not reach its assertions)"
+              echo '```'
+            else
+              echo "_No self-test output captured._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # The real thing: restore the actual artifact on the actual host.
+  # ---------------------------------------------------------------------------
+  verify:
+    # Not on PRs. The environment secrets do not resolve there and the live stack is not
+    # reachable — and a check that cannot look must not testify about what it did not see.
+    if: github.event_name != 'pull_request'
+    name: ${{ matrix.env }} — does the REAL B2 artifact restore?
+    needs: self-test
+    runs-on: ubuntu-latest
+    # 7.9 GiB store: download, decompress, neo4j-admin load, two pg_restores, then the
+    # content comparison. The hand-run took well under this; the ceiling is deliberate.
+    timeout-minutes: 90
+    environment: ${{ matrix.env == 'prod' && 'production' || 'staging' }}
+    strategy:
+      fail-fast: false # stg being broken must not hide prod being broken
+      matrix:
+        # A dispatch verifies the one environment it was asked for; the schedule does both.
+        env: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.environment)) || fromJSON('["stg","prod"]') }}
+    concurrency:
+      # Two of these on one host would fight over the same compose project and the same
+      # scratch volumes. Queue rather than cancel: a half-torn-down run leaks volumes
+      # holding a full copy of the database.
+      group: restore-verify-${{ matrix.env }}
+      cancel-in-progress: false
+    steps:
+      - name: Restore the real artifact into a throwaway stack and compare it to live
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.VPS_HOST }}
+          username: deploy
+          key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          # The restore of a 7.9 GiB store, plus the comparison.
+          command_timeout: 80m
+          # EXPECT_PREFIX is the scoping guard (deploy#632/#633). The matrix leg says which
+          # environment it BELIEVES it is checking; the host's .env says which one it IS. If
+          # they disagree the script refuses, rather than restore one environment's backup
+          # and compare it against the other's live database. Before #632 the backup watchdog
+          # had exactly this defect: both legs scanned the same objects, so the prod leg would
+          # have reported `fresh` on the strength of STAGING's backup.
+          envs: EXPECT_PREFIX
+          script: |
+            set -euo pipefail
+            cd /opt/noorinalabs-deploy
+            export EXPECT_PREFIX='${{ matrix.env }}'
+            ./scripts/restore_verify.sh
+        env:
+          EXPECT_PREFIX: ${{ matrix.env }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Restore verify — ${{ matrix.env }}: ${{ job.status }}"
+            echo ""
+            echo "Restored the **real** \`${{ matrix.env }}\` artifact out of B2 into a throwaway"
+            echo "stack on the host, and asserted the restored **content** matches the live"
+            echo "database — row counts, full-table checksums, \`count(n)\`, label and"
+            echo "relationship-type histograms."
+            echo ""
+            echo "The verdict is **never** the restore's exit code: \`pg_restore --clean\` can"
+            echo "warn-and-succeed while restoring nothing."
+            echo ""
+            echo "| exit | meaning | what to do |"
+            echo "|---|---|---|"
+            echo "| 0 | **VERIFIED** — the artifact reproduces live, and the comparator was proven able to go red first. | Nothing. This is the evidence deploy#609 asks for. |"
+            echo "| 1 | **FAILED** — a real negative. The artifact did not reproduce the live database. | The backup is not restorable. Treat as an incident: the nightly is producing something that does not load. |"
+            echo "| 2 | **INSTRUMENT FAILURE** — the check could not run (credentials, disk/memory, an inert comparator, a dirty scratch stack). | **Not** a claim about the backup. Fix the instrument and re-run. Do **not** read it as \"backups are fine\", and do **not** read it as \"backups are broken\". |"
+            echo ""
+            echo "\`restore-rehearsal.yml\` is a different check and does not substitute for this"
+            echo "one: it restores a **fabricated** artifact, and it was green throughout the"
+            echo "entire period the real artifact was unrestorable (#613/#617/#623/#632)."
+          } >> "$GITHUB_STEP_SUMMARY"
