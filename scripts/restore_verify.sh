@@ -939,7 +939,11 @@ self_test() {
         # side so it expands INSIDE the container. The credential never reaches this script's
         # argv, cypher-shell's argv, or the run log (CWE-214). Same contract as graph-ops.yml.
         # shellcheck disable=SC2016
-        printf '%s\n' "$seed" | _st_dc "$p" exec -T neo4j sh -c \
+        NC_SEED="$seed"
+        if [[ "$p" == "$RV_PROJECT" ]]; then
+            NC_SEED="${seed//range(1, 50)/range(1, 49)}" # NEGATIVE CONTROL: deliberate divergence
+        fi
+        printf '%s\n' "$NC_SEED" | _st_dc "$p" exec -T neo4j sh -c \
             'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell' >/dev/null
     done
 
