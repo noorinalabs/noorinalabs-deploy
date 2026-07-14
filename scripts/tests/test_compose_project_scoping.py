@@ -76,9 +76,14 @@ def _executable_surface() -> list[Path]:
 
 
 # Subcommands that do NOT resolve a project, so a missing `-p` cannot misaddress anything.
-# `config` parses the file; `version` asks the binary. Everything else — ps, exec, logs, up,
-# stop, start, pull, run, cp, restart, down — operates on a project's containers.
-PROJECT_AGNOSTIC_SUBCOMMANDS = {"config", "version"}
+# `config` parses the file; `version` asks the binary; `ls` ENUMERATES projects rather than
+# selecting one (it is what an operator runs to find out which project the stack is actually
+# in, and compose_project.sh's own diagnostic now tells them to). Everything else — ps, exec,
+# logs, up, stop, start, pull, run, cp, restart, down — operates on one project's containers.
+#
+# The property being enforced is not "a `-p` appears on every line". It is "no compose call
+# can resolve the WRONG project". These three cannot resolve one at all.
+PROJECT_AGNOSTIC_SUBCOMMANDS = {"config", "version", "ls"}
 
 PROJECT_FLAGS = {"-p", "--project-name"}
 # Compose top-level flags that consume the following token as their value.
@@ -146,7 +151,12 @@ def _compose_invocations(script: Path) -> list[tuple[str, list[str], str | None]
         while i < len(tokens):
             token = tokens[i]
             if not token.startswith("-"):
-                subcommand = token
+                # Strip trailing shell/prose punctuation. A `docker compose ls` quoted INSIDE a
+                # diagnostic string ("Run 'docker compose ls' and ...") tokenizes as `ls'`, and
+                # an un-normalized token would miss the project-agnostic exemption and flag the
+                # message as if it were a call. A real invocation's subcommand never carries
+                # quotes, so this cannot mask one.
+                subcommand = token.strip("\"'`;.,)")
                 break
             flags.append(token)
             i += 2 if token in VALUE_FLAGS else 1
@@ -170,6 +180,8 @@ def test_every_docker_compose_invocation_names_a_project() -> None:
     unflagged = []
     for script in SCANNED:
         for line, flags, subcommand in _compose_invocations(script):
+            if subcommand in PROJECT_AGNOSTIC_SUBCOMMANDS:
+                continue
             if not PROJECT_FLAGS & set(flags):
                 unflagged.append(f"{script.name}: {line}  (subcommand={subcommand})")
 
@@ -594,6 +606,34 @@ REAL_PROJECT="noorinalabs"
 
 printf '%s\n' "$*" >> "$DOCKER_ARGV_LOG"
 
+# --- bare `docker` verbs (NOT `docker compose`) -----------------------------------------
+# The Neo4j leg resolves its data volume with `docker inspect` and dumps with a bare
+# `docker run` (not `compose run`). Without these the leg can never SUCCEED here: NEO4J_OK
+# stays false, the partial gate fires, and the run exits non-zero for a reason unrelated to
+# the branch under test. A test that goes green because a DIFFERENT gate fired has measured
+# nothing (deploy#574) — and the graph-down test needs a COMPLETE artifact before the
+# restart fails.
+case "${1:-}" in
+    inspect)
+        printf '%s_neo4j_data\n' "$REAL_PROJECT"
+        exit 0
+        ;;
+    run)
+        # `neo4j-admin database dump --to-path=/backups/` writes /backups/neo4j.dump; the
+        # host side of that bind mount is $LOCAL_BACKUP_PATH.
+        dest=""
+        while [[ $# -gt 0 ]]; do
+            if [[ "$1" == "-v" && "${2:-}" == */backups ]]; then
+                dest="${2%%:*}"
+            fi
+            shift
+        done
+        [[ -n "$dest" ]] || exit 1
+        { printf 'fake-neo4j-dump\n'; head -c 2048 /dev/zero | tr '\0' 'n'; } > "${dest}/neo4j.dump"
+        exit 0
+        ;;
+esac
+
 [[ "${1:-}" == "compose" ]] || exit 0
 shift
 
@@ -623,7 +663,35 @@ shift || true
 
 case "$sub" in
     ps)
-        for s in $FAKE_RUNNING; do printf '%s:running\n' "$s"; done
+        # `-aq <svc>` asks for CONTAINER IDS including STOPPED ones (that is the `-a`) — it is
+        # how backup.sh resolves the data volume AFTER stopping the graph. It must keep
+        # answering once neo4j is stopped, or the volume is unresolvable, the leg dies in the
+        # "refusing to guess" branch, and the test exercises the wrong code path entirely.
+        if [[ "$*" == *-aq* ]]; then
+            svc=""
+            for a in "$@"; do case "$a" in -*) ;; *) svc="$a" ;; esac; done
+            for s in $FAKE_RUNNING; do
+                [[ "$s" == "$svc" ]] && { printf 'fake-cid-%s\n' "$svc"; exit 0; }
+            done
+            exit 0   # not in this project — empty, exactly like the real thing
+        fi
+
+        # Container state must be REAL state, not a constant. A service that has been STOPPED
+        # must stop reporting itself running, or backup.sh's stop-wait loop spins to its 30s
+        # timeout, SKIPS the dump, and exits down the stop-timeout path — never reaching the
+        # restart branch under test.
+        want_health=0
+        [[ "$*" == *Health* ]] && want_health=1
+
+        for s in $FAKE_RUNNING; do
+            if [[ -f "${DOCKER_STOPPED_FLAG}.${s}" ]]; then
+                [[ "$want_health" == "1" ]] || printf '%s:exited\n' "$s"
+            elif [[ "$want_health" == "1" ]]; then
+                printf '%s:healthy\n' "$s"
+            else
+                printf '%s:running\n' "$s"
+            fi
+        done
         exit 0
         ;;
     exec)
@@ -640,7 +708,21 @@ case "$sub" in
         echo "service \"${svc}\" is not running" >&2
         exit 1
         ;;
-    stop|start) exit 0 ;;
+    stop)
+        for a in "$@"; do case "$a" in -*) ;; *) : > "${DOCKER_STOPPED_FLAG}.${a}" ;; esac; done
+        exit 0
+        ;;
+    start)
+        # FAKE_START_FAILS models the graph refusing to come back after the dump — a
+        # crash-loop, a corrupt store, an OOM. `start` cannot create, so it simply fails: the
+        # run has produced a COMPLETE artifact and left production DOWN.
+        if [[ "${FAKE_START_FAILS:-0}" == "1" ]]; then
+            echo "Error response from daemon: cannot start neo4j" >&2
+            exit 1
+        fi
+        for a in "$@"; do case "$a" in -*) ;; *) rm -f "${DOCKER_STOPPED_FLAG}.${a}" ;; esac; done
+        exit 0
+        ;;
     up)
         printf 'CREATED %s in project %s\n' "$*" "$project" >> "$DOCKER_CREATED_LOG"
         exit 0
@@ -674,13 +756,25 @@ esac
 
 class BackupRun:
     def __init__(
-        self, proc: subprocess.CompletedProcess[str], upload: Path, argv: str, created: str
+        self,
+        proc: subprocess.CompletedProcess[str],
+        upload: Path,
+        argv: str,
+        created: str,
+        textfile_dir: Path,
     ) -> None:
         self.rc = proc.returncode
         self.output = proc.stdout + proc.stderr
         self.upload = upload
         self.argv = argv
         self.created = created
+        self.textfile_dir = textfile_dir
+
+    def textfiles(self) -> list[str]:
+        """What the run actually left on the box for node-exporter to scrape."""
+        if not self.textfile_dir.is_dir():
+            return []
+        return sorted(f.name for f in self.textfile_dir.iterdir() if f.suffix == ".prom")
 
     def uploaded(self) -> list[str]:
         if not self.upload.is_dir():
@@ -695,8 +789,18 @@ class BackupRun:
         )
 
 
-def _run_backup(running: str, tmp_path: Path, project: str = CANONICAL_PROJECT) -> BackupRun:
-    """Run the REAL backup.sh with `running` as the set of services actually up."""
+def _run_backup(
+    running: str,
+    tmp_path: Path,
+    project: str = CANONICAL_PROJECT,
+    *,
+    start_fails: bool = False,
+) -> BackupRun:
+    """Run the REAL backup.sh with `running` as the set of services actually up.
+
+    start_fails — `docker compose start neo4j` returns 1: the graph does not come back after
+    the dump. Every dump still succeeds, so the ARTIFACT is complete and the HOST is broken.
+    """
     stub = tmp_path / "stub"
     stub.mkdir()
     (stub / "docker").write_text(FAKE_DOCKER_E2E)
@@ -729,6 +833,14 @@ def _run_backup(running: str, tmp_path: Path, project: str = CANONICAL_PROJECT) 
         UPLOAD_DIR=str(upload),
         DOCKER_ARGV_LOG=str(argv_log),
         DOCKER_CREATED_LOG=str(created_log),
+        FAKE_START_FAILS="1" if start_fails else "0",
+        # Container state must be real state: `stop` writes a marker here and `ps` reads it.
+        DOCKER_STOPPED_FLAG=str(tmp_path / "stopped"),
+        # Where the run leaves its metrics. backup.sh `rm -f`s the FAILURE textfile from here
+        # when it emits the success gauge — which is how "the backup that took the graph down
+        # cleared its own failure marker" happened. Point it somewhere inspectable so the
+        # assertions read what the run ACTUALLY left on the box, not a log line.
+        TEXTFILE_DIR=str(tmp_path / "textfile"),
     )
 
     proc = subprocess.run(
@@ -744,6 +856,7 @@ def _run_backup(running: str, tmp_path: Path, project: str = CANONICAL_PROJECT) 
         upload,
         argv_log.read_text(),
         created_log.read_text() if created_log.exists() else "",
+        tmp_path / "textfile",
     )
 
 
@@ -810,4 +923,84 @@ def test_a_stray_neo4j_alone_does_not_satisfy_the_project_gate(tmp_path: Path) -
     assert "Stopping Neo4j" not in run.output, (
         "the stray, empty graph was about to be dumped — this is exactly the artifact that "
         "would have checksummed cleanly and restored as an empty database"
+    )
+
+
+# --------------------------------------------------------------------------
+# The producer must not lie about the HOST (deploy#618 review — Aisha Idrissi)
+# --------------------------------------------------------------------------
+
+
+def test_a_run_that_leaves_the_graph_down_does_not_report_success(tmp_path: Path) -> None:
+    """Every dump succeeds; then Neo4j does not come back. This run took production down.
+
+    Before NEO4J_DOWN, that run exited **0**. NEO4J_OK was set true at the dump; the
+    restart-failure branch logged "the graph is DOWN" and set nothing; the final gate read
+    only the three _OK flags. So systemd marked isnad-backup.service SUCCEEDED,
+    `OnFailure=isnad-backup-failure-marker.service` never fired, and emit_success_metric's
+    `rm -f "$FAILURE_TEXTFILE"` meant THE BACKUP THAT TOOK THE GRAPH DOWN CLEARED ITS OWN
+    FAILURE MARKER. The operator's only surviving signal was a generic ServiceDown page with
+    nothing tying it to the backup.
+
+    The correct behaviour is NOT simply "fail". Two facts are true at once and BOTH must
+    reach the box:
+
+      * the backup IS complete and restorable -> emit the success gauge. Suppressing it would
+        hide a good artifact and make BackupStale fire on a backup that exists — the
+        alert-fatigue trap deploy#559/#565 closed.
+      * the run DID break production -> exit non-zero, so OnFailure fires and a human comes.
+    """
+    run = _run_backup("postgres user-postgres neo4j", tmp_path, start_fails=True)
+    uploaded = run.uploaded()
+
+    # The artifact is COMPLETE: all three stores dumped and uploaded.
+    assert any(f.startswith("isnad-pg-") for f in uploaded), f"no isnad dump uploaded: {uploaded}"
+    assert any(f.startswith("isnad-userpg-") for f in uploaded), (
+        f"no user-postgres dump uploaded: {uploaded}"
+    )
+    assert any("neo4j" in f for f in uploaded), (
+        f"no neo4j dump uploaded: {uploaded} — the fixture must reach a COMPLETE artifact, or "
+        "this test passes off the partial gate and proves nothing about the restart branch"
+    )
+    assert "complete=true" in run.manifest(), (
+        "every dump succeeded, so the artifact IS complete and the manifest must say so"
+    )
+
+    # ...and it is ATTESTED: a good backup must not go invisible.
+    assert "isnad_backup_success.prom" in run.textfiles(), (
+        "the success gauge was NOT emitted for a COMPLETE backup. Suppressing it hides a good "
+        "artifact and makes BackupStale fire falsely (deploy#559/#565). 'the artifact is good' "
+        "and 'the host is broken' are different facts and need different signals."
+    )
+
+    # ...and the run FAILS, because it left production down.
+    assert run.rc != 0, (
+        "a run that left the graph DOWN exited 0. systemd marks the unit SUCCEEDED, OnFailure= "
+        "never fires the failure marker, and nobody is told — while the script's own log says "
+        "'the graph is DOWN'."
+    )
+    assert "the graph is DOWN" in run.output
+
+
+def test_the_health_timeout_branch_also_raises_the_graph_down_flag() -> None:
+    """The same structural hole, one state further on.
+
+    `start` succeeds but the graph never becomes HEALTHY within MAX_HEALTH_WAIT. That branch
+    logged a WARNING and walked straight into a green exit. A graph that never came back
+    healthy is a graph that is down.
+
+    Pinned separately because it is a DIFFERENT branch from the restart failure — and the
+    first fixup pass closed one and left the other open, which is exactly how this class of
+    bug survives its own fix.
+    """
+    src = BACKUP.read_text()
+    assert "NEO4J_DOWN=true" in src, "the graph-down flag is gone entirely"
+
+    before, _, after = src.partition("did not become healthy")
+    assert after, "the health-timeout branch vanished — retarget this test, do not delete it"
+    window = before[-500:] + after[:300]
+    assert "NEO4J_DOWN=true" in window, (
+        "the health-timeout branch does not raise NEO4J_DOWN. A graph that never came back "
+        "healthy is DOWN, and this branch would exit 0 over it — the same hole as the "
+        "restart-failure branch, which is why both are pinned."
     )

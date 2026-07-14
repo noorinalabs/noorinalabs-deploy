@@ -39,10 +39,33 @@ FAILURE_METRIC = "isnad_backup_last_failure_timestamp_seconds"
 
 
 def _textfile_dir_assignment(script: Path) -> str:
-    """Extract the TEXTFILE_DIR="..." literal a shell script assigns."""
-    match = re.search(r'^TEXTFILE_DIR="([^"]+)"', script.read_text(), re.MULTILINE)
+    """The directory a script will actually write metrics to WHEN PRODUCTION RUNS IT.
+
+    Accepts either form, and returns the same thing for both — the path used when nothing in
+    the environment overrides it:
+
+        TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+        TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
+
+    backup.sh took the second form so a test sandbox can point the gauge somewhere writable
+    and OBSERVE what a run leaves on the box (deploy#618 review: the run that dumps everything
+    and then fails to restart Neo4j used to exit 0 and `rm -f` its own failure marker — you
+    cannot assert on that without a writable textfile dir). Nothing in production sets the
+    variable: the systemd unit passes no such env and grants ReadWritePaths=/var/lib/node_exporter.
+
+    So what this helper must return is the DEFAULT, not the literal text of the assignment.
+    Returning the raw `${TEXTFILE_DIR:-...}` string would make the two assertions below compare
+    a shell expression against a path and fail — while the property they exist to protect (the
+    metric lands where node-exporter scrapes) is still perfectly true.
+    """
+    text = script.read_text()
+    match = re.search(
+        r'^TEXTFILE_DIR="(?:\$\{TEXTFILE_DIR:-(?P<default>[^}"]+)\}|(?P<literal>[^"$]+))"',
+        text,
+        re.MULTILINE,
+    )
     assert match, f"{script.name} does not assign TEXTFILE_DIR"
-    return match.group(1)
+    return match.group("default") or match.group("literal")
 
 
 def _collector_directory_flag() -> str:

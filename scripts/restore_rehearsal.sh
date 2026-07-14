@@ -612,6 +612,40 @@ main() {
         assert_restored_content
     fi
 
+    # -----------------------------------------------------------------------
+    # THE DR CASE: NEO4J IS NOT RUNNING. (deploy#618 review, Aisha Idrissi)
+    # -----------------------------------------------------------------------
+    # Every case above restores into a HEALTHY stack — which is not the stack anyone restores
+    # into in anger. You reach for a dump because the graph is DEAD: crashed, OOM-killed,
+    # crash-looping on a corrupt store. Neo4j is then `exited`, never `running`.
+    #
+    # So the rehearsal could not see the very thing it exists to rehearse. That is the same
+    # shape as the COMPOSE_PROJECT_NAME finding that produced this PR — a harness that hands
+    # the code under test an input production never provides (there, a project name; here, a
+    # healthy database) is not exercising the code under test. It is why an over-strict
+    # `assert_stack_present ... neo4j` would have sailed through CI and only failed on the one
+    # night it was needed.
+    #
+    # restore.sh does NOT need Neo4j running: restore_neo4j() STOPS it first, and resolves the
+    # volume with `ps -aq`, which sees a stopped container perfectly well. The load is offline.
+    # This case pins that, end to end, against real containers.
+    empty_scratch_stores
+    log "INFO" "--- DR case: stopping neo4j BEFORE the restore (you restore because it is dead) ---"
+    dc stop neo4j > /dev/null 2>&1
+    local neo4j_state
+    neo4j_state="$(dc ps -a --format '{{.Service}}:{{.State}}' 2>/dev/null | grep '^neo4j:' || echo 'neo4j:<gone>')"
+    log "INFO" "neo4j is now ${neo4j_state} — restoring into a stack whose graph is DOWN"
+    if [[ "$neo4j_state" == "neo4j:running" ]]; then
+        # An inert fixture proves nothing: if neo4j is still running, this case is just the
+        # positive case again under a different name.
+        fail "DR case: neo4j is STILL running — the fixture cannot express the state it tests"
+    else
+        if expect_pass "intact_artifact_with_neo4j_stopped" "$ARTIFACT"; then
+            wait_neo4j_healthy
+            assert_restored_content
+        fi
+    fi
+
     echo ""
     log "INFO" "=== Rehearsal summary ==="
     log "INFO" "passed: ${PASS_COUNT}   failed: ${FAIL_COUNT}"

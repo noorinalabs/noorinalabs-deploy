@@ -136,7 +136,14 @@ source "$COMPOSE_PROJECT_LIB"
 # The directory below is the one node-exporter is actually pointed at
 # (`--collector.textfile.directory`, compose/docker-compose.prod.yml) and is the
 # only path bind-mounted into the container.
-TEXTFILE_DIR="/var/lib/node_exporter/textfile_collector"
+# Overridable ONLY so a test can observe what the run leaves on the box. The default is the
+# real path and the unit grants it (ReadWritePaths=/var/lib/node_exporter); nothing in
+# production sets this. It matters because the interesting assertion here is about the
+# textfiles themselves — the success gauge AND the failure marker `emit_success_metric`
+# deletes (:171) — and with the path hardcoded, a sandboxed run dies at `install -d` with
+# "Permission denied" and exits non-zero for a reason that has nothing to do with the
+# behaviour under test. That is a measurement of the sandbox, not of the script.
+TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
 SUCCESS_TEXTFILE="${TEXTFILE_DIR}/isnad_backup_success.prom"
 FAILURE_TEXTFILE="${TEXTFILE_DIR}/isnad_backup_failure.prom"
 
@@ -292,6 +299,32 @@ PG_OK=false
 USER_PG_OK=false
 NEO4J_OK=false
 
+# Did THIS RUN leave the graph down? (deploy#617 review — Aisha Idrissi)
+#
+# Deliberately SEPARATE from NEO4J_OK, and the distinction is the whole point:
+#
+#   NEO4J_OK   — is the ARTIFACT good?  (did the dump succeed and get uploaded)
+#   NEO4J_DOWN — is the HOST  good?     (did we put the graph back the way we found it)
+#
+# They are independent, and the interesting case is exactly the one where they disagree: a
+# run that dumps all three stores perfectly and then FAILS TO RESTART NEO4J has produced a
+# complete, restorable backup AND taken production down.
+#
+# Before this flag, that run reported plain SUCCESS. NEO4J_OK was set true at the dump; the
+# restart-failure branch logged "the graph is DOWN" and set nothing; the final gate read
+# only the three _OK flags, so it did not fire; the script exited 0. systemd therefore
+# marked the unit SUCCEEDED, `OnFailure=isnad-backup-failure-marker.service` never fired,
+# and emit_success_metric's `rm -f` of the failure textfile meant THE BACKUP THAT TOOK THE
+# GRAPH DOWN CLEARED ITS OWN FAILURE MARKER. The operator's only remaining signal was a
+# generic ServiceDown page with nothing to say the backup had caused it.
+#
+# The fix is NOT to fold this into NEO4J_OK. That would suppress the success gauge — hiding
+# a backup that is genuinely complete and restorable, and letting BackupStale fire falsely,
+# the alert-fatigue trap deploy#559/#565 closed. BOTH facts must reach the box, because both
+# are TRUE: *the last complete backup is at T* (the gauge) and *the last run broke something
+# and needs a human* (non-zero exit -> OnFailure -> failure marker).
+NEO4J_DOWN=false
+
 # ---------------------------------------------------------------------------
 # 1. PostgreSQL dumps (isnad + user-service)
 # ---------------------------------------------------------------------------
@@ -370,7 +403,12 @@ if service_is_running neo4j; then
     while dc ps --format '{{.Service}}:{{.State}}' 2>/dev/null | grep -q "neo4j:running"; do
         if [[ $WAITED -ge $MAX_WAIT ]]; then
             log "ERROR" "Neo4j did not stop within ${MAX_WAIT}s"
-            neo4j_start || log "ERROR" "Neo4j restart failed after a stop timeout — check manually"
+            # `|| log …` used to SWALLOW the return code here: the restart failed, the run
+            # logged a line, and exited 0 with the graph down. Set the flag instead.
+            if ! neo4j_start; then
+                NEO4J_DOWN=true
+                log "ERROR" "Neo4j restart failed after a stop timeout — the graph is DOWN. Start it by hand."
+            fi
             break
         fi
         sleep 1
@@ -385,7 +423,15 @@ if service_is_running neo4j; then
         # across all compose projects, so on a box running more than one stack the backup
         # could silently dump a different project's graph and be restored over the real one.
         # (deploy#559, same resolution as restore.sh restore_neo4j().)
-        NEO4J_CID=$(dc ps -aq neo4j 2>/dev/null | head -1)
+        # `|| NEO4J_CID=""` is not belt-and-braces here — it is the difference between a
+        # degraded backup and a DOWN DATABASE (deploy#622, Aisha Idrissi).
+        #
+        # This is a bare assignment under `set -euo pipefail`, and we are in the window AFTER
+        # Neo4j has been STOPPED. A daemon blip, a socket timeout, a `docker` that exits
+        # non-zero for any reason at all makes this a failing simple command — errexit fires AT
+        # THE ASSIGNMENT, the restart below is NEVER REACHED, and the graph stays down. The
+        # same deploy#563 shape assert_stack_present is careful about; these two lines were not.
+        NEO4J_CID="$(dc ps -aq neo4j 2>/dev/null | head -1)" || NEO4J_CID=""
         if [[ -z "$NEO4J_CID" ]]; then
             NEO4J_VOLUME=""
         else
@@ -447,7 +493,11 @@ if service_is_running neo4j; then
             HEALTH_WAITED=0
             while ! dc ps --format '{{.Service}}:{{.Health}}' 2>/dev/null | grep -q "neo4j:healthy"; do
                 if [[ $HEALTH_WAITED -ge $MAX_HEALTH_WAIT ]]; then
-                    log "WARNING" "Neo4j did not become healthy within ${MAX_HEALTH_WAIT}s — check manually"
+                    # A graph that never came back HEALTHY is a graph that is down, and this
+                    # branch used to say so at WARNING and then exit 0 — the same structural
+                    # hole as the restart-failure branch below, one state further on.
+                    NEO4J_DOWN=true
+                    log "ERROR" "Neo4j did not become healthy within ${MAX_HEALTH_WAIT}s — the graph is DOWN. Check it by hand."
                     break
                 fi
                 sleep 5
@@ -463,6 +513,7 @@ if service_is_running neo4j; then
             # fall into `[[ 0 -lt 120 ]]` and log "Neo4j healthy (waited 0s)" over a database
             # that is not running at all. That is the exact sentence the stg run printed while a
             # stray, empty container came up beside the real one.
+            NEO4J_DOWN=true
             log "ERROR" "Neo4j did NOT restart — the graph is DOWN. Start it by hand; do not wait for this script."
         fi
     else
@@ -652,3 +703,24 @@ if [[ "$PG_OK" == "false" || "$USER_PG_OK" == "false" || "$NEO4J_OK" == "false" 
 fi
 
 emit_success_metric
+
+# The ARTIFACT is complete (we are past the gate above) but THIS RUN left the graph DOWN.
+# Both facts are true and both must reach the box, so the order here is load-bearing:
+#
+#   emit_success_metric FIRST — the backup really is complete and restorable, and the gauge
+#   is what the alerts read as "a complete backup exists". Suppressing it would hide a good
+#   artifact and make BackupStale fire falsely (deploy#559/#565's alert-fatigue trap).
+#
+#   THEN exit non-zero — so systemd marks the unit failed and `OnFailure=` fires the failure
+#   marker. Because OnFailure runs AFTER the script exits, the marker is written after
+#   emit_success_metric's `rm -f`, and both signals survive.
+#
+# The run that produced this state is precisely the one the old code called a success: every
+# dump good, the restart dead, the graph offline, exit 0, and the success metric wiping the
+# failure textfile on its way out (deploy#617 review — Aisha Idrissi).
+if [[ "$NEO4J_DOWN" == "true" ]]; then
+    log "ERROR" "Backup artifact is COMPLETE and uploaded — but this run left Neo4j DOWN."
+    log "ERROR" "  The success metric WAS emitted: the backup at ${TIMESTAMP} is good and restorable."
+    log "ERROR" "  Exiting non-zero anyway so OnFailure= fires: production needs a human NOW."
+    exit 1
+fi

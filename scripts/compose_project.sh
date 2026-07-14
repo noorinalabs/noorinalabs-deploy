@@ -156,8 +156,35 @@ assert_stack_present() {
         log "ERROR" "Compose project '${COMPOSE_PROJECT}' is not running: ${missing[*]}"
         log "ERROR" "  compose file:  ${COMPOSE_FILE}"
         log "ERROR" "  running there: ${seen:-<nothing at all>}"
-        log "ERROR" "  Every deploy path brings this stack up as '-p noorinalabs'. If the services"
-        log "ERROR" "  ARE up, then this project name is wrong — not the stack. Set COMPOSE_PROJECT."
+
+        # ---------------------------------------------------------------------------
+        # THE DIAGNOSIS IS DECIDED BY EVIDENCE, AND IT MUST NEVER SAY "RETARGET".
+        # (deploy#618 review, Aisha Idrissi)
+        # ---------------------------------------------------------------------------
+        # This used to end, unconditionally, with "this project name is wrong — Set
+        # COMPOSE_PROJECT." Read that as the operator who is about to see it: they are
+        # mid-incident, restoring a database, and the very next command they run carries
+        # `--overwrite-destination`. The guard whose entire purpose is to STOP a load into the
+        # wrong project was handing them an instruction to change the project until the guard
+        # stopped complaining. That is the guard becoming the accident.
+        #
+        # The two causes are distinguishable, and the listing already holds the evidence:
+        #
+        #   nothing running at all  -> could be a phantom project, or a stack that is simply
+        #                              down. Say both; assert neither.
+        #   other services running  -> the project is REAL. The name is RIGHT. The named
+        #                              services are DOWN. Retargeting could only make it worse.
+        if [[ -z "$states" ]]; then
+            log "ERROR" "  This project holds NO containers at all. Either the stack is down, or"
+            log "ERROR" "  '${COMPOSE_PROJECT}' is not the project it runs in — every deploy path"
+            log "ERROR" "  brings this stack up as '-p noorinalabs'. Run 'docker compose ls' and"
+            log "ERROR" "  find out WHICH before you change anything."
+        else
+            log "ERROR" "  This project IS the right one — other services are running in it. The"
+            log "ERROR" "  services listed above are DOWN. Start them."
+            log "ERROR" "  Do NOT change COMPOSE_PROJECT: the name is not the problem, and pointing"
+            log "ERROR" "  this run at a different project is how a restore overwrites the wrong stack."
+        fi
         return 1
     fi
 

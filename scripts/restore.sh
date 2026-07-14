@@ -829,8 +829,14 @@ restore_neo4j() {
     # `| head -1` is safe here for the same reason as the wait-loop above: a one-service
     # container-id list is environment-bounded and fits the pipe buffer, so nothing is still
     # writing when `head` quits.
-    local neo4j_cid
-    neo4j_cid=$(dc ps -aq neo4j 2>/dev/null | head -1)
+    # `|| neo4j_cid=""`, for the same reason as backup.sh's NEO4J_CID (deploy#622): a bare
+    # assignment under `set -euo pipefail`, in the window AFTER Neo4j has been stopped. Any
+    # non-zero exit from docker — a daemon blip, a socket timeout — fires errexit AT THE
+    # ASSIGNMENT, and the restart below is never reached: the graph stays down, mid-restore.
+    # With the guard, an unreadable listing becomes an empty cid, which the "refusing to guess"
+    # branch below already handles correctly AND which restarts Neo4j on its way out.
+    local neo4j_cid=""
+    neo4j_cid="$(dc ps -aq neo4j 2>/dev/null | head -1)" || neo4j_cid=""
     if [[ -z "$neo4j_cid" ]]; then
         log "ERROR" "Cannot resolve a neo4j container in project '${COMPOSE_PROJECT}' (${COMPOSE_FILE}) — refusing to guess a data volume"
         neo4j_start || log "ERROR" "  ...and there is no neo4j container to start in that project either (deploy#617)"
