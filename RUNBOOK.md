@@ -343,19 +343,54 @@ hand-edited file on the box.
 
 | Path | GH secret names (env scope) | VPS env-var names | Bucket | Consumer |
 |---|---|---|---|---|
-| Backups | `BACKUP_B2_KEY_ID`, `BACKUP_B2_APP_KEY`, `BACKUP_B2_BUCKET` | `B2_KEY_ID`, `B2_APP_KEY`, `B2_BUCKET` | `isnad-graph-backups` | `scripts/backup.sh`, `scripts/restore.sh` (rclone-native via `RCLONE_CONFIG_ISNAD_*` exports inside the script) |
+| Backups | `BACKUP_B2_KEY_ID`, `BACKUP_B2_APP_KEY`, `BACKUP_B2_BUCKET` | `B2_KEY_ID`, `B2_APP_KEY`, `B2_BUCKET` | `${B2_BUCKET}` (⚠️ see below — never hardcode it) | `scripts/backup.sh`, `scripts/restore.sh` (rclone-native via `RCLONE_CONFIG_ISNAD_*` exports inside the script) |
 | Terraform state | `TF_STATE_B2_KEY_ID`, `TF_STATE_B2_APP_KEY` (also exposed as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` to the S3-protocol backend) | n/a (Actions only) | `noorinalabs-terraform-state` | `terraform.yml` |
 | Pipeline ingest | `PIPELINE_B2_KEY_ID`, `PIPELINE_B2_KEY` | `PIPELINE_B2_KEY_ID`, `PIPELINE_B2_KEY` | (declared in data-acquisition repo) | data-acquisition / ingest workers |
 
-Rotating one path does not affect the others. The local FS path
-`/var/lib/noorinalabs-backups` is the staging directory `backup.sh`
-writes to before the rclone upload — it is **not** a B2 bucket name and
-does not need rotation.
+Rotating one path does not affect the others.
+
+> ### ⚠️ Never type a bucket name. Use `${B2_BUCKET}`. (deploy#636)
+>
+> **In any command you run, write `isnad:${B2_BUCKET}/<env>/…` — never a literal
+> bucket name.** `${B2_BUCKET}` resolves to whatever the `BACKUP_B2_BUCKET`
+> secret actually says, which is the only thing true by construction. A literal
+> is a stale artifact waiting to happen, and this table is the proof: it used to
+> name the wrong bucket, and it did so confidently, for months.
+>
+> Three names in this repo look alike. Two are buckets and only one is real:
+>
+> | Name | What it is |
+> |---|---|
+> | **`${B2_BUCKET}`** | the **B2 bucket** — every real backup lives here (9 `stg/` + 18 `prod/` objects, 2026-07-14). **Use this form.** Its literal value is the `BACKUP_B2_BUCKET` secret; do not hardcode it. |
+> | **`/var/lib/noorinalabs-backups`** | a **local directory** on the VPS — the staging area `backup.sh` writes to before the rclone upload. **Not** a bucket at all. Does not need rotation. Its name is *confusingly close* to the bucket's; that resemblance is what misled this document. |
+> | **`isnad-graph-backups`** | a **legacy, EMPTY B2 bucket**. It EXISTS, so nothing errors — it simply holds nothing, and never will. |
+>
+> The last row is the trap, and it is worse than a stale doc. An operator
+> mid-incident copies a line naming it, runs
+> `rclone lsf isnad:isnad-graph-backups/prod`, and gets `status=absent dumps=0
+> bucket_objects=0` — a clean, confident **zero**, from the one check that reads
+> B2 rather than a host-local gauge — and concludes **production has no
+> restorable backup**. Measured against stg at the same moment:
+>
+> ```text
+> isnad:isnad-graph-backups/prod  ->  status=absent  dumps=0  objects=0
+> isnad:${B2_BUCKET}/prod         ->  status=fresh   dumps=3  objects=20  age=5h
+> ```
+>
+> A false **RED**, and it sticks: an empty bucket lists `rc=0` with nothing in
+> it, which is byte-for-byte the signature of a healthy-but-empty prefix. *A
+> silent zero is not a measurement* — least of all in the document you only read
+> when you are already in trouble.
+>
+> **And always name the environment.** stg and prod share this one bucket,
+> namespaced `${B2_BUCKET}/stg/…` and `${B2_BUCKET}/prod/…` (deploy#632). A path
+> at the bucket **root** reads both environments' objects as one pool, so a prod
+> check can report healthy on the strength of a staging backup.
 
 **Rotation procedure (backup path — most common):**
 
 1. Generate a new B2 application key in the Backblaze console scoped to
-   the `isnad-graph-backups` bucket only (read+write+delete).
+   the `noorinalabs-backups` bucket only (read+write+delete).
 2. Update the env-scoped GH secrets:
    ```bash
    gh secret set BACKUP_B2_KEY_ID  --env staging    --body "$NEW_KEY_ID"
@@ -375,7 +410,18 @@ does not need rotation.
    sudo journalctl -u isnad-backup.service -n 200
    ```
    Confirm the rclone upload step exits 0 and a new dated subdirectory
-   appears in the B2 bucket.
+   appears under **that host's own prefix** — never at the bucket root, and
+   never against a hardcoded bucket name:
+   ```bash
+   rclone lsf "isnad:${B2_BUCKET}/stg/daily/"    # on stg
+   rclone lsf "isnad:${B2_BUCKET}/prod/daily/"   # on prod
+   ```
+   An empty result here is **not** proof the backup is missing. Two different
+   things both return `rc=0` with no output: a prefix the key is not permitted
+   to list (deploy#634/#638), and a bucket that is simply empty — which is what
+   you get if you typed a bucket name and typed the wrong one. Check
+   `isnad_backup_retention_ok` and the journal before concluding anything from
+   a zero.
 5. Revoke the old keys in the Backblaze console only after step 4 has
    passed on **both** stg and prod.
 
