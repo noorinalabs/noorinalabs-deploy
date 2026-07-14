@@ -328,6 +328,38 @@ _cypher_hist_raw() {
 # Guards — all of these run BEFORE anything is started or loaded
 # =============================================================================
 guard_not_live() {
+    # EMPTY IS AS DANGEROUS AS ABSENT, and it is more dangerous than WRONG.
+    #
+    # restore.sh resolves its OWN project (scripts/compose_project.sh:48):
+    #
+    #     COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}"
+    #
+    # and `${VAR:-default}` treats "" EXACTLY like unset. So a BLANK RV_PROJECT does not
+    # produce a harmless no-op — it silently resolves to `noorinalabs`, THE LIVE PROJECT, and
+    # `neo4j-admin database load --overwrite-destination` writes the production graph.
+    #
+    # This is reachable today: load_env() sources the host `.env` with `set -a`, AFTER the
+    # `RV_PROJECT="${RV_PROJECT:-…}"` default at the top of this file has already been applied.
+    # An `RV_PROJECT=` line in that .env would blank it. Nothing writes that key today; nothing
+    # REFUSED it either, and the "!= noorinalabs" check below passes happily on "".
+    #
+    # So: an empty project is not a missing setting, it is an aimed gun. (Weronika Zielinska,
+    # PR#642 review.)
+    # `-z` alone would let a whitespace-only value through, and `-p '   '` is not a project —
+    # it is garbage that no guard downstream is looking for. Strip before testing.
+    local var stripped
+    for var in RV_PROJECT RV_COMPOSE LIVE_PROJECT; do
+        stripped="${!var:-}"
+        stripped="${stripped//[[:space:]]/}"
+        if [[ -z "$stripped" ]]; then
+            instrument_fail "${var} is EMPTY or unset. Refusing.
+        restore.sh resolves its own compose project and FALLS BACK TO THE LIVE ONE
+        ('${LIVE_PROJECT:-noorinalabs}') when COMPOSE_PROJECT is empty — \${VAR:-default} does not
+        distinguish \"\" from unset. An empty RV_PROJECT would aim a --overwrite-destination
+        Neo4j load at the PRODUCTION graph."
+        fi
+    done
+
     # The single most important refusal in this file. Everything else is hygiene.
     if [[ "$RV_PROJECT" == "$LIVE_PROJECT" ]]; then
         instrument_fail "RV_PROJECT='${RV_PROJECT}' IS the live project. Refusing: this script
@@ -753,14 +785,60 @@ calibrate() {
 run_restore() {
     log "INFO" "=== Restoring the REAL artifact from B2 (prefix: ${BACKUP_PREFIX}) ==="
 
-    # restore.sh reads COMPOSE_FILE / COMPOSE_PROJECT. Export ours so it can only ever
-    # address the throwaway stack. This is the same pair guard_not_live() refuses to
-    # inherit — we are the ones who get to set it.
-    local rc=0
+    # THE DESTRUCTIVE WRITE DOES NOT HAPPEN IN THIS FILE.
+    #
+    # `neo4j-admin database load --overwrite-destination` is executed by restore.sh, which
+    # RESOLVES ITS OWN PROJECT and falls back to the LIVE one (compose_project.sh:48). The
+    # `COMPOSE_PROJECT=` below is therefore not a convenience — it is the entire thing standing
+    # between a scheduled run and `noorinalabs_neo4j_data`. Delete it and this workflow
+    # overwrites the production graph, unattended, on a cron.
+    #
+    # assert_volume_isolation() does NOT protect this. It inspects the container running in
+    # $RV_PROJECT and confirms its volume is the throwaway one — a claim that stays TRUE while
+    # a DIFFERENT process addressing a DIFFERENT project destroys the live graph. It guards the
+    # stack the load will not touch. (Weronika Zielinska, PR#642 review.)
+    local rc=0 out
+    out="$(mktemp)"
+
     COMPOSE_FILE="$RV_COMPOSE" \
         COMPOSE_PROJECT="$RV_PROJECT" \
         RESTORE_DIR="$RESTORE_STAGING_DIR" \
-        "${SCRIPT_DIR}/restore.sh" --force latest || rc=$?
+        "${SCRIPT_DIR}/restore.sh" --force latest 2>&1 | tee "$out" || rc=$?
+
+    # VERIFY THE HANDOFF; DO NOT TRUST IT.
+    #
+    # restore.sh announces the volume it resolved ("Resolved Neo4j data volume: …") precisely so
+    # this is auditable. Read it back and require it to be OURS. Everything else in this script
+    # asserts rather than assumes; the one hand-off that can destroy production should not be the
+    # exception. This catches the whole class — a dropped export, an inherited COMPOSE_PROJECT, a
+    # future edit to compose_project.sh's fallback — at the only place that sees the truth: what
+    # restore.sh ITSELF says it is about to write to.
+    local resolved=""
+    if ! resolved="$(sed -n 's/.*Resolved Neo4j data volume: \([^ ]*\).*/\1/p' "$out" | head -1)"; then
+        resolved=""
+    fi
+    rm -f "$out"
+
+    if [[ -z "$resolved" ]]; then
+        instrument_fail "restore.sh never reported which Neo4j volume it resolved.
+        Without that line this script CANNOT confirm the load went to the throwaway stack rather
+        than the live graph, so it will not certify the restore. (If restore.sh's log wording
+        changed, scripts/tests/test_restore_verify.py pins the string and will say so.)"
+    fi
+    log "INFO" "restore.sh resolved Neo4j volume: ${resolved}"
+
+    case "$resolved" in
+        "${RV_PROJECT}_rv_"*)
+            pass "handoff verified: restore.sh loaded into '${resolved}', the throwaway volume"
+            ;;
+        *)
+            fail "HANDOFF VIOLATION: restore.sh resolved '${resolved}', which is NOT a volume of"
+            log "ERROR" "the throwaway project '${RV_PROJECT}'. It runs neo4j-admin database load"
+            log "ERROR" "with --overwrite-destination. If this names a live volume, the production"
+            log "ERROR" "graph has just been overwritten and it is UNRECOVERABLE."
+            exit "$RC_INSTRUMENT"
+            ;;
+    esac
 
     # rc != 0 IS a real negative: restore.sh treats an ignored pg_restore error as a failed
     # restore, and it is right to. But rc == 0 is NOT a pass — that is what compare() is for.

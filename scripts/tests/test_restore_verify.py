@@ -109,6 +109,82 @@ def test_the_scan_does_not_false_positive_on_a_comment() -> None:
     assert not _unflagged_compose_calls("# every `docker compose` here carries -p")
 
 
+def _run_restore_body(text: str) -> str:
+    m = re.search(r"^run_restore\(\) \{(.*?)^\}", text, re.S | re.M)
+    assert m, "could not locate run_restore() — the scan must not silently find nothing"
+    return m.group(1)
+
+
+def test_run_restore_hands_restore_sh_the_throwaway_project() -> None:
+    """THE line the whole workflow's safety rests on.
+
+    `restore.sh` does not take a project argument — it RESOLVES ITS OWN, and the fallback is
+    the LIVE project (scripts/compose_project.sh:48):
+
+        COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}"
+
+    `restore.sh` is what runs `neo4j-admin database load --overwrite-destination`. So the ONLY
+    thing between a scheduled restore-verify run and `noorinalabs_neo4j_data` is that this
+    export is present. Delete it and the workflow overwrites the production graph, on a cron,
+    unattended — and every other guard in the script still passes, because they all inspect the
+    stack the load will not touch.
+
+    This scan is the same shape as the `-p` scan above, applied to the env handoff instead of
+    the compose argv. It exists because deleting that one line left the whole suite green.
+    (Weronika Zielinska, PR#642 review.)
+    """
+    body = _run_restore_body(_source())
+    assert re.search(r'COMPOSE_PROJECT="\$(RV_PROJECT|\{RV_PROJECT\})"', body), (
+        'run_restore() does not pass COMPOSE_PROJECT="$RV_PROJECT" to restore.sh.\n'
+        "restore.sh will then resolve its own project and FALL BACK TO THE LIVE ONE, and it is\n"
+        "the process that runs `neo4j-admin database load --overwrite-destination`.\n"
+        "This overwrites the PRODUCTION GRAPH. Unrecoverable."
+    )
+
+
+def test_the_handoff_scan_can_actually_see_the_missing_export() -> None:
+    """Calibrate the scan above against the EXACT mutation that survived: delete the
+    `COMPOSE_PROJECT="$RV_PROJECT"` line from run_restore's var-prefix.
+
+    Without this, the scan could be a no-op and its silence would mean nothing — which is
+    precisely the state the suite was in when it reported `33 passed` on a tree that would have
+    destroyed the production graph.
+    """
+    mutated = textwrap.dedent(
+        """\
+        run_restore() {
+            local rc=0
+            COMPOSE_FILE="$RV_COMPOSE" \\
+                RESTORE_DIR="$RESTORE_STAGING_DIR" \\
+                "${SCRIPT_DIR}/restore.sh" --force latest || rc=$?
+        }
+        """
+    )
+    body = _run_restore_body(mutated)
+    assert not re.search(r'COMPOSE_PROJECT="\$(RV_PROJECT|\{RV_PROJECT\})"', body), (
+        "the scan cannot see a run_restore() that has DROPPED the COMPOSE_PROJECT export — "
+        "it would not have caught the live-graph-overwrite mutation, so it proves nothing"
+    )
+
+
+def test_restore_sh_still_emits_the_volume_line_the_handoff_check_reads() -> None:
+    """run_restore verifies the handoff by reading restore.sh's own "Resolved Neo4j data
+    volume:" announcement. That string belongs to someone else's file.
+
+    A producer-side rename would not break the parser — it would QUIETLY NARROW it, the guard
+    downstream would stop guarding, and the tests would stay green
+    (feedback_paraphrase_in_the_product). So pin the anchor against the REAL producer: if
+    restore.sh's wording changes, this fails and names the guard that depends on it, rather than
+    the guard silently going blind.
+    """
+    restore_sh = (SCRIPTS_DIR / "restore.sh").read_text()
+    assert "Resolved Neo4j data volume:" in restore_sh, (
+        "restore.sh no longer emits 'Resolved Neo4j data volume:'. run_restore()'s handoff "
+        "verification reads that exact string and will now refuse to certify any restore "
+        "(rc=2). Update BOTH, or the guard is dead."
+    )
+
+
 def test_the_measurement_path_never_discards_stderr() -> None:
     """`_run_capture` is the only function in the script that produces a value that is read.
 
@@ -232,7 +308,18 @@ world = json.load(open(os.environ["FAKE_WORLD"]))
 argv = sys.argv[1:]
 LIVE = os.environ["LIVE_PROJECT"]
 RV = os.environ["RV_PROJECT"]
-restored = os.path.exists(os.environ["RESTORE_MARKER"])
+
+# WHICH project did restore.sh actually load into?
+#
+# The scratch stack becomes populated ONLY if the restore was addressed to IT. A restore
+# aimed at the live project loads the PRODUCTION graph and leaves the scratch stack empty —
+# which is exactly what would have happened in production, and exactly what the old model
+# (a bare "did restore.sh run?" marker) could not express. That inability is the root cause
+# of the surviving mutation: a harness that cannot represent the catastrophe cannot rule it
+# out. (Weronika Zielinska, PR#642 review.)
+_pf = os.environ["RESTORE_PROJECT_FILE"]
+restored_into = open(_pf).read().strip() if os.path.exists(_pf) else None
+restored = restored_into == RV
 
 def log_call():
     with open(os.environ["FAKE_CALLS"], "a") as fh:
@@ -456,13 +543,42 @@ class Harness:
         self.marker = tmp / "restore_ran"
         self.calls = tmp / "calls.log"
         self.calls.write_text("")
+        # WHICH PROJECT the restore was actually addressed to. This file is the whole point of
+        # the harness rework: without it, "restore.sh loaded into the LIVE project" was a state
+        # the world model could not represent, and the mutation that causes it survived.
+        self.restore_project = tmp / "restore_project"
 
-        # A fake restore.sh that records that it ran. Whether it is reached at all is the
-        # assertion for every guard that must abort BEFORE any load.
+        # THE REAL compose_project.sh, not a paraphrase of it. Its line 48 —
+        #   COMPOSE_PROJECT="${COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-noorinalabs}}"
+        # — is the fallback that makes a dropped export catastrophic, and a restatement of it
+        # here would drift from the original and quietly stop modelling the hazard
+        # (feedback_paraphrase_in_the_product). So the fake restore.sh SOURCES the real file and
+        # resolves its project exactly the way the real restore.sh does.
+        shutil.copy(SCRIPTS_DIR / "compose_project.sh", self.scripts / "compose_project.sh")
+
+        # A fake restore.sh that RESOLVES ITS OWN PROJECT the way the real one does, records it,
+        # and announces the volume it would load into — including, when it has been aimed at the
+        # live project, the LIVE volume. Whether it is reached at all is the assertion for every
+        # guard that must abort BEFORE any load.
         (self.scripts / "restore.sh").write_text(
             "#!/usr/bin/env bash\n"
+            "set -uo pipefail\n"
+            'log() { echo "[$1] ${*:2}"; }\n'
+            'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
+            "# shellcheck source=/dev/null\n"
+            'source "${SCRIPT_DIR}/compose_project.sh"\n'
+            f'printf "%s" "${{COMPOSE_PROJECT}}" > {self.restore_project}\n'
             f"echo RESTORE_INVOKED >> {self.marker}\n"
-            'echo "fake restore.sh: $*"\n'
+            # The volume it resolves is the /data volume of the neo4j container in WHATEVER
+            # project it was pointed at. Aimed at `noorinalabs`, that is the production graph.
+            'if [ "${COMPOSE_PROJECT}" = "' + LIVE_PROJECT + '" ]; then\n'
+            f'  VOL="{LIVE_PROJECT}_neo4j_data"\n'
+            "else\n"
+            '  VOL="${COMPOSE_PROJECT}_rv_neo4j_data"\n'
+            "fi\n"
+            'VOL="${FAKE_RESOLVED_VOLUME:-$VOL}"\n'
+            'log "INFO" "Resolved Neo4j data volume: ${VOL}'
+            ' (project ${COMPOSE_PROJECT}, ${COMPOSE_FILE:-})"\n'
             "exit ${FAKE_RESTORE_RC:-0}\n"
         )
         os.chmod(self.scripts / "restore.sh", 0o755)
@@ -501,6 +617,7 @@ class Harness:
             "FAKE_DOCKER_ROOT": str(self.tmp),
             "FAKE_SWEPT": str(self.tmp / "swept"),
             "RESTORE_MARKER": str(self.marker),
+            "RESTORE_PROJECT_FILE": str(self.restore_project),
             "LIVE_PROJECT": LIVE_PROJECT,
             "RV_PROJECT": RV_PROJECT,
             "ENV_FILE": str(self.tmp / ".env"),
@@ -521,6 +638,14 @@ class Harness:
     @property
     def restore_was_invoked(self) -> bool:
         return self.marker.exists()
+
+    @property
+    def restored_into(self) -> str | None:
+        """The compose project restore.sh actually resolved — i.e. the project whose Neo4j
+        volume `neo4j-admin database load --overwrite-destination` would have written to."""
+        if not self.restore_project.exists():
+            return None
+        return self.restore_project.read_text().strip()
 
 
 @pytest.fixture
@@ -636,6 +761,118 @@ def test_an_empty_live_graph_refuses_to_testify(harness) -> None:
     assert r.returncode == RC_INSTRUMENT
     assert "ZERO :Narrator" in r.stdout
     assert not h.restore_was_invoked
+
+
+# ---------------------------------------------------------------------------
+# THE HANDOFF: which project does the destructive load actually land in?
+# ---------------------------------------------------------------------------
+# The load is NOT performed by any compose call in restore_verify.sh. It is performed by
+# restore.sh, which resolves its OWN project and falls back to the LIVE one. Everything below
+# is about that handoff, and none of it was expressible before the fake restore.sh was taught
+# to source the real compose_project.sh and record what it resolved.
+def test_the_restore_is_addressed_to_the_throwaway_project(harness) -> None:
+    h = harness()
+    r = h.run()
+    assert r.returncode == RC_VERIFIED
+    assert h.restored_into == RV_PROJECT, (
+        f"restore.sh loaded into project {h.restored_into!r}, not the throwaway one"
+    )
+
+
+def test_the_restore_is_NEVER_addressed_to_the_live_project(harness) -> None:
+    """The catastrophe, as an assertion. `-p noorinalabs` + service `neo4j` resolves the LIVE
+    container, whose /data is `noorinalabs_neo4j_data`. restore.sh would resolve it, log it, and
+    load into it with --overwrite-destination. Unrecoverable.
+    """
+    h = harness()
+    h.run()
+    assert h.restored_into not in (LIVE_PROJECT, "", None), (
+        f"THE RESTORE WAS AIMED AT {h.restored_into!r} — this overwrites the production graph"
+    )
+
+
+def test_the_harness_can_express_the_catastrophe(harness) -> None:
+    """THE ROOT CAUSE OF THE SURVIVING MUTATION, made into a test.
+
+    The old fake restore.sh ignored COMPOSE_PROJECT entirely, and the old fake docker decided
+    what the scratch stack contained purely from a "did restore.sh run?" marker. So *"restore.sh
+    loaded into the LIVE project"* was **a state the world model could not represent** — and a
+    mutation deleting the one line that prevents it passed 33/33.
+
+    A mutation harness that cannot express the catastrophe cannot rule it out. This test proves
+    the harness now can: drive restore.sh with no COMPOSE_PROJECT and watch it resolve
+    `noorinalabs` through the REAL compose_project.sh.
+    """
+    h = harness()
+    env = {
+        "PATH": f"{h.bin}:{os.environ['PATH']}",
+        "FAKE_WORLD": str(h.world_file),
+        "FAKE_CALLS": str(h.calls),
+        "RESTORE_MARKER": str(h.marker),
+        "RESTORE_PROJECT_FILE": str(h.restore_project),
+        "LIVE_PROJECT": LIVE_PROJECT,
+        "RV_PROJECT": RV_PROJECT,
+        "COMPOSE_FILE": str(h.tmp / "compose" / "docker-compose.restore-verify.yml"),
+    }
+    # Exactly what run_restore does MINUS the COMPOSE_PROJECT export — i.e. the mutation.
+    subprocess.run(
+        ["bash", str(h.scripts / "restore.sh"), "--force", "latest"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert h.restored_into == LIVE_PROJECT, (
+        "the harness STILL cannot express a restore aimed at the live project — so a green "
+        "suite would still not rule out overwriting production"
+    )
+
+
+def test_a_restore_that_reports_a_live_volume_is_refused(harness) -> None:
+    """Fix 4: verify the handoff, do not trust it. If restore.sh announces that it resolved a
+    volume that is not ours, the run must refuse — loudly — rather than proceed to compare.
+    """
+    h = harness(FAKE_RESOLVED_VOLUME=f"{LIVE_PROJECT}_neo4j_data")
+    r = h.run()
+    assert r.returncode == RC_INSTRUMENT, f"a live-volume handoff must be refused\n{r.stdout}"
+    assert "HANDOFF VIOLATION" in r.stdout
+    assert "UNRECOVERABLE" in r.stdout
+
+
+def test_the_handoff_check_accepts_our_own_volume(harness) -> None:
+    """Calibrate the guard above: it must be able to say YES, or it is an unconditional abort."""
+    h = harness()
+    r = h.run()
+    assert r.returncode == RC_VERIFIED
+    assert "handoff verified" in r.stdout
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_the_env_file_cannot_blank_the_project(harness, blank) -> None:
+    """Fix 1: EMPTY is as dangerous as ABSENT — and more dangerous than WRONG.
+
+    `${VAR:-default}` treats "" exactly like unset, so a blank RV_PROJECT does not no-op: it
+    resolves to `noorinalabs` inside restore.sh and aims --overwrite-destination at production.
+    `guard_not_live`'s `!= noorinalabs` check passes happily on "".
+
+    THE REACHABLE PATH IS THE .env, NOT AN INHERITED ENV VAR — and getting this wrong is
+    instructive. An inherited `RV_PROJECT=""` is REPAIRED by the script's own
+    `RV_PROJECT="${RV_PROJECT:-…}"` default before any guard sees it, so a test that exported an
+    empty var would pass for entirely the wrong reason and prove nothing.
+
+    The dangerous ordering is the one Weronika identified: `load_env()` sources the host `.env`
+    with `set -a` AFTER that default has already been applied. An `RV_PROJECT=` line there lands
+    downstream of the repair, and nothing has refused it since. That is the path under test.
+    """
+    h = harness()
+    (h.tmp / ".env").write_text((h.tmp / ".env").read_text() + f"RV_PROJECT={blank}\n")
+    r = h.run()
+    assert r.returncode == RC_INSTRUMENT, f"a blanked RV_PROJECT must be refused\n{r.stdout}"
+    assert "EMPTY or unset" in r.stdout
+    assert not h.restore_was_invoked, (
+        "restore.sh was invoked with a blank project — it would resolve `noorinalabs` and "
+        "overwrite the production graph"
+    )
 
 
 # ---------------------------------------------------------------------------
