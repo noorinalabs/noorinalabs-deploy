@@ -166,15 +166,20 @@ _LEADING_VAR = re.compile(r"^\$\{?(\w+)\}?")
 # `23 passed`. `sudo rclone`, `eval rclone`, `for … do rclone`, `| rclone rcat`,
 # `xargs -I{} rclone` and `RC=rclone; $RC purge` all sailed through the same hole.
 #
-# So there is no anchor any more. ANY bare `rclone` token outside a quoted string, on a
-# non-comment logical line, is a call — and if the scanner cannot parse it into a shape it
+# So there is no anchor any more. ANY bare `rclone` token outside a DOUBLE-quoted string, on
+# a non-comment logical line, is a call — and if the scanner cannot parse it into a shape it
 # recognises, that is an OFFENDER ("unrecognised call shape"), never a skip. Fail closed on
 # what you cannot read; do not wave it through.
 #
-# The QUOTED-STRING exclusion is what keeps the scanner off the prose, and it does that job
+# DOUBLE-quoted, and only double-quoted. A SINGLE-quoted region is not prose — it is CODE
+# that `eval`, `trap` and `bash -c` execute, and `b2_preflight.sh` already uses that idiom.
+# Skipping single quotes made `eval 'rclone purge …'`, `trap 'rclone purge …' EXIT` and
+# `RC='rclone'` invisible. See the long note on `_rclone_token_positions`.
+#
+# The DOUBLE-quote exclusion is what keeps the scanner off the prose, and it does that job
 # without an anchor: b2_preflight.sh's own diagnostics say things like
 # `echo "...retention prune uses 'rclone purge' and will fail silently-late"`, and that
-# `rclone` sits inside a double-quoted string.
+# `rclone` sits inside a double-quoted string — the apostrophes around it are irrelevant.
 #
 # Command substitution re-enters UNQUOTED context, which matters enormously: every real call
 # in restore.sh is `out="$(rclone lsf …)"` — the token is inside double quotes but inside a
@@ -213,42 +218,71 @@ _NON_CALL_CONTEXTS: list[tuple[re.Pattern[str], str]] = [
 
 
 def _rclone_token_positions(line: str) -> list[int]:
-    """Offsets of every bare `rclone` token OUTSIDE a quoted string.
+    """Offsets of every bare `rclone` token that is CODE rather than prose.
 
-    Tracks single/double quoting, and treats `$( … )` as re-entering unquoted context —
-    without that, restore.sh's `out="$(rclone lsf …)"` calls are invisible and the file goes
-    green by saying nothing.
+    A SINGLE-QUOTED REGION IS NOT PROSE — IT IS CODE SOMEONE ELSE EXECUTES (deploy#637
+    review round 3, Lucas Ferreira). This scanner used to skip single-quoted regions the way
+    it skips double-quoted ones, and that made all of these invisible in the real backup.sh
+    while the suite stayed at 49 passed:
+
+        eval    'rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"'
+        trap    'rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"' EXIT
+        bash -c 'rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"'
+        RC='rclone'                       # <-- ONE PAIR OF QUOTES walks straight through
+        $RC purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"
+
+    The fourth is the one that indicts the previous round: I closed `RC=rclone` by making an
+    unparseable shape an offender, and a single pair of quotes reopened it.
+
+    And this is NOT contrived, because `b2_preflight.sh` — the file THIS PR brings into the
+    guard's scope — already uses the idiom, with a comment correctly explaining why:
+
+        # Single-quoted so $tmp expands when the trap FIRES, not when it is set.
+        trap 'rm -rf -- "$tmp"' RETURN
+
+    Twenty lines below that sits the canary `copyto`/`deletefile`. The obvious next change to
+    the file — "an interrupted preflight orphans its canary, so fold the delete into the
+    existing RETURN trap" — is written by extending that single-quoted trap, and a guard that
+    cannot see inside single quotes says NOTHING. That is deploy#638 reintroduced invisibly by
+    a maintainer following the file's own documented idiom. Not an attack: the path of least
+    resistance.
+
+    So there is no single-quote toggle. Only DOUBLE-quoted regions are excluded — that is what
+    holds the operator prose (`echo "...uses 'rclone purge' and will fail..."`), and it still
+    does, because that `rclone` is inside double quotes regardless of the apostrophes around
+    it.
+
+    `$( … )` re-enters unquoted context: every real call in restore.sh is
+    `out="$(rclone lsf …)"`, and without the re-entry all four are invisible and the file goes
+    green by saying nothing at all.
     """
     positions: list[int] = []
-    in_single = in_double = False
-    stack: list[tuple[bool, bool]] = []
+    in_double = False
+    stack: list[bool] = []
     i, n = 0, len(line)
     while i < n:
         c = line[i]
-        if c == "\\" and not in_single:
+        if c == "\\":
             i += 2
             continue
-        if not in_single and line.startswith("$(", i):
-            stack.append((in_single, in_double))
-            in_single = in_double = False
+        if line.startswith("$(", i):
+            stack.append(in_double)
+            in_double = False
             i += 2
             continue
-        if c == ")" and stack and not in_single and not in_double:
-            in_single, in_double = stack.pop()
+        if c == ")" and stack and not in_double:
+            in_double = stack.pop()
             i += 1
             continue
-        if c == "'" and not in_double:
-            in_single = not in_single
-            i += 1
-            continue
-        if c == '"' and not in_single:
+        if c == '"':
             in_double = not in_double
             i += 1
             continue
-        if not in_single and not in_double and line.startswith("rclone", i):
+        if not in_double and line.startswith("rclone", i):
             before = line[i - 1] if i else " "
             after = line[i + 6] if i + 6 < n else " "
-            # A whole token: not `/usr/bin/rclone`, not `rclone_helper`.
+            # A whole token: not `/usr/bin/rclone`, not `rclone_helper`. A leading `'` is NOT
+            # excluded — `RC='rclone'` must be seen.
             if not (before.isalnum() or before in "_-./") and not (
                 after.isalnum() or after in "_-"
             ):
@@ -652,6 +686,40 @@ rclone moveto "${REMOTE_ROOT}/${category}/" "${RCLONE_REMOTE}:${B2_BUCKET}/${cat
         "in restore.sh has this shape.",
         '    out="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/" --dirs-only 2>"$err")" || rc=$?',  # noqa: E501
     ),
+    # -----------------------------------------------------------------------
+    # deploy#637 REVIEW ROUND 3 (Lucas Ferreira) — A SINGLE-QUOTED REGION IS NOT PROSE.
+    # It is CODE that eval / trap / bash -c EXECUTE. The scanner skipped single-quoted
+    # regions exactly as it skipped double-quoted ones, so every one of these was invisible
+    # in the real backup.sh while the suite reported `49 passed`.
+    # -----------------------------------------------------------------------
+    (
+        "SINGLE-QUOTED — `eval '…'`. The string is not text; eval executes it.",
+        """    eval 'rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"'""",
+    ),
+    (
+        "SINGLE-QUOTED — `trap '…' EXIT`. Deferred, and it still deletes.",
+        """    trap 'rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"' EXIT""",
+    ),
+    (
+        "SINGLE-QUOTED — `bash -c '…'`.",
+        """    bash -c 'rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/"'""",
+    ),
+    (
+        "THE ONE-QUOTE-PAIR BYPASS OF MY OWN FIX. Round 2 closed `RC=rclone` by making an "
+        "unparseable shape an OFFENDER. `RC='rclone'` walks straight back through it: the "
+        "quotes hid the token from the scanner entirely, so there was no shape left to refuse.",
+        "    RC='rclone'\n    $RC purge \"${RCLONE_REMOTE}:${B2_BUCKET}/${category}/${dir}/\"",
+    ),
+    (
+        "WHY THIS IS NOT CONTRIVED — it is the change b2_preflight.sh is ASKING someone to "
+        "make. That file already has `trap 'rm -rf -- \"$tmp\"' RETURN`, single-quoted, with "
+        "a comment explaining that single-quoting is the correct idiom for deferred "
+        "expansion. Twenty lines below it sits the canary. The obvious next edit — 'an "
+        "interrupted preflight orphans its canary, so fold the delete into the existing "
+        "RETURN trap' — reintroduces deploy#638 INVISIBLY, written by a maintainer following "
+        "the file's own documented idiom. The path of least resistance, not an attack.",
+        '    trap \'rm -rf -- "$tmp"; rclone deletefile "${remote}:${B2_BUCKET}/${canary}"\' RETURN',  # noqa: E501
+    ),
 ]
 
 POST_FIX_SNIPPETS_MUST_NOT_FLAG: list[tuple[str, str]] = [
@@ -713,6 +781,13 @@ echo "rclone reports a read-only key's 401 as 'failed to create bucket'. Ignore 
     (
         "DEPENDENCY ARRAY. restore.sh appends rclone to REQUIRED_CMDS on the B2 path.",
         "    REQUIRED_CMDS+=(rclone)",
+    ),
+    (
+        "THE REAL SINGLE-QUOTED TRAP in b2_preflight.sh. Removing the single-quote toggle "
+        "must not make this fire: it contains no rclone token at all. This is the file's own "
+        "documented idiom and it is CORRECT — the hazard is what someone might ADD to it, "
+        "not the line itself.",
+        "    trap 'rm -rf -- \"$tmp\"' RETURN",
     ),
     (
         "COMMAND SUBSTITUTION INSIDE DOUBLE QUOTES. Every real call in restore.sh is this "
