@@ -79,5 +79,14 @@ jobs:
       # is DERIVED: the same write passes or fails according to what ReadWritePaths= says.
       #
       # A harness that has not been shown to fail is not evidence. It is decoration.
+      #
+      # HARNESS_REQUIRE_NAMESPACE=1 is the load-bearing part. The tests `skipif` when there is no
+      # mount namespace, so that a stock Ubuntu 24.04 dev box does not red-line the shared
+      # `pytest (scripts)` gate on every unrelated push. That skip is only defensible because THIS
+      # job cannot take it: with the var set, a missing namespace is a HARD FAIL, not a skip.
+      # A bare skip on its own would be the false green this whole gate exists to kill.
+      # test_the_dedicated_workflow_cannot_skip_this_suite asserts this stays true.
       - name: Calibration — prove the harness can actually fail
+        env:
+          HARNESS_REQUIRE_NAMESPACE: "1"
         run: python3 -m pytest scripts/tests/test_backup_under_unit_hardening.py -v

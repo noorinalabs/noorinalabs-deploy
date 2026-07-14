@@ -177,8 +177,13 @@ repos:
       # `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. Heavier, so pre-push.
       #
       # The CALIBRATION half (scripts/tests/test_backup_under_unit_hardening.py — the mutations
-      # that prove this harness can actually FAIL) is already carried by pytest-scripts above,
-      # which runs the whole scripts/tests suite.
+      # that prove this harness can actually FAIL) is carried by pytest-scripts above, which runs
+      # the whole scripts/tests suite — but ONLY on a box that can build a namespace. On a stock
+      # Ubuntu 24.04 box those tests SKIP (loudly, naming the sysctl) rather than red-lining a
+      # shared gate for reasons unrelated to the developer's change. CI cannot skip them:
+      # backup-hardening.yml lifts the AppArmor restriction AND sets HARNESS_REQUIRE_NAMESPACE=1,
+      # which turns a missing namespace into a hard failure. That guarantee is itself asserted by
+      # test_the_dedicated_workflow_cannot_skip_this_suite. (deploy#654 review — Bereket Tadesse.)
       - id: backup-under-unit-hardening
         name: backup-under-unit-hardening (pre-push)
         entry: python3 scripts/tests/unit_hardening.py

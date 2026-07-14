@@ -90,6 +90,38 @@ API_FILESYSTEMS = ("/proc", "/sys", "/dev")
 # ProtectHome=yes makes these inaccessible (systemd.exec(5)).
 HOME_PATHS = ("/home", "/root", "/run/user")
 
+COMPOSE_FILE = REPO_ROOT / "compose" / "docker-compose.prod.yml"
+
+
+def scraped_textfile_dir(compose_file: Path = COMPOSE_FILE) -> str:
+    """The directory node-exporter ACTUALLY READS, out of compose. Never re-typed.
+
+    deploy#565 is the bug where the backup gauge was written to `/var/lib/node_exporter` — the
+    PARENT of the collector directory — and so was, in backup.sh's own words, "emitted faithfully
+    and scraped never", for months, while the alert keyed off it could not fire.
+
+    The first version of this harness asserted the gauge with a SUBSTRING match
+    (`"isnad_backup_success.prom" in artifact`). That string is a substring of the WRONG path as
+    well as the right one, so re-injecting deploy#565 verbatim left the gate GREEN — while the
+    harness printed the wrong path in its own artifact listing (deploy#654 review — Nurul Hakim).
+
+    The fix is not to hand-type the full path: that would be one more re-typed constant in a
+    module whose entire thesis is *never re-type the constraint*. `--collector.textfile.directory`
+    in compose is what decides which directory is scraped, so it is what the oracle reads. Change
+    the flag and the assertion moves with it, in the same commit.
+    """
+    flag = "--collector.textfile.directory="
+    for raw in compose_file.read_text().splitlines():
+        if flag in raw:
+            # Split on the flag FIRST, then strip the YAML quoting off the value. Stripping the
+            # line first would eat the flag's own leading `--` along with the list dash.
+            return raw.split(flag, 1)[1].strip().strip("\"',")
+    raise Unsupported(
+        f"no {flag} found in {compose_file}. The harness cannot tell which directory "
+        f"node-exporter actually scrapes, so it CANNOT check that a gauge lands somewhere it "
+        f"will be read — which is deploy#565 exactly. Refusing to guess."
+    )
+
 
 class Unsupported(Exception):
     """A unit directive we cannot faithfully emulate. Refuse to testify — never pass silently.
@@ -171,12 +203,32 @@ class Unit:
         return out
 
     @property
-    def exec_start(self) -> str:
-        line = self.one("ExecStart")
-        if not line:
+    def exec_starts(self) -> list[str]:
+        """EVERY ExecStart=, in order. Not the last one. (deploy#654 review — Nurul Hakim)
+
+        This used to be `one("ExecStart")`, i.e. `vals[-1]` — the LAST command. Both our units
+        are `Type=oneshot`, and systemd.service(5) is explicit that oneshot is exactly the type
+        where **multiple ExecStart= lines are legal and run in sequence**. So a unit like
+
+            ExecStart=/opt/noorinalabs-deploy/scripts/prestep.sh   <- writes /tmp, DIES on the box
+            ExecStart=/opt/noorinalabs-deploy/scripts/backup.sh
+
+        ran only `backup.sh`, reported PASS, and **never executed the command carrying the
+        defect**. Nurul built that unit, put deploy#613's own bug in the first command, and the
+        gate went green.
+
+        That is the worst possible place for a silent skip, and the reason is structural: the
+        DIRECTIVES table catches directives it does not KNOW. `ExecStart` is known — so a second
+        one was not an instrument failure, it was a silently dropped command. The armour did not
+        apply to the one directive that selects WHAT CODE RUNS AT ALL, which defeats this
+        module's own doctrine ("never a silent pass") on the only directive where a silent pass
+        means "we tested nothing".
+        """
+        lines = self.directives.get("ExecStart", [])
+        if not lines:
             raise Unsupported(f"{self.path.name} has no ExecStart=")
         # ExecStart= may carry prefix characters (-, @, +, !) before the binary.
-        return shlex.split(line)[0].lstrip("-@+!")
+        return [shlex.split(line)[0].lstrip("-@+!") for line in lines]
 
     @property
     def environment(self) -> dict[str, str]:
@@ -433,12 +485,21 @@ def sandbox_backend() -> list[str] | None:
 
     None means we could not get a namespace. The caller MUST turn that into rc=2 — never 0.
     """
+    # `unshare` absent entirely is a missing instrument, not a crash. Bereket Tadesse removed the
+    # binary for real in the #654 review; callers (including this module's test suite, at import)
+    # must get a clean None rather than a FileNotFoundError out of the probe.
+    if shutil.which("unshare") is None:
+        return None
+
     candidates = [
         ["unshare", "--user", "--map-root-user", "--mount"],
         *([["unshare", "--mount"]] if os.geteuid() == 0 else []),
     ]
     for argv in candidates:
-        probe = subprocess.run([*argv, "true"], capture_output=True, text=True)
+        try:
+            probe = subprocess.run([*argv, "true"], capture_output=True, text=True)
+        except OSError:
+            continue
         if probe.returncode == 0:
             return argv
     return None
@@ -457,7 +518,7 @@ class Sandbox:
     masked_paths: list[str]  # ProtectHome=yes
     private_tmp: bool
     workdir: str
-    exec_start: str
+    exec_starts: list[str]  # ALL of them, in order — Type=oneshot runs them in sequence
     deploy_root: str
     environment: dict[str, str]
 
@@ -525,11 +586,18 @@ def plan(unit: Unit) -> Sandbox:
     # there. Derived from ExecStart and this repo's layout (scripts/ sits at the root), never
     # from a hard-coded "/opt/noorinalabs-deploy": the self-check below re-verifies by asserting
     # ExecStart is executable inside the sandbox, so a wrong derivation is rc=2, not a lie.
-    exec_start = unit.exec_start
-    deploy_root = str(Path(exec_start).parent.parent)
+    exec_starts = unit.exec_starts
+    roots = {str(Path(e).parent.parent) for e in exec_starts}
+    if len(roots) != 1:
+        raise Unsupported(
+            f"{unit.path.name}: its ExecStart= commands live under different roots "
+            f"({sorted(roots)}). The harness sites ONE tree, so it cannot run them all. Refusing "
+            f"to run a subset — that is the silent skip this whole module exists to prevent."
+        )
+    deploy_root = roots.pop()
     if deploy_root == "/":
         raise Unsupported(
-            f"{unit.path.name}: ExecStart={exec_start} is not <root>/scripts/<script>, so the "
+            f"{unit.path.name}: ExecStart={exec_starts[0]} is not <root>/scripts/<script>, so the "
             f"harness cannot work out where to site the repo."
         )
 
@@ -543,7 +611,7 @@ def plan(unit: Unit) -> Sandbox:
         masked_paths=list(HOME_PATHS) if protect_home == "yes" else [],
         private_tmp=private_tmp,
         workdir=workdir,
-        exec_start=exec_start,
+        exec_starts=exec_starts,
         deploy_root=deploy_root,
         environment=unit.environment,
     )
@@ -706,10 +774,11 @@ def render_namespace_script(sb: Sandbox, repo_root: Path) -> str:
             f"[ -e {q(sb.masked_paths[0] + '/.harness-selfcheck')} ] "
             f"&& instrument_fail 'ProtectHome mask did not take'"
         )
-    lines.append(
-        f"[ -x {q(sb.exec_start)} ] || instrument_fail 'ExecStart {sb.exec_start} is not "
-        f"executable inside the sandbox — the repo bind failed'"
-    )
+    for ex in sb.exec_starts:
+        lines.append(
+            f"[ -x {q(ex)} ] || instrument_fail 'ExecStart {ex} is not executable inside the "
+            f"sandbox — the repo bind failed, or the unit names a script that is not there'"
+        )
 
     # --- 5. Run it. -----------------------------------------------------------------------
     lines += [
@@ -721,8 +790,23 @@ def render_namespace_script(sb: Sandbox, repo_root: Path) -> str:
         "# The entry point's own exit status is DATA, not the harness's verdict. Capture it,",
         "# report it on a marker line, and let the caller decide. A missing marker means the",
         "# namespace script itself died -> the caller reads that as rc=2, could-not-find-out.",
+        "#",
+        "# EVERY ExecStart=, IN ORDER — Type=oneshot runs them in sequence, and stops at the",
+        "# first one that fails (systemd.service(5)). Taking only the LAST one silently skipped",
+        "# any command before it, so a defect in the FIRST ExecStart was never executed and the",
+        "# gate went green over it (deploy#654 review — Nurul Hakim).",
         "exec_rc=0",
-        f"{q(sb.exec_start)} || exec_rc=$?",
+    ]
+    for ex in sb.exec_starts:
+        lines += [
+            "if [ $exec_rc -eq 0 ]; then",
+            f"  echo '[harness] ExecStart: {ex}'",
+            f"  {q(ex)} || exec_rc=$?",
+            "else",
+            f"  echo '[harness] ExecStart NOT REACHED (a previous one failed): {ex}'",
+            "fi",
+        ]
+    lines += [
         "",
         "# What the run LEFT BEHIND, listed from INSIDE the namespace — it is torn down on exit,",
         "# so this is the caller's only window onto the product. An exit code alone cannot see a",
