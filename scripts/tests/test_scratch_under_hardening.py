@@ -173,7 +173,27 @@ _MKTEMP_CALL = re.compile(r"\bmktemp\b([^|;&)`\n]*)")
 # (backup.sh, emit-backup-failure-marker.sh) were converted to `-p` to meet it — same landing
 # directory, now checkable. Cost: `mktemp "$dir/x.XXXXXX"` is a false RED. That is the correct
 # direction to be wrong in, and it is one flag to fix.
-_HAS_PARENT = re.compile(r'(-p\s*["$\w/]|--tmpdir=)')
+#
+# THE OPTION MUST BE AN OPTION, NOT A SUBSTRING. (#624 review 3 — Lucas Ferreira)
+#
+# The first cut of this regex was `-p\s*["$\w/]`, unanchored — so a `-p` ANYWHERE in the
+# argument text exempted the call, INCLUDING inside a template NAME. The library's own scratch
+# template is `compose-project-XXXXXX`. It contains `-p`. So:
+#
+#     err2="$(mktemp -t compose-project-XXXXXX)"     <-- allocates in the READ-ONLY /tmp
+#
+# passed GREEN, and that is deploy#613 verbatim, in the file the unit executes. `mktemp
+# --tmpdir backup-pg.XXXXXX` evades identically (`-pg`). Worse, the calibration fixtures I
+# wrote to PROVE this filter worked used template names — `probe.XXXXXX`, `${PREFIX}.XXXXXX` —
+# that happen to contain no `-p`, so the very test meant to catch this could not see it. A
+# guard and its calibration sharing the same blind spot is not a guard
+# (cf. `feedback_fixture_makes_guard_assertion_inert`).
+#
+# So the option is anchored: it must START a token (preceded by whitespace or the string
+# start). `-\w*p` admits clustered short flags (`-dp DIR`) while still requiring the `p` to
+# live in a token that begins with `-`. The fixtures below now carry `-p` INSIDE the template
+# name in both classes, so this cannot silently reopen.
+_HAS_PARENT = re.compile(r'(?:\s|^)(?:-\w*p\s*["$\w/]|--tmpdir=)')
 
 
 def _mktemp_invocations(line: str) -> list[str]:
@@ -382,6 +402,12 @@ def test_the_offender_filter_itself_separates_tmp_from_not_tmp() -> None:
         'mkdir -p "${BACKUP_DIR}" && tmp="$(mktemp)"',
         # An unrelated `-p` belonging to some other command on the line.
         'grep -p foo bar || true; tmp="$(mktemp)"',
+        # THE TEMPLATE NAME CONTAINS `-p`. (Lucas Ferreira, #624 review 3.) These are the two
+        # that shipped past the unanchored regex — and note the first uses the library's OWN
+        # scratch template, so the codebase supplies the evasion for free. Both allocate in the
+        # read-only /tmp. If either of these ever goes green again, deploy#613 is back.
+        'err2="$(mktemp -t compose-project-XXXXXX)"',
+        'tmp="$(mktemp --tmpdir backup-pg.XXXXXX)"',
     ]
     # Each of these says where the file goes. These are the real forms in the closure.
     names_its_parent = [
@@ -389,6 +415,11 @@ def test_the_offender_filter_itself_separates_tmp_from_not_tmp() -> None:
         'tmp="$(mktemp -d -p "$scratch_parent" b2-preflight-XXXXXX)"',
         'TMP="$(mktemp -p "$TEXTFILE_DIR" isnad_backup_failure.prom.XXXXXX)"',
         'tmp="$(mktemp --tmpdir=/var/lib/x probe.XXXXXX)"',
+        # The positive-control half of Lucas's finding: a REAL `-p` whose template ALSO carries
+        # a `-p`. Anchoring the option must not cost us the legitimate call it looks like.
+        'tmp="$(mktemp -p "$parent" compose-project-XXXXXX)"',
+        # Clustered short flags — `-d` and `-p` in one token. Still names its parent.
+        'tmp="$(mktemp -dp "$parent" compose-project-XXXXXX)"',
     ]
 
     for line in lands_in_tmp:

@@ -133,7 +133,15 @@ def test_success_metric_written_atomically() -> None:
     """
     body = BACKUP_SH.read_text()
 
-    m = re.search(r'tmp="\$\(mktemp\b([^\n]*)\)"', body)
+    # Scope to emit_success_metric's own body. A whole-file search would take the FIRST
+    # `mktemp` in backup.sh, which today happens to be this one and tomorrow may not — and
+    # then this test would be vouching for a call in some other function while the one it
+    # names goes unchecked (Lucas Ferreira, #624 review 3).
+    fn = re.search(r"\nemit_success_metric\(\)\s*\{(.*?)\n\}", body, re.DOTALL)
+    assert fn, "emit_success_metric() not found in backup.sh — this test is checking nothing"
+    fn_body = fn.group(1)
+
+    m = re.search(r'tmp="\$\(mktemp\b([^\n]*)\)"', fn_body)
     assert m, "emit_success_metric no longer allocates its temp file with mktemp"
     call = m.group(1)
 
