@@ -136,6 +136,76 @@ def test_an_empty_reading_is_refused_rather_than_returned_as_a_value() -> None:
     assert "EMPTY reading" in body
 
 
+def test_no_teardown_trap_references_a_function_local() -> None:
+    """An EXIT trap runs AFTER the installing function's scope is gone. A trap that reads a
+    `local` dies on `set -u` with "unbound variable" — and it dies BEFORE tearing anything
+    down, leaking the stack and its volumes.
+
+    This is not hypothetical. `self_test`'s cleanup trap referenced a `local ref_project`, and
+    on its first CI run all four calibration cases passed and then the teardown crashed on
+    exactly that line, leaving both stacks up. The leak is the same class the hand-run hit
+    when compose's `${POSTGRES_USER:?}` guard aborted `down -v`.
+
+    Every name a teardown trap touches must outlive the function that installed it.
+    """
+    src = _source()
+    locals_declared = set(re.findall(r"^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)", src, re.M))
+
+    offenders = []
+    for fn in ("teardown", "_st_cleanup"):
+        m = re.search(rf"^\s*{re.escape(fn)}\(\) \{{(.*?)^\s*\}}", src, re.S | re.M)
+        assert m, f"could not locate {fn}() — the scan must not silently find nothing"
+        body = m.group(1)
+        # Names the trap READS, minus the ones it declares itself.
+        own = set(re.findall(r"^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)", body, re.M))
+        for var in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", body):
+            if var in locals_declared and var not in own:
+                offenders.append(f"{fn}() reads ${var}, which is a `local` elsewhere")
+
+    assert not offenders, "teardown trap(s) reference a function-local:\n  " + "\n  ".join(
+        dict.fromkeys(offenders)
+    )
+
+
+@pytest.mark.parametrize("name", ["ref_project", "ST_REF_PROJECT"])
+def test_the_trap_scan_can_see_the_defect_it_was_written_for(name: str) -> None:
+    """Calibrate the scan against the ACTUAL defect, verbatim: a trap reading a local declared
+    by the function that installed it.
+
+    BOTH CASINGS ARE FIXTURES, and that is not padding. The first version of this scan matched
+    only `[a-z_]`, so when the fix renamed the variable to the UPPERCASE `ST_REF_PROJECT` the
+    guard went blind to precisely the line it had just been written to protect — and a mutation
+    re-introducing the bug SURVIVED. Shell locals are freely cased; a case-sensitive scan of
+    them is a scan with a hole in it.
+
+    An author cannot calibrate their own guard by reading it
+    (feedback_measurement_is_the_thing_that_breaks, deploy#624): the fixture shared the
+    filter's blind spot by construction, exactly as it did there. Only running the mutation
+    exposed it.
+    """
+    broken = textwrap.dedent(
+        f"""\
+        self_test() {{
+            local {name}="isnad-rv-selftest-ref"
+            _st_cleanup() {{
+                local r=$?
+                _st_dc "${name}" down -v || true
+                exit "$r"
+            }}
+            trap _st_cleanup EXIT
+        }}
+        """
+    )
+    locals_declared = set(re.findall(r"^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)", broken, re.M))
+    m = re.search(r"^\s*_st_cleanup\(\) \{(.*?)^\s*\}", broken, re.S | re.M)
+    assert m
+    own = set(re.findall(r"^\s*local\s+([A-Za-z_][A-Za-z0-9_]*)", m.group(1), re.M))
+    reads = set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", m.group(1)))
+    assert (reads & locals_declared) - own == {name}, (
+        f"the scan cannot see a trap reading the function-local {name!r} — it proves nothing"
+    )
+
+
 def test_instrument_failure_is_a_distinct_exit_code_from_a_real_negative() -> None:
     """A check that cannot run must say so, and must NOT testify. rc=2 ("could not find
     out") must never collapse into rc=1 ("the backup is broken").

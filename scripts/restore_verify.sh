@@ -109,6 +109,10 @@ DISK_MARGIN_MB="${DISK_MARGIN_MB:-2048}"
 
 STACK_STARTED=false
 
+# The self-test's reference project. Script-scope, NOT a function-local, because the EXIT
+# trap that tears it down runs after the installing function's scope is gone. See self_test().
+ST_REF_PROJECT="${ST_REF_PROJECT:-isnad-rv-selftest-ref}"
+
 # --- Logging -----------------------------------------------------------------
 log() { printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "${*:2}"; }
 
@@ -774,7 +778,14 @@ self_test() {
     export USER_POSTGRES_USER="${USER_POSTGRES_USER:-user_service}"
     export USER_POSTGRES_DB="${USER_POSTGRES_DB:-user_service}"
     # Two throwaway stacks. Neither is `noorinalabs`; there is no live stack on this box.
-    local ref_project="isnad-rv-selftest-ref"
+    #
+    # ST_REF_PROJECT is deliberately NOT `local`. An EXIT trap runs AFTER the function's scope
+    # is gone, so a trap that references a function-local dies on `set -u` with "unbound
+    # variable" — and it dies BEFORE tearing anything down, leaking the stacks and their
+    # volumes. That is not hypothetical: it is what this very function did on its first CI run
+    # (the four calibration cases all passed, then the teardown crashed on this line). Every
+    # name a teardown trap touches must outlive the function that installed it.
+    ST_REF_PROJECT="isnad-rv-selftest-ref"
     RV_PROJECT="isnad-rv-selftest-sub"
 
     _st_dc() { # _st_dc <project> <args...>
@@ -796,20 +807,20 @@ self_test() {
     _st_cleanup() {
         local r=$?
         log "INFO" "self-test: tearing down both stacks"
-        _st_dc "$ref_project" down -v --remove-orphans >/dev/null 2>&1 || true
+        _st_dc "$ST_REF_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
         _st_dc "$RV_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
         exit "$r"
     }
     trap _st_cleanup EXIT
 
     local p
-    for p in "$ref_project" "$RV_PROJECT"; do
+    for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
         log "INFO" "self-test: starting ${p}"
         _st_dc "$p" down -v --remove-orphans >/dev/null 2>&1 || true
         _st_dc "$p" up -d neo4j
     done
 
-    for p in "$ref_project" "$RV_PROJECT"; do
+    for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
         local waited=0 cid health
         while :; do
             cid="$(_st_dc "$p" ps -q neo4j | head -1)"
@@ -838,7 +849,7 @@ self_test() {
     MATCH (a:Narrator {id:'nar:1'}), (b:Narrator {id:'nar:2'}) CREATE (a)-[:NARRATED_TO]->(b);
     MATCH (n:Narrator {id:'nar:1'}), (h:Hadith {id:'had:1'}) CREATE (n)-[:NARRATED]->(h);
     "
-    for p in "$ref_project" "$RV_PROJECT"; do
+    for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
         # INTENTIONAL, not an oversight: the single quotes keep ${NEO4J_AUTH} unexpanded on this
         # side so it expands INSIDE the container. The credential never reaches this script's
         # argv, cypher-shell's argv, or the run log (CWE-214). Same contract as graph-ops.yml.
@@ -848,14 +859,14 @@ self_test() {
     done
 
     local ref_fp sub_fp ref_parts
-    ref_fp="$(_st_cypher "$ref_project" "$CY_FP")"
+    ref_fp="$(_st_cypher "$ST_REF_PROJECT" "$CY_FP")"
     sub_fp="$(_st_cypher "$RV_PROJECT" "$CY_FP")"
 
     # --- Case 0: the components are alive (the n.name trap) ------------------
-    ref_parts="$(_st_cypher "$ref_project" "$CY_FP_PARTS")"
+    ref_parts="$(_st_cypher "$ST_REF_PROJECT" "$CY_FP_PARTS")"
     log "INFO" "seeded narrator components (count/ar/en/id): ${ref_parts}"
     local dead_fp
-    dead_fp="$(_st_cypher "$ref_project" \
+    dead_fp="$(_st_cypher "$ST_REF_PROJECT" \
         "MATCH (n:Narrator) RETURN toString(count(n)) + '/' + toString(sum(size(coalesce(n.name,'')))) AS fp;")"
     log "INFO" "THE n.name TRAP — fingerprint over the NON-EXISTENT property 'n.name': ${dead_fp}"
     case "$dead_fp" in
@@ -891,7 +902,7 @@ self_test() {
     _st_cypher "$RV_PROJECT" \
         "CREATE (n:Narrator {id:'nar:7', name_ar:'XXXXXXXXXXXX', name_en:'Corrupted'});" >/dev/null
     local sub_count ref_count
-    ref_count="$(_st_cypher "$ref_project" "MATCH (n:Narrator) RETURN count(n);")"
+    ref_count="$(_st_cypher "$ST_REF_PROJECT" "MATCH (n:Narrator) RETURN count(n);")"
     sub_count="$(_st_cypher "$RV_PROJECT" "MATCH (n:Narrator) RETURN count(n);")"
     sub_fp="$(_st_cypher "$RV_PROJECT" "$CY_FP")"
     if [[ "$ref_count" == "$sub_count" && "$ref_fp" != "$sub_fp" ]]; then
