@@ -423,7 +423,17 @@ case "${1:-}" in
         # b2_preflight reads the LAST field of each line as a bucket name.
         printf '          -1 2026-01-01 00:00:00        -1 %s\n' "${B2_BUCKET:?}"
         ;;
-    lsf)   ;;  # no pre-existing date dirs -> the retention prune has nothing to purge
+    lsf)
+        # Emit TODAY's date dir — the one the run just uploaded — so retention's HAPPY PATH is
+        # the baseline, not a no-op. An empty listing meant prune_old_backups iterated NOTHING,
+        # so its whole body (date parse, cutoff compare, the scratch a deploy#661-shaped
+        # regression lives on) never ran, and a scratch failure there could not be observed by a
+        # gate whose baseline never exercised it. The date is computed the way backup.sh computes
+        # its own DATE_STAMP (`date -u +%Y-%m-%d`) so the stub and the code cannot disagree at
+        # midnight UTC. Being TODAY, it is newer than any retention cutoff, so it is listed and
+        # parsed but correctly NOT purged — the happy path, and the baseline stays clean.
+        printf '%s/\n' "$(date -u +%Y-%m-%d)"
+        ;;
     copyto|deletefile|copy|purge) ;;
     *) ;;
 esac
