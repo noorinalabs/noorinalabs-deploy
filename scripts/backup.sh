@@ -106,6 +106,67 @@ if [[ ! "$BACKUP_PREFIX" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# IS THIS PREFIX THE PREFIX FOR THE HOST WE ARE ACTUALLY STANDING ON? (deploy#636)
+# ---------------------------------------------------------------------------
+# The charset guard above refuses `../prod` and `prod/../stg`. It cannot — by construction —
+# refuse the one accepted value that is catastrophic:
+#
+#     BACKUP_PREFIX=prod          ...on the STAGING host
+#
+# A perfectly legal bare name. Staging then writes its dumps into `prod/`, and staging's
+# retention purge — now correctly scoped to "its own" prefix — DELETES PRODUCTION'S BACKUPS.
+# That is deploy#632 walked back in through the front door. No regex over the value alone can
+# see it, because the value is not malformed: it is wrong only RELATIVE TO THIS HOST.
+#
+# So we need a SECOND, INDEPENDENT witness of which environment this box is. BASE_DOMAIN is
+# one, and it is in scope here because isnad-backup.service loads the whole of
+# /opt/noorinalabs-deploy/.env (`EnvironmentFile=`). The deploy composite writes it from the
+# workflow's `base_domain:` input — `stg.noorinalabs.com` on stg, `noorinalabs.com` on prod.
+#
+# WHY BASE_DOMAIN IS A WITNESS WORTH BELIEVING, rather than a second copy of the same guess:
+# IT IS LOAD-BEARING FOR CADDY. If it were wrong, TLS and every route on the box would be
+# wrong — loudly, immediately, in daylight, with a human already looking. BACKUP_PREFIX is
+# load-bearing for NOTHING until the purge runs at 03:00, unattended, against the other
+# environment's backups. That asymmetry is the entire reason one can testify about the other:
+# we are cross-checking the silent variable against the noisy one.
+#
+# THE THREAT IS THE HAND-EDITED .env, and only that. `write-deploy-env` TRUNCATES and rewrites
+# .env on every deploy (`: > "$env_file"`), so a workflow-injected prefix is authoritative and
+# self-repairing — a bad value there is fixed by the next deploy. The file an operator edits AT
+# 3AM DURING AN INCIDENT is not, and the nightly timer fires before anyone re-deploys. A
+# single-line edit to BACKUP_PREFIX leaves BASE_DOMAIN still telling the truth. This catches
+# exactly that, which is the path deploy#636 names as real.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO: TESTIFY WHEN IT CANNOT SEE. An absent or unrecognised
+# BASE_DOMAIN means WE DO NOT KNOW which host this is. It is NOT evidence that the prefix is
+# wrong. Refusing there would take a backup outage on a host that is perfectly healthy (a new
+# environment, a restore drill, a hand-run invocation) — and it would be the deploy#613 shape
+# exactly: a check that could not run, reporting its own blindness as a fact about the system
+# it was supposed to be checking. So it WARNS and PROCEEDS, and it refuses ONLY on a positive
+# contradiction between two things that both claim to know the answer.
+case "${BASE_DOMAIN:-}" in
+    stg.noorinalabs.com) HOST_ENV="stg" ;;
+    noorinalabs.com)     HOST_ENV="prod" ;;
+    *)                   HOST_ENV="" ;;
+esac
+
+if [[ -n "$HOST_ENV" && "$BACKUP_PREFIX" != "$HOST_ENV" ]]; then
+    echo "FATAL: BACKUP_PREFIX='${BACKUP_PREFIX}' but this host is '${HOST_ENV}'" >&2
+    echo "       (BASE_DOMAIN='${BASE_DOMAIN}')." >&2
+    echo "       Refusing to run. This backup would write into the '${BACKUP_PREFIX}' namespace," >&2
+    echo "       and its retention purge would DELETE THAT ENVIRONMENT'S BACKUPS (deploy#632/#636)." >&2
+    echo "       If this host really IS '${BACKUP_PREFIX}', then BASE_DOMAIN is the thing that is" >&2
+    echo "       wrong — fix that. Do not 'fix' this check." >&2
+    exit 1
+fi
+
+if [[ -z "$HOST_ENV" ]]; then
+    echo "WARNING: cannot verify BACKUP_PREFIX='${BACKUP_PREFIX}' against this host:" >&2
+    echo "         BASE_DOMAIN='${BASE_DOMAIN:-<unset>}' is not a known environment domain." >&2
+    echo "         Proceeding on the prefix alone. This says NOTHING about whether it is right." >&2
+fi
+
 # The REMOTE path is namespaced; the LOCAL one is not. BACKUP_DIR is already
 # per-host, so a prefix there would buy nothing and would churn restore.sh's
 # local-run selection for no reason. Only the shared bucket needs the namespace.
@@ -170,6 +231,23 @@ source "$COMPOSE_PROJECT_LIB"
 TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
 SUCCESS_TEXTFILE="${TEXTFILE_DIR}/isnad_backup_success.prom"
 FAILURE_TEXTFILE="${TEXTFILE_DIR}/isnad_backup_failure.prom"
+RETENTION_TEXTFILE="${TEXTFILE_DIR}/isnad_backup_retention.prom"
+
+# Did the retention pass actually RUN? (deploy#635)
+#
+# Set false by prune_old_backups() when it could not LIST a category. Deliberately a SEPARATE
+# fact from the three _OK dump flags, for the same reason NEO4J_DOWN is separate from
+# NEO4J_OK: they answer different questions and the interesting case is where they disagree.
+#
+#   PG_OK/USER_PG_OK/NEO4J_OK — is the ARTIFACT good?   (did we produce a restorable backup)
+#   RETENTION_OK              — is the STORE tidy?      (did we manage to prune the old ones)
+#
+# A run can produce a perfect, complete, restorable backup AND fail entirely to prune, and
+# before this flag that run reported unblemished success: the listing failed, `2>/dev/null`
+# ate the diagnostic, `|| true` ate the return code, the empty string read as "nothing to
+# prune", the loop iterated nothing, and the script logged "=== Backup finished ===" and
+# emitted the success gauge. B2 then grows without bound and NO SIGNAL ANYWHERE SAYS SO.
+RETENTION_OK=true
 
 # Emitted ONLY on a fully-successful run (every dump OK + upload OK). A partial
 # backup must not advance the success timestamp: doing so would silence
@@ -209,6 +287,48 @@ EOF
     rm -f "$FAILURE_TEXTFILE"
 
     log "INFO" "Emitted success metric: ${SUCCESS_TEXTFILE} (ts=${now_epoch})"
+}
+
+# The retention pass's own verdict, as a scrapeable gauge. (deploy#635)
+#
+# Emitted on EVERY run that reaches retention — including a partial backup, which exits
+# non-zero further down. Retention and the artifact are independent facts and each gets its
+# own signal; folding retention into the success gauge would mean a broken purge SUPPRESSED
+# the success gauge on a genuinely complete backup, firing BackupStale falsely and walking
+# straight back into the alert-fatigue trap deploy#559/#565 closed.
+#
+# The failure direction here is SAFE-BUT-SILENT, and that is precisely why it needs a gauge
+# rather than an exit code. `rclone lsf` failing means we could not LIST, so we cannot PURGE:
+# nothing is deleted, no data is lost, and B2 simply keeps growing. Exiting non-zero on it
+# would convert a storage-cost problem into a TOTAL BACKUP OUTAGE — strictly worse, and it
+# would take the run down before emit_success_metric on a night the backup itself was fine.
+# So the run continues, the artifact is honoured, and the gauge carries the bad news.
+emit_retention_metric() {
+    local ok="$1" now_epoch tmp
+    now_epoch="$(date -u +%s)"
+
+    install -d -m 0755 "$TEXTFILE_DIR"
+
+    # Same discipline as emit_success_metric: atomic temp+rename, the temp NAMES ITS PARENT
+    # explicitly (`-p`) so it lands beside the target and not in the read-only /tmp
+    # (deploy#613/#623), and its name ends in .XXXXXX rather than .prom so the collector does
+    # not scrape it half-written.
+    tmp="$(mktemp -p "$(dirname "$RETENTION_TEXTFILE")" "$(basename "$RETENTION_TEXTFILE").XXXXXX")"
+    cat > "$tmp" <<EOF
+# HELP isnad_backup_retention_ok Whether the last backup run's retention pass completed (1) or could not run (0).
+# TYPE isnad_backup_retention_ok gauge
+isnad_backup_retention_ok ${ok}
+# HELP isnad_backup_retention_last_run_timestamp_seconds Unix timestamp of the most recent retention pass.
+# TYPE isnad_backup_retention_last_run_timestamp_seconds gauge
+isnad_backup_retention_last_run_timestamp_seconds ${now_epoch}
+EOF
+    # `umask 077` (set at the top) would otherwise leave this 0600 and root-owned, and
+    # node-exporter reads it as an unprivileged uid through a read-only bind mount — written
+    # and never scraped, the same silent gap deploy#565 exists to close.
+    chmod 644 "$tmp"
+    mv "$tmp" "$RETENTION_TEXTFILE"
+
+    log "INFO" "Emitted retention metric: ${RETENTION_TEXTFILE} (isnad_backup_retention_ok=${ok})"
 }
 
 # ---------------------------------------------------------------------------
@@ -717,9 +837,98 @@ prune_old_backups() {
     # older than the cutoff — so prod's nightly retention would have deleted STG's
     # backups, and stg's would have deleted PROD's. Each environment can now only
     # ever see, and therefore only ever delete, its own.
-    local dirs
-    dirs=$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}/${category}/" --dirs-only 2>/dev/null || true)
+    #
+    # -----------------------------------------------------------------------------
+    # AN EMPTY LISTING AND A FAILED LISTING ARE THE SAME EMPTY STRING. (deploy#635)
+    # -----------------------------------------------------------------------------
+    # This was:
+    #
+    #     dirs=$(rclone lsf "…/${BACKUP_PREFIX}/${category}/" --dirs-only 2>/dev/null || true)
+    #
+    # `2>/dev/null` discarded the diagnostic and `|| true` discarded the return code, so a bad
+    # credential, a network fault, a wrong bucket and a wrong prefix ALL COLLAPSED INTO THE
+    # SAME VALUE as the legitimate "this environment has no old backups": the empty string.
+    # The `while` loop then iterated nothing, retention silently no-op'd, and the run went on
+    # to log "=== Backup finished ===" and emit the success gauge. B2 grows without bound and
+    # nothing anywhere says so.
+    #
+    # `restore.sh` has read this exact instrument correctly since deploy#584 (`list_category`,
+    # `resolve_latest`) — capture the rc, capture stderr to a file, log rclone's OWN WORDS on a
+    # non-zero rc, and say out loud that an instrument failure is NOT a verdict about the data.
+    # The two scripts disagreed about how to read the same tool. They now agree.
+    #
+    # The stderr capture MUST come from `scratch_file()` and never a bare `mktemp`: under
+    # isnad-backup.service /tmp is READ-ONLY (ProtectSystem=strict, PrivateTmp deliberately
+    # unset — deploy#121 Bug A), the allocation would fail, `$lerr` would be empty, the
+    # `2>"$lerr"` redirect would die, and this guard would report ITS OWN breakage as a fact
+    # about B2. That is deploy#613/#623, which has shipped twice, and CI cannot see it because
+    # CI has a writable /tmp.
+    local dirs lrc=0 lerr
+    if ! lerr="$(scratch_file)"; then
+        log "ERROR" "Retention (${category}): could not RUN — no writable scratch file."
+        log "ERROR" "  This says NOTHING about B2 or about your backups. Scratch parent tried:"
+        log "ERROR" "  ${BACKUP_DIR:-${TMPDIR:-/tmp}} — the unit grants it via ReadWritePaths."
+        log "ERROR" "  Check free space first (BACKUP_DIR is the volume the dumps just filled)."
+        RETENTION_OK=false
+        return 1
+    fi
 
+    # `|| lrc=$?`, never a bare assignment: under `set -euo pipefail` an assignment whose
+    # command substitution exits non-zero IS a failing simple command, and errexit fires AT THE
+    # ASSIGNMENT — the rc check below would be dead code on every failing path (deploy#563).
+    dirs="$(rclone lsf "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}/${category}/" --dirs-only 2>"$lerr")" || lrc=$?
+    if [[ "$lrc" -ne 0 ]]; then
+        log "ERROR" "Retention (${category}): could not LIST ${BACKUP_PREFIX}/${category}/ (rclone rc=${lrc}):"
+        log_captured_stderr "$lerr"
+        log "ERROR" "  This is an INSTRUMENT failure — NOT a claim that there is nothing to prune."
+        log "ERROR" "  Nothing has been deleted and no backup is at risk; the failure direction is"
+        log "ERROR" "  safe. But retention DID NOT RUN for '${category}', so B2 keeps growing until"
+        log "ERROR" "  this is fixed. isnad_backup_retention_ok will be 0 for this run."
+        rm -f "$lerr"
+        RETENTION_OK=false
+        return 1
+    fi
+    rm -f "$lerr"
+
+    # -------------------------------------------------------------------------------
+    # rc=0 IS NOT PROOF THAT WE SAW ANYTHING. (deploy#634/#638)
+    # -------------------------------------------------------------------------------
+    # rclone returns rc=0 WITH EMPTY OUTPUT for a listing the key is not permitted to see. It is
+    # not a 403 — it is a successful listing of nothing. So the rc check above closes the
+    # bad-credential and network-fault classes and CANNOT, even in principle, close this one: a
+    # key scoped away from this prefix returns byte-for-byte what "no old backups" returns.
+    # An exit code reports whether a tool finished its work, never whether it was ALLOWED to.
+    #
+    # But we know something this listing does not: WE JUST UPLOADED INTO THIS PREFIX, a few lines
+    # ago, and `rclone copy` said it succeeded. So for the category THIS RUN WROTE TO,
+    # `${DATE_STAMP}/` is necessarily present in the bucket. If the listing cannot show it to us,
+    # the listing is not describing the bucket, and nothing downstream of it may be believed —
+    # least of all a decision about what to DELETE.
+    #
+    # That is a positive control carried in production, and it is the only reason the empty
+    # string below can be trusted at all: prove the instrument can see a thing we KNOW is there
+    # before believing it when it tells us a thing is NOT there.
+    #
+    # Scoped to the category this run actually wrote to. The OTHER category is legitimately empty
+    # on a young environment — no Sunday has happened yet — and demanding a directory there would
+    # refuse to prune on a perfectly healthy host.
+    if [[ "$category" == "$BACKUP_CATEGORY" ]] && ! grep -qE "^${DATE_STAMP}/?$" <<< "$dirs"; then
+        log "ERROR" "Retention (${category}): the listing came back rc=0 but does NOT contain"
+        log "ERROR" "  ${DATE_STAMP}/ — the directory THIS RUN JUST UPLOADED into it."
+        log "ERROR" "  That is impossible for a listing that is actually describing the bucket, so"
+        log "ERROR" "  this one is not. The most likely cause is an application key that cannot"
+        log "ERROR" "  LIST this prefix: rclone renders that as rc=0 and an EMPTY listing, not as a"
+        log "ERROR" "  permission error (deploy#634/#638)."
+        log "ERROR" "  REFUSING to prune from a listing that cannot see a directory known to exist."
+        log "ERROR" "  Nothing has been deleted. isnad_backup_retention_ok will be 0 for this run."
+        RETENTION_OK=false
+        return 1
+    fi
+
+    # rc=0 with EMPTY output is NOW a legitimate "nothing to prune" — a young environment, or one
+    # whose every directory is still inside the retention window. It is a measurement, and it is
+    # the ONLY empty string this function is willing to believe, because the control above has
+    # just established that this listing CAN see what is really there.
     while IFS= read -r dir; do
         [[ -z "$dir" ]] && continue
         # Strip trailing slash
@@ -736,16 +945,45 @@ prune_old_backups() {
                     log "INFO" "[DRY RUN] Would prune: ${BACKUP_PREFIX}/${category}/${dir}/"
                 else
                     log "INFO" "Pruning: ${BACKUP_PREFIX}/${category}/${dir}/"
-                    rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}/${category}/${dir}/" 2>>"$LOG_FILE" || \
-                        log "WARNING" "Failed to prune ${BACKUP_PREFIX}/${category}/${dir}/"
+                    # A purge that FAILED is retention that did not happen, and it used to say
+                    # so at WARNING and leave every other signal reading clean. The directory is
+                    # still there, still costing money, still counted as pruned by nobody. Same
+                    # gauge, same reason: the failure is safe (nothing was deleted) but it must
+                    # not be silent.
+                    local prc=0
+                    rclone purge "${RCLONE_REMOTE}:${B2_BUCKET}/${BACKUP_PREFIX}/${category}/${dir}/" 2>>"$LOG_FILE" || prc=$?
+                    if [[ "$prc" -ne 0 ]]; then
+                        log "ERROR" "Retention: FAILED to prune ${BACKUP_PREFIX}/${category}/${dir}/ (rclone rc=${prc})"
+                        log "ERROR" "  rclone's own words are in ${LOG_FILE}. The directory REMAINS in B2."
+                        RETENTION_OK=false
+                    fi
                 fi
             fi
         fi
     done <<< "$dirs"
 }
 
-prune_old_backups "daily" "$DAILY_RETAIN"
-prune_old_backups "weekly" "$((WEEKLY_RETAIN * 7))"
+# `|| true` here is DELIBERATE and is not the deploy#584 anti-pattern it resembles.
+#
+# prune_old_backups returns non-zero when it could not LIST — an honest function contract. But
+# these are bare simple commands under `set -e`, so a bare call would ABORT THE RUN on that rc:
+# no summary, no success gauge, no retention gauge, and a complete, uploaded, restorable backup
+# reported to systemd as a total failure. That is the outcome deploy#635 explicitly rules out —
+# it converts a storage-cost problem into a backup outage, which is strictly worse.
+#
+# The rc is therefore NOT the signal, and nothing here reads it. RETENTION_OK is the signal, the
+# function sets it before returning, and the gauge below carries it off the box. The diagnostic
+# was already logged, with rclone's own words, inside the function.
+prune_old_backups "daily" "$DAILY_RETAIN" || true
+prune_old_backups "weekly" "$((WEEKLY_RETAIN * 7))" || true
+
+# Emitted on EVERY run that reaches retention, success or partial, so the gauge always describes
+# THIS run rather than decaying into a stale reading from the last one that happened to get here.
+if [[ "$RETENTION_OK" == "true" ]]; then
+    emit_retention_metric 1
+else
+    emit_retention_metric 0
+fi
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -754,8 +992,19 @@ log "INFO" "=== Backup summary ==="
 log "INFO" "PostgreSQL (isnad):        $(if $PG_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "PostgreSQL (user-service): $(if $USER_PG_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "Neo4j:                     $(if $NEO4J_OK; then echo "OK"; else echo "FAILED"; fi)"
+log "INFO" "Retention:                 $(if $RETENTION_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "Category:   ${BACKUP_CATEGORY}"
 log "INFO" "Remote:     ${RCLONE_REMOTE}:${B2_BUCKET}/${REMOTE_SUBDIR}/"
+
+# A run whose retention could not run must not be able to print an unqualified finish. The
+# artifact is still good and still uploaded — that is why this is an ERROR line and not an
+# `exit 1` — but "=== Backup finished ===" on its own is the sentence that made this invisible.
+if [[ "$RETENTION_OK" != "true" ]]; then
+    log "ERROR" "Retention did NOT run to completion — see the errors above. The backup ARTIFACT"
+    log "ERROR" "  is unaffected and nothing was deleted, but old backups are NOT being pruned"
+    log "ERROR" "  and B2 will grow without bound. isnad_backup_retention_ok=0."
+fi
+
 log "INFO" "=== Backup finished ==="
 
 # A partial backup is a failed backup: exit non-zero WITHOUT emitting the

@@ -74,12 +74,34 @@
 # shown to return all four cannot be believed when it returns one.
 #
 # Usage:
-#   B2_ROOT="isnad:isnad-graph-backups" ./scripts/verify_b2_backup_artifact.sh
+#   # ALWAYS NAME THE ENVIRONMENT. (deploy#636)
+#   #
+#   # This example used to read `B2_ROOT="isnad:isnad-graph-backups"` — the BUCKET ROOT, with
+#   # no environment in it. stg and prod SHARE one bucket, so that scans BOTH environments'
+#   # objects at once and reports `fresh` on whichever it happens to find. It is the exact
+#   # cross-environment false-green that deploy#633 removed from verify-backup-artifact.yml —
+#   # where the prod leg of the [stg, prod] matrix would have reported healthy on the strength
+#   # of STAGING's backup, on the one check that exists because every other signal can lie.
+#   #
+#   # It survived here as a copy-pasteable line in a runbook comment, which is worse than it
+#   # sounds: this is a file an operator reaches for DURING AN INCIDENT, when they are least
+#   # likely to notice the missing path segment.
+#   #
+#   # The workflow itself invokes it correctly — B2_ROOT="isnad:${B2_BUCKET}/${{ matrix.env }}"
+#   # (.github/workflows/verify-backup-artifact.yml) — so this is the form to copy:
+#   B2_ROOT="isnad:isnad-graph-backups/prod" ./scripts/verify_b2_backup_artifact.sh
+#
+#   # Equivalently, via the sub-path variable:
+#   B2_ROOT="isnad:isnad-graph-backups" B2_PREFIX="prod" ./scripts/verify_b2_backup_artifact.sh
+#
 #   ./scripts/verify_b2_backup_artifact.sh --self-test
 #
 # Env:
-#   B2_ROOT          rclone path to the BUCKET (reachability probe + scan root)
-#   B2_PREFIX        optional sub-path under the bucket to scan (default: whole bucket)
+#   B2_ROOT          rclone path to the bucket AND the environment prefix under it
+#                    (reachability probe + scan root). NEVER the bare bucket: see above.
+#   B2_PREFIX        optional sub-path under B2_ROOT to scan. Either this or a prefix baked
+#                    into B2_ROOT must name the environment — scanning the bare bucket reads
+#                    stg's and prod's objects as one pool (deploy#632/#633/#636).
 #   MAX_AGE_HOURS    freshness bound (default 30 — one nightly run plus slack)
 # =============================================================================
 set -euo pipefail
