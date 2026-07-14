@@ -76,6 +76,33 @@ def _write(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def _stage_mutant(tmp_path: Path, mutant_body: str) -> Path:
+    """Write a mutated `backup.sh` into a temp `scripts/` dir that ALSO holds every library it
+    could source, and return the mutant's path.
+
+    `backup.sh` sources its siblings by `$(dirname "${BASH_SOURCE[0]}")/<lib>.sh`, and each is
+    fail-closed if absent — so a mutant dropped in a bare dir dies on line 1, before it reaches
+    the code under test, and any "the diagnostic is absent" assertion then passes VACUOUSLY on
+    the silence of a script that never ran. That already bit this module once (the compose_project
+    lib), and deploy#661 made it bite again: `backup.sh` now sources `scratch.sh` transitively
+    through `compose_project.sh`, and a hand-maintained `(compose_project.sh, b2_preflight.sh)`
+    list did not know to stage it. Each PR was green in isolation; the merged tree broke.
+
+    So DERIVE THE SET, don't hand-type it (the lesson that has cost this wave three times): copy
+    EVERY sibling `*.sh` from the real scripts dir, then overwrite `backup.sh` with the mutant.
+    A new sourced dependency lands in the fixture automatically, and the only cost is copying a
+    few unused shell files — cheap, and the correct direction to be wrong in.
+    """
+    mutant_dir = tmp_path / "scripts"
+    mutant_dir.mkdir(parents=True)
+    real_scripts = REPO_ROOT / "scripts"
+    for sh in real_scripts.glob("*.sh"):
+        (mutant_dir / sh.name).write_bytes(sh.read_bytes())
+    mutant = mutant_dir / "backup.sh"
+    mutant.write_text(mutant_body)
+    return mutant
+
+
 def _stubs(tmp_path: Path, *, lsf_mode: str, purge_mode: str = "ok") -> Path:
     """A stub bin/ that carries the real backup.sh all the way to the retention pass.
 
@@ -480,19 +507,11 @@ def test_the_pre_fix_line_would_FAIL_these_assertions(tmp_path: Path) -> None:
     mutant_body = body[:start] + pre_fix + body[end:]
     assert mutant_body != body, "the mutation did not change the script — it is INERT."
 
-    # The mutant must live in a directory that ALSO holds the libraries backup.sh sources by
-    # `$(dirname "${BASH_SOURCE[0]}")` — compose_project.sh and b2_preflight.sh. Dropping it in a
-    # bare tmp dir makes it die on line 1 with "Missing …/compose_project.sh", and then the two
-    # "the diagnostic is absent" assertions below PASS VACUOUSLY — absent from the output of a
-    # script that never ran. That is not a calibration, it is a coincidence, and it is exactly
-    # the shape of bug this module exists to catch. (It happened while writing this test; only
-    # the gauge assertion noticed.)
-    mutant_dir = tmp_path / "scripts"
-    mutant_dir.mkdir(parents=True)
-    for lib in ("compose_project.sh", "b2_preflight.sh"):
-        (mutant_dir / lib).write_bytes((REPO_ROOT / "scripts" / lib).read_bytes())
-    mutant = mutant_dir / "backup.sh"
-    mutant.write_text(mutant_body)
+    # Stage the mutant beside EVERY library backup.sh could source — see _stage_mutant. A bare
+    # tmp dir makes it die on line 1 (a sourced lib is fail-closed if absent), and the two "the
+    # diagnostic is absent" assertions below would then PASS VACUOUSLY on the silence of a script
+    # that never ran. That is the exact shape this module exists to catch.
+    mutant = _stage_mutant(tmp_path, mutant_body)
 
     proc, textfile_dir = _run_backup(tmp_path, lsf_mode="fail", script=mutant)
     combined = proc.stdout + proc.stderr
@@ -678,12 +697,7 @@ def test_the_substring_glob_mutant_is_KILLED(tmp_path: Path) -> None:
         '    *)                     HOST_ENV="" ;;\n'
         "esac"
     )
-    mutant_dir = tmp_path / "scripts"
-    mutant_dir.mkdir(parents=True)
-    for lib in ("compose_project.sh", "b2_preflight.sh"):
-        (mutant_dir / lib).write_bytes((REPO_ROOT / "scripts" / lib).read_bytes())
-    mutant = mutant_dir / "backup.sh"
-    mutant.write_text(body.replace(anchored, globbed))
+    mutant = _stage_mutant(tmp_path, body.replace(anchored, globbed))
 
     # THE MUTANT MUST STILL BE CORRECT ON THE KNOWN HOSTS. If it broke those, it would be caught
     # by tests that already exist, it would not be the bug Nino described, and this calibration
