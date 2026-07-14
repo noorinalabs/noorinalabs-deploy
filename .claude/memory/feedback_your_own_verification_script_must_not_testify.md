@@ -62,9 +62,36 @@ return, because it is indistinguishable from good news being absent.
    returns non-zero for a case you *know* is populated.
 4. **Read the whole output before reacting to the verdict line.** The permission error was line 1.
    I nearly reported a catastrophe on the strength of line 8 of the same block.
-5. **Assume this applies to whatever you are writing right now.** I wrote this class of bug into a
+5. **Calibrate the PROBE, not just the pipeline.** The experiment I later wrote to *prove* the
+   purge was scoped (deploy#641) failed for a **different instrument bug**, in the same script,
+   the same night. Its probe was:
+
+   ```bash
+   present() { rclone lsf "$1" >/dev/null 2>&1 && echo PRESENT || echo GONE; }   # $1 = FULL OBJECT PATH
+   ```
+
+   **`rclone lsf` on a full object path returns rc=0 for a path that does not exist.** (This is
+   already recorded in `reference_b2_preflight_discriminator` / the B2 notes as *"a full-object-path
+   rclone probe is VACUOUS"* — I had written that down and still walked into it.) So `present()`
+   answered `PRESENT` for **everything**, the verdict printed `*** INERT ***`, and the purge had in
+   fact worked perfectly. I nearly reported a working fix as broken — the mirror image of nearly
+   reporting an intact backup as destroyed, ninety minutes earlier.
+
+   The fix is a **calibration step on the probe itself, before it is used to read anything**:
+
+   ```
+   probe on an object that EXISTS    -> PRESENT   (must be)
+   probe on an object that DOES NOT  -> GONE      (must be)
+   -> the probe separates. Readings below mean something.
+   ```
+   Probe the **directory** and look for the object in it; never `lsf` an object path. And take the
+   **verdict before cleanup** — take 1 purged both canaries before I could tell which one the
+   *prune* had deleted, destroying its own evidence.
+6. **Assume this applies to whatever you are writing right now.** I wrote this class of bug into a
    verification script *while* fixing the same class of bug in production code, on the same night,
-   having just documented it. Knowing the lesson does not confer immunity; running the control does.
+   having just documented it — **and then did it twice more.** Three instrument failures in one
+   session, all mine, all in throwaway shell I was too confident to control. Knowing the lesson does
+   not confer immunity; **running the control does.**
 
 See [[feedback_prod_hardening_unreachable_in_ci]], [[feedback_calibrate_the_mutation_before_counting_it]],
 [[feedback_stderr_is_commentary_not_data]], [[feedback_errexit_kills_assignment_guard]].

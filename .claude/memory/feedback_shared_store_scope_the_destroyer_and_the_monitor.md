@@ -14,10 +14,35 @@ enabled, two things would have happened, and the quiet one is worse than the lou
 
 **1. The destructive job deletes the other environment's data.** `prune_old_backups` listed
 `${B2_BUCKET}/${category}/` and `rclone purge`d every date dir past the cutoff — *not scoped to
-the environment that ran it*. **Prod's nightly retention would have deleted stg's backups**, and
-stg's would have deleted prod's. Both also ran `DAILY_RETAIN=7`, so each silently halved the
-other's retention window. A backup system whose retention job destroys the other environment's
-backups is worse than no backup system, because **it reports success while doing it.**
+the environment that ran it*. A backup system whose retention job destroys the other
+environment's backups is worse than no backup system, because **it reports success while doing
+it.**
+
+Be precise about the mechanism, because the obvious guess is wrong. Retention is **age**-based,
+not count-based: `prune_old_backups` purges any date dir older than `now − DAILY_RETAIN` days. It
+does **not** keep "the newest N dirs". Both environments write into the same UTC `daily/<date>/`
+and both inherit `DAILY_RETAIN=7`, so with identical settings they compute the **identical cutoff**
+and make **identical purge decisions** — *nothing is halved, and no window is shortened*. (An
+earlier draft of this file said each "silently halved the other's retention window." That presumes
+count-based retention, and a future reader would have reasoned wrongly about every retention
+question thereafter. Caught by Lucas Ferreira and Nino Kavtaradze on deploy#641.)
+
+The loss is **conditional — and both conditions were live**:
+
+* **(a) A failing environment stops pruning, and then loses everything.** `backup.sh` exits
+  non-zero on a failed run *before* it reaches `prune_old_backups`. So an environment whose
+  backups are failing never prunes, and its date dirs age past the cutoff. **That is exactly where
+  stg was.** The moment prod's timer was enabled, prod's **first** prune would have purged every
+  stg dir older than 7 days — **all of stg's remaining backups, leaving it with none** — while
+  stg's own prune, which would have been the only thing to notice, had not run and would not run.
+* **(b) Any divergence in retention config becomes silent cross-environment deletion.** The instant
+  prod and stg hold different `DAILY_RETAIN`/`WEEKLY_RETAIN` — and prod wanting a *longer* window
+  than stg is the obvious, likely change — the environment with the **shorter** window deletes the
+  other's older backups on a schedule, with no bug and no attacker.
+* **(c) And the shared date dir can take usable restores to zero anyway.** Two environments writing
+  into one `daily/<date>/` means two run-ids in it, so `count_runs` > 1 and `restore.sh` trips the
+  torn-restore refusal (deploy#589). The shared prefix does not shorten your retention window —
+  **it can make the window unusable**, at the one moment you are looking: a DR restore.
 
 **2. The monitor reports the other environment's health as yours.** `verify-backup-artifact.yml`
 runs a `[stg, prod]` matrix — the *right* shape — but scanned the bucket **ROOT**, so both legs
@@ -57,8 +82,29 @@ the other.
    preflight canary must move first (deploy#638), or a scoped key 401s it and takes **both** hosts
    into a total backup outage reported as a credential fault.
 
-Verified in production, not in a test: after prod ran retention twice, stg's 9 objects were still
-there with unchanged checksums.
+6. **Verify the DESTRUCTIVE leg with an experiment that can fail — and beware the one that
+   cannot.** The first thing I claimed as proof was: *"after prod ran retention twice, stg's 9
+   objects were still there."* **That was inert.** Today was `2026-07-14` and `DAILY_RETAIN=7` put
+   the cutoff at `2026-07-07`, so the bucket's only date dir (`2026-07-14`) was **never
+   purge-eligible**. Prod's retention runs were no-ops. **An unfixed `backup.sh` would have
+   produced the identical observation.** A mutation that cannot change the outcome, recorded as a
+   kill — `feedback_calibrate_the_mutation_before_counting_it`, sitting in this same corpus, names
+   exactly that. (Caught by Nino Kavtaradze and Lucas Ferreira on deploy#641.)
+
+   The experiment with discriminating power — **plant a BACK-DATED canary under BOTH prefixes** (a
+   date older than the cutoff), then run the real prune with `BACKUP_PREFIX=prod`:
+
+   ```
+   POSITIVE CONTROL  prod/daily/2026-07-01/  -> GONE      the purge FIRED and was eligible
+   THE PROPERTY      stg/daily/2026-07-01/   -> PRESENT   it CANNOT cross the prefix
+   ```
+
+   **Both halves, or you have measured nothing.** "stg survived" alone is satisfied by a purge that
+   never ran. This one passed — and it could have failed.
+
+**Verified in production by the canary experiment above** (deploy#641), not by the inert
+observation that preceded it.
 
 See [[feedback_prod_hardening_unreachable_in_ci]], [[reference_b2_preflight_discriminator]],
-[[feedback_calibrate_the_mutation_before_counting_it]]. deploy#632/#633.
+[[feedback_calibrate_the_mutation_before_counting_it]],
+[[feedback_your_own_verification_script_must_not_testify]]. deploy#632/#633/#641.
