@@ -1,0 +1,107 @@
+# =============================================================================
+# Restore-verify throwaway stack (deploy#640). NEVER a deploy target.
+#
+# compose/docker-compose.rehearsal.yml seeds SYNTHETIC data and restores a
+# LOCALLY-FABRICATED artifact (restore.sh's RESTORE_LOCAL_DIR path, no B2). It
+# proves the restore CODE PATH works. It cannot prove THIS artifact loads — and
+# those came apart in practice: the real artifact only became restorable after
+# #613/#617/#623/#632, and the synthetic rehearsal was GREEN through all of it.
+# It supplies COMPOSE_PROJECT_NAME, the one input production omits, so it could
+# never have caught #617.
+#
+# This stack exists to restore the REAL artifact out of B2, on the real host,
+# and assert the restored content matches the live database.
+#
+# Safety properties, each load-bearing:
+#
+#   * `rv_*` volumes — cannot collide with the live stack's (`noorinalabs_*`) or
+#     the synthetic rehearsal's (`*_rehearsal_*`). scripts/restore_verify.sh
+#     asserts the resolved Neo4j volume belongs to THIS project BEFORE anything
+#     is loaded; that assertion is the deploy#617 guard and it is the only
+#     reason a restore-on-a-live-box is safe to automate at all.
+#
+#   * No `ports:` — nothing is published to the host. The live stack is already
+#     bound to those ports; publishing here would either collide or, worse,
+#     expose a scratch datastore holding a full copy of production. Reached only
+#     via `docker compose exec`.
+#
+#   * No bind mounts of any path a live service reads or writes.
+#
+#   * Postgres identity is taken from the ENVIRONMENT, so it matches the live
+#     stack exactly. This is NOT cosmetic. The dump's objects are owned by the
+#     live role (`IsnadDbUseer` / `Isnad-Prod` — note the spelling; it is real).
+#     A stack with different names fails `pg_restore` on a MISSING ROLE (ALTER
+#     OWNER -> exit 1), and restore.sh correctly treats an ignored error as a
+#     FAILED restore. So a mismatched stack fails for a reason that has nothing
+#     whatever to do with the backup, and you will chase it for an hour. The
+#     `:?` guards below turn that hour into one line, at startup.
+#
+#   * Passwords are scratch literals. These containers are unreachable from off
+#     the compose network and are destroyed at the end of the run. The restored
+#     Neo4j `system` database (auth) is NOT part of the dump — `neo4j-admin
+#     database load` loads only the `neo4j` database — so live credentials are
+#     neither needed here nor restored into here.
+#
+# NOTE ON THE `:?` GUARDS AND TEARDOWN: `docker compose down -v` interpolates
+# this file too, so a teardown run without these vars in the environment ABORTS
+# and LEAKS THE VOLUMES. That happened during the hand-run; recovery was
+# `docker rm -f` + `docker volume rm` + `docker network rm` by hand.
+# restore_verify.sh sources the env-file BEFORE installing its teardown trap,
+# and verifies the volumes are actually gone afterwards.
+# =============================================================================
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?must match the live stack — a different role fails pg_restore on a missing ALTER OWNER target, not on the backup}
+      POSTGRES_DB: ${POSTGRES_DB:?must match the live stack}
+      POSTGRES_PASSWORD: restore_verify_scratch_only
+    volumes:
+      - rv_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  user-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${USER_POSTGRES_USER:?must match the live stack}
+      POSTGRES_DB: ${USER_POSTGRES_DB:?must match the live stack}
+      POSTGRES_PASSWORD: restore_verify_scratch_only
+    volumes:
+      - rv_user_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/restore_verify_scratch_only
+      # The synthetic rehearsal's 512m/256m would START but thrash on the real
+      # store. Sized to actually serve the restored graph while sharing the box
+      # with the live Neo4j — restore_verify.sh's resource gate refuses to start
+      # if the host cannot spare this on top of what is already running.
+      NEO4J_server_memory_heap_max__size: ${RV_NEO4J_HEAP:-2g}
+      NEO4J_server_memory_pagecache_size: ${RV_NEO4J_PAGECACHE:-2g}
+    volumes:
+      - rv_neo4j_data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -u neo4j -p restore_verify_scratch_only 'RETURN 1' || exit 1",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+
+volumes:
+  rv_pg_data:
+  rv_user_pg_data:
+  rv_neo4j_data:
