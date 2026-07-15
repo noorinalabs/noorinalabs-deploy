@@ -52,6 +52,10 @@ on:
     paths:
       - "scripts/restore_verify.sh"
       - "scripts/restore.sh"
+      # deploy#687: the count+md5 constants restore_verify.sh's comparator now runs are
+      # defined here, shared with backup.sh — a change to this file alone must still run
+      # the self-test, not only a change to restore_verify.sh itself.
+      - "scripts/user_pg_content_queries.sh"
       - "scripts/tests/test_restore_verify.py"
       - "compose/docker-compose.restore-verify.yml"
       - ".github/workflows/restore-verify.yml"

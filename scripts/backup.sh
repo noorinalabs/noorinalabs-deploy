@@ -346,6 +346,17 @@ cleanup() {
     # per-run subdirectory, not the root above it. Runs FIRST, before the log lines below,
     # because it must not depend on anything this function does afterwards.
     scratch_cleanup_all
+
+    # Sweep the content-manifest scratch container (deploy#687), same reasoning as
+    # scratch_cleanup_all above: the EXIT trap runs on SIGTERM even though a `trap … RETURN`
+    # at the allocation site would not, so this is the only place a killed run's container is
+    # guaranteed to be removed. Tagged with THIS shell's PID ($$, stable across the
+    # generate_content_manifest() call — not $BASHPID), so a concurrent run's own container is
+    # untouchable. `docker rm -f` on a name that never existed, or was already removed, is a
+    # harmless no-op — this line does not depend on CONTENT_MANIFEST_OK or on how far
+    # generate_content_manifest() got before failing.
+    docker rm -f "content-manifest-$$" >/dev/null 2>&1 || true
+
     # Order matters: emit our last log lines BEFORE rm-ing the directory the
     # log file lives in, otherwise tee fails silently with "No such file or
     # directory" and we lose the cleanup confirmation.
@@ -460,6 +471,16 @@ PG_OK=false
 USER_PG_OK=false
 NEO4J_OK=false
 
+# Did the content manifest generate? (deploy#687)
+#
+# Deliberately separate from USER_PG_OK, same shape as RETENTION_OK vs the three dump _OK
+# flags: the ARTIFACT (the dump) and the MANIFEST (a restore-derived attestation of what is
+# IN it) are different facts, and a failure to compute the second must never take down the
+# first. A scratch-container hiccup generating the manifest is not a reason to discard a
+# perfectly good user-postgres dump — "a partial backup beats none" applies here too, one
+# level down: a backup with no content manifest still beats no backup at all.
+CONTENT_MANIFEST_OK=false
+
 # Did THIS RUN leave the graph down? (deploy#617 review — Aisha Idrissi)
 #
 # Deliberately SEPARATE from NEO4J_OK, and the distinction is the whole point:
@@ -518,6 +539,130 @@ dump_postgres() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# user-postgres content manifest (deploy#687)
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS: restore_verify.sh's user-postgres comparators were restored-vs-LIVE,
+# and live legitimately drifts between dump-time and verify-time (a login updates
+# last_login_at, a session is created) — so a perfectly good backup reported MISMATCH,
+# every night, forever. The fix is to compare the restored artifact against an attestation
+# of what THAT ARTIFACT actually contained, not against live's current state.
+#
+# WHY RESTORE-DERIVED, NOT A SECOND LIVE READ: the manifest must be computed from the
+# LITERAL BYTES that went into the dump file, not from a second query against live taken at
+# "approximately the same instant" — the latter is a timing race by construction, the former
+# is not a race at all. So: restore the just-produced dump into a throwaway, disposable
+# postgres:16-alpine container (same bare `docker run --rm` idiom this file already uses for
+# the Neo4j leg's `neo4j-admin`), and query THAT restored copy. See Weronika Zielinska's
+# design note on deploy#687 (owner-approved mechanism, ruling 1) for the full comparison
+# against a held-open `pg_export_snapshot()` coprocess, which this repo's own incident
+# history (command-substitution-eats-your-return-channel, errexit-kills-the-assignment-guard)
+# is the reason NOT to build.
+#
+# The container name is tagged with THIS shell's PID ($$), the same convention scratch.sh
+# uses for its own allocations, so cleanup() can remove it unconditionally and a concurrent
+# run's container is never touched.
+CONTENT_MANIFEST_CONTAINER="content-manifest-$$"
+
+# generate_content_manifest <dump-file> — restores <dump-file> into a throwaway container,
+# queries it, and writes CONTENT_MANIFEST_FILE. Returns 0 on success. On ANY failure it logs
+# the diagnostic and returns 1 WITHOUT writing a manifest file — absence, not a torn file, is
+# the failure mode restore_verify.sh's manifest-fetch is built to recognise (deploy#687 design
+# §2). It must never fail the backup RUN: the raw dump this restores from has already
+# succeeded and is still good, so every call site treats this as best-effort.
+generate_content_manifest() {
+    local dump_file="$1"
+
+    log "INFO" "Generating user-postgres content manifest (restore-derived, deploy#687)..."
+
+    # A previous run's container of the same name (a prior crash mid-generation) must not
+    # make `docker run --name` fail with "name already in use".
+    docker rm -f "$CONTENT_MANIFEST_CONTAINER" >/dev/null 2>&1 || true
+
+    if ! docker run -d --rm --name "$CONTENT_MANIFEST_CONTAINER" \
+        -e POSTGRES_USER="$USER_POSTGRES_USER" \
+        -e POSTGRES_DB="$USER_POSTGRES_DB" \
+        -e POSTGRES_PASSWORD=content_manifest_scratch_only \
+        -v "${dump_file}:/tmp/user-pg.dump:ro" \
+        postgres:16-alpine >>"$LOG_FILE" 2>&1; then
+        log "ERROR" "Content manifest: could not start the scratch postgres container"
+        return 1
+    fi
+
+    local waited=0
+    until docker exec "$CONTENT_MANIFEST_CONTAINER" \
+        pg_isready -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" >/dev/null 2>&1; do
+        if [[ "$waited" -ge 60 ]]; then
+            log "ERROR" "Content manifest: scratch postgres did not become ready within 60s"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # The container's own bootstrap superuser is named identically to the LIVE role
+    # (POSTGRES_USER=$USER_POSTGRES_USER), so the dump's `ALTER ... OWNER TO` statements
+    # resolve against a role that actually exists here — a plain restore, no --no-owner
+    # needed, into a database nothing else can reach or has ever written to.
+    if ! docker exec "$CONTENT_MANIFEST_CONTAINER" \
+        pg_restore -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" \
+        /tmp/user-pg.dump >>"$LOG_FILE" 2>&1; then
+        log "ERROR" "Content manifest: pg_restore into the scratch container failed"
+        return 1
+    fi
+
+    local queries_lib
+    queries_lib="$(dirname "${BASH_SOURCE[0]}")/user_pg_content_queries.sh"
+    if [[ ! -f "$queries_lib" ]]; then
+        log "ERROR" "Content manifest: missing ${queries_lib} — cannot query the restored copy"
+        return 1
+    fi
+    # shellcheck source=scripts/user_pg_content_queries.sh
+    source "$queries_lib"
+
+    local table query reading rc line count md5 lines=""
+    for table in "${UPG_CONTENT_TABLES[@]}"; do
+        query="$(upg_content_query_for "$table")" || {
+            log "ERROR" "Content manifest: no shared query for table '${table}' — cannot continue"
+            return 1
+        }
+
+        # `|| rc=$?`, never a bare assignment: under `set -euo pipefail` an assignment whose
+        # command substitution exits non-zero IS a failing simple command and errexit fires AT
+        # THE ASSIGNMENT (feedback_errexit_kills_assignment_guard, deploy#563/#584/#591) — the
+        # rc check below would be dead code on every failing path.
+        rc=0
+        # `-q`: each UPG_CONTENT_<TABLE> query is "SET timezone='UTC'; SELECT ..." — without
+        # -q, psql prints the SET statement's own command tag ahead of the reading, corrupting
+        # the count/md5 split below (found in CI: restore_verify.sh's self-test surfaced it).
+        reading="$(docker exec "$CONTENT_MANIFEST_CONTAINER" \
+            psql -q -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -tAc "$query" 2>>"$LOG_FILE")" || rc=$?
+        if [[ "$rc" -ne 0 || -z "$reading" ]]; then
+            log "ERROR" "Content manifest: query for table '${table}' failed or returned an empty reading (rc=${rc})"
+            return 1
+        fi
+
+        # "<count>|<md5-or-EMPTY>" — split on the FIRST '|'. string_agg's own separator is
+        # also '|', but it is never visible here: this column is always a 32-hex md5 digest
+        # or the literal EMPTY, never the joined row text.
+        count="${reading%%|*}"
+        md5="${reading#*|}"
+        if [[ -z "$count" || -z "$md5" ]]; then
+            log "ERROR" "Content manifest: could not parse '${reading}' for table '${table}' as count|md5"
+            return 1
+        fi
+
+        line="$(printf 'CONTENT_MANIFEST table=%s count=%s md5=%s' "$table" "$count" "$md5")"
+        lines="${lines}${line}"$'\n'
+        log "INFO" "  ${line}"
+    done
+
+    printf '%s' "$lines" > "$CONTENT_MANIFEST_FILE"
+    sha256sum "$CONTENT_MANIFEST_FILE" | sed "s|${LOCAL_BACKUP_PATH}/||" > "${CONTENT_MANIFEST_FILE}.sha256"
+    log "INFO" "Content manifest written: $(basename "$CONTENT_MANIFEST_FILE")"
+    return 0
+}
+
 PG_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-pg-${TIMESTAMP}.dump"
 if dump_postgres postgres "$POSTGRES_USER" "$POSTGRES_DB" "$PG_DUMP_FILE" "PostgreSQL (isnad)"; then
     PG_OK=true
@@ -531,6 +676,27 @@ USER_PG_DUMP_FILE="${LOCAL_BACKUP_PATH}/isnad-userpg-${TIMESTAMP}.dump"
 if dump_postgres user-postgres "$USER_POSTGRES_USER" "$USER_POSTGRES_DB" \
     "$USER_PG_DUMP_FILE" "PostgreSQL (user-service)"; then
     USER_PG_OK=true
+fi
+
+# The content manifest attests to what THIS run's user-postgres dump actually contains, so
+# restore_verify.sh can compare a later restore against it instead of against live (which
+# legitimately drifts between dump-time and verify-time — deploy#687). Only attempted when
+# there is a dump to attest to; on any failure the raw dump is untouched and still good, so
+# this never fails the backup run (see generate_content_manifest's own contract above).
+if $USER_PG_OK; then
+    CONTENT_MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_content_manifest-${TIMESTAMP}.txt"
+    if generate_content_manifest "$USER_PG_DUMP_FILE"; then
+        CONTENT_MANIFEST_OK=true
+    else
+        log "ERROR" "Content manifest generation FAILED — the user-postgres dump is still good"
+        log "ERROR" "  and uploaded, but the restore-verify content check will not be able to"
+        log "ERROR" "  compare a future restore of THIS run against its content (rc=2 there,"
+        log "ERROR" "  not a backup fault)."
+    fi
+    # Always remove the scratch container promptly on the normal path; cleanup()'s EXIT trap
+    # is the backstop for a run that dies mid-generation (deploy#629's reasoning, one object
+    # class over — a container instead of a scratch file).
+    docker rm -f "$CONTENT_MANIFEST_CONTAINER" >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1158,7 @@ log "INFO" "=== Backup summary ==="
 log "INFO" "PostgreSQL (isnad):        $(if $PG_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "PostgreSQL (user-service): $(if $USER_PG_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "Neo4j:                     $(if $NEO4J_OK; then echo "OK"; else echo "FAILED"; fi)"
+log "INFO" "Content manifest:          $(if $CONTENT_MANIFEST_OK; then echo "OK"; else echo "FAILED (backup artifact unaffected)"; fi)"
 log "INFO" "Retention:                 $(if $RETENTION_OK; then echo "OK"; else echo "FAILED"; fi)"
 log "INFO" "Category:   ${BACKUP_CATEGORY}"
 log "INFO" "Remote:     ${RCLONE_REMOTE}:${B2_BUCKET}/${REMOTE_SUBDIR}/"
