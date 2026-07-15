@@ -142,6 +142,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --- Shared user-postgres content queries (deploy#687) -----------------------
+# The five UPG_CONTENT_<TABLE> count+md5 constants, UPG_CONTENT_TABLES, and the four
+# MINUS1 calibration legs are defined ONCE in scripts/user_pg_content_queries.sh and
+# sourced by BOTH this script and backup.sh, so the SQL that writes the content manifest
+# and the SQL that recomputes it at verify time cannot independently drift. See that
+# file's header for the full reasoning. Sourced here — after argument parsing, before
+# anything else — so both --self-test and the real run get it.
+USER_PG_CONTENT_QUERIES_LIB="${SCRIPT_DIR}/user_pg_content_queries.sh"
+if [[ ! -f "$USER_PG_CONTENT_QUERIES_LIB" ]]; then
+    instrument_fail "missing ${USER_PG_CONTENT_QUERIES_LIB} — cannot query user-postgres content"
+fi
+# shellcheck source=scripts/user_pg_content_queries.sh
+source "$USER_PG_CONTENT_QUERIES_LIB"
+
 # --- Compose plumbing --------------------------------------------------------
 # Every compose call in this file goes through _dc, and every one of them names its
 # PROJECT explicitly. `-f` names the FILE; with no `-p` and no COMPOSE_PROJECT_NAME,
@@ -312,7 +326,13 @@ readonly PG_HADITH_COUNT="SELECT count(*) FROM isnad_graph.hadiths;"
 readonly PG_HADITH_MD5="SELECT md5(string_agg(t,'|' ORDER BY t)) FROM (SELECT h::text AS t FROM isnad_graph.hadiths h) s;"
 readonly PG_HADITH_MD5_MINUS1="SELECT md5(string_agg(t,'|' ORDER BY t)) FROM (SELECT h::text AS t FROM isnad_graph.hadiths h ORDER BY t OFFSET 1) s;"
 
-readonly UPG_USERS_MD5="SELECT md5(string_agg(t,'|' ORDER BY t)) FROM (SELECT u::text AS t FROM users u) s;"
+# The user-postgres count+md5 queries (UPG_CONTENT_*, UPG_CONTENT_TABLES) and their
+# calibration MINUS1 legs are sourced from scripts/user_pg_content_queries.sh — see the
+# "Shared user-postgres content queries" block below main's argument parsing. They replace
+# the single ad hoc UPG_USERS_MD5 this file used to carry: that query compared users
+# restored-vs-LIVE, which is the exact false-negative deploy#687 exists to fix (live
+# legitimately drifts between dump-time and verify-time), and it covered only one of the
+# five user-postgres tables.
 
 # Multi-row readings (histograms) collapse to one line so they compare as scalars.
 cypher_hist() { # cypher_hist <live|rv> <query>
@@ -783,6 +803,40 @@ calibrate() {
     fi
     pass "calibration: the hadiths checksum DIFFERS when one row is removed — it can go red"
 
+    # (4) Same, for EVERY mutable user-postgres table (deploy#687). Before this, calibrate()
+    #     proved only the graph fingerprint and the hadiths checksum could go red — the four
+    #     user-postgres comparators compare() now runs (users, oauth_accounts, sessions,
+    #     audit_log) had no equivalent proof. `alembic_version` deliberately has no MINUS1 leg
+    #     — see scripts/user_pg_content_queries.sh's header for why.
+    local upg_table upg_full upg_full_md5 upg_minus1 minus1_query
+    for upg_table in users oauth_accounts sessions audit_log; do
+        upg_val "$REF" "$(upg_content_query_for "$upg_table")" ||
+            instrument_fail "cannot compute the reference ${upg_table} content"
+        upg_full="$MEASURED"
+        upg_full_md5="${upg_full#*|}"
+
+        case "$upg_table" in
+            users) minus1_query="$UPG_USERS_MD5_MINUS1" ;;
+            oauth_accounts) minus1_query="$UPG_OAUTH_ACCOUNTS_MD5_MINUS1" ;;
+            sessions) minus1_query="$UPG_SESSIONS_MD5_MINUS1" ;;
+            audit_log) minus1_query="$UPG_AUDIT_LOG_MD5_MINUS1" ;;
+        esac
+        upg_val "$REF" "$minus1_query" ||
+            instrument_fail "cannot compute the minus-one ${upg_table} checksum"
+        upg_minus1="$MEASURED"
+
+        log "INFO" "  ${upg_table} md5            : ${upg_full_md5}"
+        log "INFO" "  ${upg_table} md5 minus 1 row: ${upg_minus1}"
+        if [[ "$upg_full_md5" == "$upg_minus1" ]]; then
+            instrument_fail "the ${upg_table} checksum CANNOT SEE A MISSING ROW. It is inert.
+            REFUSING TO TESTIFY. (If ${upg_table} genuinely holds 0 or 1 rows on the reference
+            stack right now, 'minus one row' degenerates to the same EMPTY reading as the full
+            set — that is not a false alarm, it is this calibration correctly refusing to trust
+            a comparator it cannot prove can see a loss on this table today.)"
+        fi
+        pass "calibration: the ${upg_table} checksum DIFFERS when one row is removed — it can go red"
+    done
+
     log "INFO" "=== CALIBRATION PASSED — a MATCH below now means something ==="
 }
 
@@ -829,7 +883,33 @@ run_restore() {
     #                the COMPOSE_PROJECT one. A throwaway run must use the throwaway compose file.
     local rline=""
     rline="$(grep -F 'Resolved Neo4j data volume:' "$out" | tail -1)" || rline=""
+
+    # WHICH RUN'S CONTENT MANIFEST DO WE COMPARE AGAINST? (deploy#687)
+    #
+    # restore.sh already announces exactly this, on two lines, while resolving `latest` and
+    # selecting the manifest-attested dumps for that run:
+    #
+    #     Resolved 'latest' to: <category>/<date>
+    #     Manifest attests run <TIMESTAMP> — selecting that run's dumps
+    #
+    # Read them back from the SAME capture rather than re-deriving BACKUP_PATH/RESTORE_RUN_TS
+    # independently — restore.sh is the only party that actually resolved `latest` and picked
+    # a run, and an independent re-resolution here could disagree with what it chose (the same
+    # discipline this function already applies to the Neo4j volume/project/file handoff below).
+    local backup_path_line="" run_ts_line=""
+    backup_path_line="$(grep -F "Resolved 'latest' to:" "$out" | tail -1)" || backup_path_line=""
+    run_ts_line="$(grep -F 'Manifest attests run' "$out" | tail -1)" || run_ts_line=""
     rm -f "$out"
+
+    if [[ -n "$backup_path_line" ]]; then
+        CONTENT_MANIFEST_BACKUP_PATH="${backup_path_line##*Resolved \'latest\' to: }"
+        CONTENT_MANIFEST_BACKUP_PATH="${CONTENT_MANIFEST_BACKUP_PATH%% *}"
+    fi
+    if [[ -n "$run_ts_line" ]]; then
+        CONTENT_MANIFEST_RUN_TS="${run_ts_line##*Manifest attests run }"
+        CONTENT_MANIFEST_RUN_TS="${CONTENT_MANIFEST_RUN_TS%% *}"
+    fi
+    log "INFO" "restore.sh restored run: backup-path='${CONTENT_MANIFEST_BACKUP_PATH:-<unknown>}' run-ts='${CONTENT_MANIFEST_RUN_TS:-<unknown>}'"
 
     if [[ -z "$rline" ]]; then
         instrument_fail "restore.sh never reported which Neo4j volume it resolved.
@@ -879,6 +959,83 @@ run_restore() {
 }
 
 # =============================================================================
+# Content manifest fetch (deploy#687)
+# =============================================================================
+# populated by fetch_content_manifest(): table -> "count", table -> "md5-or-EMPTY".
+declare -gA CM_COUNT=()
+declare -gA CM_MD5=()
+
+# fetch_content_manifest — pull the B2 object that ATTESTS what the run restore_restore()
+# just restored actually contained, and populate CM_COUNT / CM_MD5.
+#
+# WHY THIS SCRIPT NOW TOUCHES B2 AT ALL: previously restore_verify.sh never read B2 directly
+# — it only shells out to restore.sh, which owns all B2/rclone access. The content manifest
+# is a separate, small object restore.sh does not read, so this is a minimal, LOCAL rclone
+# bootstrap (mirroring restore.sh's own three-line one) rather than a reason to route this
+# through restore.sh — the manifest is verification-only, not a restore input.
+#
+# NEVER FALLS BACK TO LIVE. A missing/unreadable manifest is a THIRD, explicit state — not a
+# false rc=0 pass, not a false rc=1 fail — because restoring the old (pre-deploy#687)
+# restored-vs-live comparison for user-postgres on manifest-less runs would silently
+# reintroduce the exact false-negative this design fixes, with no signal explaining why.
+fetch_content_manifest() {
+    if [[ -z "$CONTENT_MANIFEST_BACKUP_PATH" || -z "$CONTENT_MANIFEST_RUN_TS" ]]; then
+        instrument_fail "could not determine which run's content manifest to fetch — restore.sh
+        never logged its \"Resolved 'latest' to:\" / \"Manifest attests run\" lines (or this
+        script could not read them back). Without both, this script cannot know WHICH object
+        to fetch, and guessing is exactly the independent re-resolution deploy#687's design
+        forbids. (backup-path='${CONTENT_MANIFEST_BACKUP_PATH:-<empty>}'
+        run-ts='${CONTENT_MANIFEST_RUN_TS:-<empty>}')"
+    fi
+
+    export RCLONE_CONFIG_ISNAD_TYPE="b2"
+    export RCLONE_CONFIG_ISNAD_ACCOUNT="${B2_KEY_ID}"
+    export RCLONE_CONFIG_ISNAD_KEY="${B2_APP_KEY}"
+
+    local remote_path manifest_text rc=0
+    remote_path="isnad:${B2_BUCKET}/${BACKUP_PREFIX}/${CONTENT_MANIFEST_BACKUP_PATH}/_content_manifest-${CONTENT_MANIFEST_RUN_TS}.txt"
+
+    # `|| rc=$?`, never a bare assignment — see the header's rules on errexit and assignments.
+    manifest_text="$(rclone cat "$remote_path" 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 || -z "$manifest_text" ]]; then
+        instrument_fail "content manifest absent for run ${CONTENT_MANIFEST_RUN_TS} — cannot
+        verify user-postgres content. ${remote_path} did not read back (rc=${rc}).
+
+        This is EXPECTED on the very first restore-verify run after deploy#687 merges, before
+        any new backup has produced a content manifest — see the design's rollout sequence. It
+        is NOT a claim that the backup is bad, and this script will NOT fall back to comparing
+        user-postgres against LIVE: that fallback is precisely the false-negative this design
+        exists to fix (live legitimately drifts between dump-time and verify-time).
+
+        rclone's own words:
+        ${manifest_text}"
+    fi
+
+    local line table count md5
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^CONTENT_MANIFEST\ table=([a-z_]+)\ count=([0-9]+)\ md5=([A-Za-z0-9]+)$ ]]; then
+            table="${BASH_REMATCH[1]}"
+            count="${BASH_REMATCH[2]}"
+            md5="${BASH_REMATCH[3]}"
+            CM_COUNT["$table"]="$count"
+            CM_MD5["$table"]="$md5"
+        fi
+    done <<< "$manifest_text"
+
+    local t
+    for t in "${UPG_CONTENT_TABLES[@]}"; do
+        if [[ -z "${CM_MD5[$t]:-}" ]]; then
+            instrument_fail "content manifest for run ${CONTENT_MANIFEST_RUN_TS} has no
+            parseable line for table '${t}'. Either the object is torn, or backup.sh's table
+            set has drifted from this script's UPG_CONTENT_TABLES — refusing to compare
+            against a partial attestation. Raw manifest text follows:
+            ${manifest_text}"
+        fi
+    done
+    pass "content manifest fetched for run ${CONTENT_MANIFEST_RUN_TS}: ${#CM_MD5[@]} table(s) attested"
+}
+
+# =============================================================================
 # The comparison
 # =============================================================================
 row() { # row <label> <reference> <restored>
@@ -916,13 +1073,37 @@ compare() {
     _cmp "pg hadiths"         pg_val      "$PG_HADITH_COUNT"
     _cmp "pg hadiths md5"     pg_val      "$PG_HADITH_MD5"
 
-    # The user-service store is the one nothing else covers (deploy#558-#561).
-    _cmp "users"              upg_val     "SELECT count(*) FROM users;"
-    _cmp "oauth_accounts"     upg_val     "SELECT count(*) FROM oauth_accounts;"
-    _cmp "sessions"           upg_val     "SELECT count(*) FROM sessions;"
-    _cmp "audit_log"          upg_val     "SELECT count(*) FROM audit_log;"
-    _cmp "users md5"          upg_val     "$UPG_USERS_MD5"
-    _cmp "alembic version"    upg_val     "SELECT version_num FROM alembic_version;"
+    # The user-service store (deploy#558-#561) is compared RESTORED-vs-MANIFEST, not
+    # restored-vs-live: live legitimately drifts between dump-time and verify-time (a login,
+    # a new session), and comparing against live's CURRENT state is the proven false-negative
+    # deploy#687 fixes. fetch_content_manifest() has already populated CM_COUNT/CM_MD5 from
+    # the B2 object that attests what THIS run's backup actually contained.
+    _cmp_manifest() { # _cmp_manifest <table>
+        local table="$1" reading count md5
+        upg_val rv "$(upg_content_query_for "$table")" ||
+            instrument_fail "restored reading failed for user-postgres table '${table}'"
+        reading="$MEASURED"
+        count="${reading%%|*}"
+        md5="${reading#*|}"
+        row "${table} count" "${CM_COUNT[$table]}" "$count" || mismatches=$((mismatches + 1))
+        row "${table} md5"   "${CM_MD5[$table]}"   "$md5"   || mismatches=$((mismatches + 1))
+    }
+
+    local upg_table
+    for upg_table in "${UPG_CONTENT_TABLES[@]}"; do
+        _cmp_manifest "$upg_table"
+    done
+
+    # The table-set check (deploy#687 design §5c / deploy#662): a pg_restore that silently
+    # dropped a table would still MATCH on every table it DID restore — this catches that a
+    # per-table comparison structurally cannot. Compared against UPG_CONTENT_TABLES (the fixed
+    # set the manifest itself declares), not against live: same restored-vs-manifest doctrine
+    # as everything else in this block.
+    local expected_tables
+    expected_tables="$(printf '%s\n' "${UPG_CONTENT_TABLES[@]}" | sort | paste -sd, -)"
+    upg_val rv "SET timezone='UTC'; SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public';" ||
+        instrument_fail "cannot read the restored user-postgres table set"
+    row "user-pg table set" "$expected_tables" "$MEASURED" || mismatches=$((mismatches + 1))
 
     if [[ "$mismatches" -gt 0 ]]; then
         log "ERROR" "${mismatches} metric(s) MISMATCHED — the restored artifact does NOT reproduce"
@@ -1016,6 +1197,15 @@ self_test() {
             'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "$1"' \
             _ "$q" | tail -n +2 | tr -d '"\r' | tr '\n' ' '
     }
+    # _st_upg <project> <sql> — the user-postgres equivalent of _st_cypher (deploy#687). No
+    # credential-quoting subtlety here: the scratch compose file's user-postgres password is
+    # a literal (POSTGRES_PASSWORD=restore_verify_scratch_only), not derived from an env var
+    # the shell must keep unexpanded.
+    _st_upg() {
+        local p="$1" q="$2"
+        _st_dc "$p" exec -T user-postgres \
+            psql -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "$q"
+    }
 
     _st_cleanup() {
         # THE VERDICT. Captured on the first line, before anything here can clobber `$?`,
@@ -1039,25 +1229,30 @@ self_test() {
     for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
         log "INFO" "self-test: starting ${p}"
         _st_dc "$p" down -v --remove-orphans >/dev/null 2>&1 || true
-        _st_dc "$p" up -d neo4j
+        # user-postgres added for the content-manifest calibration legs (deploy#687) —
+        # neither project needed it before those legs existed.
+        _st_dc "$p" up -d neo4j user-postgres
     done
 
     for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
-        local waited=0 cid health
-        while :; do
-            # A container that does not exist YET is the normal case on the first pass, so a
-            # failing `ps` here is not an error — but `cid="$(… | head -1)"` under `set -e`
-            # is a CRASH on that path, killing the wait loop before the stack can come up.
-            # start_stack() already guards its identical wait this way and its comment says so;
-            # this is the same fix, the copy that was left behind (deploy#677).
-            cid=""
-            cid="$(_st_dc "$p" ps -q neo4j | head -1)" || cid=""
-            health="none"
-            [[ -n "$cid" ]] && { health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid")" || health="none"; }
-            [[ "$health" == "healthy" ]] && break
-            [[ "$waited" -ge 240 ]] && instrument_fail "self-test: ${p} neo4j never became healthy"
-            sleep 3
-            waited=$((waited + 3))
+        local svc
+        for svc in neo4j user-postgres; do
+            local waited=0 cid health
+            while :; do
+                # A container that does not exist YET is the normal case on the first pass, so a
+                # failing `ps` here is not an error — but `cid="$(… | head -1)"` under `set -e`
+                # is a CRASH on that path, killing the wait loop before the stack can come up.
+                # start_stack() already guards its identical wait this way and its comment says
+                # so; this is the same fix, the copy that was left behind (deploy#677).
+                cid=""
+                cid="$(_st_dc "$p" ps -q "$svc" | head -1)" || cid=""
+                health="none"
+                [[ -n "$cid" ]] && { health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid")" || health="none"; }
+                [[ "$health" == "healthy" ]] && break
+                [[ "$waited" -ge 240 ]] && instrument_fail "self-test: ${p} ${svc} never became healthy"
+                sleep 3
+                waited=$((waited + 3))
+            done
         done
     done
 
@@ -1085,6 +1280,49 @@ self_test() {
         printf '%s\n' "$seed" | _st_dc "$p" exec -T neo4j sh -c \
             'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell' >/dev/null
     done
+
+    # =========================================================================
+    # user-postgres content-manifest calibration (deploy#687)
+    # =========================================================================
+    # A bare postgres:16-alpine has no schema of its own — this creates just enough of one
+    # to exercise every UPG_CONTENT_* query the real comparator runs, seeded IDENTICALLY into
+    # both throwaway stacks (same discipline as the Neo4j seed above).
+    local upg_seed="
+    CREATE TABLE users (id serial PRIMARY KEY, email text NOT NULL, last_login_at timestamptz, updated_at timestamptz);
+    CREATE TABLE oauth_accounts (id serial PRIMARY KEY, user_id int NOT NULL, provider text NOT NULL);
+    CREATE TABLE sessions (id serial PRIMARY KEY, user_id int NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+    CREATE TABLE audit_log (id serial PRIMARY KEY, user_id int, action text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+    CREATE TABLE alembic_version (version_num varchar(32) PRIMARY KEY);
+    INSERT INTO users (id, email, last_login_at, updated_at) VALUES
+        (1, 'narrator1@example.test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+        (2, 'narrator2@example.test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+    INSERT INTO oauth_accounts (id, user_id, provider) VALUES (1, 1, 'google');
+    INSERT INTO sessions (id, user_id, created_at) VALUES (1, 1, '2026-01-01T00:00:00Z');
+    INSERT INTO audit_log (id, user_id, action, created_at) VALUES
+        (1, 1, 'login', '2026-01-01T00:00:00Z'),
+        (2, 2, 'login', '2026-01-01T00:00:00Z');
+    INSERT INTO alembic_version (version_num) VALUES ('abc123');
+    SELECT setval('users_id_seq', 2);
+    SELECT setval('sessions_id_seq', 1);
+    SELECT setval('audit_log_id_seq', 2);
+    "
+    for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
+        printf '%s\n' "$upg_seed" | _st_dc "$p" exec -T user-postgres \
+            psql -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -v ON_ERROR_STOP=1 >/dev/null
+    done
+
+    # --- Capture the MANIFEST at seed time, from the REF stack only ----------
+    # This stands in for "the manifest backup.sh wrote from its own restore-derived scratch
+    # container" — computed once, here, before ST_REF_PROJECT is touched again. Everything
+    # that follows compares against THESE captured values, never against a re-read of REF.
+    local st_table st_reading
+    declare -A CAPTURED_COUNT=() CAPTURED_MD5=()
+    for st_table in "${UPG_CONTENT_TABLES[@]}"; do
+        st_reading="$(_st_upg "$ST_REF_PROJECT" "$(upg_content_query_for "$st_table")")"
+        CAPTURED_COUNT["$st_table"]="${st_reading%%|*}"
+        CAPTURED_MD5["$st_table"]="${st_reading#*|}"
+    done
+    log "INFO" "self-test: captured baseline manifest from ${ST_REF_PROJECT} (pre-mutation)"
 
     local ref_fp sub_fp ref_parts
     ref_fp="$(_st_cypher "$ST_REF_PROJECT" "$CY_FP")"
@@ -1210,6 +1448,70 @@ self_test() {
         rc=1
     fi
 
+    # --- Case 4: BENIGN LIVE DRIFT MUST STILL PASS (the actual point of deploy#687) ----------
+    # This is the deliverable. Mutate ST_REF_PROJECT ONLY — reproducing the #687 scenario
+    # exactly: a new session, a login timestamp update — so REF's live content has now moved
+    # AWAY from the manifest captured above. RV_PROJECT (standing in for "the restored
+    # artifact") is left untouched. The comparator must still report MATCH against the
+    # CAPTURED MANIFEST, because that is what deploy#687 changes it to compare against.
+    # Comparing RV against a FRESH read of REF here would recreate the exact false-negative
+    # this design fixes, and this case is what would catch that regression.
+    _st_upg "$ST_REF_PROJECT" \
+        "INSERT INTO sessions (id, user_id, created_at) VALUES (2, 2, now());
+         UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = 1;" >/dev/null
+
+    local drift_ok=true rv_reading rv_count rv_md5 ref_reread
+    for st_table in "${UPG_CONTENT_TABLES[@]}"; do
+        rv_reading="$(_st_upg "$RV_PROJECT" "$(upg_content_query_for "$st_table")")"
+        rv_count="${rv_reading%%|*}"
+        rv_md5="${rv_reading#*|}"
+        # XXX(deploy#687 red-proof, commit 1/2): comparing against a FRESH read of REF —
+        # exactly the pre-#687 bug — instead of the CAPTURED manifest. This is deliberately
+        # wrong and is fixed in the very next commit; it exists so CI's self-test job proves
+        # this leg can actually fail before the fix commit proves it passes.
+        ref_reread="$(_st_upg "$ST_REF_PROJECT" "$(upg_content_query_for "$st_table")")"
+        if [[ -z "$rv_reading" || -z "$ref_reread" || "$rv_reading" != "$ref_reread" ]]; then
+            drift_ok=false
+            log "ERROR" "  benign-drift MATCH failed for ${st_table}: ref(fresh)=${ref_reread} restored=${rv_reading}"
+        fi
+    done
+    if [[ "$drift_ok" == "true" ]]; then
+        pass "self-test MATCH: restored-vs-MANIFEST still agrees after live (REF) drifted post-capture"
+        log "INFO" "        a new session and a login timestamp update on REF did not break the"
+        log "INFO" "        comparison — this is the false-negative deploy#687 exists to fix"
+    else
+        fail "self-test MATCH: restored-vs-manifest comparison broke when only REF drifted — the"
+        log "ERROR" "        comparator is (still) comparing against LIVE, not the manifest"
+        rc=1
+    fi
+
+    # --- Case 5 (mirror of Case 4): REAL LOSS ON THE RESTORED SIDE MUST FAIL -----------------
+    # The other half of the same proof. Mutate RV_PROJECT itself — the side standing in for
+    # "the restored artifact" — and require the SAME comparator to now report MISMATCH against
+    # the SAME captured manifest. Without this leg, Case 4 alone could be satisfied by a
+    # comparator that has simply stopped comparing anything at all.
+    _st_upg "$RV_PROJECT" "DELETE FROM sessions WHERE id = 1;" >/dev/null
+
+    local loss_detected=false
+    for st_table in "${UPG_CONTENT_TABLES[@]}"; do
+        rv_reading="$(_st_upg "$RV_PROJECT" "$(upg_content_query_for "$st_table")")"
+        rv_count="${rv_reading%%|*}"
+        rv_md5="${rv_reading#*|}"
+        if [[ -z "$rv_count" || -z "$rv_md5" \
+            || "$rv_count" != "${CAPTURED_COUNT[$st_table]}" \
+            || "$rv_md5" != "${CAPTURED_MD5[$st_table]}" ]]; then
+            loss_detected=true
+        fi
+    done
+    if [[ "$loss_detected" == "true" ]]; then
+        pass "self-test MISMATCH: deleting a row from the restored side IS caught against the manifest"
+    else
+        fail "self-test MISMATCH: deleting a row from the restored side was NOT caught — the"
+        log "ERROR" "        comparator cannot see real loss on the restored side. It must not be"
+        log "ERROR" "        used to certify a restore."
+        rc=1
+    fi
+
     log "INFO" "=== SELF-TEST: ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="
     if [[ "$rc" -ne 0 || "$FAIL_COUNT" -gt 0 ]]; then
         log "ERROR" "The comparator did NOT separate. It must not be used to certify a restore."
@@ -1258,6 +1560,11 @@ main() {
     if [[ "$rc" -ne 0 ]]; then
         return "$rc"
     fi
+
+    # The content manifest for THIS run — fetched only now, using the backup-path/run-ts
+    # run_restore() just read back from restore.sh's own log (deploy#687). A failure here is
+    # an instrument failure (rc=2), never a fallback to comparing user-postgres against live.
+    fetch_content_manifest
 
     compare || return $?
 

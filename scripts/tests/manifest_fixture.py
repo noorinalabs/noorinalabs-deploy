@@ -36,7 +36,18 @@ _PRINTF = re.compile(
 )
 
 # `MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_backup_manifest-${TIMESTAMP}.txt"`
-_MANIFEST_FILE = re.compile(r'MANIFEST_FILE="\$\{LOCAL_BACKUP_PATH\}/(?P<name>[^"]+)"')
+#
+# `(?<!\w)` is load-bearing, not decoration: deploy#687 added a SIBLING assignment,
+# `CONTENT_MANIFEST_FILE="${LOCAL_BACKUP_PATH}/_content_manifest-${TIMESTAMP}.txt"`, whose text
+# ends in the same "MANIFEST_FILE=" substring. Without the negative lookbehind, `.search()`
+# (first match wins) matched THAT line instead — `CONTENT_` is right there in the identifier —
+# and `manifest_filename()` started returning `_content_manifest-*.txt`, silently renaming what
+# every consumer of this fixture believed `_backup_manifest-*.txt` was. Precisely the class this
+# suite's own header warns about: a paraphrase in the product doesn't break the parser, it
+# quietly narrows what it matches (feedback_paraphrase_in_the_product, deploy#589) — except here
+# the near-duplicate was IN THE PRODUCT, not a test paraphrase, and the regex was the thing not
+# anchored to the identifier it meant to find.
+_MANIFEST_FILE = re.compile(r'(?<!\w)MANIFEST_FILE="\$\{LOCAL_BACKUP_PATH\}/(?P<name>[^"]+)"')
 
 # The default run id used across the fixtures. `backup.sh` builds it with
 # `date -u +%Y%m%d-%H%M%S`, so it is strict and self-delimiting — which is why every parser in

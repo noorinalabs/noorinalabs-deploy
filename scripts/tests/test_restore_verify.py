@@ -47,6 +47,11 @@ RC_VERIFIED, RC_FAILED, RC_INSTRUMENT = 0, 1, 2
 LIVE_PROJECT = "noorinalabs"
 RV_PROJECT = "isnad-restore-verify"
 
+# The run the fake restore.sh claims to have restored (deploy#687) — arbitrary but fixed and
+# self-consistent; nothing compares these against a real B2 object in this suite.
+FAKE_BACKUP_PATH = "daily/2026-07-13"
+FAKE_RUN_TS = "20260713-030100"
+
 
 # ---------------------------------------------------------------------------
 # Static scans
@@ -183,7 +188,7 @@ def test_the_selftest_wait_does_not_crash_on_a_missing_container() -> None:
     m = re.search(r"^self_test\(\) \{(.*?)^\}", src, re.S | re.M)
     assert m, "could not locate self_test()"
     body = m.group(1)
-    assert 'cid="$(_st_dc "$p" ps -q neo4j | head -1)" || cid=""' in body, (
+    assert 'cid="$(_st_dc "$p" ps -q "$svc" | head -1)" || cid=""' in body, (
         'the self-test wait\'s `cid=$(… ps -q …)` is not guarded with `|| cid=""`; under set -e '
         "a missing container (the normal first-pass state) crashes the wait loop before the "
         "stack can come up"
@@ -557,18 +562,51 @@ if rest[0] == "exec":
             print(S["hadiths"]); sys.exit(0)
         die("fake docker: unmodelled sql: " + sql)
 
+    # deploy#687: every UPG_CONTENT_<TABLE> query is now "count(*) || '|' || md5(...)" —
+    # ALL FIVE tables' full-content queries contain "md5", so a generic "md5 in sql" check
+    # (the pre-#687 shape, which only "users" ever exercised) would misroute every table to
+    # the same key. Matched instead by each query's own FROM-clause anchor (unambiguous,
+    # unique per table — see scripts/user_pg_content_queries.sh), with "OFFSET 1" deciding
+    # full vs. MINUS1 exactly as the isnad-postgres branch above already does for hadiths.
     if "user-postgres" in rest:
         sql = rest[-1]
         if "information_schema" in sql:
             print(S["upg_tables"]); sys.exit(0)
-        for key, tok in (("users_md5", "md5"), ("users", "FROM users"),
-                         ("oauth", "oauth_accounts"), ("sessions", "sessions"),
-                         ("audit", "audit_log"), ("alembic", "alembic_version")):
-            if tok in sql:
+        minus1 = "OFFSET 1" in sql
+        for table, anchor in (
+            ("users", "FROM users u"),
+            ("oauth_accounts", "FROM oauth_accounts o"),
+            ("sessions", "FROM sessions sess"),
+            ("audit_log", "FROM audit_log a"),
+            ("alembic_version", "FROM alembic_version v"),
+        ):
+            if anchor in sql:
+                key = f"{table}_md5_minus1" if minus1 else table
                 print(S[key]); sys.exit(0)
         die("fake docker: unmodelled user sql: " + sql)
 
 die("fake docker: unmodelled call: " + " ".join(argv))
+"""
+
+# The content-manifest fetch (deploy#687) is a SEPARATE binary (rclone), not docker — this
+# fake reads the SAME world file so the manifest a "faithful restore" test sees is exactly
+# what the "restored" stack itself reports, and a MISMATCH test that only ever touches
+# `restored`'s neo4j/hadith fields (this suite's existing coverage) leaves the manifest
+# comparison trivially satisfied, same as it always has been for user-postgres.
+FAKE_RCLONE = r"""#!/usr/bin/env python3
+import json, os, sys
+
+world = json.load(open(os.environ["FAKE_WORLD"]))
+argv = sys.argv[1:]
+
+if argv and argv[0] == "cat" and "_content_manifest" in argv[-1]:
+    S = world["restored"]
+    for table in ("users", "oauth_accounts", "sessions", "audit_log", "alembic_version"):
+        count, md5 = S[table].split("|", 1)
+        print(f"CONTENT_MANIFEST table={table} count={count} md5={md5}")
+    sys.exit(0)
+
+sys.exit(0)
 """
 
 # A populated, self-consistent world. The scratch stack starts EMPTY and becomes a copy of
@@ -585,13 +623,21 @@ LIVE_WORLD = {
     "hadith_md5": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "hadith_md5_minus1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",  # DIFFERS
     "pg_tables": "12",
-    "upg_tables": "6",
-    "users": "42",
-    "users_md5": "cccccccccccccccccccccccccccccccc",
-    "oauth": "7",
-    "sessions": "3",
-    "audit": "900",
-    "alembic": "a1b2c3d4",
+    # string_agg(table_name, ',' ORDER BY table_name) — alphabetical, matching
+    # restore_verify.sh's own `printf '%s\n' "${UPG_CONTENT_TABLES[@]}" | sort | paste -sd, -`.
+    "upg_tables": "alembic_version,audit_log,oauth_accounts,sessions,users",
+    # "<count>|<md5>", the exact shape UPG_CONTENT_<TABLE> returns.
+    "users": "42|cccccccccccccccccccccccccccccccc",
+    "users_md5_minus1": "c0cccccccccccccccccccccccccccccc",  # DIFFERS from the "users" md5
+    "oauth_accounts": "7|dddddddddddddddddddddddddddddddd",
+    "oauth_accounts_md5_minus1": "d0dddddddddddddddddddddddddddddd",  # DIFFERS
+    "sessions": "3|eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "sessions_md5_minus1": "e0eeeeeeeeeeeeeeeeeeeeeeeeeeeeee",  # DIFFERS
+    "audit_log": "900|ffffffffffffffffffffffffffffffff",
+    "audit_log_md5_minus1": "f0ffffffffffffffffffffffffffffff",  # DIFFERS
+    # A single-row schema-version marker — no MINUS1 leg (see
+    # scripts/user_pg_content_queries.sh's header for why).
+    "alembic_version": "1|1111111111111111111111111111111",
 }
 
 EMPTY_WORLD = {
@@ -603,7 +649,16 @@ EMPTY_WORLD = {
     "rel_hist": "",
     "hadith_md5": "",
     "hadith_md5_minus1": "",
-    "alembic": "",
+    # assert_scratch_empty() queries information_schema for a bare COUNT before any restore
+    # has run — this must stay "0" (a value), not "" (which reads as an instrument failure).
+    # The table-NAME-list shape (what compare()'s table-set check expects post-restore) only
+    # ever gets read from the "restored" world, which inherits LIVE_WORLD's list by default.
+    "upg_tables": "0",
+    "users": "0|EMPTY",
+    "oauth_accounts": "0|EMPTY",
+    "sessions": "0|EMPTY",
+    "audit_log": "0|EMPTY",
+    "alembic_version": "0|EMPTY",
 }
 
 
@@ -632,6 +687,16 @@ class Harness:
         # The script under test, in a scripts/ dir whose sibling restore.sh we control.
         shutil.copy(RESTORE_VERIFY, self.scripts / "restore_verify.sh")
         os.chmod(self.scripts / "restore_verify.sh", 0o755)
+
+        # deploy#687: restore_verify.sh now sources this sibling file (the shared
+        # count+md5 query constants). Copied fresh alongside it, same discipline as
+        # RV_COMPOSE below — so a change to the real file is reflected here rather than
+        # this harness silently testing against a frozen paraphrase of it
+        # (feedback_test_the_merged_tree_not_the_two_green_prs, deploy#644x#661).
+        shutil.copy(
+            SCRIPTS_DIR / "user_pg_content_queries.sh",
+            self.scripts / "user_pg_content_queries.sh",
+        )
 
         (tmp / "compose").mkdir()
         shutil.copy(RV_COMPOSE, tmp / "compose" / "docker-compose.restore-verify.yml")
@@ -675,6 +740,14 @@ class Harness:
             f'printf "%s" "${{COMPOSE_PROJECT}}" > {self.restore_project}\n'
             f'printf "%s" "${{COMPOSE_FILE}}" > {self.restore_file}\n'
             f"echo RESTORE_INVOKED >> {self.marker}\n"
+            # deploy#687: run_restore() reads these two lines back out of restore.sh's OWN
+            # stdout to learn which run's content manifest to fetch — never re-resolving
+            # independently. Fixed, deterministic values; FAKE_RCLONE's content-manifest
+            # response is keyed on the object PATH containing "_content_manifest", not on
+            # these exact values, so any self-consistent pair works.
+            f'log "INFO" "Resolved \'latest\' to: {FAKE_BACKUP_PATH}"\n'
+            f'log "INFO" "Manifest attests run {FAKE_RUN_TS} '
+            "— selecting that run's dumps\"\n"
             # The volume it resolves is the /data volume of the neo4j container in WHATEVER
             # project it was pointed at. Aimed at `noorinalabs`, that is the production graph.
             'if [ "${COMPOSE_PROJECT}" = "' + LIVE_PROJECT + '" ]; then\n'
@@ -692,7 +765,12 @@ class Harness:
 
         (self.bin / "docker").write_text(FAKE_DOCKER)
         os.chmod(self.bin / "docker", 0o755)
-        for stub in ("rclone", "zstd", "sha256sum"):
+        # rclone now does real work here (deploy#687: fetch_content_manifest's `rclone cat`),
+        # so it gets the same world-driven fake docker gets, rather than the bare `exit 0`
+        # every other B2 access in this file still delegates to restore.sh.
+        (self.bin / "rclone").write_text(FAKE_RCLONE)
+        os.chmod(self.bin / "rclone", 0o755)
+        for stub in ("zstd", "sha256sum"):
             (self.bin / stub).write_text("#!/bin/sh\nexit 0\n")
             os.chmod(self.bin / stub, 0o755)
 
