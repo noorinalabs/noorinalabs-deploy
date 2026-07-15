@@ -1331,6 +1331,11 @@ self_test() {
     CREATE TABLE sessions (id serial PRIMARY KEY, user_id int NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
     CREATE TABLE audit_log (id serial PRIMARY KEY, user_id int, action text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
     CREATE TABLE alembic_version (version_num varchar(32) PRIMARY KEY);
+    -- The real user_pg schema has MORE tables than the five this manifest attests to
+    -- (user_roles, subscriptions, totp_secrets, verification_tokens, ... — see
+    -- docs/DATASTORES.md). user_roles here mirrors that: the table-set check must
+    -- tolerate a table it has never heard of, not just the five it knows by name.
+    CREATE TABLE user_roles (id serial PRIMARY KEY, name text NOT NULL);
     INSERT INTO users (id, email, last_login_at, updated_at) VALUES
         (1, 'narrator1@example.test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
         (2, 'narrator2@example.test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
@@ -1344,10 +1349,12 @@ self_test() {
         (1, 1, 'login', '2026-01-01T00:00:00Z'),
         (2, 2, 'login', '2026-01-01T00:00:00Z');
     INSERT INTO alembic_version (version_num) VALUES ('abc123');
+    INSERT INTO user_roles (id, name) VALUES (1, 'admin');
     SELECT setval('users_id_seq', 2);
     SELECT setval('oauth_accounts_id_seq', 2);
     SELECT setval('sessions_id_seq', 2);
     SELECT setval('audit_log_id_seq', 2);
+    SELECT setval('user_roles_id_seq', 1);
     "
     for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
         printf '%s\n' "$upg_seed" | _st_dc "$p" exec -T user-postgres \
@@ -1576,6 +1583,25 @@ self_test() {
         fail "self-test MISMATCH: deleting a row from the restored side was NOT caught — the"
         log "ERROR" "        comparator cannot see real loss on the restored side. It must not be"
         log "ERROR" "        used to certify a restore."
+        rc=1
+    fi
+
+    # --- Case 6: table-set check must tolerate a table it does not know about (Weronika review) --
+    # RED-FIRST PROOF (deploy#687): the real user_pg schema has more tables than the five
+    # this manifest attests to — user_roles, seeded above, stands in for that. This case is
+    # DELIBERATELY written with the CURRENT (strict-equality) table-set comparison compare()
+    # uses today, to prove that comparison breaks the moment an extra, non-manifest table
+    # exists — which it always will in production. The very next commit fixes compare() to a
+    # presence check and updates this case to match; only then does it pass.
+    local expected_tables actual_tables
+    expected_tables="$(printf '%s\n' "${UPG_CONTENT_TABLES[@]}" | sort | paste -sd, -)"
+    actual_tables="$(_st_upg "$RV_PROJECT" "SET timezone='UTC'; SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public';")"
+    if [[ "$expected_tables" == "$actual_tables" ]]; then
+        pass "self-test table-set: matches despite an EXTRA (non-manifest) table present"
+    else
+        fail "self-test table-set: strict equality BROKE on an extra table — expected='${expected_tables}' actual='${actual_tables}'"
+        log "ERROR" "        this is exactly what happens on every REAL restore: the real user_pg"
+        log "ERROR" "        schema always has more tables than the five this manifest attests to"
         rc=1
     fi
 
