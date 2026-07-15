@@ -632,8 +632,11 @@ generate_content_manifest() {
         # THE ASSIGNMENT (feedback_errexit_kills_assignment_guard, deploy#563/#584/#591) — the
         # rc check below would be dead code on every failing path.
         rc=0
+        # `-q`: each UPG_CONTENT_<TABLE> query is "SET timezone='UTC'; SELECT ..." — without
+        # -q, psql prints the SET statement's own command tag ahead of the reading, corrupting
+        # the count/md5 split below (found in CI: restore_verify.sh's self-test surfaced it).
         reading="$(docker exec "$CONTENT_MANIFEST_CONTAINER" \
-            psql -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -tAc "$query" 2>>"$LOG_FILE")" || rc=$?
+            psql -q -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -tAc "$query" 2>>"$LOG_FILE")" || rc=$?
         if [[ "$rc" -ne 0 || -z "$reading" ]]; then
             log "ERROR" "Content manifest: query for table '${table}' failed or returned an empty reading (rc=${rc})"
             return 1

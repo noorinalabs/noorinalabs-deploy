@@ -268,11 +268,20 @@ pg_val() {
 }
 
 # upg_val <live|rv> <sql>  — the user-service store
+#
+# `-q`: the UPG_CONTENT_* queries (deploy#687) are "SET timezone='UTC'; SELECT ..." — a
+# non-SELECT statement ahead of the reading. `-t` (tuples-only) suppresses column headers and
+# the row-count footer for SELECT output; it does NOT suppress the `SET` COMMAND TAG psql
+# prints for the SET statement itself. Without `-q`, MEASURED comes back as "SET\n<row>" —
+# the leading "SET" survives into `${reading%%|*}` (there's no `|` in "SET", so the split
+# lands one line later than intended) and corrupts every count/table-set reading that uses
+# this shape, while md5-only extractions (`${reading#*|}`) happen to still be correct because
+# the LAST `|` in the string is unaffected. Caught by CI's self-test printing the raw value.
 upg_val() {
     local which="$1" sql="$2"
     _run_capture "psql-user(${which})" \
         _dc "$which" exec -T user-postgres \
-        psql -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -tAc "$sql" || return $?
+        psql -q -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -tAc "$sql" || return $?
 }
 
 # =============================================================================
@@ -1203,8 +1212,10 @@ self_test() {
     # the shell must keep unexpanded.
     _st_upg() {
         local p="$1" q="$2"
+        # `-q`: suppresses the `SET` command tag the UPG_CONTENT_*/MINUS1 queries' leading
+        # `SET timezone='UTC';` would otherwise print ahead of the actual reading — see upg_val().
         _st_dc "$p" exec -T user-postgres \
-            psql -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "$q"
+            psql -q -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "$q"
     }
 
     _st_cleanup() {
@@ -1460,19 +1471,16 @@ self_test() {
         "INSERT INTO sessions (id, user_id, created_at) VALUES (2, 2, now());
          UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = 1;" >/dev/null
 
-    local drift_ok=true rv_reading rv_count rv_md5 ref_reread
+    local drift_ok=true rv_reading rv_count rv_md5
     for st_table in "${UPG_CONTENT_TABLES[@]}"; do
         rv_reading="$(_st_upg "$RV_PROJECT" "$(upg_content_query_for "$st_table")")"
         rv_count="${rv_reading%%|*}"
         rv_md5="${rv_reading#*|}"
-        # XXX(deploy#687 red-proof, commit 1/2): comparing against a FRESH read of REF —
-        # exactly the pre-#687 bug — instead of the CAPTURED manifest. This is deliberately
-        # wrong and is fixed in the very next commit; it exists so CI's self-test job proves
-        # this leg can actually fail before the fix commit proves it passes.
-        ref_reread="$(_st_upg "$ST_REF_PROJECT" "$(upg_content_query_for "$st_table")")"
-        if [[ -z "$rv_reading" || -z "$ref_reread" || "$rv_reading" != "$ref_reread" ]]; then
+        if [[ -z "$rv_count" || -z "$rv_md5" \
+            || "$rv_count" != "${CAPTURED_COUNT[$st_table]}" \
+            || "$rv_md5" != "${CAPTURED_MD5[$st_table]}" ]]; then
             drift_ok=false
-            log "ERROR" "  benign-drift MATCH failed for ${st_table}: ref(fresh)=${ref_reread} restored=${rv_reading}"
+            log "ERROR" "  benign-drift MATCH failed for ${st_table}: captured=${CAPTURED_COUNT[$st_table]}|${CAPTURED_MD5[$st_table]} restored=${rv_count}|${rv_md5}"
         fi
     done
     if [[ "$drift_ok" == "true" ]]; then
