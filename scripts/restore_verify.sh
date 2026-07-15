@@ -1001,6 +1001,17 @@ run_restore() {
 declare -gA CM_COUNT=()
 declare -gA CM_MD5=()
 
+# Pre-declared as empty (Weronika review, PR#688): run_restore() assigns these only
+# CONDITIONALLY, inside `if [[ -n "$backup_path_line" ]]`. restore.sh has a real, supported
+# path (its heuristic newest-run fallback when no completeness manifest exists — restore.sh's
+# `elif` branch) that never prints the "Resolved 'latest' to:" / "Manifest attests run" lines,
+# so without this pre-declaration `set -u` turns fetch_content_manifest()'s bare read into an
+# "unbound variable" crash BEFORE its own instrument_fail diagnostic (the one written for
+# exactly that missing-log case) can fire. Same class as self_test()'s ST_REF_PROJECT
+# not-`local` fix (deploy#677). Empty string, so the instrument_fail guard below still trips.
+declare -g CONTENT_MANIFEST_BACKUP_PATH=""
+declare -g CONTENT_MANIFEST_RUN_TS=""
+
 # fetch_content_manifest — pull the B2 object that ATTESTS what the run restore_restore()
 # just restored actually contained, and populate CM_COUNT / CM_MD5.
 #
@@ -1024,18 +1035,38 @@ fetch_content_manifest() {
         run-ts='${CONTENT_MANIFEST_RUN_TS:-<empty>}')"
     fi
 
-    export RCLONE_CONFIG_ISNAD_TYPE="b2"
-    export RCLONE_CONFIG_ISNAD_ACCOUNT="${B2_KEY_ID}"
-    export RCLONE_CONFIG_ISNAD_KEY="${B2_APP_KEY}"
-
-    local remote_path manifest_text rc=0
+    local remote_path local_path manifest_text manifest_source rc=0
+    local_path="${RESTORE_STAGING_DIR}/_content_manifest-${CONTENT_MANIFEST_RUN_TS}.txt"
     remote_path="isnad:${B2_BUCKET}/${BACKUP_PREFIX}/${CONTENT_MANIFEST_BACKUP_PATH}/_content_manifest-${CONTENT_MANIFEST_RUN_TS}.txt"
 
-    # `|| rc=$?`, never a bare assignment — see the header's rules on errexit and assignments.
-    manifest_text="$(rclone cat "$remote_path" 2>&1)" || rc=$?
+    # PREFER the local, already-checksum-verified copy (Lucas review, PR#688). restore.sh —
+    # invoked by run_restore() just above — does an unfiltered `rclone copy` of the ENTIRE
+    # backup-path directory into $RESTORE_STAGING_DIR, which includes _content_manifest-<TS>.txt
+    # and its .sha256 sidecar, and then verify_checksums() globs EVERY *.sha256 in that dir and
+    # verifies it. So by the time we reach here the manifest is already on local disk AND
+    # cryptographically verified, and teardown (which rm -rf's the staging dir) has not run yet.
+    # Reading it locally avoids: a needless second B2 round-trip; a second exposure of
+    # B2_APP_KEY in this process; and — the operative risk — a torn/bit-flipped `rclone cat`
+    # whose corrupted md5 hex would still satisfy the [A-Za-z0-9]+ parse below and silently
+    # substitute a wrong attestation value (a spurious MISMATCH, fail-safe direction, but still
+    # the transient-blip alert-fatigue class this codebase treats as a first-order cost —
+    # deploy#559/#565). Fall back to a direct B2 read ONLY if the local copy is somehow absent,
+    # never the reverse.
+    if [[ -s "$local_path" ]]; then
+        # `|| rc=$?`, never a bare assignment — see the header's rules on errexit and assignments.
+        manifest_text="$(cat "$local_path" 2>&1)" || rc=$?
+        manifest_source="local checksum-verified copy ${local_path}"
+    else
+        export RCLONE_CONFIG_ISNAD_TYPE="b2"
+        export RCLONE_CONFIG_ISNAD_ACCOUNT="${B2_KEY_ID}"
+        export RCLONE_CONFIG_ISNAD_KEY="${B2_APP_KEY}"
+        # `|| rc=$?`, never a bare assignment — see the header's rules on errexit and assignments.
+        manifest_text="$(rclone cat "$remote_path" 2>&1)" || rc=$?
+        manifest_source="B2 fallback ${remote_path} (local copy ${local_path} was absent)"
+    fi
     if [[ "$rc" -ne 0 || -z "$manifest_text" ]]; then
         instrument_fail "content manifest absent for run ${CONTENT_MANIFEST_RUN_TS} — cannot
-        verify user-postgres content. ${remote_path} did not read back (rc=${rc}).
+        verify user-postgres content. Source tried: ${manifest_source} (rc=${rc}).
 
         This is EXPECTED on the very first restore-verify run after deploy#687 merges, before
         any new backup has produced a content manifest — see the design's rollout sequence. It
@@ -1043,7 +1074,7 @@ fetch_content_manifest() {
         user-postgres against LIVE: that fallback is precisely the false-negative this design
         exists to fix (live legitimately drifts between dump-time and verify-time).
 
-        rclone's own words:
+        underlying reader's own words:
         ${manifest_text}"
     fi
 
@@ -1131,15 +1162,31 @@ compare() {
     done
 
     # The table-set check (deploy#687 design §5c / deploy#662): a pg_restore that silently
-    # dropped a table would still MATCH on every table it DID restore — this catches that a
-    # per-table comparison structurally cannot. Compared against UPG_CONTENT_TABLES (the fixed
-    # set the manifest itself declares), not against live: same restored-vs-manifest doctrine
-    # as everything else in this block.
-    local expected_tables
-    expected_tables="$(printf '%s\n' "${UPG_CONTENT_TABLES[@]}" | sort | paste -sd, -)"
-    upg_val rv "SET timezone='UTC'; SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public';" ||
+    # dropped a table would still MATCH on every table it DID restore — a per-table content
+    # comparison structurally cannot catch a table that is simply GONE. This asserts PRESENCE
+    # (a subset test), NOT set-equality: every table the manifest attests (UPG_CONTENT_TABLES)
+    # must exist in the restored public schema. It deliberately does NOT require the restored
+    # set to contain nothing else — the real user-service schema carries more tables than the
+    # manifest tracks (user_roles, subscriptions, totp_secrets, verification_tokens, … —
+    # docs/DATASTORES.md), so a strict-equality check would MISMATCH on every real restore,
+    # reintroducing the exact false-negative deploy#687 exists to remove (Weronika review,
+    # PR#688). Filtered to BASE TABLE so a restored view/matview can't stand in for a dropped
+    # table. Per-table rows so a drop NAMES the missing table rather than diffing two opaque
+    # comma blobs.
+    local restored_tables upg_table present
+    upg_val rv "SET timezone='UTC'; SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" ||
         instrument_fail "cannot read the restored user-postgres table set"
-    row "user-pg table set" "$expected_tables" "$MEASURED" || mismatches=$((mismatches + 1))
+    # Wrap in delimiters so the membership test is exact (',user_roles,' cannot match inside
+    # another name) even though no current table name is a substring of another.
+    restored_tables=",${MEASURED},"
+    for upg_table in "${UPG_CONTENT_TABLES[@]}"; do
+        if [[ "$restored_tables" == *",${upg_table},"* ]]; then
+            present="present"
+        else
+            present="ABSENT"
+        fi
+        row "table present: ${upg_table}" "present" "$present" || mismatches=$((mismatches + 1))
+    done
 
     if [[ "$mismatches" -gt 0 ]]; then
         log "ERROR" "${mismatches} metric(s) MISMATCHED — the restored artifact does NOT reproduce"
@@ -1586,23 +1633,45 @@ self_test() {
         rc=1
     fi
 
-    # --- Case 6: table-set check must tolerate a table it does not know about (Weronika review) --
-    # RED-FIRST PROOF (deploy#687): the real user_pg schema has more tables than the five
-    # this manifest attests to — user_roles, seeded above, stands in for that. This case is
-    # DELIBERATELY written with the CURRENT (strict-equality) table-set comparison compare()
-    # uses today, to prove that comparison breaks the moment an extra, non-manifest table
-    # exists — which it always will in production. The very next commit fixes compare() to a
-    # presence check and updates this case to match; only then does it pass.
-    local expected_tables actual_tables
-    expected_tables="$(printf '%s\n' "${UPG_CONTENT_TABLES[@]}" | sort | paste -sd, -)"
-    actual_tables="$(_st_upg "$RV_PROJECT" "SET timezone='UTC'; SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public';")"
-    if [[ "$expected_tables" == "$actual_tables" ]]; then
-        pass "self-test table-set: matches despite an EXTRA (non-manifest) table present"
+    # --- Case 6: table-set PRESENCE check — tolerates an unknown table AND catches a dropped one
+    # (Weronika review, PR#688; bidirectional calibration per feedback_drop_gate_bidirectional_ab).
+    # This mirrors compare()'s production table-set logic EXACTLY (subset over UPG_CONTENT_TABLES,
+    # BASE TABLE filter, comma-delimited membership) so the self-test calibrates the real code,
+    # not a parallel reimplementation.
+    #
+    # 6a — TOLERANCE: the real user_pg schema always has MORE tables than the five the manifest
+    # attests to (user_roles, seeded above, stands in for subscriptions/totp_secrets/
+    # verification_tokens/… — docs/DATASTORES.md). The subset check MUST pass despite that extra
+    # table. The strict set-equality this replaced went RED here — proven in the parent commit
+    # (9072350), which is exactly why the fixture seeds user_roles: without a table the manifest
+    # does not know about, neither the bug nor its fix is expressible (main#927).
+    # 6b — RED-ABILITY: tolerance without detection is blindness. Drop a manifest table from the
+    # restored side and require the SAME check to catch it, or "tolerant of extras" degrades to
+    # "blind to drops" — the very failure this check exists to prevent.
+    _st_present_ok() { # _st_present_ok <project> — 0 iff every UPG_CONTENT_TABLES member present
+        local proj="$1" measured wrapped t
+        measured="$(_st_upg "$proj" "SET timezone='UTC'; SELECT string_agg(table_name, ',' ORDER BY table_name) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';")"
+        wrapped=",${measured},"
+        for t in "${UPG_CONTENT_TABLES[@]}"; do
+            [[ "$wrapped" == *",${t},"* ]] || return 1
+        done
+        return 0
+    }
+    if _st_present_ok "$RV_PROJECT"; then
+        pass "self-test table-set: all manifest tables present despite an EXTRA (non-manifest) table"
     else
-        fail "self-test table-set: strict equality BROKE on an extra table — expected='${expected_tables}' actual='${actual_tables}'"
-        log "ERROR" "        this is exactly what happens on every REAL restore: the real user_pg"
-        log "ERROR" "        schema always has more tables than the five this manifest attests to"
+        fail "self-test table-set: subset check FAILED with all manifest tables present plus one extra"
+        log "ERROR" "        the presence check is over-strict — it would red on every real restore"
         rc=1
+    fi
+    # 6b: drop a manifest table on the restored side; the presence check must now go red.
+    _st_upg "$RV_PROJECT" "DROP TABLE audit_log;" >/dev/null
+    if _st_present_ok "$RV_PROJECT"; then
+        fail "self-test table-set: a DROPPED manifest table (audit_log) was NOT caught — the check"
+        log "ERROR" "        is blind, not tolerant; it cannot certify that a restore is complete."
+        rc=1
+    else
+        pass "self-test table-set: DROP of a manifest table (audit_log) correctly caught (red-ability)"
     fi
 
     log "INFO" "=== SELF-TEST: ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="

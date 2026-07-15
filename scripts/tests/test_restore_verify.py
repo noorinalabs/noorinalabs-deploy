@@ -623,9 +623,15 @@ LIVE_WORLD = {
     "hadith_md5": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "hadith_md5_minus1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",  # DIFFERS
     "pg_tables": "12",
-    # string_agg(table_name, ',' ORDER BY table_name) — alphabetical, matching
-    # restore_verify.sh's own `printf '%s\n' "${UPG_CONTENT_TABLES[@]}" | sort | paste -sd, -`.
-    "upg_tables": "alembic_version,audit_log,oauth_accounts,sessions,users",
+    # string_agg(table_name, ',' ORDER BY table_name) — alphabetical. This includes user_roles,
+    # a table the content manifest does NOT attest (FAKE_RCLONE emits only the five
+    # UPG_CONTENT_TABLES), mirroring the real user-service schema, which carries more tables than
+    # the manifest tracks (user_roles, subscriptions, totp_secrets, verification_tokens, … —
+    # docs/DATASTORES.md). compare()'s table-set check is a PRESENCE/subset test, so the extra
+    # table must be TOLERATED; the strict set-equality it replaced would MISMATCH here. Without a
+    # table the manifest does not know about, this fixture could not express the defect the
+    # subset check exists to prevent (Weronika review, PR#688; main#927).
+    "upg_tables": "alembic_version,audit_log,oauth_accounts,sessions,user_roles,users",
     # "<count>|<md5>", the exact shape UPG_CONTENT_<TABLE> returns.
     "users": "42|cccccccccccccccccccccccccccccccc",
     "users_md5_minus1": "c0cccccccccccccccccccccccccccccc",  # DIFFERS from the "users" md5
