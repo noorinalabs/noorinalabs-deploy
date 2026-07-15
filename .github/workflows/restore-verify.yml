@@ -184,6 +184,22 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/noorinalabs-deploy
+
+            # Refresh the on-box checkout to origin/main BEFORE running the script,
+            # exactly as graph-ops.yml / graph-prune-narrators.yml / deploy-data-load.yml
+            # do, so the host runs the current committed restore_verify.sh rather than
+            # whatever was last synced by hand. Its absence was this workflow's FIRST
+            # failure on the real host (deploy#685): `./scripts/restore_verify.sh: No
+            # such file or directory` on a checkout behind main. Guarded even though
+            # `set -e` is on: an unguarded `git fetch` failure would abort with git's
+            # own message and no hint that the danger is the following `reset --hard
+            # origin/main` succeeding against a STALE remote-tracking ref.
+            echo "==> Pulling latest deploy config..."
+            git fetch origin main \
+              || { echo "ERROR: [${{ matrix.env }}] git fetch origin main failed — refusing to run against a stale checkout." >&2; exit 1; }
+            git reset --hard origin/main \
+              || { echo "ERROR: [${{ matrix.env }}] git reset --hard origin/main failed." >&2; exit 1; }
+
             export EXPECT_PREFIX='${{ matrix.env }}'
             ./scripts/restore_verify.sh
         env:

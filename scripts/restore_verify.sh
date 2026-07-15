@@ -296,10 +296,17 @@ readonly CY_FP_PARTS="MATCH (n:Narrator)
 readonly CY_NODES="MATCH (n) RETURN count(n);"
 readonly CY_RELS="MATCH ()-[r]->() RETURN count(r);"
 # Histograms: a node count can match while the LABELS are wrong.
+# Neo4j 5.x rejects a RETURN that mixes a grouping expression (`l`) with an aggregate
+# (`count(*)`) in the same projection ("Aggregation column contains implicit grouping
+# expressions"). The WITH separates grouping from aggregation before the string is built
+# (deploy#684 — self_test() never exercised these two constants, so this was invalid on
+# every real run and only ever caught by the live comparator dying at exit 2).
 readonly CY_LABEL_HIST="MATCH (n) UNWIND labels(n) AS l
-    RETURN l + '=' + toString(count(*)) AS h ORDER BY h;"
+    WITH l, count(*) AS c
+    RETURN l + '=' + toString(c) AS h ORDER BY h;"
 readonly CY_REL_HIST="MATCH ()-[r]->()
-    RETURN type(r) + '=' + toString(count(r)) AS h ORDER BY h;"
+    WITH type(r) AS t, count(r) AS c
+    RETURN t + '=' + toString(c) AS h ORDER BY h;"
 
 readonly PG_HADITH_COUNT="SELECT count(*) FROM isnad_graph.hadiths;"
 readonly PG_HADITH_MD5="SELECT md5(string_agg(t,'|' ORDER BY t)) FROM (SELECT h::text AS t FROM isnad_graph.hadiths h) s;"
@@ -998,6 +1005,17 @@ self_test() {
             'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "$1"' \
             _ "$q" | tail -n +2 | tr -d ' "\r'
     }
+    # _st_cypher_hist <project> <query> — same flattening as _cypher_hist_raw (multi-row
+    # readings collapse to one line so they compare as scalars). A SEPARATE helper from
+    # _st_cypher because that one strips ALL spaces, which would silently glue
+    # "Hadith=20 Narrator=50" into "Hadith=20Narrator=50" and hide the row boundary.
+    _st_cypher_hist() {
+        local p="$1" q="$2"
+        # shellcheck disable=SC2016
+        _st_dc "$p" exec -T neo4j sh -c \
+            'NEO4J_USERNAME=neo4j NEO4J_PASSWORD="${NEO4J_AUTH#neo4j/}" exec cypher-shell --format plain "$1"' \
+            _ "$q" | tail -n +2 | tr -d '"\r' | tr '\n' ' '
+    }
 
     _st_cleanup() {
         # THE VERDICT. Captured on the first line, before anything here can clobber `$?`,
@@ -1096,6 +1114,37 @@ self_test() {
         rc=1
     fi
 
+    # --- Case 1b: the HISTOGRAM readers are READABLE at all, and MATCH -------
+    # CY_LABEL_HIST / CY_REL_HIST mix a grouping expression with an aggregate in the
+    # same RETURN — invalid on Neo4j 5.x ("Aggregation column contains implicit
+    # grouping expressions"). Nothing above exercises them (calibrate()/self_test()'s
+    # fingerprint cases only ever touch CY_FP / CY_FP_PARTS), so this was invalid on
+    # every real run and only ever caught by the live comparator dying at exit 2
+    # (deploy#684). An INSTRUMENT FAILURE here — an empty reading from a query the
+    # engine refused — must FAIL the case exactly like an empty fingerprint would.
+    local ref_label_hist sub_label_hist ref_rel_hist sub_rel_hist
+    ref_label_hist="$(_st_cypher_hist "$ST_REF_PROJECT" "$CY_LABEL_HIST")" || ref_label_hist=""
+    sub_label_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_LABEL_HIST")" || sub_label_hist=""
+    log "INFO" "  label histogram (ref): ${ref_label_hist}"
+    log "INFO" "  label histogram (sub): ${sub_label_hist}"
+    if [[ -n "$ref_label_hist" && -n "$sub_label_hist" && "$ref_label_hist" == "$sub_label_hist" ]]; then
+        pass "self-test MATCH: label histogram is READABLE and agrees on identically-seeded stacks (${ref_label_hist})"
+    else
+        fail "self-test MATCH: label histogram is unreadable (invalid Cypher / instrument failure) or disagreed on identical stacks (ref='${ref_label_hist}' sub='${sub_label_hist}')"
+        rc=1
+    fi
+
+    ref_rel_hist="$(_st_cypher_hist "$ST_REF_PROJECT" "$CY_REL_HIST")" || ref_rel_hist=""
+    sub_rel_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_REL_HIST")" || sub_rel_hist=""
+    log "INFO" "  reltype histogram (ref): ${ref_rel_hist}"
+    log "INFO" "  reltype histogram (sub): ${sub_rel_hist}"
+    if [[ -n "$ref_rel_hist" && -n "$sub_rel_hist" && "$ref_rel_hist" == "$sub_rel_hist" ]]; then
+        pass "self-test MATCH: reltype histogram is READABLE and agrees on identically-seeded stacks (${ref_rel_hist})"
+    else
+        fail "self-test MATCH: reltype histogram is unreadable (invalid Cypher / instrument failure) or disagreed on identical stacks (ref='${ref_rel_hist}' sub='${sub_rel_hist}')"
+        rc=1
+    fi
+
     # --- Case 2: minus one narrator MUST differ ------------------------------
     _st_cypher "$RV_PROJECT" "MATCH (n:Narrator {id:'nar:7'}) DETACH DELETE n;" >/dev/null
     sub_fp="$(_st_cypher "$RV_PROJECT" "$CY_FP")"
@@ -1107,6 +1156,37 @@ self_test() {
         pass "self-test DIFFER: removing ONE narrator changed the fingerprint (ref=${ref_fp} sub=${sub_fp})"
     else
         fail "self-test DIFFER: the fingerprint is INERT or a reading was EMPTY — cannot see a missing narrator (ref=${ref_fp} sub=${sub_fp})"
+        rc=1
+    fi
+
+    # --- Case 2b: the label histogram MUST also see the missing narrator -----
+    # A count/label histogram is coarser than the fingerprint, but it must still be
+    # able to go red: it is the ONLY comparator reading in compare() that a narrator's
+    # own properties never reach (deploy#684).
+    sub_label_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_LABEL_HIST")" || sub_label_hist=""
+    if st_fp_differs "$ref_label_hist" "$sub_label_hist"; then
+        pass "self-test DIFFER: removing ONE narrator changed the label histogram (ref=${ref_label_hist} sub=${sub_label_hist})"
+    else
+        fail "self-test DIFFER: the label histogram is INERT or a reading was EMPTY — cannot see a missing narrator (ref=${ref_label_hist} sub=${sub_label_hist})"
+        rc=1
+    fi
+
+    # --- Case 2c: the reltype histogram MUST also see a REMOVED RELATIONSHIP -
+    # Case 2b proved the LABEL histogram can go red — but nar:7 (the narrator Case 2
+    # deletes) owns no relationships, so CY_REL_HIST reads identically before and
+    # after that mutation and Case 2b never exercises this reader's DIFFER side. A
+    # histogram proven bidirectional on one axis and MATCH-only on the other is
+    # exactly the gap that erases a class rather than merely under-counting it:
+    # prove the reltype reader separates on a mutation of its OWN class (a
+    # relationship), not a sibling's (feedback_drop_gate_bidirectional_ab,
+    # feedback_silent_zero_is_not_a_measurement).
+    _st_cypher "$RV_PROJECT" \
+        "MATCH (:Narrator {id:'nar:1'})-[e:NARRATED_TO]->(:Narrator {id:'nar:2'}) DELETE e;" >/dev/null
+    sub_rel_hist="$(_st_cypher_hist "$RV_PROJECT" "$CY_REL_HIST")" || sub_rel_hist=""
+    if st_fp_differs "$ref_rel_hist" "$sub_rel_hist"; then
+        pass "self-test DIFFER: removing ONE relationship changed the reltype histogram (ref=${ref_rel_hist} sub=${sub_rel_hist})"
+    else
+        fail "self-test DIFFER: the reltype histogram is INERT or a reading was EMPTY — cannot see a missing relationship (ref=${ref_rel_hist} sub=${sub_rel_hist})"
         rc=1
     fi
 
