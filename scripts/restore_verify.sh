@@ -817,12 +817,40 @@ calibrate() {
     #     user-postgres comparators compare() now runs (users, oauth_accounts, sessions,
     #     audit_log) had no equivalent proof. `alembic_version` deliberately has no MINUS1 leg
     #     — see scripts/user_pg_content_queries.sh's header for why.
-    local upg_table upg_full upg_full_md5 upg_minus1 minus1_query
+    #
+    # ZERO ROWS LIVE IS NOT AN INSTRUMENT FAILURE — IT IS A FACT ABOUT A LOW-ACTIVITY
+    # ENVIRONMENT, AND THIS CALIBRATION MUST NOT REFUSE TO RUN OVER IT. (team-lead review)
+    #
+    # A 0-row table cannot be MINUS1-calibrated here: EMPTY vs EMPTY compare equal, and that is
+    # not this comparator being blind — there is nothing to remove. `audit_log` is legitimately
+    # 0 on stg today, and any user-pg table can be empty on a freshly-provisioned environment.
+    # The first cut of this calibration made that case `instrument_fail` (rc=2), which means
+    # restore_verify.sh would refuse to certify ANY restore on a quiet environment — a strictly
+    # worse operational property than the false-negative this whole design exists to fix.
+    #
+    # So the red-ability proof for a possibly-empty table does not belong here at all: it
+    # belongs in self_test(), on SEEDED data this calibration does not control the row count
+    # of. self_test() seeds every one of these four tables with >=2 rows and asserts each MINUS1
+    # leg differs there — that is where "can this comparator see a missing row" is actually
+    # proven, once, deterministically, against a real engine. This live check is a BONUS: when
+    # the table happens to be populated, prove it here too; when it is not, log why and move on.
+    local upg_table upg_full upg_full_count upg_full_md5 upg_minus1 minus1_query
     for upg_table in users oauth_accounts sessions audit_log; do
         upg_val "$REF" "$(upg_content_query_for "$upg_table")" ||
             instrument_fail "cannot compute the reference ${upg_table} content"
         upg_full="$MEASURED"
+        upg_full_count="${upg_full%%|*}"
         upg_full_md5="${upg_full#*|}"
+
+        if [[ "$upg_full_count" == "0" ]]; then
+            log "INFO" "  ${upg_table}: 0 rows on the reference stack right now — live MINUS1"
+            log "INFO" "    calibration is not possible (EMPTY vs EMPTY compare equal, and there"
+            log "INFO" "    is nothing to remove). This comparator's red-ability is already"
+            log "INFO" "    proven in self_test() on seeded data; THIS run relies on the count"
+            log "INFO" "    comparison, the table-set check, and the manifest's md5=EMPTY match."
+            pass "calibration: ${upg_table} MINUS1 skipped (0 rows live) — proven separately in self-test"
+            continue
+        fi
 
         case "$upg_table" in
             users) minus1_query="$UPG_USERS_MD5_MINUS1" ;;
@@ -838,10 +866,9 @@ calibrate() {
         log "INFO" "  ${upg_table} md5 minus 1 row: ${upg_minus1}"
         if [[ "$upg_full_md5" == "$upg_minus1" ]]; then
             instrument_fail "the ${upg_table} checksum CANNOT SEE A MISSING ROW. It is inert.
-            REFUSING TO TESTIFY. (If ${upg_table} genuinely holds 0 or 1 rows on the reference
-            stack right now, 'minus one row' degenerates to the same EMPTY reading as the full
-            set — that is not a false alarm, it is this calibration correctly refusing to trust
-            a comparator it cannot prove can see a loss on this table today.)"
+            REFUSING TO TESTIFY. (${upg_table} holds ${upg_full_count} row(s) on the reference
+            stack right now, so this is NOT the 0-row degenerate case above — the comparator
+            genuinely cannot detect a loss on populated data.)"
         fi
         pass "calibration: the ${upg_table} checksum DIFFERS when one row is removed — it can go red"
     done
@@ -1307,14 +1334,19 @@ self_test() {
     INSERT INTO users (id, email, last_login_at, updated_at) VALUES
         (1, 'narrator1@example.test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
         (2, 'narrator2@example.test', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
-    INSERT INTO oauth_accounts (id, user_id, provider) VALUES (1, 1, 'google');
-    INSERT INTO sessions (id, user_id, created_at) VALUES (1, 1, '2026-01-01T00:00:00Z');
+    INSERT INTO oauth_accounts (id, user_id, provider) VALUES
+        (1, 1, 'google'),
+        (2, 2, 'github');
+    INSERT INTO sessions (id, user_id, created_at) VALUES
+        (1, 1, '2026-01-01T00:00:00Z'),
+        (2, 2, '2026-01-01T00:00:00Z');
     INSERT INTO audit_log (id, user_id, action, created_at) VALUES
         (1, 1, 'login', '2026-01-01T00:00:00Z'),
         (2, 2, 'login', '2026-01-01T00:00:00Z');
     INSERT INTO alembic_version (version_num) VALUES ('abc123');
     SELECT setval('users_id_seq', 2);
-    SELECT setval('sessions_id_seq', 1);
+    SELECT setval('oauth_accounts_id_seq', 2);
+    SELECT setval('sessions_id_seq', 2);
     SELECT setval('audit_log_id_seq', 2);
     "
     for p in "$ST_REF_PROJECT" "$RV_PROJECT"; do
@@ -1334,6 +1366,33 @@ self_test() {
         CAPTURED_MD5["$st_table"]="${st_reading#*|}"
     done
     log "INFO" "self-test: captured baseline manifest from ${ST_REF_PROJECT} (pre-mutation)"
+
+    # --- Per-table MINUS1 red-ability, on SEEDED data (team-lead review) --------------------
+    # calibrate()'s live MINUS1 check cannot prove red-ability on a table that happens to be
+    # empty at verify time (EMPTY vs EMPTY compare equal — there is nothing to remove), and
+    # `audit_log` is legitimately 0 on stg today. So THIS is where "can each user-pg comparator
+    # actually see a missing row" gets proven: deterministically, against a real engine, on
+    # data this self-test controls the row count of (every one of the four tables was just
+    # seeded with >=2 rows, specifically so this is never a degenerate case). calibrate()'s
+    # live check becomes a bonus proof when the live table happens to be populated; this is
+    # the one that is never skipped.
+    local minus1_table minus1_query minus1_full minus1_reduced
+    for minus1_table in users oauth_accounts sessions audit_log; do
+        case "$minus1_table" in
+            users) minus1_query="$UPG_USERS_MD5_MINUS1" ;;
+            oauth_accounts) minus1_query="$UPG_OAUTH_ACCOUNTS_MD5_MINUS1" ;;
+            sessions) minus1_query="$UPG_SESSIONS_MD5_MINUS1" ;;
+            audit_log) minus1_query="$UPG_AUDIT_LOG_MD5_MINUS1" ;;
+        esac
+        minus1_full="${CAPTURED_MD5[$minus1_table]}"
+        minus1_reduced="$(_st_upg "$ST_REF_PROJECT" "$minus1_query")"
+        if [[ -n "$minus1_full" && -n "$minus1_reduced" && "$minus1_full" != "$minus1_reduced" ]]; then
+            pass "self-test calibration: ${minus1_table} md5 DIFFERS when one (seeded) row is removed — it can go red"
+        else
+            fail "self-test calibration: ${minus1_table} md5 CANNOT SEE a missing row on seeded data (full=${minus1_full:-<empty>} minus1=${minus1_reduced:-<empty>})"
+            rc=1
+        fi
+    done
 
     local ref_fp sub_fp ref_parts
     ref_fp="$(_st_cypher "$ST_REF_PROJECT" "$CY_FP")"
@@ -1468,7 +1527,7 @@ self_test() {
     # Comparing RV against a FRESH read of REF here would recreate the exact false-negative
     # this design fixes, and this case is what would catch that regression.
     _st_upg "$ST_REF_PROJECT" \
-        "INSERT INTO sessions (id, user_id, created_at) VALUES (2, 2, now());
+        "INSERT INTO sessions (id, user_id, created_at) VALUES (3, 2, now());
          UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = 1;" >/dev/null
 
     local drift_ok=true rv_reading rv_count rv_md5
