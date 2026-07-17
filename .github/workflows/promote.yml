@@ -60,6 +60,15 @@ on:
           to move it alongside a stack promotion). An `embed`-only promotion
           writes `prod-<short>`/`prod-latest` for the embed image and does NOT
           trigger a prod VPS rollout (see trigger-prod-deploy guard below).
+          `load` (noorinalabs-data-acquisition-load) is likewise OPT-IN
+          (deploy#693): the one-shot graph loader image consumed by the prod
+          graph ops (deploy-data-load.yml / graph-prune-narrators.yml /
+          graph-ops.yml, env=prod), which refuse a stg-tagged loader on
+          env=prod. It is the SOLE path that mints the loader's `prod-*` tag
+          (da's ghcr-publish.yml writes stg-* only). Request it explicitly
+          (e.g. `images=load`). Like `embed`, a `load`-only promotion writes
+          `prod-<short>`/`prod-latest` for the loader image and does NOT
+          trigger a prod VPS rollout.
         required: false
         default: "api,frontend,user-service,landing"
       skip_stg_verify:
@@ -237,11 +246,22 @@ jobs:
               # to pull instead of falling back to a stg tag. NOT in the default
               # set and NOT part of the prod VPS stack roll — see trigger-prod-deploy.
               "embed":        "noorinalabs/noorinalabs-isnad-graph-embed",
+              # Opt-in (deploy#693): the one-shot graph loader image
+              # (noorinalabs-data-acquisition-load). Same opt-in, non-stack
+              # contract as `embed` — retagged stg -> prod via the same
+              # sha-<short>-sourced imagetools path so the prod graph ops
+              # (deploy-data-load.yml / graph-prune-narrators.yml / graph-ops.yml,
+              # env=prod) have a `prod-latest`/`prod-<short>` to pull instead of
+              # being refused for carrying a stg tag. da's ghcr-publish.yml
+              # refuses to write prod-* ("deploy's promote flow ONLY"), so this
+              # promote flow is the sole path that mints the loader's prod tag.
+              # NOT in the default set and NOT part of the prod VPS stack roll.
+              "load":         "noorinalabs/noorinalabs-data-acquisition-load",
           }
           # Implicit "all" (empty input) = the four daemon-stack services only.
-          # `embed` is opt-in (deploy#470) and must be named explicitly — it is
-          # NOT swept in by the empty-input fallback (that would give an
-          # implicit promotion an unexpected embed retag).
+          # `embed` and `load` are opt-in (deploy#470 / deploy#693) and must be
+          # named explicitly — they are NOT swept in by the empty-input fallback
+          # (that would give an implicit promotion an unexpected embed/load retag).
           _default_set = ["api", "frontend", "user-service", "landing"]
           raw = os.environ.get("IMAGES_INPUT", "").strip() or ",".join(_default_set)
           requested = [s.strip() for s in raw.split(",") if s.strip()]
@@ -1017,13 +1037,16 @@ jobs:
     # gate-stg-verify + migrate-prod acceptability, so retag==success is
     # sufficient. Same pattern `retag` uses to ignore a skipped ancestor.
     # The final clause gates the prod VPS rollout on at least one DAEMON-STACK
-    # service being in the promotion set. `embed` (deploy#470) is a one-shot,
-    # profile-gated re-embed image that deploy-prod.yml does NOT roll — so an
-    # `embed`-only promotion leaves all four stack shorts empty. Without this
-    # clause, deploy-prod.yml would be dispatched with all-empty tags and fall
-    # back to `prod-latest` for EVERY stack service, silently re-rolling the
-    # entire prod stack as a side effect of an embed-only retag. The embed prod
-    # tag is consumed by reembed-corpus.yml, not by a VPS rollout.
+    # service being in the promotion set. `embed` (deploy#470) and `load`
+    # (deploy#693) are one-shot op images that deploy-prod.yml does NOT roll —
+    # so an `embed`-only or `load`-only promotion leaves all four stack shorts
+    # empty. Without this clause, deploy-prod.yml would be dispatched with
+    # all-empty tags and fall back to `prod-latest` for EVERY stack service,
+    # silently re-rolling the entire prod stack as a side effect of an
+    # embed/load-only retag. The embed prod tag is consumed by
+    # reembed-corpus.yml and the load prod tag by the prod graph ops
+    # (deploy-data-load.yml / graph-prune-narrators.yml / graph-ops.yml), not
+    # by a VPS rollout.
     if: ${{ always() && needs.plan.result == 'success' && needs.retag.result == 'success' && (needs.plan.outputs.api_short != '' || needs.plan.outputs.frontend_short != '' || needs.plan.outputs.user_service_short != '' || needs.plan.outputs.landing_short != '') }}
     runs-on: ubuntu-latest
     permissions:
