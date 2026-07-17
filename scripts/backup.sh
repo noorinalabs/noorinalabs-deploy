@@ -589,9 +589,19 @@ generate_content_manifest() {
         return 1
     fi
 
+    # Readiness gate: query the TARGET DATABASE over TCP — NOT pg_isready (deploy#690).
+    # The postgres image entrypoint runs a TEMPORARY bootstrap server on the unix socket only
+    # (`listen_addresses=''`) to run initdb and CREATE DATABASE "$POSTGRES_DB", then stops it and
+    # starts the real server. `pg_isready` (which hits the socket) reports "ready" DURING that
+    # bootstrap phase — before "$USER_POSTGRES_DB" exists — so pg_restore below then connects and
+    # dies with `FATAL: database "user_service" does not exist`. Observed on the stg host: under
+    # backup-time load pg_isready passed while the DB was still absent; a plain repro didn't hit
+    # the window (calibrated: pg_isready@1.0s vs target-DB-over-TCP@1.3s). A TCP `SELECT 1` against
+    # the target DB is deterministic: the temp bootstrap server refuses TCP, so a TCP connection
+    # succeeds ONLY against the fully-started real server, by which point CREATE DATABASE has run.
     local waited=0
     until docker exec "$CONTENT_MANIFEST_CONTAINER" \
-        pg_isready -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" >/dev/null 2>&1; do
+        psql -h 127.0.0.1 -U "$USER_POSTGRES_USER" -d "$USER_POSTGRES_DB" -tAc 'SELECT 1' >/dev/null 2>&1; do
         if [[ "$waited" -ge 60 ]]; then
             log "ERROR" "Content manifest: scratch postgres did not become ready within 60s"
             return 1
