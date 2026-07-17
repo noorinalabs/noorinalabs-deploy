@@ -44,16 +44,19 @@ name: Graph flag over-merged narrators (live-graph annotate)
 # run unless every configured id is present in the live graph (a mismatch means the
 # seed is stale against the loaded resolve run — reconcile it, do not flag a subset).
 #
-# stg-gated + PROD HELD. This wave the op runs on stg ONLY. Prod flagging is held
-# behind an explicit owner go-ahead AND a verified-green backup (main#928); the
-# script hard-refuses env=prod until that hold is lifted. dry_run defaults to TRUE
-# — a fat-fingered dispatch reports what it WOULD flag and writes nothing.
+# ENV-GATED, prod AUTHORIZED (deploy#611). Prod flagging was HELD behind an explicit
+# owner go-ahead AND a verified-green backup (main#928); that hold is now LIFTED —
+# the backup go/no-go signed off (deploy#609) and the prod graph data cutover landed
+# at stg parity (deploy#610), so the badge annotates the CORRECT graph. Prod remains
+# gated by (1) the `production` GH-environment manual approval, (2) the 8/8-ids-present
+# refuse below (flag a subset = never), and (3) dry_run defaulting to TRUE — a
+# fat-fingered dispatch reports what it WOULD flag and writes nothing.
 
 on:
   workflow_dispatch:
     inputs:
       env:
-        description: "Target env — stg (prod is HELD this wave; see below)"
+        description: "Target env — stg or prod (prod requires production-environment approval)"
         required: true
         type: choice
         options: [stg, prod]
@@ -81,8 +84,9 @@ jobs:
     # 6h hard cap. Dry-run is seconds.
     timeout-minutes: 20
     # Maps to GH Environment protection (stg -> staging, prod -> production). prod
-    # additionally requires manual approval — but the script ALSO hard-refuses prod
-    # this wave (the hold), so prod is double-gated. Same env mapping as graph-ops.yml.
+    # additionally requires manual approval at the `production` environment gate —
+    # the live second gate now that the wave-level hold is lifted (deploy#611). Same
+    # env mapping as graph-ops.yml.
     environment: ${{ inputs.env == 'prod' && 'production' || 'staging' }}
     permissions:
       # No GHCR pull (Neo4j-only op) — read is all this needs.
@@ -107,15 +111,11 @@ jobs:
           script: |
             set -uo pipefail
 
-            # PROD HOLD (deploy#603 / main#928): prod flagging is not authorized this
-            # wave — held behind an explicit owner go-ahead AND a verified-green backup.
-            # Refuse BEFORE touching anything. Remove this guard only when prod is
-            # authorized (the env choice + production-environment approval remain the
-            # gate at that point).
-            if [ "${ENV_NAME}" = "prod" ]; then
-              echo "ERROR: [prod] over-merged flagging is HELD this wave — owner go-ahead + verified backup required (main#928). Refusing." >&2
-              exit 1
-            fi
+            # PROD HOLD LIFTED (deploy#611, was deploy#603 / main#928). Prod flagging is
+            # now authorized: the backup go/no-go signed off (deploy#609) and the prod
+            # graph cutover landed at stg parity (deploy#610). The `production` GH-env
+            # manual approval (see the job `environment:` above) is the live gate, and
+            # the 8/8-ids-present refuse below still blocks flagging a stale subset.
 
             cd /opt/noorinalabs-deploy
 
@@ -294,5 +294,5 @@ jobs:
             fi
             echo "Sets \`over_merged=true\` (boolean only) on the producer's curated canonical ids (da#448)."
             echo "The per-node \`over_merge_note\` rides the durable deploy-data-load.yml reload, not this op."
-            echo "stg-gated: prod flagging is HELD this wave behind owner go-ahead + verified backup (main#928)."
+            echo "env-gated: prod is authorized (deploy#611) behind the \`production\` GH-env approval + the 8/8-ids-present refuse."
           } >> "$GITHUB_STEP_SUMMARY"
