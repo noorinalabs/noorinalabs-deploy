@@ -1,7 +1,7 @@
 # Base pinned to a digest + in-image apt upgrade per tech-decisions.md
 # § Base Image Pinning (noorinalabs-main#735); refresh the digest when bumping
 # the python tag (docker buildx imagetools inspect python:3.14-slim).
-FROM python:3.14-slim@sha256:d3400aa122fa42cf0af0dbe8ec3091b047eac5c8f7e3539f7135e86d855dc015
+FROM python:3.14-slim@sha256:a7fb1e634c4a578f9e0bd6327f11a3cde11b7a9395f48e24360c0988bcc5c2bc
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
