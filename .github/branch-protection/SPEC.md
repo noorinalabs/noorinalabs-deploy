@@ -19,26 +19,48 @@ pilots (`noorinalabs-user-service`, `noorinalabs-landing-page`).
 
 ## Application status
 
-The **spec + apply script** land in this PR (W14, `Refs noorinalabs-main#322`).
-The actual **apply is owner/admin-gated** and is a **post-merge step**:
+**Live** — ruleset id `17139848` is applied and enforced on `noorinalabs-deploy`'s
+`main`, as of `2026-06-01T19:54:09-04:00` (renamed in place on `2026-09-10`; see
+"The ruleset shape" below for the rename rationale). Verify at any time:
 
-1. Creating a repository ruleset requires repo-admin permission, which the agent
-   `gh` principal (`parametrization`) does not hold for this purpose.
-2. Applying default-branch protection while a wave-branch PR is in flight can
-   block our own merges, so the apply runs from a window with **no in-flight
-   default-branch merge** — post-wave-wrapup is the safe window.
+```bash
+gh api repos/noorinalabs/noorinalabs-deploy/rulesets/17139848
+```
 
-So #322 is **met for this repo only when the owner has run `apply-ruleset.sh`
-and read-back-verified the ruleset on `main`.** `#322` stays OPEN as the
-org-wide rollout tracker until all 8 default branches carry the protection.
+Live rules, confirmed by read-back on 2026-09-10:
 
-This repo currently has **no ruleset and no classic branch protection** on
-`main` (`gh api repos/noorinalabs/noorinalabs-deploy/branches/main/protection`
-returns 404 at the time of writing) — this ruleset is added fresh, there is no
-existing default-branch protection to reconcile or duplicate. (The deploy
-charter's existing "require 1 review" ruleset targets the `deployments/**` wave
-branches — a *different* target ref — and is unaffected by this `~DEFAULT_BRANCH`
-ruleset.)
+| Rule | Value |
+|------|-------|
+| `deletion` | present — no branch delete on `main` |
+| `non_fast_forward` | present — no force-push on `main` |
+| `pull_request` | `required_approving_review_count: 0`, `allowed_merge_methods: [merge, squash, rebase]` |
+| `required_status_checks` | **omitted by design** — see below |
+| `bypass_actors` | `actor_id: 5` (Repository admin), `bypass_mode: always` |
+| `enforcement` | `active` |
+
+`noorinalabs-main#322` (Phase-3 end-state criterion #4) **closed on
+2026-06-02** once this and the other 7 default branches carried the
+protection. Any remaining branch-protection follow-up items (such as this
+rename) are tracked on the org-wide tracker `noorinalabs-main#1464`, which
+stays open; #322 itself does not reopen for them.
+
+The omission of `required_status_checks` here is **deliberate**, not an
+oversight or a not-yet-applied state — see "The ruleset shape" below for why,
+and note the ruleset's name now says so explicitly (`CI green enforced by
+validate_pr_ci_status hook`) rather than implying a server-side status-check
+gate exists. CI-green-blocks-merge for this repo is instead enforced at merge
+time by the `validate_pr_ci_status` hook, which this repo's
+`.claude/settings.json` registers (from the parent's absolute hook path) on
+every `PreToolUse` Bash call. (The deploy charter's separate "require 1
+review" ruleset targets the `deployments/**` wave branches — a *different*
+target ref — and is unaffected by this `~DEFAULT_BRANCH` ruleset.)
+
+`apply-ruleset.sh` remains the idempotent create-or-update tool for future
+changes to this ruleset (e.g. adding `required_status_checks` if deploy ever
+gains an unconditional CI gate — see below). Re-applying it is still an
+owner/admin-gated step, run from a window with no in-flight default-branch
+merge, because creating/updating a repository ruleset requires repo-admin
+permission that the agent `gh` principal (`parametrization`) does not hold.
 
 ## The ruleset shape (and why)
 
@@ -77,6 +99,17 @@ A **repository ruleset** targeting `~DEFAULT_BRANCH`, `enforcement: active`:
   `validate_pr_ci_status` ADMIN_MERGE_EXCEPTION gate** until/unless an
   unconditional CI gate is added.
 
+  The live ruleset's `name` was renamed on 2026-09-10 (owner ruling, "Rename to
+  match the shape") from `Protect main — require PR + green CI (...)` to
+  `Protect main — require PR; CI green enforced by validate_pr_ci_status hook
+  (...)`, so the name stops promising a server-side "green CI" gate this
+  ruleset deliberately does not provide — the enforcement point is the
+  `validate_pr_ci_status` hook, registered from the parent's absolute path at
+  `.claude/settings.json:59` in this repo. `ruleset-main.json`'s `name` field
+  was updated to match in the same change (deploy-side half of
+  `noorinalabs-main#1464`; see `noorinalabs-main#1544` for the parent-repo
+  ruleset's matching rename).
+
   **If deploy later gains an unconditional (un-path-filtered) PR CI gate**, add
   its job-name context here and to `apply-ruleset.sh`'s read-back, e.g.:
 
@@ -101,6 +134,12 @@ A **repository ruleset** targeting `~DEFAULT_BRANCH`, `enforcement: active`:
   exceptions.
 
 ## How to apply (owner)
+
+`apply-ruleset.sh` matches the live ruleset by **name** (`select(.name == ...)`),
+so if you are ever renaming a live ruleset, do the live rename first and only
+then update `ruleset-main.json`'s `name` to match — updating the payload's name
+before the live rename would make the script's name-match miss the existing
+ruleset and attempt a `CREATE` (a duplicate) instead of an `UPDATE`.
 
 ```bash
 # From a window with NO in-flight default-branch merge (post-wave-wrapup):
