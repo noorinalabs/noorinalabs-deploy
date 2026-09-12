@@ -1,5 +1,5 @@
 {
-  "name": "Protect main — require PR + green CI (P3 end-state #4, main#322)",
+  "name": "Protect main — require PR; CI green enforced by validate_pr_ci_status hook (P3 end-state #4, main#322, tracker main#1464)",
   "target": "branch",
   "enforcement": "active",
   "conditions": {
