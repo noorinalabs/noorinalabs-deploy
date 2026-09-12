@@ -51,9 +51,10 @@ validate_pr_ci_status hook`) rather than implying a server-side status-check
 gate exists. CI-green-blocks-merge for this repo is instead enforced at merge
 time by the `validate_pr_ci_status` hook, which this repo's
 `.claude/settings.json` registers (from the parent's absolute hook path) on
-every `PreToolUse` Bash call. (The deploy charter's separate "require 1
-review" ruleset targets the `deployments/**` wave branches — a *different*
-target ref — and is unaffected by this `~DEFAULT_BRANCH` ruleset.)
+every `PreToolUse` Bash call. (The deploy charter describes a separate
+"require 1 review" rule for `deployments/**` wave branches; no such ruleset
+is applied — per-ref rules for those branches return empty, and review-count
+enforcement there is hook-side (`validate_pr_review`) — see deploy#712.)
 
 `apply-ruleset.sh` remains the idempotent create-or-update tool for future
 changes to this ruleset (e.g. adding `required_status_checks` if deploy ever
