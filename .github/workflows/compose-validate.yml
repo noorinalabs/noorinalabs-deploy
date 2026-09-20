@@ -172,7 +172,7 @@ jobs:
         # the org-canonical pin (ig/da/us/ingest/main). types-PyYAML supplies the
         # stubs for check_tf_apply_locking.py's `import yaml` so mypy doesn't trip
         # on import-untyped (which --ignore-missing-imports does NOT suppress).
-        run: pip install ruff==0.15.11 mypy types-PyYAML
+        run: pip install ruff==0.15.11 mypy==1.19.1 types-PyYAML==6.0.12.20260518
       - name: Ruff lint (scripts)
         if: steps.discover.outputs.found == '1'
         run: ruff check scripts .github/workflows/scripts integration-tests/scripts
@@ -360,7 +360,7 @@ jobs:
         # which parses the deploy workflows via `import yaml` (deploy#434). The
         # setup-python tool-cache interpreter has no PyYAML preinstalled (unlike
         # the system python the compose-config job's gate step runs on).
-        run: pip install pytest pyyaml
+        run: pip install pytest==9.0.2 pyyaml==6.0.3
       - name: Install rclone
         # test_b2_backup_artifact.py EXECUTES scripts/verify_b2_backup_artifact.sh
         # against local fixtures (rclone treats a filesystem path as a remote), so the
@@ -409,6 +409,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install pytest
-        run: pip install pytest
+        run: pip install pytest==9.0.2
       - name: Run integration-tests/scripts unit tests
         run: python3 -m pytest integration-tests/scripts/tests -q

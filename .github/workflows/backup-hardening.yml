@@ -51,7 +51,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install pytest
-        run: pip install pytest
+        run: pip install pytest==9.0.2
 
       # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which blocks the
       # rootless user namespace the harness prefers (the one a developer gets from pre-commit

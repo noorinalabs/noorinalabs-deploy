@@ -57,6 +57,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install pytest pyyaml
+      - run: pip install pytest==9.0.2 pyyaml==6.0.3
       - name: Run pre_commit_ci_sync tests
         run: python3 -m pytest .claude/lib/tests/test_pre_commit_ci_sync.py -q
